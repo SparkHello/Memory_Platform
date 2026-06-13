@@ -8,14 +8,7 @@ from pydantic import ValidationError
 from app.api.deps import get_embedding_client, get_llm_client, get_memory_store
 from app.config import get_settings
 from app.memory.core import CoreMemoryConsolidator
-from app.memory.extractor import (
-    EXPLICIT_MEMORY_MARKERS,
-    MIN_CONFIDENCE,
-    MIN_IMPORTANCE,
-    SENSITIVE_MIN_CONFIDENCE,
-    SENSITIVE_MIN_IMPORTANCE,
-    find_assumption_marker,
-)
+from app.memory.extractor import validate_candidate_for_save
 from app.memory.models import (
     CandidateMemory,
     CoreMemorySection,
@@ -335,7 +328,7 @@ async def save_memory(
         return _dump({"action": "ignore", "reason": rejection})
 
     candidate_json = _dump({"source": "mcp", **candidate.model_dump()})
-    rejection = _save_gate_reason(candidate)
+    rejection = validate_candidate_for_save(candidate)
     if rejection:
         store.create_decision_log(
             user_id=user_id,
@@ -498,38 +491,3 @@ async def forget_memories(query: str, limit: int = 5) -> str:
             "query": normalized_query,
         }
     )
-
-
-def _save_gate_reason(candidate: CandidateMemory) -> str | None:
-    """MCP 版保存门槛：与 extractor 的规则一致，但服务端看不到完整对话，
-    source_quote 的逐字校验降级为非空 + 假设表达检测。"""
-    if not candidate.memory:
-        return "memory 内容为空"
-    if candidate.importance < MIN_IMPORTANCE:
-        return f"importance {candidate.importance} 低于保存阈值 {MIN_IMPORTANCE}"
-    if candidate.confidence < MIN_CONFIDENCE:
-        return f"confidence {candidate.confidence} 低于保存阈值 {MIN_CONFIDENCE}"
-    if not candidate.source_quote:
-        return "缺少 source_quote（必须提供用户原话的逐字片段）"
-    if candidate.sensitivity != "normal":
-        if candidate.importance < SENSITIVE_MIN_IMPORTANCE:
-            return (
-                f"{candidate.sensitivity} 记忆 importance {candidate.importance} "
-                f"低于敏感信息保存阈值 {SENSITIVE_MIN_IMPORTANCE}"
-            )
-        if candidate.confidence < SENSITIVE_MIN_CONFIDENCE:
-            return (
-                f"{candidate.sensitivity} 记忆 confidence {candidate.confidence} "
-                f"低于敏感信息保存阈值 {SENSITIVE_MIN_CONFIDENCE}"
-            )
-        if not _has_explicit_memory_marker(candidate.source_quote):
-            return "隐私或敏感信息只有在用户明确要求记住时才保存"
-    marker = find_assumption_marker(candidate.source_quote)
-    if marker:
-        return f"假设场景（命中「{marker}」），不保存"
-    return None
-
-
-def _has_explicit_memory_marker(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in EXPLICIT_MEMORY_MARKERS)

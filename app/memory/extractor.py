@@ -112,7 +112,12 @@ class LLMMemoryExtractor:
         return content if isinstance(content, str) else ""
 
 
-def _gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
+def validate_candidate_for_save(
+    candidate: CandidateMemory,
+    *,
+    user_message: str | None = None,
+    require_quote_in_user_message: bool = False,
+) -> str | None:
     """逐条核对保存规则，返回拒绝原因；全部通过时返回 None。"""
     if candidate.action == "ignore":
         return candidate.reason or "提取模型判定无需保存"
@@ -123,23 +128,59 @@ def _gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
     if candidate.confidence < MIN_CONFIDENCE:
         return f"confidence {candidate.confidence} 低于保存阈值 {MIN_CONFIDENCE}"
 
-    sensitive_rejection = _sensitive_gate_reason(candidate, user_message)
-    if sensitive_rejection:
-        return sensitive_rejection
-
     quote = candidate.source_quote.strip()
-    if not quote:
-        return "缺少 source_quote"
-    if quote not in user_message:
-        return "source_quote 不是用户原话，疑似模型自行编造"
+    quote_rejection = _source_quote_gate_reason(
+        quote,
+        user_message=user_message,
+        require_quote_in_user_message=require_quote_in_user_message,
+    )
+    explicit_memory_text = user_message if require_quote_in_user_message else quote
 
-    marker = find_assumption_marker(_sentence_containing(user_message, quote))
+    if require_quote_in_user_message:
+        sensitive_rejection = _sensitive_gate_reason(candidate, explicit_memory_text or "")
+        if sensitive_rejection:
+            return sensitive_rejection
+        if quote_rejection:
+            return quote_rejection
+        assumption_text = _sentence_containing(user_message or "", quote)
+    else:
+        if quote_rejection:
+            return quote_rejection
+        sensitive_rejection = _sensitive_gate_reason(candidate, explicit_memory_text)
+        if sensitive_rejection:
+            return sensitive_rejection
+        assumption_text = quote
+
+    marker = find_assumption_marker(assumption_text)
     if marker:
         return f"假设场景（命中「{marker}」），不保存"
     return None
 
 
-def _sensitive_gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
+def _gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
+    return validate_candidate_for_save(
+        candidate,
+        user_message=user_message,
+        require_quote_in_user_message=True,
+    )
+
+
+def _source_quote_gate_reason(
+    quote: str,
+    *,
+    user_message: str | None,
+    require_quote_in_user_message: bool,
+) -> str | None:
+    if not quote:
+        if require_quote_in_user_message:
+            return "缺少 source_quote"
+        return "缺少 source_quote（必须提供用户原话的逐字片段）"
+    if require_quote_in_user_message and quote not in (user_message or ""):
+        return "source_quote 不是用户原话，疑似模型自行编造"
+    return None
+
+
+def _sensitive_gate_reason(candidate: CandidateMemory, explicit_memory_text: str) -> str | None:
     if candidate.sensitivity == "normal":
         return None
     if candidate.importance < SENSITIVE_MIN_IMPORTANCE:
@@ -152,7 +193,7 @@ def _sensitive_gate_reason(candidate: CandidateMemory, user_message: str) -> str
             f"{candidate.sensitivity} 记忆 confidence {candidate.confidence} "
             f"低于敏感信息保存阈值 {SENSITIVE_MIN_CONFIDENCE}"
         )
-    if not _has_explicit_memory_marker(user_message):
+    if not _has_explicit_memory_marker(explicit_memory_text):
         return "隐私或敏感信息只有在用户明确要求记住时才保存"
     return None
 
