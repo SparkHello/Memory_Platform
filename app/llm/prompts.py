@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 from app.memory.models import CoreMemorySection, MemoryRecord, RecentContextSummary
+from app.memory.utils import _parse_iso_datetime
 
 
 def render_memory_context(memories: list[MemoryRecord]) -> str:
@@ -187,15 +188,3 @@ def render_core_memory_consolidation_messages(
         {"role": "system", "content": CORE_MEMORY_CONSOLIDATION_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)

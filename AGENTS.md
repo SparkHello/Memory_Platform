@@ -49,6 +49,8 @@ curl http://localhost:8000/health
 
 ```powershell
 pytest
+# 如果 pytest 不在 PATH 中，使用项目虚拟环境：
+.\.venv\Scripts\python -m pytest
 ```
 
 常用定向测试：
@@ -108,6 +110,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/core.py`：核心记忆整理。只从已保存长期记忆中提炼，并要求 evidence ids。
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
+- `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
 - `scripts/`：Windows PowerShell 辅助脚本。
 
@@ -140,6 +143,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改搜索排序时，重点跑 `tests/test_memory_search.py` 和 MCP 搜索相关测试。
 - 修改保存门槛时，重点跑 `tests/test_memory_extraction.py` 和 `tests/test_mcp_server.py`。
 - 修改核心记忆整理时，重点跑 `tests/test_core_memory.py`。
+- 修改 `app/memory/utils.py` 里的共享工具函数时，要同时考虑搜索、提取、解析、体检、核心记忆和 prompt 注入路径，并优先跑相关定向测试后再跑完整 `pytest`。
 - 修改响应格式时，确保 `tests/test_response_charset.py` 和聊天网关测试仍通过。
 - 测试应继续使用 fake LLM，不要引入真实网络调用。
 - 当前仓库可能存在用户未提交改动。修改前先看 `git status --short`，不要回滚用户改动。

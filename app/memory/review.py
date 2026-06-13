@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-import re
 
 from app.memory.models import (
     MemoryRecord,
@@ -8,6 +7,13 @@ from app.memory.models import (
     MemoryReviewResult,
 )
 from app.memory.store import MemoryStore
+from app.memory.utils import (
+    _char_overlap,
+    _has_negation,
+    _normalize,
+    _parse_iso_datetime,
+    _term_jaccard,
+)
 
 
 class MemoryReviewer:
@@ -178,58 +184,3 @@ def _content_relation(left: str, right: str) -> MemoryRelation:
 
 def _newer(left: MemoryRecord, right: MemoryRecord) -> MemoryRecord:
     return right if right.updated_at >= left.updated_at else left
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
-
-
-def _term_jaccard(left: str, right: str) -> float:
-    left_terms = _terms(left)
-    right_terms = _terms(right)
-    if not left_terms or not right_terms:
-        return 0.0
-    return len(left_terms & right_terms) / len(left_terms | right_terms)
-
-
-def _terms(text: str) -> set[str]:
-    return {term.lower() for term in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", text)}
-
-
-def _char_overlap(left: str, right: str) -> float:
-    left_chars = {char.lower() for char in left if not char.isspace()}
-    right_chars = {char.lower() for char in right if not char.isspace()}
-    if not left_chars or not right_chars:
-        return 0.0
-    return len(left_chars & right_chars) / len(left_chars | right_chars)
-
-
-def _has_negation(text: str) -> bool:
-    lowered = text.lower()
-    markers = (
-        "不",
-        "不是",
-        "不再",
-        "没有",
-        "没",
-        "停止",
-        "戒掉",
-        "讨厌",
-        "不喜欢",
-        "不喝",
-        "no longer",
-        "not",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", "", text).strip("。.!?！？").lower()

@@ -1,5 +1,3 @@
-import json
-import re
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field, ValidationError
@@ -8,6 +6,7 @@ from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import render_core_memory_consolidation_messages
 from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRecord
 from app.memory.store import MemoryStore
+from app.memory.utils import _parse_iso_datetime, _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest
 
 
@@ -162,18 +161,6 @@ def _is_expired_non_stable(memory: MemoryRecord) -> bool:
     return valid_until is not None and valid_until < datetime.now(UTC)
 
 
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
-
-
 def _candidate_rejection(
     candidate: CoreMemorySectionCandidate,
     valid_memory_ids: set[str],
@@ -187,25 +174,3 @@ def _candidate_rejection(
     if not any(memory_id in valid_memory_ids for memory_id in candidate.evidence_memory_ids):
         return "evidence_memory_ids 不在输入记忆中"
     return None
-
-
-def _parse_json_object(text: str) -> dict | None:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z]*\s*", "", stripped)
-        stripped = re.sub(r"```\s*$", "", stripped)
-    for candidate_text in (stripped, _first_json_block(stripped)):
-        if not candidate_text:
-            continue
-        try:
-            data = json.loads(candidate_text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return None
-
-
-def _first_json_block(text: str) -> str | None:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    return match.group() if match else None

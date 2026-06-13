@@ -1,9 +1,9 @@
 import json
-import re
 
 from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
 from app.memory.search import EmbeddingClient, cosine_similarity
 from app.memory.store import MemoryStore
+from app.memory.utils import _char_overlap, _has_negation, _normalize, _term_jaccard
 
 # embedding 余弦相似度达到该值即视为同主题旧记忆
 EMBEDDING_SIMILARITY_THRESHOLD = 0.80
@@ -153,14 +153,6 @@ def _load_vector(embedding_json: str | None) -> list[float] | None:
         return None
 
 
-def _term_jaccard(left: str, right: str) -> float:
-    left_terms = _terms(left)
-    right_terms = _terms(right)
-    if not left_terms or not right_terms:
-        return 0.0
-    return len(left_terms & right_terms) / len(left_terms | right_terms)
-
-
 def _related_content_relation(new_content: str, old_content: str) -> MemoryRelation:
     if _looks_conflicting(new_content, old_content):
         return "conflict"
@@ -183,25 +175,6 @@ def _looks_conflicting(new_content: str, old_content: str) -> bool:
     return _char_overlap(new_content, old_content) >= 0.45
 
 
-def _has_negation(text: str) -> bool:
-    lowered = text.lower()
-    markers = (
-        "不",
-        "不是",
-        "不再",
-        "没有",
-        "没",
-        "停止",
-        "戒掉",
-        "讨厌",
-        "不喜欢",
-        "不喝",
-        "no longer",
-        "not",
-    )
-    return any(marker in lowered for marker in markers)
-
-
 def _looks_superseding(text: str) -> bool:
     lowered = text.lower()
     markers = (
@@ -219,19 +192,3 @@ def _looks_superseding(text: str) -> bool:
         "now",
     )
     return any(marker in lowered for marker in markers)
-
-
-def _char_overlap(left: str, right: str) -> float:
-    left_chars = {char.lower() for char in left if not char.isspace()}
-    right_chars = {char.lower() for char in right if not char.isspace()}
-    if not left_chars or not right_chars:
-        return 0.0
-    return len(left_chars & right_chars) / len(left_chars | right_chars)
-
-
-def _terms(text: str) -> set[str]:
-    return {term.lower() for term in re.findall(r"[A-Za-z0-9_一-鿿]+", text)}
-
-
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", "", text).strip("。.!?！？").lower()

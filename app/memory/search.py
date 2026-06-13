@@ -2,12 +2,12 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 import json
 import math
-import re
 
 import httpx
 
 from app.memory.models import MemoryRecord
 from app.memory.store import MemoryStore
+from app.memory.utils import _parse_iso_datetime, _terms
 
 
 class EmbeddingClient(ABC):
@@ -175,10 +175,6 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _terms(text: str) -> set[str]:
-    return {term.lower() for term in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", text)}
-
-
 def _char_overlap_score(query: str, content: str) -> float:
     query_chars = {char for char in query if not char.isspace()}
     content_chars = {char for char in content if not char.isspace()}
@@ -239,15 +235,3 @@ def _sensitivity_penalty(memory: MemoryRecord, *, embedding_mode: bool) -> float
         "sensitive": 0.18 if embedding_mode else 0.60,
     }
     return penalties.get(memory.sensitivity, 0.0)
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)

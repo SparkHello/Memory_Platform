@@ -331,6 +331,8 @@ X-User-Id: user-123
 
 ```powershell
 pytest
+# 如果 pytest 不在 PATH 中，使用项目虚拟环境：
+.\.venv\Scripts\python -m pytest
 ```
 
 运行单个测试文件：
@@ -386,7 +388,8 @@ memory-gateway/
 │  │  ├─ resolver.py
 │  │  ├─ review.py
 │  │  ├─ search.py
-│  │  └─ store.py
+│  │  ├─ store.py
+│  │  └─ utils.py
 │  ├─ openai_compat/
 │  │  ├─ chat.py
 │  │  ├─ schemas.py
@@ -421,6 +424,7 @@ memory-gateway/
 - `app/memory/core.py`：核心记忆整理。
 - `app/memory/review.py`：记忆体检建议。
 - `app/memory/report.py`：报告、导出和恢复导入。
+- `app/memory/utils.py`：记忆模块共享纯工具函数，集中处理 ISO datetime、JSON 对象提取、文本 terms/normalize、相似度和否定词检测。
 - `scripts/install-service.ps1`：Windows 服务安装脚本，使用 2026 端口。
 - `scripts/show-access-urls.ps1`：列出 LAN/Tailscale 访问地址。
 
@@ -440,4 +444,3 @@ memory-gateway/
 - embedding 存储仍在 SQLite JSON 字段里，没有向量索引。
 - Windows 服务脚本包含本机路径和固定端口，换机器前需要检查。
 - `data/memory.db` 是真实本地数据，调试时不要随意删除、覆盖或用测试数据污染。
-
