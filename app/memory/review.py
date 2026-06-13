@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from app.memory.models import (
@@ -8,11 +9,10 @@ from app.memory.models import (
 )
 from app.memory.store import MemoryStore
 from app.memory.utils import (
-    _char_overlap,
     _has_negation,
     _normalize,
     _parse_iso_datetime,
-    _term_jaccard,
+    _terms,
 )
 
 
@@ -32,6 +32,15 @@ class MemoryReviewer:
         recommendations.extend(_relationship_recommendations(memories))
 
         return MemoryReviewResult(total=len(memories), recommendations=recommendations)
+
+
+@dataclass
+class _PreparedMemory:
+    record: MemoryRecord
+    normalized: str
+    terms: set[str]
+    chars: set[str]
+    has_negation: bool
 
 
 def _review_after_recommendations(memories: list[MemoryRecord]) -> list[MemoryReviewRecommendation]:
@@ -106,15 +115,24 @@ def _relationship_recommendations(memories: list[MemoryRecord]) -> list[MemoryRe
     recommendations: list[MemoryReviewRecommendation] = []
     seen_pairs: set[tuple[str, str]] = set()
     ordered = sorted(memories, key=lambda memory: memory.updated_at)
+    prepared = [_prepare_memory(memory) for memory in ordered]
+    grouped: dict[str, list[_PreparedMemory]] = {}
+    group_positions: dict[str, int] = {}
 
-    for index, left in enumerate(ordered):
-        for right in ordered[index + 1 :]:
-            if left.type != right.type:
-                continue
-            pair = tuple(sorted((left.id, right.id)))
+    for item in prepared:
+        group = grouped.setdefault(item.record.type, [])
+        group_positions[item.record.id] = len(group)
+        group.append(item)
+
+    for left in prepared:
+        group = grouped[left.record.type]
+        left_position = group_positions[left.record.id]
+        for group_index in range(left_position + 1, len(group)):
+            right = group[group_index]
+            pair = tuple(sorted((left.record.id, right.record.id)))
             if pair in seen_pairs:
                 continue
-            recommendation = _pair_recommendation(left, right)
+            recommendation = _prepared_pair_recommendation(left, right)
             if recommendation is None:
                 continue
             seen_pairs.add(pair)
@@ -123,12 +141,35 @@ def _relationship_recommendations(memories: list[MemoryRecord]) -> list[MemoryRe
     return recommendations
 
 
+def _prepare_memory(memory: MemoryRecord) -> _PreparedMemory:
+    return _PreparedMemory(
+        record=memory,
+        normalized=_normalize(memory.content),
+        terms=_terms(memory.content),
+        chars={char.lower() for char in memory.content if not char.isspace()},
+        has_negation=_has_negation(memory.content),
+    )
+
+
+def _set_jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def _pair_recommendation(
     left: MemoryRecord,
     right: MemoryRecord,
 ) -> MemoryReviewRecommendation | None:
-    left_normalized = _normalize(left.content)
-    right_normalized = _normalize(right.content)
+    return _prepared_pair_recommendation(_prepare_memory(left), _prepare_memory(right))
+
+
+def _prepared_pair_recommendation(
+    left: _PreparedMemory,
+    right: _PreparedMemory,
+) -> MemoryReviewRecommendation | None:
+    left_normalized = left.normalized
+    right_normalized = right.normalized
     if not left_normalized or not right_normalized:
         return None
 
@@ -137,8 +178,8 @@ def _pair_recommendation(
             action="merge",
             relation="same",
             reason="存在重复记忆，建议保留一条并合并来源",
-            memory_ids=[left.id, right.id],
-            suggested_content=_newer(left, right).content,
+            memory_ids=[left.record.id, right.record.id],
+            suggested_content=_newer(left.record, right.record).content,
         )
 
     if left_normalized in right_normalized:
@@ -146,23 +187,23 @@ def _pair_recommendation(
             action="merge",
             relation="supplement",
             reason="后一条记忆包含前一条信息，建议合并为更完整版本",
-            memory_ids=[left.id, right.id],
-            suggested_content=right.content,
+            memory_ids=[left.record.id, right.record.id],
+            suggested_content=right.record.content,
         )
     if right_normalized in left_normalized:
         return MemoryReviewRecommendation(
             action="merge",
             relation="supplement",
             reason="前一条记忆包含后一条信息，建议合并为更完整版本",
-            memory_ids=[left.id, right.id],
-            suggested_content=left.content,
+            memory_ids=[left.record.id, right.record.id],
+            suggested_content=left.record.content,
         )
 
-    similarity = max(_term_jaccard(left.content, right.content), _char_overlap(left.content, right.content))
+    similarity = max(_set_jaccard(left.terms, right.terms), _set_jaccard(left.chars, right.chars))
     if similarity < 0.65:
         return None
 
-    relation = _content_relation(left.content, right.content)
+    relation = _prepared_content_relation(left, right)
     return MemoryReviewRecommendation(
         action="review",
         relation=relation,
@@ -171,9 +212,15 @@ def _pair_recommendation(
             if relation == "conflict"
             else "两条同类型记忆高度相似，建议确认是否由新记忆取代旧记忆"
         ),
-        memory_ids=[left.id, right.id],
-        suggested_content=_newer(left, right).content,
+        memory_ids=[left.record.id, right.record.id],
+        suggested_content=_newer(left.record, right.record).content,
     )
+
+
+def _prepared_content_relation(left: _PreparedMemory, right: _PreparedMemory) -> MemoryRelation:
+    if left.has_negation != right.has_negation:
+        return "conflict"
+    return "supersede"
 
 
 def _content_relation(left: str, right: str) -> MemoryRelation:
