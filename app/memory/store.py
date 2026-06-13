@@ -63,6 +63,18 @@ class MemoryStore:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_memories_user_archived_importance_updated
+                ON memories(user_id, archived, importance DESC, updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_user_archived_archived_updated
+                ON memories(user_id, archived, archived_at DESC, updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS memory_decision_logs (
                     id TEXT PRIMARY KEY,
                     user_id TEXT,
@@ -144,6 +156,18 @@ class MemoryStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_recent_context_user_updated
                 ON recent_context_summaries(user_id, archived, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recent_context_user_conversation_archived_updated
+                ON recent_context_summaries(user_id, conversation_id, archived, updated_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recent_context_user_archived_updated_desc
+                ON recent_context_summaries(user_id, archived, updated_at DESC)
                 """
             )
 
