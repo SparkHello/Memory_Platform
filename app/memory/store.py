@@ -415,12 +415,12 @@ class MemoryStore:
                 and abs(existing.confidence - confidence) < 0.001
             ):
                 return "ignore", existing
-            self._create_core_memory_section_history(
-                connection=None,
-                section=existing,
-                replaced_at=now,
-            )
             with self._connect() as connection:
+                self._create_core_memory_section_history(
+                    connection=connection,
+                    section=existing,
+                    replaced_at=now,
+                )
                 connection.execute(
                     """
                     UPDATE core_memory_sections
