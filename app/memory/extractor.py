@@ -22,6 +22,18 @@ ASSUMPTION_MARKERS = (
 
 MIN_IMPORTANCE = 6
 MIN_CONFIDENCE = 0.8
+SENSITIVE_MIN_IMPORTANCE = 8
+SENSITIVE_MIN_CONFIDENCE = 0.9
+
+EXPLICIT_MEMORY_MARKERS = (
+    "记住",
+    "记得",
+    "别忘",
+    "不要忘",
+    "以后记得",
+    "remember",
+    "don't forget",
+)
 
 
 class ExtractionOutcome(BaseModel):
@@ -110,6 +122,10 @@ def _gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
     if candidate.confidence < MIN_CONFIDENCE:
         return f"confidence {candidate.confidence} 低于保存阈值 {MIN_CONFIDENCE}"
 
+    sensitive_rejection = _sensitive_gate_reason(candidate, user_message)
+    if sensitive_rejection:
+        return sensitive_rejection
+
     quote = candidate.source_quote.strip()
     if not quote:
         return "缺少 source_quote"
@@ -120,6 +136,29 @@ def _gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
     if marker:
         return f"假设场景（命中「{marker}」），不保存"
     return None
+
+
+def _sensitive_gate_reason(candidate: CandidateMemory, user_message: str) -> str | None:
+    if candidate.sensitivity == "normal":
+        return None
+    if candidate.importance < SENSITIVE_MIN_IMPORTANCE:
+        return (
+            f"{candidate.sensitivity} 记忆 importance {candidate.importance} "
+            f"低于敏感信息保存阈值 {SENSITIVE_MIN_IMPORTANCE}"
+        )
+    if candidate.confidence < SENSITIVE_MIN_CONFIDENCE:
+        return (
+            f"{candidate.sensitivity} 记忆 confidence {candidate.confidence} "
+            f"低于敏感信息保存阈值 {SENSITIVE_MIN_CONFIDENCE}"
+        )
+    if not _has_explicit_memory_marker(user_message):
+        return "隐私或敏感信息只有在用户明确要求记住时才保存"
+    return None
+
+
+def _has_explicit_memory_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in EXPLICIT_MEMORY_MARKERS)
 
 
 def _sentence_containing(message: str, quote: str) -> str:

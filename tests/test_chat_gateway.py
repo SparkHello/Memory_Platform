@@ -44,6 +44,42 @@ def test_chat_completion_injects_memory_context(
     assert "黑咖啡" in fake_llm.messages[0]["content"]
 
 
+def test_chat_completion_injects_recent_context_summary(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    first = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "ios-model",
+            "conversation_id": "conv-recent",
+            "messages": [{"role": "user", "content": "我们刚才在聊周末早餐。"}],
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "ios-model",
+            "conversation_id": "conv-recent",
+            "messages": [{"role": "user", "content": "继续这个话题。"}],
+        },
+    )
+
+    assert second.status_code == 200
+    assert fake_llm.messages[0]["role"] == "system"
+    assert "近期会话摘要" in fake_llm.messages[0]["content"]
+    assert "周末早餐" in fake_llm.messages[0]["content"]
+
+    summaries = client.get("/memories/recent-context", headers=auth_headers)
+    assert summaries.status_code == 200
+    assert summaries.json()["data"][0]["conversation_id"] == "conv-recent"
+
+
 def test_streaming_returns_not_implemented(client: TestClient, auth_headers: dict[str, str]) -> None:
     response = client.post(
         "/v1/chat/completions",

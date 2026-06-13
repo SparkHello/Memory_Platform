@@ -4,8 +4,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.tools/
 .env
+.claude/
 data/*.db
 data/*.db-*
 logs/
-

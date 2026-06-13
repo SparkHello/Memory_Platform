@@ -12,8 +12,13 @@ from app.api.deps import (
     require_api_key,
 )
 from app.llm.client import OpenAICompatibleClient
-from app.llm.prompts import render_memory_context
+from app.llm.prompts import (
+    render_core_memory_context,
+    render_memory_context,
+    render_recent_context_summary_context,
+)
 from app.memory.extractor import LLMMemoryExtractor
+from app.memory.models import CoreMemorySection, MemoryRecord, RecentContextSummary
 from app.memory.resolver import MemoryResolver
 from app.memory.search import EmbeddingClient, MemorySearchService
 from app.memory.store import MemoryStore
@@ -48,7 +53,17 @@ async def create_chat_completion(
         user_id=user_id,
         limit=8,
     )
-    upstream_messages = _inject_memories(request.messages, memories)
+    core_sections = store.list_core_memory_sections(user_id=user_id)
+    recent_summary = store.get_recent_context_summary(
+        user_id=user_id,
+        conversation_id=request.conversation_id,
+    )
+    upstream_messages = _inject_memories(
+        request.messages,
+        memories,
+        core_sections,
+        recent_summary,
+    )
     upstream_response = await llm_client.create_chat_completion(
         request=request,
         messages=upstream_messages,
@@ -67,6 +82,14 @@ async def create_chat_completion(
             assistant_message=assistant_message,
             source_conversation_id=request.conversation_id,
         )
+        background_tasks.add_task(
+            _update_recent_context_summary,
+            store=store,
+            user_id=user_id,
+            conversation_id=request.conversation_id,
+            user_message=latest_user_message.content,
+            assistant_message=assistant_message,
+        )
 
     return client_response
 
@@ -78,11 +101,21 @@ def _latest_user_message(messages: list[ChatMessage]) -> ChatMessage | None:
     return None
 
 
-def _inject_memories(messages: list[ChatMessage], memories: list) -> list[dict[str, str]]:
+def _inject_memories(
+    messages: list[ChatMessage],
+    memories: list[MemoryRecord],
+    core_sections: list[CoreMemorySection],
+    recent_summary: RecentContextSummary | None,
+) -> list[dict[str, str]]:
+    core_memory_prompt = render_core_memory_context(core_sections)
+    recent_context_prompt = render_recent_context_summary_context(recent_summary)
     memory_prompt = render_memory_context(memories)
     upstream_messages = [message.model_dump(exclude_none=True) for message in messages]
-    if memory_prompt:
-        return [{"role": "system", "content": memory_prompt}, *upstream_messages]
+    context_blocks = [
+        block for block in (core_memory_prompt, recent_context_prompt, memory_prompt) if block
+    ]
+    if context_blocks:
+        return [{"role": "system", "content": "\n\n".join(context_blocks)}, *upstream_messages]
     return upstream_messages
 
 
@@ -138,6 +171,7 @@ async def _extract_and_resolve_memories(
         )
         if not outcome.accepted or outcome.candidate is None:
             store.create_decision_log(
+                user_id=user_id,
                 conversation_id=source_conversation_id,
                 candidate_json=outcome.candidate_json,
                 decision="ignore",
@@ -149,10 +183,11 @@ async def _extract_and_resolve_memories(
         result = await resolver.resolve(
             user_id=user_id,
             candidate=outcome.candidate,
-            source_message=user_message,
+            source_message=outcome.candidate.source_quote,
             conversation_id=source_conversation_id,
         )
         store.create_decision_log(
+            user_id=user_id,
             conversation_id=source_conversation_id,
             candidate_json=outcome.candidate_json,
             decision=result.action,
@@ -160,3 +195,54 @@ async def _extract_and_resolve_memories(
         )
     except Exception:
         logger.exception("记忆提取后台任务失败")
+
+
+def _update_recent_context_summary(
+    *,
+    store: MemoryStore,
+    user_id: str,
+    conversation_id: str | None,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    try:
+        previous = store.get_recent_context_summary(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        summary = _build_recent_context_summary(
+            previous.summary if previous else "",
+            user_message=user_message,
+            assistant_message=assistant_message,
+        )
+        if summary:
+            store.upsert_recent_context_summary(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                summary=summary,
+            )
+    except Exception:
+        logger.exception("近期会话摘要更新失败")
+
+
+def _build_recent_context_summary(
+    previous_summary: str,
+    *,
+    user_message: str,
+    assistant_message: str,
+) -> str:
+    lines = [line.strip() for line in previous_summary.splitlines() if line.strip()]
+    lines.extend(
+        [
+            f"用户：{_compact_context_line(user_message)}",
+            f"助手：{_compact_context_line(assistant_message)}",
+        ]
+    )
+    return "\n".join(lines[-8:])[:1200]
+
+
+def _compact_context_line(text: str, limit: int = 220) -> str:
+    compacted = " ".join(text.split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 1] + "…"

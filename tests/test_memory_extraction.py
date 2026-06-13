@@ -102,6 +102,30 @@ def test_fabricated_source_quote_is_not_saved(
     assert "source_quote" in logs[0].reason
 
 
+def test_sensitive_memory_requires_explicit_memory_request(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户有一项健康隐私。",
+        type="fact",
+        importance=8,
+        confidence=0.95,
+        sensitivity="sensitive",
+        source_quote="我有一项健康隐私",
+    )
+
+    response = _post_chat(client, auth_headers, "我有一项健康隐私。")
+
+    assert response.status_code == 200
+    assert memory_store.list_memories(user_id="default") == []
+    logs = memory_store.list_decision_logs()
+    assert logs[0].decision == "ignore"
+    assert "敏感信息" in logs[0].reason or "隐私" in logs[0].reason
+
+
 def test_similar_memory_is_not_duplicated(
     client: TestClient,
     auth_headers: dict[str, str],

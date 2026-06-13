@@ -1,182 +1,177 @@
 # memory-gateway
 
-`memory-gateway` 是一个给 iOS AI 客户端（如 Kelivo）提供长期记忆的 FastAPI 服务，支持两种接入方式：
+`memory-gateway` 是一个给 AI 客户端提供长期记忆能力的本地服务。它主要面向 Kelivo 这类 iOS AI 客户端，也可以被任何支持 OpenAI-compatible API 或 MCP Streamable HTTP 的客户端接入。
 
-1. **MCP 模式（推荐）**：作为远程 MCP 服务器（Streamable HTTP）暴露 `search_memory` / `save_memory` 等记忆工具。Kelivo 直连各家模型 API（流式、换模型都不受影响），模型在对话中按需调用工具完成记忆的检索与保存（RAG）。
-2. **网关模式**：兼容 OpenAI Chat Completions API。客户端把本服务当上游使用，服务在中间自动注入记忆、调用上游模型、回答后后台提取记忆。`stream=true` 暂未实现。
+项目提供两种模式：
 
-两种模式共享同一套记忆库与「不乱记」校验逻辑，可同时开启。
+- MCP 模式：`POST /mcp`，暴露记忆工具，由模型主动调用工具完成检索、保存、整理和删除。
+- 网关模式：`POST /v1/chat/completions`，兼容 OpenAI Chat Completions API，服务端自动注入记忆、调用上游模型，并在回答后后台提取新记忆。
 
-## 功能
+两种模式共享同一个 SQLite 记忆库和同一套保存门槛。
 
-- MCP 端点：`POST /mcp`（Streamable HTTP，无状态），提供 `search_memory` / `save_memory` / `list_memories` / `delete_memory` 四个工具
-- OpenAI 风格聊天接口：`POST /v1/chat/completions`
-- 长期记忆列表：`GET /memories`（不返回向量字段）
-- 长期记忆搜索：`POST /memories/search`
-- 软删除记忆：`DELETE /memories/{memory_id}`
-- 记忆决策日志：`GET /memories/decision-logs`，调试「为什么记了 / 为什么没记」
-- SQLite 存储
-- embedding 搜索优先，关键词搜索 fallback
-- 聊天模型和 embedding 模型使用独立站点、独立 API Key
-- iOS 客户端只持有 `GATEWAY_API_KEY`，不接触上游模型密钥
+## 技术栈
 
-## 记忆管理逻辑
+- Python 3.12
+- FastAPI
+- Uvicorn
+- Pydantic / pydantic-settings
+- httpx
+- MCP Python SDK / FastMCP
+- SQLite
+- pytest / pytest-asyncio
 
-目标：**不乱记**。只保存长期有用、用户明确表达过、未来回答可能用到的信息。
+## 主要功能
 
-### Memory Extractor（提取）
+- MCP Streamable HTTP 服务，端点为 `/mcp`。
+- OpenAI-compatible 聊天网关，端点为 `/v1/chat/completions`。
+- 长期记忆的保存、检索、去重、更新、软删除和恢复。
+- 核心记忆整理：从长期记忆中整理少量稳定背景。
+- 近期会话摘要：网关模式会按 `conversation_id` 保存短期上下文摘要。
+- 记忆体检：找出重复、过期、需要复核或敏感的记忆，只返回建议，不自动修改数据。
+- 记忆报告、导出和恢复导入。
+- embedding 搜索优先，未配置 embedding 或调用失败时退回关键词搜索。
+- 多用户隔离：通过 `X-User-Id` 请求头区分用户，不传时使用 `default`。
+- UTF-8 JSON 响应，兼容 Windows PowerShell 5.1 等旧客户端。
 
-模型回答完成后，后台任务调用上游模型分析本轮对话，要求输出严格 JSON：
-
-```json
-{
-  "action": "create | update | ignore",
-  "memory": "记忆内容",
-  "type": "project | preference | fact | learning | style",
-  "importance": 7,
-  "confidence": 0.9,
-  "reason": "为什么要保存或忽略",
-  "source_quote": "来自用户原话的短引用"
-}
-```
-
-模型输出之后，代码层还会硬性校验一遍，全部满足才允许写库：
-
-| 规则 | 说明 |
-| --- | --- |
-| `action` 是 `create` 或 `update` | `ignore` 直接忽略 |
-| `importance >= 6` | 临时情绪、玩笑闲聊、一次性任务不保存 |
-| `confidence >= 0.8` | 猜测、推断不保存 |
-| `memory` 非空 | |
-| `source_quote` 必须是用户原话的逐字片段 | 防止模型自己编造依据 |
-| 引用所在句子不含假设表达 | 命中「如果 / 假如 / 假设 / 比如我用 / suppose / if I use / imagine / let's say」一律不保存 |
-
-例如：「如果我以后用 Mac，应该怎么配置？」不会被存成「用户使用 Mac」；
-而「我现在用 iPhone 和 Kelivo 做 AI 客户端。」可以存成「用户使用 iPhone，并在尝试用 Kelivo 作为 AI 客户端前端。」
-
-提取模型输出非法 JSON 时不会影响聊天接口，只会留下一条 ignore 决策日志。
-
-### Memory Resolver（解析落库）
-
-保存前先和已有记忆比对：
-
-1. 没有相似旧记忆，创建新记忆。
-2. 内容完全相同（或已有更完整版本），忽略，不重复创建。
-3. 新信息补充了旧记忆的细节，更新旧记忆，而不是新建。
-4. 与旧记忆冲突时，只有用户明确表达的新事实（已通过上面的校验门槛）才覆盖更新；猜测、假设、玩笑到不了这一步。
-5. 更新时保留旧记忆的 `created_at`，只刷新 `updated_at`。
-
-相似判断优先用 embedding 余弦相似度（阈值 0.80），没有向量时退化为词重叠。
-
-### 决策日志（memory_decision_logs）
-
-每次提取后，无论最终是 `create`、`update` 还是 `ignore`，都会写一条决策日志，包含候选 JSON、决策和原因：
-
-```
-GET /memories/decision-logs?conversation_id=xxx&limit=100
-```
-
-聊天请求体里可附带 `conversation_id` 字段，会一并写入决策日志，方便按会话排查。
-
-## 安装
+## 快速开始
 
 需要 Python 3.12。
 
-```bash
-cd memory-gateway
+```powershell
+cd C:\Users\spari\Documents\Memory\memory-gateway
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 ```
 
-macOS 或 Linux 激活虚拟环境时使用：
+macOS / Linux 激活虚拟环境：
 
 ```bash
 source .venv/bin/activate
 ```
 
-## 创建 .env
+复制配置文件：
 
-复制示例文件：
-
-```bash
+```powershell
 copy .env.example .env
 ```
 
-macOS 或 Linux：
-
-```bash
-cp .env.example .env
-```
-
-然后编辑 `.env`：
+编辑 `.env`：
 
 ```env
-GATEWAY_API_KEY=给-iOS-客户端使用的网关密钥
+GATEWAY_API_KEY=change-me
 
-# 聊天模型：智谱中国站点
 UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-UPSTREAM_API_KEY=你的智谱API密钥
+UPSTREAM_API_KEY=your-zhipu-api-key
 UPSTREAM_MODEL=glm-5.1
 
-# Embedding：阿里云百炼中国站点
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_API_KEY=你的阿里云百炼API密钥
+EMBEDDING_API_KEY=your-dashscope-api-key
 EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIMENSIONS=1024
 
 DATABASE_PATH=data/memory.db
+REQUEST_TIMEOUT_SECONDS=60
 ```
 
-注意：
+启动开发服务：
 
-- 聊天请求只使用 `UPSTREAM_BASE_URL`、`UPSTREAM_API_KEY`、`UPSTREAM_MODEL`。
-- embedding 请求只使用 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`。
-- 不要把智谱 API Key 和阿里云百炼 API Key 混用。
-- 如果 `EMBEDDING_API_KEY` 没有配置，服务会自动退回关键词搜索 fallback。
-
-## 运行服务
-
-```bash
+```powershell
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 健康检查：
 
-```bash
+```powershell
 curl http://localhost:8000/health
 ```
 
-聊天请求示例：
+## 配置项
 
-```bash
-curl http://localhost:8000/v1/chat/completions ^
-  -H "Authorization: Bearer 给-iOS-客户端使用的网关密钥" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"model\":\"any-model\",\"messages\":[{\"role\":\"user\",\"content\":\"我喜欢黑咖啡，请记住。\"}],\"temperature\":0.7}"
+| 变量 | 说明 |
+| --- | --- |
+| `GATEWAY_API_KEY` | 客户端访问本服务的 Bearer token。 |
+| `UPSTREAM_BASE_URL` | 聊天模型的 OpenAI-compatible base URL。 |
+| `UPSTREAM_API_KEY` | 聊天模型 API key。 |
+| `UPSTREAM_MODEL` | 实际调用的聊天模型。客户端传入的 model 会被映射到这里。 |
+| `EMBEDDING_BASE_URL` | embedding 服务的 OpenAI-compatible base URL。 |
+| `EMBEDDING_API_KEY` | embedding API key。留空时使用关键词搜索 fallback。 |
+| `EMBEDDING_MODEL` | embedding 模型名。 |
+| `EMBEDDING_DIMENSIONS` | embedding 维度。 |
+| `DATABASE_PATH` | SQLite 数据库路径，默认 `data/memory.db`。 |
+| `REQUEST_TIMEOUT_SECONDS` | 调用上游模型和 embedding 服务的超时时间，默认 60 秒。 |
+
+不要提交真实 `.env`。`.gitignore` 已忽略 `.env`、`data/*.db`、`logs/`、`.venv/` 等本地文件。
+
+## 运行方式
+
+### 开发模式
+
+```powershell
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-macOS 或 Linux 可以把换行符 `^` 换成 `\`。
+本地访问：
 
-## Windows PowerShell 中文请求建议
+- Health: `http://localhost:8000/health`
+- MCP: `http://localhost:8000/mcp`
+- OpenAI-compatible Base URL: `http://localhost:8000/v1`
 
-在 Windows PowerShell 里测试中文请求时，建议先用 hashtable 构造对象，再用 `ConvertTo-Json` 和 `UTF8.GetBytes` 生成 UTF-8 请求体。不要直接把包含中文的 JSON 字符串写进 `-Body`，否则本地 shell 或终端编码可能先把请求体弄坏。
+### Windows 服务模式
+
+脚本位于 `scripts/`，使用 NSSM 注册 Windows 服务。当前脚本里硬编码了：
+
+- NSSM 路径：`C:\Users\spari\Tools\nssm.exe`
+- 项目路径：`C:\Users\spari\Documents\Memory\memory-gateway`
+- 服务端口：`2026`
+
+安装服务需要管理员 PowerShell：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
+```
+
+卸载服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
+```
+
+查看 LAN / Tailscale 访问地址：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1
+```
+
+如果开发服务跑在 8000 端口：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 8000
+```
+
+## OpenAI-compatible 网关模式
+
+客户端配置：
+
+- Base URL: `http://<host>:8000/v1`
+- API Key: `.env` 中的 `GATEWAY_API_KEY`
+- Model: 任意，服务端会改用 `UPSTREAM_MODEL`
+
+请求示例：
 
 ```powershell
 $headers = @{
-  Authorization = "Bearer 给-iOS-客户端使用的网关密钥"
+  Authorization = "Bearer change-me"
   "Content-Type" = "application/json; charset=utf-8"
 }
 
 $body = @{
   model = "any-model"
   messages = @(
-    @{
-      role = "user"
-      content = "我喜欢黑咖啡，请记住。"
-    }
+    @{ role = "user"; content = "我喜欢黑咖啡，请记住。" }
   )
   temperature = 0.7
+  conversation_id = "optional-conversation-id"
 } | ConvertTo-Json -Depth 10
 
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
@@ -188,106 +183,261 @@ Invoke-RestMethod `
   -Body $bytes
 ```
 
-后端已经按 UTF-8 JSON 处理请求和响应；如果请求体本身没有被客户端或 shell 提前破坏，返回内容不应该出现中文乱码。
+网关模式行为：
 
-## 运行测试
+- 每次请求先检索当前用户的相关长期记忆。
+- 优先注入核心记忆，再注入近期会话摘要和普通长期记忆。
+- 调用上游 chat completions。
+- 返回前会移除 `reasoning_content`、`tool_calls` 等不适合透传给普通客户端的字段。
+- 回答完成后后台提取新记忆，不阻塞聊天响应。
+- `stream=true` 当前返回 501，未实现流式转发。
 
-```bash
-pytest
-```
+## MCP 模式
 
-测试不依赖任何外部服务（上游模型与向量服务都被替换为测试桩）：
-
-| 文件 | 覆盖内容 |
-| --- | --- |
-| `tests/test_memory_extraction.py` | 保存门槛（低重要性 / 假设场景 / 编造引用不保存）、去重、补充更新、冲突处理、非法 JSON 容错、决策日志 |
-| `tests/test_chat_gateway.py` | 聊天接口鉴权、记忆注入、reasoning 字段剥离、流式 501 |
-| `tests/test_llm_client.py` | 上游调用的编码处理 |
-| `tests/test_memory_store.py` / `tests/test_memory_search.py` | 存储与检索 |
-| `tests/test_mcp_server.py` | MCP 端点鉴权、initialize、工具调用、保存门槛、去重、用户隔离 |
-| `tests/test_response_charset.py` | 响应头必须带 `charset=utf-8`（兼容 Windows PowerShell 5.1 等旧客户端） |
-
-## MCP 模式（推荐 Kelivo 使用）
-
-MCP 端点：`http://你的服务器:8000/mcp`，传输方式为 Streamable HTTP（无状态 + JSON 响应，对移动端弱网最友好）。
-
-### 工具一览
-
-| 工具 | 作用 |
-| --- | --- |
-| `search_memory(query, limit)` | 按主题检索相关记忆，embedding 优先、关键词 fallback |
-| `save_memory(memory, type, importance, confidence, source_quote, reason)` | 保存记忆。服务端硬校验 + 自动去重/更新，被拒时返回原因 |
-| `list_memories(limit)` | 全量列出记忆，用于「你记住了我什么」 |
-| `delete_memory(memory_id)` | 软删除，用于「忘掉这件事」 |
-
-`save_memory` 在服务端保留与网关模式一致的「不乱记」门槛：`importance >= 6`、`confidence >= 0.8`、`source_quote` 非空且不含假设表达（如果 / 假如 / suppose / let's say…），未过门槛只写决策日志不落库。落库前仍走 Resolver 去重：内容相同忽略、同主题更新旧记忆。与网关模式的差别是 `source_quote` 的逐字校验无法执行（服务端看不到完整对话）。
-
-每次 `save_memory` 无论结果如何都会写决策日志，`candidate_json` 中带 `"source": "mcp"` 标记，可与网关模式的自动提取区分开。
-
-### Kelivo 配置
-
-在 Kelivo 的 MCP 设置中添加服务器：
-
-- URL：`http://你的服务器:8000/mcp`（公网部署建议套 HTTPS）
-- 传输类型：Streamable HTTP
-- 请求头：
-  - `Authorization: Bearer <GATEWAY_API_KEY>`
-  - `X-User-Id: 你的用户标识`（可选，不传按 `default` 用户）
-
-然后在助手的系统提示词中加入记忆使用规范（模型是否主动调工具主要由提示词决定）。下面这份模板面向日常聊天场景——关键是让模型明白：闲聊中自然流露的信息也要记，不需要用户说「记住」：
+MCP 端点：
 
 ```text
-你可以使用长期记忆工具（search_memory / save_memory / list_memories / delete_memory）：
-
-【检索】聊到与我有关的事——喜好、习惯、家人朋友、宠物、健康、计划安排、工作，或我们之前聊过的话题——先调用 search_memory 再回答，让对话自然延续。
-
-【保存】我在闲聊中自然流露的长期信息也要保存，不需要我说「记住」。值得保存的例子：
-- 喜好与雷点：口味、饮食禁忌、喜欢或讨厌的音乐 / 影视 / 游戏 / 事物
-- 生活事实：所在城市、作息习惯、宠物、正在养成的习惯
-- 重要的人：家人朋友的称呼、和我的关系、对他们重要的日子
-- 目标与计划：在学的东西、健身目标、旅行计划
-- 工作与项目：职业、正在做的事
-这类对我长期成立的信息 importance 给 6-8，重大信息（家人、健康、原则性偏好）给 8-10；confidence 由我亲口说出的给 0.9；source_quote 摘抄我的原话片段。
-
-【不要保存】当下情绪、玩笑反讽、一次性安排（「今晚吃火锅」）、假设话题（「如果我以后…」）、还没定下来的想法。保存被拒绝时按返回原因处理，不要换说法重试。
-
-【删除】我要求忘记某件事时，先查到对应记忆的 id，再调用 delete_memory。
-
-自然地运用记忆，不必每次向我汇报你查了或存了什么。
+http://<host>:8000/mcp
 ```
 
-服务端也会通过 MCP 的 `instructions` 字段下发一份简版规范，支持该字段的客户端会自动注入。
+请求头：
 
-### 选哪种模式
+```http
+Authorization: Bearer <GATEWAY_API_KEY>
+X-User-Id: optional-user-id
+```
 
-| | MCP 模式 | 网关模式 |
-| --- | --- | --- |
-| 流式输出 | 跟随客户端直连，天然支持 | 暂未实现 |
-| 模型切换 | 任意，记忆功能跟着走 | 锁定 `UPSTREAM_MODEL` |
-| 记忆召回/保存 | 模型主动调用工具，受提示词影响 | 服务端 100% 注入与提取 |
-| 聊天流量 | 不经过本服务 | 全部经过本服务 |
+传输方式：
 
-## iOS 客户端配置（网关模式）
+- Streamable HTTP
+- stateless
+- JSON response
 
-在 Kelivo 这类支持 OpenAI-compatible API 的 iOS 客户端中：
+当前 MCP 工具：
 
-- Base URL: `http://你的服务器:8000/v1`
-- API Key: `.env` 中的 `GATEWAY_API_KEY`
-- Model: 任意模型名，服务端会映射到 `UPSTREAM_MODEL`
+| 工具 | 说明 |
+| --- | --- |
+| `search_memory` | 按主题检索长期记忆，会更新 `usage_count` 和 `last_used_at`。 |
+| `save_memory` | 保存长期记忆，服务端会做门槛校验、去重和同主题更新。 |
+| `why_remember` | 解释某条记忆的来源、保存时间、置信度和核心记忆引用情况。 |
+| `merge_memories` | 合并多条同主题记忆，保留第一条，软删除其余条目。 |
+| `get_recent_context_summary` | 读取近期会话摘要。 |
+| `get_core_memory` | 读取核心记忆。 |
+| `get_core_memory_history` | 查看核心记忆历史版本。 |
+| `consolidate_core_memory` | 调用上游模型整理核心记忆。 |
+| `review_memories` | 体检记忆库，返回建议，不自动修改数据。 |
+| `memory_report` | 生成当前用户的记忆报告，支持 markdown/json。 |
+| `export_memories` | 导出当前用户记忆，embedding 不会导出。 |
+| `list_memories` | 列出当前用户的长期记忆。 |
+| `list_deleted_memories` | 列出软删除记忆。 |
+| `delete_memory` | 按 id 软删除记忆。 |
+| `restore_memory` | 按 id 恢复软删除记忆。 |
+| `forget_memories` | 按自然语言主题搜索并软删除相关记忆。 |
 
-客户端请求头中的 `Authorization: Bearer <GATEWAY_API_KEY>` 只用于访问本项目。真正的 `UPSTREAM_API_KEY` 和 `EMBEDDING_API_KEY` 只在服务端使用。
+MCP 模式依赖模型主动调用工具。建议在客户端系统提示词里明确：
 
-如果需要区分用户，可以额外传入请求头：
+- 与用户个人有关的问题先调用 `search_memory`。
+- 用户自然流露长期信息时调用 `save_memory`，不必等用户说“记住”。
+- 检索旧记忆和保存新记忆是两个独立判断，可以同一轮都发生。
+- 用户要求忘记一类信息时优先调用 `forget_memories`。
+- 用户要求检查或清理记忆时调用 `review_memories`，根据用户确认再删除或合并。
+
+服务端也会通过 MCP `instructions` 下发简版规则。
+
+## 记忆保存规则
+
+目标是“不乱记”。只有长期有用、用户明确表达过、未来回答可能用到的信息才保存。
+
+硬性门槛：
+
+- `action` 必须是 `create` 或 `update`。
+- `importance >= 6`。
+- `confidence >= 0.8`。
+- `memory` 非空。
+- `source_quote` 非空。
+- 网关模式下，`source_quote` 必须是用户原话片段。
+- 命中假设表达时不保存，例如“如果”“假如”“假设”“suppose”“if I use”“imagine”“let's say”。
+- `private` / `sensitive` 记忆要求 `importance >= 8`、`confidence >= 0.9`，且用户明确要求记住。
+
+记忆类型：
+
+- `project`
+- `preference`
+- `fact`
+- `learning`
+- `style`
+- `person`
+- `relationship`
+
+稳定性：
+
+- `temporary`
+- `medium`
+- `stable`
+
+敏感级别：
+
+- `normal`
+- `private`
+- `sensitive`
+
+保存前会和已有记忆比对：
+
+- 完全相同或已有更完整版本时忽略。
+- 新信息补充旧记忆时更新旧记忆。
+- 同主题新事实取代旧记忆时更新旧记忆。
+- 无相似旧记忆时创建新记忆。
+
+## REST API
+
+所有 `/memories` 和 `/v1` 路由都需要：
+
+```http
+Authorization: Bearer <GATEWAY_API_KEY>
+```
+
+可选：
 
 ```http
 X-User-Id: user-123
 ```
 
-不传时默认使用 `default` 用户。
+主要端点：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 健康检查，不需要鉴权。 |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible 聊天接口。 |
+| `GET` | `/memories` | 列出活跃长期记忆，不返回 embedding。 |
+| `POST` | `/memories/search` | 搜索长期记忆。 |
+| `GET` | `/memories/deleted` | 列出软删除记忆。 |
+| `DELETE` | `/memories/{memory_id}` | 软删除记忆。 |
+| `POST` | `/memories/{memory_id}/restore` | 恢复软删除记忆。 |
+| `GET` | `/memories/{memory_id}/why` | 解释某条记忆来源。 |
+| `POST` | `/memories/merge` | 合并多条记忆。 |
+| `POST` | `/memories/review` | 生成记忆体检建议。 |
+| `GET` | `/memories/report` | 生成记忆报告，`format=json|markdown`。 |
+| `GET` | `/memories/export` | 导出记忆，`format=json|markdown`。 |
+| `POST` | `/memories/restore` | 从导出数据恢复导入。 |
+| `GET` | `/memories/decision-logs` | 查看保存/忽略决策日志。 |
+| `GET` | `/memories/recent-context` | 查看近期会话摘要。 |
+| `GET` | `/memories/core` | 查看核心记忆。 |
+| `GET` | `/memories/core/history` | 查看核心记忆历史版本。 |
+| `POST` | `/memories/core/consolidate` | 整理核心记忆。 |
+
+## 测试
+
+运行全部测试：
+
+```powershell
+pytest
+```
+
+运行单个测试文件：
+
+```powershell
+pytest tests/test_mcp_server.py
+pytest tests/test_chat_gateway.py
+pytest tests/test_memory_store.py
+```
+
+测试使用 FastAPI `TestClient`、临时 SQLite 数据库和 fake LLM，不需要真实上游模型或 embedding 服务。
+
+主要覆盖：
+
+- 鉴权和 UTF-8 响应头。
+- OpenAI-compatible 网关的记忆注入、近期摘要、后台提取和 `stream=true` 501。
+- MCP 初始化、工具列表、保存、搜索、删除、恢复、体检、导出。
+- 记忆保存门槛、假设场景拦截、敏感信息门槛、去重和更新。
+- 核心记忆整理、历史版本和敏感记忆过滤。
+- embedding 配置独立于聊天模型配置。
+
+## 构建
+
+项目没有前端，也没有定义单独的构建命令。日常开发使用 editable install：
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+如需做 Python 包分发，可基于 `pyproject.toml` 的 setuptools 配置另行引入构建工具。
+
+## 目录结构
+
+```text
+memory-gateway/
+├─ app/
+│  ├─ api/
+│  │  ├─ deps.py
+│  │  ├─ health.py
+│  │  └─ memories.py
+│  ├─ llm/
+│  │  ├─ client.py
+│  │  └─ prompts.py
+│  ├─ mcp_server/
+│  │  ├─ auth.py
+│  │  ├─ context.py
+│  │  └─ server.py
+│  ├─ memory/
+│  │  ├─ core.py
+│  │  ├─ extractor.py
+│  │  ├─ models.py
+│  │  ├─ report.py
+│  │  ├─ resolver.py
+│  │  ├─ review.py
+│  │  ├─ search.py
+│  │  └─ store.py
+│  ├─ openai_compat/
+│  │  ├─ chat.py
+│  │  ├─ schemas.py
+│  │  └─ streaming.py
+│  ├─ config.py
+│  └─ main.py
+├─ scripts/
+│  ├─ install-service.ps1
+│  ├─ show-access-urls.ps1
+│  └─ uninstall-service.ps1
+├─ tests/
+├─ data/
+├─ logs/
+├─ .env.example
+├─ pyproject.toml
+└─ README.md
+```
+
+重要文件说明：
+
+- `app/main.py`：FastAPI 应用工厂，初始化数据库，挂载 MCP 子应用。
+- `app/config.py`：从 `.env` 读取配置。
+- `app/api/deps.py`：REST 鉴权、用户 id、依赖注入。
+- `app/api/memories.py`：记忆管理 REST API。
+- `app/openai_compat/chat.py`：聊天网关、记忆注入、后台提取和近期摘要。
+- `app/mcp_server/auth.py`：MCP 子应用鉴权。
+- `app/mcp_server/server.py`：MCP server、instructions 和工具实现。
+- `app/memory/store.py`：SQLite schema、兼容迁移、记忆 CRUD、软删除、恢复、合并、核心记忆历史。
+- `app/memory/search.py`：embedding/关键词搜索、排序、衰减和使用统计。
+- `app/memory/extractor.py`：调用 LLM 提取候选记忆并做保存门槛校验。
+- `app/memory/resolver.py`：创建、更新、忽略的落库决策。
+- `app/memory/core.py`：核心记忆整理。
+- `app/memory/review.py`：记忆体检建议。
+- `app/memory/report.py`：报告、导出和恢复导入。
+- `scripts/install-service.ps1`：Windows 服务安装脚本，使用 2026 端口。
+- `scripts/show-access-urls.ps1`：列出 LAN/Tailscale 访问地址。
+
+## 数据文件
+
+- SQLite 数据库默认在 `data/memory.db`。
+- 日志默认在 `logs/`。
+- embedding 存在 SQLite 的 JSON 字符串字段里，不使用向量数据库。
+- 导出接口不会导出 embedding，迁移后应重新生成。
+- 删除是软删除，`restore_memory` 或 REST restore 可以恢复。
 
 ## 当前限制
 
-- 网关模式 `stream=true` 暂未实现（MCP 模式不受影响，流式由客户端直连模型完成）。
-- 网关模式的记忆提取每轮对话会额外调用一次上游模型（temperature 为 0）。
-- MCP 模式下记忆的召回与保存依赖模型主动调用工具，效果受助手系统提示词影响。
-- embedding 存储仍使用 SQLite 中的 JSON 数组字符串，暂不引入向量数据库。
+- 网关模式 `stream=true` 未实现。
+- 网关模式每轮回答后会额外调用一次上游模型做记忆提取。
+- MCP 模式下，是否检索和保存取决于客户端模型是否主动调用工具。
+- embedding 存储仍在 SQLite JSON 字段里，没有向量索引。
+- Windows 服务脚本包含本机路径和固定端口，换机器前需要检查。
+- `data/memory.db` 是真实本地数据，调试时不要随意删除、覆盖或用测试数据污染。
+

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 import json
 import math
 import re
@@ -67,7 +68,14 @@ class MemorySearchService:
         self.store = store
         self.embedding_client = embedding_client
 
-    async def search(self, *, query: str, user_id: str, limit: int = 8) -> list[MemoryRecord]:
+    async def search(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        limit: int = 8,
+        record_usage: bool = True,
+    ) -> list[MemoryRecord]:
         memories = self.store.list_memories(user_id=user_id, limit=200)
         if not memories:
             return []
@@ -76,10 +84,18 @@ class MemorySearchService:
         if query_embedding:
             scored = self._score_by_embedding(memories, query_embedding)
             if scored:
-                return [memory for _, memory in scored[:limit]]
+                return self._record_usage(
+                    [memory for _, memory in scored[:limit]],
+                    user_id=user_id,
+                    record_usage=record_usage,
+                )
 
         scored = self._score_by_keywords(memories, query)
-        return [memory for _, memory in scored[:limit]]
+        return self._record_usage(
+            [memory for _, memory in scored[:limit]],
+            user_id=user_id,
+            record_usage=record_usage,
+        )
 
     def _score_by_embedding(
         self,
@@ -87,6 +103,7 @@ class MemorySearchService:
         query_embedding: list[float],
     ) -> list[tuple[float, MemoryRecord]]:
         scored: list[tuple[float, MemoryRecord]] = []
+        now = datetime.now(UTC)
         for memory in memories:
             if not memory.embedding_json:
                 continue
@@ -98,7 +115,7 @@ class MemorySearchService:
                 continue
             score = cosine_similarity(query_embedding, [float(value) for value in memory_embedding])
             if score > 0:
-                scored.append((score, memory))
+                scored.append((score + _metadata_score(memory, now, embedding_mode=True), memory))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
@@ -110,6 +127,7 @@ class MemorySearchService:
         query_terms = _terms(query)
         scored: list[tuple[float, MemoryRecord]] = []
         query_lower = query.lower()
+        now = datetime.now(UTC)
 
         for memory in memories:
             content_lower = memory.content.lower()
@@ -120,11 +138,30 @@ class MemorySearchService:
                 + _char_overlap_score(query_lower, content_lower)
             )
             if text_score > 0:
-                score = text_score + memory.importance * 0.05
+                score = text_score + _metadata_score(memory, now, embedding_mode=False)
                 scored.append((score, memory))
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
+
+    def _record_usage(
+        self,
+        memories: list[MemoryRecord],
+        *,
+        user_id: str,
+        record_usage: bool,
+    ) -> list[MemoryRecord]:
+        if not record_usage:
+            return memories
+        used_at = self.store.mark_memories_used(
+            memory_ids=[memory.id for memory in memories],
+            user_id=user_id,
+        )
+        if used_at:
+            for memory in memories:
+                memory.usage_count += 1
+                memory.last_used_at = used_at
+        return memories
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -148,3 +185,69 @@ def _char_overlap_score(query: str, content: str) -> float:
     if not query_chars or not content_chars:
         return 0.0
     return len(query_chars & content_chars) / len(query_chars)
+
+
+def _metadata_score(memory: MemoryRecord, now: datetime, *, embedding_mode: bool) -> float:
+    importance_weight = 0.015 if embedding_mode else 0.05
+    usage_weight = 0.01 if embedding_mode else 0.02
+    return (
+        memory.importance * importance_weight
+        + min(memory.usage_count, 10) * usage_weight
+        - _decay_penalty(memory, now)
+        - _validity_penalty(memory, now, embedding_mode=embedding_mode)
+        - _sensitivity_penalty(memory, embedding_mode=embedding_mode)
+    )
+
+
+def _decay_penalty(memory: MemoryRecord, now: datetime) -> float:
+    # 关系、长期偏好、沟通风格不应因为少用就明显贬值；情景类事实自然下沉。
+    rate, cap, grace_days = {
+        "project": (0.0020, 0.40, 14),
+        "learning": (0.0015, 0.30, 30),
+        "fact": (0.0010, 0.25, 30),
+        "preference": (0.0003, 0.08, 60),
+        "style": (0.0002, 0.05, 60),
+        "person": (0.0, 0.0, 0),
+        "relationship": (0.0, 0.0, 0),
+    }.get(memory.type, (0.0010, 0.20, 30))
+    if rate <= 0:
+        return 0.0
+
+    anchor = _parse_iso_datetime(memory.last_used_at or memory.updated_at or memory.created_at)
+    if anchor is None:
+        return 0.0
+    elapsed_days = max(0.0, (now - anchor).total_seconds() / 86400)
+    decaying_days = max(0.0, elapsed_days - grace_days)
+    return min(cap, decaying_days * rate)
+
+
+def _validity_penalty(memory: MemoryRecord, now: datetime, *, embedding_mode: bool) -> float:
+    valid_until = _parse_iso_datetime(memory.valid_until)
+    if valid_until is None or valid_until >= now:
+        return 0.0
+    penalties = {
+        "temporary": 0.45 if embedding_mode else 1.50,
+        "medium": 0.25 if embedding_mode else 0.80,
+        "stable": 0.10 if embedding_mode else 0.30,
+    }
+    return penalties.get(memory.stability, 0.30)
+
+
+def _sensitivity_penalty(memory: MemoryRecord, *, embedding_mode: bool) -> float:
+    penalties = {
+        "private": 0.08 if embedding_mode else 0.25,
+        "sensitive": 0.18 if embedding_mode else 0.60,
+    }
+    return penalties.get(memory.sensitivity, 0.0)
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)

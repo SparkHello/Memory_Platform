@@ -12,11 +12,12 @@ from app.memory.store import MemoryStore
 
 
 class FakeLLMClient:
-    """同时伪装两类上游调用：普通聊天与记忆提取（按 system prompt 区分）。"""
+    """伪装普通聊天、记忆提取、核心记忆整理三类上游调用。"""
 
     def __init__(self) -> None:
         self.messages: list[dict] = []
         self.extraction_messages: list[dict] = []
+        self.core_messages: list[dict] = []
         self.response = {
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -44,6 +45,10 @@ class FakeLLMClient:
             },
             ensure_ascii=False,
         )
+        self.core_content = json.dumps(
+            {"sections": [], "reason": "测试默认不整理核心记忆"},
+            ensure_ascii=False,
+        )
 
     async def create_chat_completion(self, request, messages: list[dict]) -> dict:
         if self._is_extraction_call(messages):
@@ -61,6 +66,21 @@ class FakeLLMClient:
                     }
                 ],
             }
+        if self._is_core_consolidation_call(messages):
+            self.core_messages = messages
+            return {
+                "id": "chatcmpl-core-memory",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": self.core_content},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
         self.messages = messages
         return self.response
 
@@ -70,6 +90,13 @@ class FakeLLMClient:
             return False
         first = messages[0]
         return first.get("role") == "system" and "记忆提取器" in first.get("content", "")
+
+    @staticmethod
+    def _is_core_consolidation_call(messages: list[dict]) -> bool:
+        if not messages:
+            return False
+        first = messages[0]
+        return first.get("role") == "system" and "核心记忆整理器" in first.get("content", "")
 
 
 @pytest.fixture
