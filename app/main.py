@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.health import router as health_router
 from app.api.memories import router as memories_router
@@ -10,6 +12,9 @@ from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
 from app.openai_compat.chat import router as chat_router
+
+
+UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
 
 
 class UTF8JSONResponse(JSONResponse):
@@ -39,10 +44,14 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(chat_router)
     app.include_router(memories_router)
+    app.mount(
+        "/ui",
+        StaticFiles(directory=UI_DIST_DIR, html=True, check_dir=False),
+        name="memory-console",
+    )
     # MCP streamable HTTP 子应用兜底挂载在根路径，实际端点是 /mcp（FastAPI 自有路由优先匹配）
     app.mount("/", MCPAuthMiddleware(mcp.streamable_http_app()))
     return app
 
 
 app = create_app()
-

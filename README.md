@@ -445,6 +445,44 @@ memory-gateway/
 - 导出接口不会导出 embedding，迁移后应重新生成。
 - 删除是软删除，`restore_memory` 或 REST restore 可以恢复。
 
+## Memory Console 本地 UI
+
+项目现在提供第一阶段 MVP 的本地 Web 管理界面，前端源码位于 `ui/`，构建产物输出到 `ui/dist`，后端会将其挂载到 `/ui`。
+
+安装前端依赖：
+
+```powershell
+cd C:\Users\spari\Documents\Memory\memory-gateway\ui
+npm install
+```
+
+构建 UI：
+
+```powershell
+npm run build
+```
+
+启动后端服务：
+
+```powershell
+cd C:\Users\spari\Documents\Memory\memory-gateway
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+访问管理界面：
+
+```text
+http://localhost:8000/ui
+```
+
+首次进入 `/ui` 时，在 Settings 页面填写：
+
+- API Base URL：默认同源即可。
+- Gateway API Key：填写 `.env` 中的 `GATEWAY_API_KEY`。
+- User ID：默认 `default`，也可以填写自定义用户隔离 ID。
+
+当前 Settings 页面只保存浏览器本地 UI 连接信息到 `localStorage`，不会写入服务端 `.env`。服务端 `.env` 可视化写入、PATCH 编辑记忆、重建 embedding、用户列表自动发现不属于第一阶段 MVP。
+
 ## 当前限制
 
 - 网关模式 `stream=true` 未实现。
