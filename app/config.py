@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     )
     upstream_api_key: str = Field(default="", validation_alias="UPSTREAM_API_KEY")
     upstream_model: str = Field(default="glm-5.1", validation_alias="UPSTREAM_MODEL")
+    providers_config_path: str = Field(
+        default="config/providers.toml",
+        validation_alias="PROVIDERS_CONFIG_PATH",
+    )
     embedding_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         validation_alias="EMBEDDING_BASE_URL",

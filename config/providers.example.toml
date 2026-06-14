@@ -1,0 +1,80 @@
+[router]
+default_model = "glm-5.1"
+fallback_enabled = true
+
+[providers.zhipu]
+name = "Zhipu"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+enabled = true
+timeout_seconds = 60
+
+[providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+enabled = true
+timeout_seconds = 60
+
+[[provider_models]]
+id = "zhipu-glm-5-1"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+display_name = "GLM 5.1"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+pricing_tiers_json = ""
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+enabled = true
+
+[[provider_models]]
+id = "zhipu-memory-extractor"
+provider = "zhipu"
+upstream_model = "glm-4-flash"
+display_name = "Memory Extractor"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+pricing_tiers_json = ""
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+enabled = true
+
+[[provider_models]]
+id = "deepseek-chat"
+provider = "deepseek"
+upstream_model = "deepseek-chat"
+display_name = "DeepSeek Chat"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+pricing_tiers_json = ""
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+enabled = true
+
+[[routes]]
+virtual_model = "glm-5.1"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+provider_model_id = "zhipu-glm-5-1"
+priority = 100
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+min_balance = 0.0
+enabled = true
+
+[[routes]]
+virtual_model = "memory-extractor"
+provider = "zhipu"
+upstream_model = "glm-4-flash"
+provider_model_id = "zhipu-memory-extractor"
+priority = 100
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+min_balance = 0.0
+enabled = true

@@ -8,9 +8,11 @@ from app.api.deps import (
     get_llm_client,
     get_memory_search_service,
     get_memory_store,
+    get_providers_config,
     get_user_id,
     require_api_key,
 )
+from app.config import Settings, get_settings
 from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import (
     render_core_memory_context,
@@ -23,6 +25,7 @@ from app.memory.search import EmbeddingClient, MemorySearchService
 from app.memory.store import MemoryStore
 from app.openai_compat.schemas import ChatCompletionRequest, ChatMessage
 from app.openai_compat.streaming import raise_streaming_not_implemented
+from app.providers.models import ProvidersConfig
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,50 @@ router = APIRouter(
     tags=["openai-compatible"],
     dependencies=[Depends(require_api_key)],
 )
+
+
+@router.get("/models")
+def list_models(
+    settings: Annotated[Settings, Depends(get_settings)],
+    config: Annotated[ProvidersConfig, Depends(get_providers_config)],
+) -> dict:
+    if config.has_routes:
+        model_ids = _openai_compatible_model_ids(config)
+    else:
+        model_ids = [settings.upstream_model or "default"]
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "memory-gateway",
+            }
+            for model_id in model_ids
+        ],
+    }
+
+
+def _openai_compatible_model_ids(config: ProvidersConfig) -> list[str]:
+    model_ids: set[str] = set()
+    for route in config.routes:
+        if not route.enabled:
+            continue
+        provider = config.providers.get(route.provider)
+        if provider is None or not provider.enabled:
+            continue
+        if route.provider_model_id:
+            provider_model = config.provider_models.get(route.provider_model_id)
+            if (
+                provider_model is None
+                or not provider_model.enabled
+                or provider_model.provider != provider.id
+                or provider_model.api_format != "openai_compatible"
+            ):
+                continue
+        model_ids.add(route.virtual_model)
+    return sorted(model_ids)
 
 
 @router.post("/chat/completions")

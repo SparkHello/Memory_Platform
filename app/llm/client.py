@@ -6,11 +6,12 @@ import httpx
 
 from app.config import Settings
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.providers.client import ProviderRouterClient, ProviderRoutingUnavailable
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAICompatibleClient:
+class LegacyOpenAICompatibleClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
@@ -59,6 +60,28 @@ class OpenAICompatibleClient:
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="上游模型 API 返回了无法解析的 JSON",
             ) from exc
+
+
+class OpenAICompatibleClient:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.legacy_client = LegacyOpenAICompatibleClient(settings=settings)
+
+    async def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        messages: list[dict[str, str]],
+    ) -> dict:
+        try:
+            return await ProviderRouterClient(self.settings).create_chat_completion(
+                request=request,
+                messages=messages,
+            )
+        except ProviderRoutingUnavailable:
+            return await self.legacy_client.create_chat_completion(
+                request=request,
+                messages=messages,
+            )
 
 
 def _safe_error_detail(response: httpx.Response) -> str:

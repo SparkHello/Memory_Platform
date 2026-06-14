@@ -141,6 +141,29 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+.tier-editor {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.tier-row {
+  display: grid;
+  grid-template-columns: 76px repeat(3, minmax(150px, 1fr));
+  align-items: end;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #e4e7eb;
+  border-radius: 7px;
+  background: #fafbfc;
+}
+
+.tier-row strong {
+  align-self: center;
+  color: #38414c;
+  font-size: 13px;
+}
+
 .log-toolbar {
   gap: 14px;
 }
@@ -1013,6 +1036,10 @@ code {
   }
 
   .edit-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tier-row {
     grid-template-columns: 1fr;
   }
 

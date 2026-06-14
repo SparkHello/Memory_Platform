@@ -9,7 +9,18 @@ export function normalizeBaseUrl(value: string): string {
   if (!trimmed) {
     return window.location.origin;
   }
-  return trimmed.replace(/\/+$/, "");
+  const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
+  try {
+    const url = new URL(withoutTrailingSlash, window.location.origin);
+    if (url.pathname === "/ui" || url.pathname.startsWith("/ui/")) {
+      url.pathname = "";
+      url.search = "";
+      url.hash = "";
+    }
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return withoutTrailingSlash.replace(/\/ui(?:\/.*)?$/, "");
+  }
 }
 
 export function loadSettings(): ConnectionSettings {

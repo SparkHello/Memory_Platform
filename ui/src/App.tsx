@@ -4,7 +4,9 @@ import {
   Activity,
   ArrowDown,
   ArchiveRestore,
+  BarChart3,
   Clipboard,
+  CreditCard,
   Database,
   Download,
   Eye,
@@ -19,6 +21,8 @@ import {
   RefreshCcw,
   Save,
   Search,
+  Server,
+  SlidersHorizontal,
   Settings as SettingsIcon,
   ShieldAlert,
   Trash2,
@@ -30,10 +34,12 @@ import { ApiError, MemoryApi } from "./api";
 import { loadSettings, normalizeBaseUrl, saveSettings } from "./storage";
 import type {
   ConnectionSettings,
+  BalanceRecord,
   CoreMemoryHistoryItem,
   CoreMemorySection,
   CoreSectionName,
   DecisionLog,
+  GatewayProvidersResponse,
   MemoryAction,
   MemoryExport,
   MemoryRecord,
@@ -44,11 +50,20 @@ import type {
   MemoryType,
   MemoryUpdatePayload,
   PageKey,
+  ProviderConfigPayload,
+  ProviderConfigResponse,
+  ProviderModelConfigPayload,
+  ProviderModelSummary,
+  ProviderSummary,
   RecentContextSummary,
   RestoreResult,
   ReviewAction,
   ReviewRecommendation,
-  ReviewResult
+  ReviewResult,
+  RouteConfigPayload,
+  RouteSummary,
+  UsageEvent,
+  UsageSummary
 } from "./types";
 
 type Toast = {
@@ -64,6 +79,11 @@ type LoadState<T> = {
 
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof Gauge }> = [
   { key: "dashboard", label: "总览", icon: Gauge },
+  { key: "gateway-config", label: "网关配置", icon: SlidersHorizontal },
+  { key: "providers", label: "服务商", icon: Server },
+  { key: "routes", label: "路由", icon: ListChecks },
+  { key: "billing", label: "余额账本", icon: CreditCard },
+  { key: "usage", label: "用量统计", icon: BarChart3 },
   { key: "memories", label: "记忆库", icon: Database },
   { key: "core", label: "核心记忆", icon: Layers3 },
   { key: "review", label: "记忆体检", icon: ListChecks },
@@ -103,6 +123,7 @@ const CONFIG_KEYS = [
   "UPSTREAM_BASE_URL",
   "UPSTREAM_API_KEY",
   "UPSTREAM_MODEL",
+  "PROVIDERS_CONFIG_PATH",
   "EMBEDDING_BASE_URL",
   "EMBEDDING_API_KEY",
   "EMBEDDING_MODEL",
@@ -145,7 +166,9 @@ const DISPLAY_TEXT: Record<string, string> = {
   routines: "日常习惯",
   goals: "目标计划",
   communication: "沟通方式",
-  other: "其他记忆"
+  other: "其他记忆",
+  success: "成功",
+  error: "错误"
 };
 
 export function App() {
@@ -214,7 +237,7 @@ export function App() {
         <div className="brand">
           <div className="brand-mark">M</div>
           <div>
-            <div className="brand-title">记忆控制台</div>
+            <div className="brand-title">网关控制台</div>
             <div className="brand-subtitle">本地网关</div>
           </div>
         </div>
@@ -280,6 +303,13 @@ export function App() {
               notify={notify}
             />
           )}
+          {activePage === "gateway-config" && (
+            <GatewayConfigPage api={api} notify={notify} />
+          )}
+          {activePage === "providers" && <ProvidersPage api={api} notify={notify} />}
+          {activePage === "routes" && <RoutesPage api={api} notify={notify} />}
+          {activePage === "billing" && <BillingPage api={api} notify={notify} />}
+          {activePage === "usage" && <UsagePage api={api} />}
           {activePage === "memories" && <MemoriesPage api={api} notify={notify} />}
           {activePage === "core" && <CoreMemoryPage api={api} notify={notify} />}
           {activePage === "review" && <ReviewPage api={api} notify={notify} />}
@@ -430,6 +460,1825 @@ function DashboardPage({
                 查看接入信息
               </button>
             </div>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+type ProviderDraft = {
+  mode: "create" | "edit";
+  provider: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  enabled: boolean;
+  timeout_seconds: number;
+};
+
+type ProviderModelDraft = {
+  mode: "create" | "edit";
+  id: string;
+  provider: string;
+  upstream_model: string;
+  display_name: string;
+  api_format: "openai_compatible" | "claude_sdk";
+  pricing_mode: "flat" | "tiered";
+  pricing_tiers_json: string;
+  pricing_tiers: PriceTierDraft[];
+  input_price_per_million: string;
+  output_price_per_million: string;
+  currency: string;
+  enabled: boolean;
+};
+
+type PriceTierDraft = {
+  up_to_tokens: string;
+  input_price_per_million: string;
+  output_price_per_million: string;
+};
+
+type RouteDraft = {
+  mode: "create" | "edit";
+  id: string;
+  virtual_model: string;
+  provider_model_id: string;
+  provider: string;
+  upstream_model: string;
+  priority: number;
+  input_price_per_million: string;
+  output_price_per_million: string;
+  currency: string;
+  min_balance: number;
+  enabled: boolean;
+};
+
+const EMPTY_PROVIDER_DRAFT: ProviderDraft = {
+  mode: "create",
+  provider: "",
+  name: "",
+  base_url: "",
+  api_key: "",
+  enabled: true,
+  timeout_seconds: 60
+};
+
+const EMPTY_PROVIDER_MODEL_DRAFT: ProviderModelDraft = {
+  mode: "create",
+  id: "",
+  provider: "",
+  upstream_model: "",
+  display_name: "",
+  api_format: "openai_compatible",
+  pricing_mode: "flat",
+  pricing_tiers_json: "",
+  pricing_tiers: createEmptyPriceTierDrafts(),
+  input_price_per_million: "0",
+  output_price_per_million: "0",
+  currency: "CNY",
+  enabled: true
+};
+
+const EMPTY_ROUTE_DRAFT: RouteDraft = {
+  mode: "create",
+  id: "",
+  virtual_model: "",
+  provider_model_id: "",
+  provider: "",
+  upstream_model: "",
+  priority: 100,
+  input_price_per_million: "0",
+  output_price_per_million: "0",
+  currency: "CNY",
+  min_balance: 0,
+  enabled: true
+};
+
+function GatewayConfigPage({
+  api,
+  notify
+}: {
+  api: MemoryApi;
+  notify: (message: string, kind?: Toast["kind"]) => void;
+}) {
+  const [state, setState] = useState<LoadState<ProviderConfigResponse>>({
+    loading: true,
+    error: null,
+    data: null
+  });
+  const [providerDraft, setProviderDraft] = useState<ProviderDraft>(EMPTY_PROVIDER_DRAFT);
+  const [routeDraft, setRouteDraft] = useState<RouteDraft>(EMPTY_ROUTE_DRAFT);
+  const [exportText, setExportText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setState({ loading: true, error: null, data: null });
+    try {
+      setState({ loading: false, error: null, data: await api.providerConfig() });
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), data: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const data = state.data;
+  const providers = data?.providers || [];
+  const routes = data?.routes || [];
+
+  const saveProvider = async () => {
+    const provider = providerDraft.provider.trim();
+    if (!provider || !providerDraft.name.trim() || !providerDraft.base_url.trim()) {
+      notify("请填写服务商 ID、名称和基础地址", "error");
+      return;
+    }
+    setBusy(true);
+    try {
+      const payload: ProviderConfigPayload = {
+        provider,
+        name: providerDraft.name.trim(),
+        base_url: providerDraft.base_url.trim(),
+        enabled: providerDraft.enabled,
+        timeout_seconds: clampNumber(providerDraft.timeout_seconds, 1, 600)
+      };
+      if (providerDraft.api_key.trim()) {
+        payload.api_key = providerDraft.api_key.trim();
+      }
+      if (providerDraft.mode === "edit") {
+        await api.updateProviderConfig(provider, payload);
+      } else {
+        await api.createProviderConfig(payload);
+      }
+      notify("服务商已保存", "success");
+      setProviderDraft(EMPTY_PROVIDER_DRAFT);
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearProviderKey = async (provider: string) => {
+    if (!window.confirm(`确认清除 ${provider} 的 API key？`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.updateProviderConfig(provider, { api_key: "" });
+      notify("API key 已清除", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disableProvider = async (provider: string) => {
+    if (!window.confirm(`确认禁用服务商 ${provider}？`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deleteProviderConfig(provider);
+      notify("服务商已禁用", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testProvider = async (provider: string) => {
+    setBusy(true);
+    try {
+      const result = await api.testProviderConfig(provider);
+      notify(result.message, result.success ? "success" : "error");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveRoute = async () => {
+    if (!routeDraft.virtual_model.trim() || !routeDraft.provider.trim() || !routeDraft.upstream_model.trim()) {
+      notify("请填写虚拟模型、服务商和上游模型", "error");
+      return;
+    }
+    const payload: RouteConfigPayload = {
+      virtual_model: routeDraft.virtual_model.trim(),
+      provider: routeDraft.provider.trim(),
+      upstream_model: routeDraft.upstream_model.trim(),
+      priority: Math.round(routeDraft.priority),
+      input_price_per_million: clampNumber(
+        decimalInputValue(routeDraft.input_price_per_million),
+        0,
+        1_000_000
+      ),
+      output_price_per_million: clampNumber(
+        decimalInputValue(routeDraft.output_price_per_million),
+        0,
+        1_000_000
+      ),
+      currency: routeDraft.currency.trim() || "CNY",
+      min_balance: clampNumber(routeDraft.min_balance, 0, 1_000_000_000),
+      enabled: routeDraft.enabled
+    };
+    setBusy(true);
+    try {
+      if (routeDraft.mode === "edit") {
+        await api.updateRouteConfig(routeDraft.id, payload);
+      } else {
+        await api.createRouteConfig(payload);
+      }
+      notify("路由已保存", "success");
+      setRouteDraft(EMPTY_ROUTE_DRAFT);
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteRoute = async (routeId: string) => {
+    if (!window.confirm("确认删除这条路由？")) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deleteRouteConfig(routeId);
+      notify("路由已删除", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const importToml = async () => {
+    if (!window.confirm("从 providers.toml 导入会合并到 UI 配置，真实 API key 不会导入。继续？")) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api.importProviderConfigToml();
+      notify(`已导入 ${result.providers} 个服务商、${result.routes} 条路由`, "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportToml = async () => {
+    setBusy(true);
+    try {
+      setExportText(await api.exportProviderConfigToml());
+      notify("已生成 TOML", "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const showInlineConfig = false;
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="网关配置"
+        subtitle="在本机 SQLite 中配置服务商、路由、价格和连接测试。"
+        action={
+          <button className="secondary-button" type="button" onClick={load}>
+            <RefreshCcw size={16} />
+            刷新
+          </button>
+        }
+      />
+      <div className="notice warning">
+        <ShieldAlert size={18} />
+        API key 会保存在本机 SQLite 数据库中，不会在页面回显；不要提交 data/ 目录，也不要把服务暴露到公网。
+      </div>
+      {state.loading && <LoadingBlock label="正在加载网关配置" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {data && (
+        <>
+          <div className="stats-grid">
+            <StatCard label="当前来源" value={sourceText(data.source)} />
+            <StatCard label="服务商" value={providers.length} />
+            <StatCard label="路由" value={routes.length} />
+            <StatCard label="密钥" value={providers.filter((provider) => provider.api_key_configured).length} />
+          </div>
+
+          {showInlineConfig && (
+            <>
+          <section className="panel">
+            <div className="panel-header">
+              <h2>服务商管理</h2>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setProviderDraft(EMPTY_PROVIDER_DRAFT)}
+              >
+                新增
+              </button>
+            </div>
+            <div className="toolbar">
+              <label className="field-block small">
+                <span>服务商 ID</span>
+                <input
+                  value={providerDraft.provider}
+                  disabled={providerDraft.mode === "edit"}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, provider: event.target.value })}
+                  placeholder="zhipu"
+                />
+              </label>
+              <label className="field-block small">
+                <span>名称</span>
+                <input
+                  value={providerDraft.name}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, name: event.target.value })}
+                  placeholder="智谱"
+                />
+              </label>
+              <label className="field-block small wide-field">
+                <span>基础地址</span>
+                <input
+                  value={providerDraft.base_url}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, base_url: event.target.value })}
+                  placeholder="https://open.bigmodel.cn/api/paas/v4"
+                />
+              </label>
+              <label className="field-block small">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={providerDraft.api_key}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, api_key: event.target.value })}
+                  placeholder={providerDraft.mode === "edit" ? "留空则不变" : "可稍后填写"}
+                />
+              </label>
+              <label className="field-block small">
+                <span>超时</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={providerDraft.timeout_seconds}
+                  onChange={(event) =>
+                    setProviderDraft({ ...providerDraft, timeout_seconds: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={providerDraft.enabled}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, enabled: event.target.checked })}
+                />
+                启用
+              </label>
+              <button className="primary-button" type="button" disabled={busy} onClick={saveProvider}>
+                <Save size={16} />
+                保存服务商
+              </button>
+            </div>
+            {providers.length === 0 && <EmptyBlock label="暂无服务商" />}
+            {providers.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>服务商</th>
+                      <th>名称</th>
+                      <th>启用</th>
+                      <th>基础地址</th>
+                      <th>API Key</th>
+                      <th>超时</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {providers.map((provider) => (
+                      <tr key={provider.id || provider.provider}>
+                        <td>{provider.provider || provider.id}</td>
+                        <td>{provider.name}</td>
+                        <td>{provider.enabled ? "是" : "否"}</td>
+                        <td>{provider.base_url}</td>
+                        <td>{provider.api_key_configured ? "已配置" : "未配置"}</td>
+                        <td>{provider.timeout_seconds}s</td>
+                        <td>
+                          <div className="button-row">
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              onClick={() => setProviderDraft(providerToDraft(provider))}
+                            >
+                              编辑
+                            </button>
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => testProvider(provider.provider || provider.id)}
+                            >
+                              测试
+                            </button>
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => clearProviderKey(provider.provider || provider.id)}
+                            >
+                              清除密钥
+                            </button>
+                            <button
+                              className="warning-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => disableProvider(provider.provider || provider.id)}
+                            >
+                              禁用
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>路由管理</h2>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setRouteDraft(EMPTY_ROUTE_DRAFT)}
+              >
+                新增
+              </button>
+            </div>
+            <div className="toolbar">
+              <label className="field-block small">
+                <span>虚拟模型</span>
+                <input
+                  value={routeDraft.virtual_model}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, virtual_model: event.target.value })}
+                  placeholder="glm-5.1"
+                />
+              </label>
+              <label className="field-block small">
+                <span>服务商</span>
+                <select
+                  value={routeDraft.provider}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, provider: event.target.value })}
+                >
+                  <option value="">选择服务商</option>
+                  {providers.map((provider) => (
+                    <option key={provider.provider || provider.id} value={provider.provider || provider.id}>
+                      {provider.provider || provider.id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-block small">
+                <span>上游模型</span>
+                <input
+                  value={routeDraft.upstream_model}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, upstream_model: event.target.value })}
+                  placeholder="glm-5.1"
+                />
+              </label>
+              <label className="field-block small">
+                <span>优先级</span>
+                <input
+                  type="number"
+                  value={routeDraft.priority}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, priority: Number(event.target.value) })}
+                />
+              </label>
+              <label className="field-block small">
+                <span>输入价格 / 1M</span>
+                <DecimalInput
+                  value={routeDraft.input_price_per_million}
+                  onChange={(value) => setRouteDraft({ ...routeDraft, input_price_per_million: value })}
+                />
+              </label>
+              <label className="field-block small">
+                <span>输出价格 / 1M</span>
+                <DecimalInput
+                  value={routeDraft.output_price_per_million}
+                  onChange={(value) => setRouteDraft({ ...routeDraft, output_price_per_million: value })}
+                />
+              </label>
+              <label className="field-block small">
+                <span>币种</span>
+                <input
+                  value={routeDraft.currency}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, currency: event.target.value })}
+                />
+              </label>
+              <label className="field-block small">
+                <span>最低余额</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.000001"
+                  value={routeDraft.min_balance}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, min_balance: Number(event.target.value) })}
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={routeDraft.enabled}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, enabled: event.target.checked })}
+                />
+                启用
+              </label>
+              <button className="primary-button" type="button" disabled={busy} onClick={saveRoute}>
+                <Save size={16} />
+                保存路由
+              </button>
+            </div>
+            {routes.length === 0 && <EmptyBlock label="暂无路由" />}
+            {routes.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>虚拟模型</th>
+                      <th>服务商</th>
+                      <th>上游模型</th>
+                      <th>优先级</th>
+                      <th>价格</th>
+                      <th>最低余额</th>
+                      <th>启用</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {routes.map((route) => (
+                      <tr key={route.id || `${route.virtual_model}-${route.provider}-${route.upstream_model}`}>
+                        <td>{route.virtual_model}</td>
+                        <td>{route.provider}</td>
+                        <td>{route.upstream_model}</td>
+                        <td>{route.priority}</td>
+                        <td>
+                          {moneyText(route.input_price_per_million, route.currency)} /{" "}
+                          {moneyText(route.output_price_per_million, route.currency)}
+                        </td>
+                        <td>{moneyText(route.min_balance, route.currency)}</td>
+                        <td>{route.enabled === false ? "否" : "是"}</td>
+                        <td>
+                          <div className="button-row">
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              onClick={() => setRouteDraft(routeToDraft(route))}
+                            >
+                              编辑
+                            </button>
+                            {route.id && !route.id.startsWith("toml:") && (
+                              <button
+                                className="danger-button compact"
+                                type="button"
+                                disabled={busy}
+                                onClick={() => deleteRoute(route.id || "")}
+                              >
+                                删除
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+            </>
+          )}
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>导入 / 导出</h2>
+              <div className="button-row">
+                <button className="secondary-button" type="button" disabled={busy} onClick={importToml}>
+                  <Upload size={16} />
+                  从 TOML 导入
+                </button>
+                <button className="secondary-button" type="button" disabled={busy} onClick={exportToml}>
+                  <Download size={16} />
+                  导出 TOML
+                </button>
+              </div>
+            </div>
+            {exportText && (
+              <label className="field-block">
+                <span>导出结果不包含真实 API key</span>
+                <textarea value={exportText} readOnly rows={12} />
+              </label>
+            )}
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProvidersPage({
+  api,
+  notify
+}: {
+  api: MemoryApi;
+  notify: (message: string, kind?: Toast["kind"]) => void;
+}) {
+  const [state, setState] = useState<LoadState<ProviderConfigResponse>>({
+    loading: true,
+    error: null,
+    data: null
+  });
+  const [providerDraft, setProviderDraft] = useState<ProviderDraft>(EMPTY_PROVIDER_DRAFT);
+  const [modelDraft, setModelDraft] = useState<ProviderModelDraft>(EMPTY_PROVIDER_MODEL_DRAFT);
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setState({ loading: true, error: null, data: null });
+    try {
+      setState({ loading: false, error: null, data: await api.providerConfig() });
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), data: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const data = state.data;
+  const providers = data?.providers || [];
+  const providerModels = data?.provider_models || [];
+  const selectedProvider = selectedProviderId
+    ? providers.find((provider) => (provider.provider || provider.id) === selectedProviderId)
+    : null;
+  const selectedProviderModels = selectedProviderId
+    ? providerModels.filter((model) => model.provider === selectedProviderId)
+    : [];
+
+  const saveProvider = async () => {
+    const provider = providerDraft.provider.trim();
+    if (!provider || !providerDraft.name.trim() || !providerDraft.base_url.trim()) {
+      notify("请填写服务商 ID、名称和基础地址", "error");
+      return;
+    }
+    setBusy(true);
+    try {
+      const payload: ProviderConfigPayload = {
+        provider,
+        name: providerDraft.name.trim(),
+        base_url: providerDraft.base_url.trim(),
+        enabled: providerDraft.enabled,
+        timeout_seconds: clampNumber(providerDraft.timeout_seconds, 1, 600)
+      };
+      if (providerDraft.api_key.trim()) {
+        payload.api_key = providerDraft.api_key.trim();
+      }
+      if (providerDraft.mode === "edit") {
+        await api.updateProviderConfig(provider, payload);
+      } else {
+        await api.createProviderConfig(payload);
+      }
+      notify("服务商已保存", "success");
+      setProviderDraft(EMPTY_PROVIDER_DRAFT);
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearProviderKey = async (provider: string) => {
+    if (!window.confirm(`确认清除 ${provider} 的 API key？`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.updateProviderConfig(provider, { api_key: "" });
+      notify("API key 已清除", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disableProvider = async (provider: string) => {
+    if (!window.confirm(`确认禁用服务商 ${provider}？`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deleteProviderConfig(provider);
+      notify("服务商已禁用", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testProvider = async (provider: string) => {
+    setBusy(true);
+    try {
+      const result = await api.testProviderConfig(provider);
+      notify(result.message, result.success ? "success" : "error");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveProviderModel = async () => {
+    const providerForModel = modelDraft.provider.trim() || selectedProviderId || "";
+    if (!providerForModel || !modelDraft.upstream_model.trim()) {
+      notify("请填写服务商和服务商模型 ID", "error");
+      return;
+    }
+    const payload: ProviderModelConfigPayload = {
+      provider: providerForModel,
+      upstream_model: modelDraft.upstream_model.trim(),
+      display_name: modelDraft.display_name.trim(),
+      api_format: modelDraft.api_format,
+      pricing_mode: modelDraft.pricing_mode,
+      pricing_tiers_json:
+        modelDraft.pricing_mode === "tiered" ? priceTierDraftsToJson(modelDraft.pricing_tiers) : "",
+      input_price_per_million: clampNumber(
+        decimalInputValue(modelDraft.input_price_per_million),
+        0,
+        1_000_000
+      ),
+      output_price_per_million: clampNumber(
+        decimalInputValue(modelDraft.output_price_per_million),
+        0,
+        1_000_000
+      ),
+      currency: modelDraft.currency.trim() || "CNY",
+      enabled: modelDraft.enabled
+    };
+    setBusy(true);
+    try {
+      if (modelDraft.mode === "edit") {
+        await api.updateProviderModelConfig(modelDraft.id, payload);
+      } else {
+        await api.createProviderModelConfig(payload);
+      }
+      notify("服务商模型已保存", "success");
+      setModelDraft({
+        ...EMPTY_PROVIDER_MODEL_DRAFT,
+        provider: selectedProviderId || "",
+        pricing_tiers: createEmptyPriceTierDrafts()
+      });
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disableProviderModel = async (modelId: string) => {
+    if (!window.confirm("确认禁用这个服务商模型？已绑定的路由也会停止使用它。")) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deleteProviderModelConfig(modelId);
+      notify("服务商模型已禁用", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openProviderDetail = (provider: string) => {
+    setSelectedProviderId(provider);
+    setModelDraft({
+      ...EMPTY_PROVIDER_MODEL_DRAFT,
+      provider,
+      pricing_tiers: createEmptyPriceTierDrafts()
+    });
+  };
+
+  const startNewProviderModel = () => {
+    setModelDraft({
+      ...EMPTY_PROVIDER_MODEL_DRAFT,
+      provider: selectedProviderId || "",
+      pricing_tiers: createEmptyPriceTierDrafts()
+    });
+  };
+
+  const updatePricingTier = (index: number, patch: Partial<PriceTierDraft>) => {
+    setModelDraft((current) => ({
+      ...current,
+      pricing_tiers: ensureTwoPriceTierDrafts(current.pricing_tiers).map((tier, tierIndex) =>
+        tierIndex === index ? { ...tier, ...patch } : tier
+      )
+    }));
+  };
+
+  if (data && selectedProvider) {
+    const providerId = selectedProvider.provider || selectedProvider.id;
+    return (
+      <div className="page-stack">
+        <PageHeader
+          title={selectedProvider.name || providerId}
+          subtitle="配置这个服务商下面的真实模型 ID、接口类型和价格。"
+          action={
+            <div className="button-row">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setSelectedProviderId(null)}
+              >
+                返回服务商
+              </button>
+              <button className="secondary-button" type="button" onClick={load}>
+                <RefreshCcw size={16} />
+                刷新
+              </button>
+            </div>
+          }
+        />
+
+        <div className="stats-grid">
+          <StatCard label="服务商模型" value={selectedProviderModels.length} />
+          <StatCard
+            label="OpenAI-compatible"
+            value={
+              selectedProviderModels.filter((model) => model.api_format === "openai_compatible").length
+            }
+          />
+          <StatCard
+            label="Claude SDK"
+            value={selectedProviderModels.filter((model) => model.api_format === "claude_sdk").length}
+          />
+        </div>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h2>服务商信息</h2>
+            <div className="button-row">
+              <button
+                className="secondary-button compact"
+                type="button"
+                onClick={() => {
+                  setProviderDraft(providerToDraft(selectedProvider));
+                  setSelectedProviderId(null);
+                }}
+              >
+                编辑
+              </button>
+              <button
+                className="secondary-button compact"
+                type="button"
+                disabled={busy}
+                onClick={() => testProvider(providerId)}
+              >
+                测试
+              </button>
+            </div>
+          </div>
+          <dl className="field-list compact">
+            <div>
+              <dt>服务商 ID</dt>
+              <dd>{providerId}</dd>
+            </div>
+            <div>
+              <dt>基础地址</dt>
+              <dd>{selectedProvider.base_url}</dd>
+            </div>
+            <div>
+              <dt>API Key</dt>
+              <dd>{selectedProvider.api_key_configured ? "已配置" : "未配置"}</dd>
+            </div>
+            <div>
+              <dt>状态</dt>
+              <dd>{selectedProvider.enabled ? "启用" : "禁用"}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h2>模型配置</h2>
+            <button className="secondary-button" type="button" onClick={startNewProviderModel}>
+              新增
+            </button>
+          </div>
+          <div className="toolbar">
+            <label className="field-block small">
+              <span>显示名称</span>
+              <input
+                value={modelDraft.display_name}
+                onChange={(event) => setModelDraft({ ...modelDraft, display_name: event.target.value })}
+                placeholder="GLM 5.1"
+              />
+            </label>
+            <label className="field-block small">
+              <span>服务商模型 ID</span>
+              <input
+                value={modelDraft.upstream_model}
+                onChange={(event) => setModelDraft({ ...modelDraft, upstream_model: event.target.value })}
+                placeholder="glm-5-1"
+              />
+            </label>
+            <label className="field-block small">
+              <span>接口类型</span>
+              <select
+                value={modelDraft.api_format}
+                onChange={(event) =>
+                  setModelDraft({
+                    ...modelDraft,
+                    api_format: event.target.value as ProviderModelDraft["api_format"]
+                  })
+                }
+              >
+                <option value="openai_compatible">OpenAI-compatible</option>
+                <option value="claude_sdk">Claude SDK</option>
+              </select>
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={modelDraft.pricing_mode === "tiered"}
+                onChange={(event) =>
+                  setModelDraft({
+                    ...modelDraft,
+                    pricing_mode: event.target.checked ? "tiered" : "flat",
+                    pricing_tiers: ensureTwoPriceTierDrafts(modelDraft.pricing_tiers)
+                  })
+                }
+              />
+              分级价格
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={modelDraft.enabled}
+                onChange={(event) => setModelDraft({ ...modelDraft, enabled: event.target.checked })}
+              />
+              启用
+            </label>
+          </div>
+
+          <div className="toolbar">
+            <label className="field-block small">
+              <span>输入价格 / 1M</span>
+              <DecimalInput
+                value={modelDraft.input_price_per_million}
+                onChange={(value) => setModelDraft({ ...modelDraft, input_price_per_million: value })}
+              />
+            </label>
+            <label className="field-block small">
+              <span>输出价格 / 1M</span>
+              <DecimalInput
+                value={modelDraft.output_price_per_million}
+                onChange={(value) => setModelDraft({ ...modelDraft, output_price_per_million: value })}
+              />
+            </label>
+            <label className="field-block small">
+              <span>币种</span>
+              <input
+                value={modelDraft.currency}
+                onChange={(event) => setModelDraft({ ...modelDraft, currency: event.target.value })}
+              />
+            </label>
+            <button className="primary-button" type="button" disabled={busy} onClick={saveProviderModel}>
+              <Save size={16} />
+              保存模型
+            </button>
+          </div>
+
+          {modelDraft.pricing_mode === "tiered" && (
+            <div className="tier-editor">
+              {ensureTwoPriceTierDrafts(modelDraft.pricing_tiers).map((tier, index) => (
+                <div className="tier-row" key={index}>
+                  <strong>第 {index + 1} 档</strong>
+                  <label className="field-block small">
+                    <span>Token 上限</span>
+                    <DecimalInput
+                      step="1"
+                      placeholder={index === 0 ? "1000000" : "不限"}
+                      emptyValueOnBlur={index === 0 ? "0" : ""}
+                      value={tier.up_to_tokens}
+                      onChange={(value) => updatePricingTier(index, { up_to_tokens: value })}
+                    />
+                  </label>
+                  <label className="field-block small">
+                    <span>输入价格 / 1M</span>
+                    <DecimalInput
+                      value={tier.input_price_per_million}
+                      onChange={(value) =>
+                        updatePricingTier(index, { input_price_per_million: value })
+                      }
+                    />
+                  </label>
+                  <label className="field-block small">
+                    <span>输出价格 / 1M</span>
+                    <DecimalInput
+                      value={tier.output_price_per_million}
+                      onChange={(value) =>
+                        updatePricingTier(index, { output_price_per_million: value })
+                      }
+                    />
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selectedProviderModels.length === 0 && <EmptyBlock label="暂无服务商模型" />}
+          {selectedProviderModels.length > 0 && (
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>显示名称</th>
+                    <th>服务商模型 ID</th>
+                    <th>接口类型</th>
+                    <th>计费</th>
+                    <th>价格 / 1M</th>
+                    <th>启用</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedProviderModels.map((model) => (
+                    <tr key={model.id}>
+                      <td>{model.display_name || "-"}</td>
+                      <td>{model.upstream_model}</td>
+                      <td>{apiFormatText(model.api_format)}</td>
+                      <td>{pricingModeText(model.pricing_mode)}</td>
+                      <td>
+                        {moneyText(model.input_price_per_million, model.currency)} /{" "}
+                        {moneyText(model.output_price_per_million, model.currency)}
+                      </td>
+                      <td>{model.enabled ? "是" : "否"}</td>
+                      <td>
+                        <div className="button-row">
+                          <button
+                            className="secondary-button compact"
+                            type="button"
+                            onClick={() => setModelDraft(providerModelToDraft(model))}
+                          >
+                            编辑
+                          </button>
+                          <button
+                            className="warning-button compact"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => disableProviderModel(model.id)}
+                          >
+                            禁用
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+    );
+  }
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="服务商"
+        subtitle="配置上游 API 服务商；点进某个服务商后再配置它下面的真实模型和价格。"
+        action={
+          <button className="secondary-button" type="button" onClick={load}>
+            <RefreshCcw size={16} />
+            刷新
+          </button>
+        }
+      />
+      {state.loading && <LoadingBlock label="正在加载服务商" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {data && (
+        <>
+          <div className="stats-grid">
+            <StatCard label="服务商" value={providers.length} />
+            <StatCard label="服务商模型" value={providerModels.length} />
+            <StatCard label="已配置密钥" value={providers.filter((provider) => provider.api_key_configured).length} />
+          </div>
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>服务商管理</h2>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setProviderDraft(EMPTY_PROVIDER_DRAFT)}
+              >
+                新增
+              </button>
+            </div>
+            <div className="toolbar">
+              <label className="field-block small">
+                <span>服务商 ID</span>
+                <input
+                  value={providerDraft.provider}
+                  disabled={providerDraft.mode === "edit"}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, provider: event.target.value })}
+                  placeholder="zhipu"
+                />
+              </label>
+              <label className="field-block small">
+                <span>名称</span>
+                <input
+                  value={providerDraft.name}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, name: event.target.value })}
+                  placeholder="智谱"
+                />
+              </label>
+              <label className="field-block small wide-field">
+                <span>基础地址</span>
+                <input
+                  value={providerDraft.base_url}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, base_url: event.target.value })}
+                  placeholder="https://open.bigmodel.cn/api/paas/v4"
+                />
+              </label>
+              <label className="field-block small">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={providerDraft.api_key}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, api_key: event.target.value })}
+                  placeholder={providerDraft.mode === "edit" ? "留空则不变" : "可稍后填写"}
+                />
+              </label>
+              <label className="field-block small">
+                <span>超时</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={providerDraft.timeout_seconds}
+                  onChange={(event) =>
+                    setProviderDraft({ ...providerDraft, timeout_seconds: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={providerDraft.enabled}
+                  onChange={(event) => setProviderDraft({ ...providerDraft, enabled: event.target.checked })}
+                />
+                启用
+              </label>
+              <button className="primary-button" type="button" disabled={busy} onClick={saveProvider}>
+                <Save size={16} />
+                保存服务商
+              </button>
+            </div>
+            {providers.length === 0 && <EmptyBlock label="暂无服务商配置" />}
+            {providers.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>名称</th>
+                      <th>启用</th>
+                      <th>基础地址</th>
+                      <th>API Key</th>
+                      <th>超时</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {providers.map((provider) => (
+                      <tr key={provider.id || provider.provider}>
+                        <td>{provider.provider || provider.id}</td>
+                        <td>{provider.name}</td>
+                        <td>{provider.enabled ? "是" : "否"}</td>
+                        <td>{provider.base_url}</td>
+                        <td>{provider.api_key_configured ? "已配置" : "未配置"}</td>
+                        <td>{provider.timeout_seconds}s</td>
+                        <td>
+                          <div className="button-row">
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              onClick={() => setProviderDraft(providerToDraft(provider))}
+                            >
+                              编辑
+                            </button>
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              onClick={() => openProviderDetail(provider.provider || provider.id)}
+                            >
+                              模型
+                            </button>
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => testProvider(provider.provider || provider.id)}
+                            >
+                              测试
+                            </button>
+                            <button
+                              className="secondary-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => clearProviderKey(provider.provider || provider.id)}
+                            >
+                              清除密钥
+                            </button>
+                            <button
+                              className="warning-button compact"
+                              type="button"
+                              disabled={busy}
+                              onClick={() => disableProvider(provider.provider || provider.id)}
+                            >
+                              禁用
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+        </>
+      )}
+    </div>
+  );
+}
+
+function RoutesPage({
+  api,
+  notify
+}: {
+  api: MemoryApi;
+  notify: (message: string, kind?: Toast["kind"]) => void;
+}) {
+  const [state, setState] = useState<LoadState<ProviderConfigResponse>>({
+    loading: true,
+    error: null,
+    data: null
+  });
+  const [routeDraft, setRouteDraft] = useState<RouteDraft>(EMPTY_ROUTE_DRAFT);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setState({ loading: true, error: null, data: null });
+    try {
+      setState({ loading: false, error: null, data: await api.providerConfig() });
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), data: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const data = state.data;
+  const providerModels = data?.provider_models || [];
+  const routes = data?.routes || [];
+  const enabledProviderModels = providerModels.filter((model) => model.enabled);
+
+  const saveRoute = async () => {
+    if (!routeDraft.virtual_model.trim() || !routeDraft.provider_model_id.trim()) {
+      notify("请填写对外模型名，并选择一个服务商模型", "error");
+      return;
+    }
+    const selectedModel = providerModels.find((model) => model.id === routeDraft.provider_model_id);
+    if (!selectedModel) {
+      notify("选择的服务商模型不存在", "error");
+      return;
+    }
+    const payload: RouteConfigPayload = {
+      virtual_model: routeDraft.virtual_model.trim(),
+      provider_model_id: selectedModel.id,
+      priority: Math.round(routeDraft.priority),
+      min_balance: clampNumber(routeDraft.min_balance, 0, 1_000_000_000),
+      enabled: routeDraft.enabled
+    };
+    setBusy(true);
+    try {
+      if (routeDraft.mode === "edit") {
+        await api.updateRouteConfig(routeDraft.id, payload);
+      } else {
+        await api.createRouteConfig(payload);
+      }
+      notify("路由已保存", "success");
+      setRouteDraft(EMPTY_ROUTE_DRAFT);
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteRoute = async (routeId: string) => {
+    if (!window.confirm("确认删除这条路由？")) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.deleteRouteConfig(routeId);
+      notify("路由已删除", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="路由"
+        subtitle="把对外统一模型名映射到一个或多个服务商模型。"
+        action={
+          <button className="secondary-button" type="button" onClick={load}>
+            <RefreshCcw size={16} />
+            刷新
+          </button>
+        }
+      />
+      {state.loading && <LoadingBlock label="正在加载路由" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {data && (
+        <>
+          <div className="stats-grid">
+            <StatCard label="对外模型" value={new Set(routes.map((route) => route.virtual_model)).size} />
+            <StatCard label="路由" value={routes.length} />
+            <StatCard label="可选服务商模型" value={enabledProviderModels.length} />
+          </div>
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>路由管理</h2>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setRouteDraft(EMPTY_ROUTE_DRAFT)}
+              >
+                新增
+              </button>
+            </div>
+            <div className="toolbar">
+              <label className="field-block small">
+                <span>对外模型名</span>
+                <input
+                  value={routeDraft.virtual_model}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, virtual_model: event.target.value })}
+                  placeholder="glm-5.1"
+                />
+              </label>
+              <label className="field-block small wide-field">
+                <span>服务商模型</span>
+                <select
+                  value={routeDraft.provider_model_id}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, provider_model_id: event.target.value })}
+                >
+                  <option value="">选择服务商模型</option>
+                  {enabledProviderModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {providerModelLabel(model)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-block small">
+                <span>优先级</span>
+                <input
+                  type="number"
+                  value={routeDraft.priority}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, priority: Number(event.target.value) })}
+                />
+              </label>
+              <label className="field-block small">
+                <span>最低余额</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.000001"
+                  value={routeDraft.min_balance}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, min_balance: Number(event.target.value) })}
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={routeDraft.enabled}
+                  onChange={(event) => setRouteDraft({ ...routeDraft, enabled: event.target.checked })}
+                />
+                启用
+              </label>
+              <button className="primary-button" type="button" disabled={busy} onClick={saveRoute}>
+                <Save size={16} />
+                保存路由
+              </button>
+            </div>
+            {providerModels.length === 0 && (
+              <div className="notice warning">
+                <ShieldAlert size={18} />
+                先到“服务商”页面新增至少一个服务商模型，再配置路由。
+              </div>
+            )}
+            {routes.length === 0 && <EmptyBlock label="暂无路由" />}
+            {routes.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>对外模型名</th>
+                      <th>服务商模型</th>
+                      <th>服务商</th>
+                      <th>真实模型 ID</th>
+                      <th>优先级</th>
+                      <th>价格 / 1M</th>
+                      <th>最低余额</th>
+                      <th>启用</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {routes.map((route) => {
+                      const providerModel = providerModels.find((model) => model.id === route.provider_model_id);
+                      return (
+                        <tr key={route.id || `${route.virtual_model}-${route.provider}-${route.upstream_model}`}>
+                          <td>{route.virtual_model}</td>
+                          <td>{providerModel ? providerModelLabel(providerModel) : "旧路由"}</td>
+                          <td>{route.provider}</td>
+                          <td>{route.upstream_model}</td>
+                          <td>{route.priority}</td>
+                          <td>
+                            {moneyText(route.input_price_per_million, route.currency)} /{" "}
+                            {moneyText(route.output_price_per_million, route.currency)}
+                          </td>
+                          <td>{moneyText(route.min_balance, route.currency)}</td>
+                          <td>{route.enabled === false ? "否" : "是"}</td>
+                          <td>
+                            <div className="button-row">
+                              <button
+                                className="secondary-button compact"
+                                type="button"
+                                onClick={() => setRouteDraft(routeToDraft(route))}
+                              >
+                                编辑
+                              </button>
+                              {route.id && !route.id.startsWith("toml:") && (
+                                <button
+                                  className="danger-button compact"
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => deleteRoute(route.id || "")}
+                                >
+                                  删除
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function BillingPage({
+  api,
+  notify
+}: {
+  api: MemoryApi;
+  notify: (message: string, kind?: Toast["kind"]) => void;
+}) {
+  const [state, setState] = useState<LoadState<BalanceRecord[]>>({
+    loading: true,
+    error: null,
+    data: null
+  });
+  const [draft, setDraft] = useState({
+    provider: "",
+    amount: "",
+    currency: "CNY",
+    reason: "手动调整"
+  });
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setState({ loading: true, error: null, data: null });
+    try {
+      setState({ loading: false, error: null, data: await api.balances() });
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), data: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    const firstProvider = state.data?.[0]?.provider;
+    if (firstProvider && !draft.provider) {
+      setDraft((current) => ({ ...current, provider: firstProvider }));
+    }
+  }, [draft.provider, state.data]);
+
+  const adjust = async () => {
+    const provider = draft.provider.trim();
+    const amount = Number(draft.amount);
+    if (!provider || Number.isNaN(amount)) {
+      notify("请填写服务商和有效金额", "error");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.adjustBalance(provider, {
+        amount_delta: amount,
+        currency: draft.currency.trim() || "CNY",
+        reason: draft.reason.trim()
+      });
+      notify("余额已调整", "success");
+      setDraft((current) => ({ ...current, amount: "", reason: "手动调整" }));
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const balances = state.data || [];
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="余额账本"
+        subtitle="本地服务商余额账本和手动调整。"
+        action={
+          <button className="secondary-button" type="button" onClick={load}>
+            <RefreshCcw size={16} />
+            刷新
+          </button>
+        }
+      />
+      <section className="panel">
+        <div className="panel-header">
+          <h2>手动调整余额</h2>
+        </div>
+        <div className="toolbar">
+          <label className="field-block small">
+            <span>服务商</span>
+            <input
+              value={draft.provider}
+              onChange={(event) => setDraft({ ...draft, provider: event.target.value })}
+              placeholder="zhipu"
+              list="provider-balance-list"
+            />
+            <datalist id="provider-balance-list">
+              {balances.map((balance) => (
+                <option key={balance.provider} value={balance.provider} />
+              ))}
+            </datalist>
+          </label>
+          <label className="field-block small">
+            <span>调整金额</span>
+            <input
+              type="number"
+              step="0.000001"
+              value={draft.amount}
+              onChange={(event) => setDraft({ ...draft, amount: event.target.value })}
+              placeholder="100"
+            />
+          </label>
+          <label className="field-block small">
+            <span>币种</span>
+            <input
+              value={draft.currency}
+              onChange={(event) => setDraft({ ...draft, currency: event.target.value })}
+            />
+          </label>
+          <label className="field-block small">
+            <span>原因</span>
+            <input
+              value={draft.reason}
+              onChange={(event) => setDraft({ ...draft, reason: event.target.value })}
+            />
+          </label>
+          <button className="primary-button" type="button" disabled={saving} onClick={adjust}>
+            <Save size={16} />
+            保存
+          </button>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-header">
+          <h2>余额</h2>
+        </div>
+        {state.loading && <LoadingBlock label="正在加载余额" />}
+        {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+        {!state.loading && !state.error && balances.length === 0 && <EmptyBlock label="暂无余额记录" />}
+        {balances.length > 0 && (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>服务商</th>
+                  <th>余额</th>
+                  <th>币种</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {balances.map((balance) => (
+                  <tr key={balance.provider}>
+                    <td>{balance.provider}</td>
+                    <td>{numberText(balance.balance)}</td>
+                    <td>{balance.currency}</td>
+                    <td>{dateText(balance.updated_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function UsagePage({ api }: { api: MemoryApi }) {
+  const [state, setState] = useState<LoadState<{ events: UsageEvent[]; summary: UsageSummary[] }>>({
+    loading: true,
+    error: null,
+    data: null
+  });
+
+  const load = useCallback(async () => {
+    setState({ loading: true, error: null, data: null });
+    try {
+      const [events, summary] = await Promise.all([api.usage(100), api.usageSummary()]);
+      setState({ loading: false, error: null, data: { events, summary } });
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), data: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const data = state.data;
+  const totalCalls = data?.summary.reduce((sum, item) => sum + Number(item.calls || 0), 0) || 0;
+  const totalTokens = data?.summary.reduce((sum, item) => sum + Number(item.total_tokens || 0), 0) || 0;
+  const totalCost = data?.summary.reduce((sum, item) => sum + Number(item.total_cost || 0), 0) || 0;
+  const currency = data?.summary[0]?.currency || "CNY";
+
+  return (
+    <div className="page-stack">
+      <PageHeader
+        title="用量统计"
+        subtitle="服务商调用记录和按服务商/模型聚合的用量。"
+        action={
+          <button className="secondary-button" type="button" onClick={load}>
+            <RefreshCcw size={16} />
+            刷新
+          </button>
+        }
+      />
+      {state.loading && <LoadingBlock label="正在加载用量" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {data && (
+        <>
+          <div className="stats-grid">
+            <StatCard label="调用数" value={totalCalls} />
+            <StatCard label="总 Tokens" value={numberText(totalTokens)} />
+            <StatCard label="费用" value={moneyText(totalCost, currency)} />
+            <StatCard label="最近记录" value={data.events.length} />
+          </div>
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>用量汇总</h2>
+            </div>
+            {data.summary.length === 0 && <EmptyBlock label="暂无用量汇总" />}
+            {data.summary.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>服务商</th>
+                      <th>虚拟模型</th>
+                      <th>调用数</th>
+                      <th>输入 Tokens</th>
+                      <th>输出 Tokens</th>
+                      <th>总 Tokens</th>
+                      <th>总费用</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.summary.map((item) => (
+                      <tr key={`${item.provider}-${item.virtual_model}-${item.currency}`}>
+                        <td>{item.provider}</td>
+                        <td>{item.virtual_model}</td>
+                        <td>{numberText(item.calls)}</td>
+                        <td>{numberText(item.prompt_tokens)}</td>
+                        <td>{numberText(item.completion_tokens)}</td>
+                        <td>{numberText(item.total_tokens)}</td>
+                        <td>{moneyText(item.total_cost, item.currency)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-header">
+              <h2>最近调用</h2>
+            </div>
+            {data.events.length === 0 && <EmptyBlock label="暂无调用记录" />}
+            {data.events.length > 0 && (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>状态</th>
+                      <th>服务商</th>
+                      <th>虚拟模型</th>
+                      <th>上游模型</th>
+                      <th>Tokens</th>
+                      <th>费用</th>
+                      <th>估算</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.events.map((event) => (
+                      <tr key={event.id}>
+                        <td>{dateText(event.created_at)}</td>
+                        <td>{badge(event.status)}</td>
+                        <td>{event.provider}</td>
+                        <td>{event.virtual_model}</td>
+                        <td>{event.upstream_model}</td>
+                        <td>{numberText(event.total_tokens)}</td>
+                        <td>{moneyText(event.total_cost, event.currency)}</td>
+                        <td>{event.estimated ? "是" : "否"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </section>
         </>
       )}
@@ -2080,7 +3929,7 @@ function DeveloperPage({
           entries={[
             ["基础地址", openAiBase],
             ["API Key", maskSecret(settings.apiKey)],
-            ["模型", "任意，服务端会映射到 UPSTREAM_MODEL"]
+            ["模型", "填写 providers.toml 中的 virtual model"]
           ]}
         />
       </section>
@@ -2174,6 +4023,32 @@ function FilterSelect({
         ))}
       </select>
     </label>
+  );
+}
+
+function DecimalInput({
+  value,
+  onChange,
+  step = "0.000001",
+  placeholder,
+  emptyValueOnBlur = "0"
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  step?: string;
+  placeholder?: string;
+  emptyValueOnBlur?: string;
+}) {
+  return (
+    <input
+      type="number"
+      min={0}
+      step={step}
+      value={value}
+      placeholder={placeholder}
+      onChange={(event) => onChange(normalizeDecimalInput(event.target.value))}
+      onBlur={(event) => onChange(normalizeDecimalInputOnBlur(event.target.value, emptyValueOnBlur))}
+    />
   );
 }
 
@@ -2321,6 +4196,209 @@ function dateText(value?: string | null) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
+}
+
+function sourceText(source: string): string {
+  if (source === "sqlite") return "SQLite UI 配置";
+  if (source === "toml") return "providers.toml";
+  return "legacy UPSTREAM_*";
+}
+
+function providerToDraft(provider: ProviderSummary): ProviderDraft {
+  return {
+    mode: "edit",
+    provider: provider.provider || provider.id,
+    name: provider.name,
+    base_url: provider.base_url,
+    api_key: "",
+    enabled: provider.enabled,
+    timeout_seconds: provider.timeout_seconds
+  };
+}
+
+function providerModelToDraft(model: ProviderModelSummary): ProviderModelDraft {
+  return {
+    mode: "edit",
+    id: model.id,
+    provider: model.provider,
+    upstream_model: model.upstream_model,
+    display_name: model.display_name,
+    api_format: model.api_format || "openai_compatible",
+    pricing_mode: model.pricing_mode || "flat",
+    pricing_tiers_json: model.pricing_tiers_json || "",
+    pricing_tiers: priceTierDraftsFromJson(model.pricing_tiers_json),
+    input_price_per_million: decimalInputText(model.input_price_per_million),
+    output_price_per_million: decimalInputText(model.output_price_per_million),
+    currency: model.currency,
+    enabled: model.enabled !== false
+  };
+}
+
+function routeToDraft(route: RouteSummary): RouteDraft {
+  return {
+    mode: "edit",
+    id: route.id || "",
+    virtual_model: route.virtual_model,
+    provider_model_id: route.provider_model_id || "",
+    provider: route.provider,
+    upstream_model: route.upstream_model,
+    priority: route.priority,
+    input_price_per_million: decimalInputText(route.input_price_per_million),
+    output_price_per_million: decimalInputText(route.output_price_per_million),
+    currency: route.currency,
+    min_balance: route.min_balance,
+    enabled: route.enabled !== false
+  };
+}
+
+function providerModelLabel(model: ProviderModelSummary): string {
+  const name = model.display_name ? `${model.display_name} · ` : "";
+  const apiFormat = model.api_format === "claude_sdk" ? " · Claude SDK" : "";
+  return `${model.provider} / ${name}${model.upstream_model}${apiFormat}`;
+}
+
+function apiFormatText(value?: string | null): string {
+  if (value === "claude_sdk") return "Claude SDK";
+  return "OpenAI-compatible";
+}
+
+function pricingModeText(value?: string | null): string {
+  if (value === "tiered") return "分级价格";
+  return "固定价格";
+}
+
+function numberText(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  return Number(value).toLocaleString(undefined, {
+    maximumFractionDigits: 6
+  });
+}
+
+function moneyText(value?: number | null, currency?: string | null) {
+  const amount = numberText(value);
+  return `${amount} ${currency || ""}`.trim();
+}
+
+function createEmptyPriceTierDrafts(): PriceTierDraft[] {
+  return [
+    {
+      up_to_tokens: "1000000",
+      input_price_per_million: "0",
+      output_price_per_million: "0"
+    },
+    {
+      up_to_tokens: "",
+      input_price_per_million: "0",
+      output_price_per_million: "0"
+    }
+  ];
+}
+
+function ensureTwoPriceTierDrafts(tiers?: PriceTierDraft[] | null): PriceTierDraft[] {
+  const defaults = createEmptyPriceTierDrafts();
+  return defaults.map((fallback, index) => ({
+    ...fallback,
+    ...(tiers?.[index] || {})
+  }));
+}
+
+function priceTierDraftsFromJson(raw?: string | null): PriceTierDraft[] {
+  if (!raw?.trim()) {
+    return createEmptyPriceTierDrafts();
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return createEmptyPriceTierDrafts();
+    }
+    const defaults = createEmptyPriceTierDrafts();
+    return defaults.map((fallback, index) => {
+      const tier = parsed[index];
+      if (!isRecord(tier)) {
+        return fallback;
+      }
+      return {
+        up_to_tokens:
+          tier.up_to_tokens === null || tier.up_to_tokens === undefined
+            ? fallback.up_to_tokens
+            : decimalInputText(tier.up_to_tokens, fallback.up_to_tokens),
+        input_price_per_million: decimalInputText(
+          tier.input_price_per_million ?? tier.input,
+          fallback.input_price_per_million
+        ),
+        output_price_per_million: decimalInputText(
+          tier.output_price_per_million ?? tier.output,
+          fallback.output_price_per_million
+        )
+      };
+    });
+  } catch {
+    return createEmptyPriceTierDrafts();
+  }
+}
+
+function priceTierDraftsToJson(tiers?: PriceTierDraft[] | null): string {
+  return JSON.stringify(
+    ensureTwoPriceTierDrafts(tiers).map((tier) => ({
+      up_to_tokens: tier.up_to_tokens.trim()
+        ? Math.round(clampNumber(decimalInputValue(tier.up_to_tokens), 0, Number.MAX_SAFE_INTEGER))
+        : null,
+      input: clampNumber(decimalInputValue(tier.input_price_per_million), 0, 1_000_000),
+      output: clampNumber(decimalInputValue(tier.output_price_per_million), 0, 1_000_000)
+    }))
+  );
+}
+
+function normalizeDecimalInput(raw: string): string {
+  const value = raw.trim().replace(",", ".");
+  if (!value) {
+    return "";
+  }
+  const clean = value.replace(/[^\d.]/g, "");
+  if (!clean) {
+    return "";
+  }
+  const dotIndex = clean.indexOf(".");
+  const hasDecimal = dotIndex !== -1;
+  const wholeRaw = hasDecimal ? clean.slice(0, dotIndex) : clean;
+  const fraction = hasDecimal ? clean.slice(dotIndex + 1).replace(/\./g, "") : "";
+  const whole = wholeRaw.replace(/^0+(?=\d)/, "") || "0";
+  return hasDecimal ? `${whole}.${fraction}` : whole;
+}
+
+function normalizeDecimalInputOnBlur(raw: string, emptyValue = "0"): string {
+  const normalized = normalizeDecimalInput(raw);
+  if (!normalized) {
+    return emptyValue;
+  }
+  if (normalized === "0.") {
+    return "0";
+  }
+  if (normalized.endsWith(".")) {
+    return normalized.slice(0, -1) || "0";
+  }
+  return normalized;
+}
+
+function decimalInputValue(value: string): number {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function decimalInputText(value: unknown, fallback = "0"): string {
+  if (typeof value === "string" && value.trim() === "") {
+    return fallback;
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    return fallback;
+  }
+  return number.toLocaleString("en-US", {
+    useGrouping: false,
+    maximumFractionDigits: 12
+  });
 }
 
 function valueText(value: unknown): string {
