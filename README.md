@@ -500,7 +500,7 @@ memory-gateway/
 
 ## Memory Console 本地 UI
 
-项目现在提供第一阶段 MVP 的本地 Web 管理界面，前端源码位于 `ui/`，构建产物输出到 `ui/dist`，后端会将其挂载到 `/ui`。`/ui` 会重定向到 `/ui/`，直接访问 `http://localhost:2026/ui/` 也可以。
+项目现在提供本地 Web 管理界面，前端源码位于 `ui/`，构建产物输出到 `ui/dist`，后端会将其挂载到 `/ui`。`/ui` 会重定向到 `/ui/`，直接访问 `http://localhost:2026/ui/` 也可以。
 
 安装前端依赖：
 
@@ -534,7 +534,13 @@ http://localhost:2026/ui
 - Gateway API Key：填写 `.env` 中的 `GATEWAY_API_KEY`。
 - User ID：默认 `default`，也可以填写自定义用户隔离 ID。
 
-当前 Settings 页面只保存浏览器本地 UI 连接信息到 `localStorage`，不会写入服务端 `.env`。服务端 `.env` 可视化写入、PATCH 编辑记忆、重建 embedding、用户列表自动发现不属于第一阶段 MVP。
+第二阶段 A 增强了 Memory Console 的记忆维护能力：
+
+- Memories 详情抽屉支持编辑已有记忆，可更新内容、类型、重要度、置信度、稳定性、有效期、复核时间、敏感级别和来源字段。
+- Review 页面支持在二次确认后应用 delete / merge / lower 建议，其中 delete 会将记忆移入回收站，merge 会合并记忆，lower 会降低单条记忆的重要度。
+- 编辑 `content` 后旧 `embedding_json` 会失效并被清空；后续可通过重建 embedding 功能解决，目前尚未实现 embedding 重建。
+
+当前 Settings 页面只保存浏览器本地 UI 连接信息到 `localStorage`，不会写入服务端 `.env`。服务端 `.env` 可视化写入、重建 embedding、用户列表自动发现、深色模式和手动新增记忆仍未实现。
 
 ## 当前限制
 

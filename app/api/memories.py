@@ -15,7 +15,12 @@ from app.api.deps import (
 from app.llm.client import OpenAICompatibleClient
 from app.memory.core import CoreMemoryConsolidator
 from app.memory.ingest import MemoryIngestService
-from app.memory.models import CoreMemorySectionName
+from app.memory.models import (
+    CoreMemorySectionName,
+    MemorySensitivity,
+    MemoryStability,
+    MemoryType,
+)
 from app.memory.review import MemoryReviewer
 from app.memory.report import (
     build_memory_export,
@@ -41,6 +46,19 @@ class MemorySearchRequest(BaseModel):
 class MemoryMergeRequest(BaseModel):
     memory_ids: list[str] = Field(min_length=2)
     content: str | None = None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str | None = None
+    type: MemoryType | None = None
+    importance: int | None = Field(default=None, ge=1, le=10)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    stability: MemoryStability | None = None
+    valid_until: str | None = None
+    review_after: str | None = None
+    sensitivity: MemorySensitivity | None = None
+    source_message: str | None = None
+    source_conversation_id: str | None = None
 
 
 class MemoryRestoreExportRequest(BaseModel):
@@ -241,6 +259,65 @@ def review_memories(
 ) -> dict:
     reviewer = MemoryReviewer(store=store)
     return reviewer.review(user_id=user_id, limit=limit).model_dump()
+
+
+@router.patch("/{memory_id}")
+def update_memory(
+    memory_id: str,
+    body: MemoryUpdateRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    existing = store.get_memory(memory_id=memory_id, user_id=user_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="记忆不存在或已删除",
+        )
+
+    updates = body.model_dump(exclude_unset=True)
+    if "content" in body.model_fields_set:
+        if body.content is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="content 不能为 null",
+            )
+        content = body.content.strip()
+        if not content:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="content 不能为空",
+            )
+        updates["content"] = content
+
+    content = updates.get("content", existing.content)
+    embedding_json = None if content != existing.content else existing.embedding_json
+
+    memory = store.update_memory(
+        memory_id=memory_id,
+        user_id=user_id,
+        content=content,
+        type=updates.get("type", existing.type),
+        importance=updates.get("importance", existing.importance),
+        confidence=updates.get("confidence", existing.confidence),
+        source_message=updates.get("source_message", existing.source_message),
+        source_conversation_id=updates.get(
+            "source_conversation_id",
+            existing.source_conversation_id,
+        ),
+        embedding_json=embedding_json,
+        stability=updates.get("stability", existing.stability),
+        valid_until=updates.get("valid_until", existing.valid_until),
+        review_after=updates.get("review_after", existing.review_after),
+        sensitivity=updates.get("sensitivity", existing.sensitivity),
+        evidence_memory_ids=existing.evidence_memory_ids,
+    )
+    if memory is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="记忆不存在或已删除",
+        )
+    return {"updated": True, "memory": memory.model_dump(exclude={"embedding_json"})}
 
 
 @router.post("/{memory_id}/restore")

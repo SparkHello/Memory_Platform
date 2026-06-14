@@ -117,3 +117,172 @@ def test_restore_export_imports_memories_for_current_user(
     assert [memory.content for memory in restored_active] == [active.content]
     assert [memory.content for memory in restored_deleted] == [deleted.content]
     assert restored_active[0].embedding_json is None
+
+
+def test_patch_memory_updates_content_and_clears_embedding(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User likes black coffee.",
+        type="preference",
+        importance=7,
+        confidence=0.9,
+        embedding_json="[0.1, 0.2]",
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"content": "User likes espresso."},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["updated"] is True
+    assert payload["memory"]["content"] == "User likes espresso."
+    assert "embedding_json" not in payload["memory"]
+
+    stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert stored is not None
+    assert stored.content == "User likes espresso."
+    assert stored.embedding_json is None
+
+
+def test_patch_memory_partial_update_preserves_other_fields_and_embedding(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User likes pour-over coffee.",
+        type="preference",
+        importance=6,
+        confidence=0.8,
+        source_message="I like pour-over coffee.",
+        source_conversation_id="conv-1",
+        embedding_json="[0.3, 0.4]",
+        stability="stable",
+        valid_until="2026-12-31",
+        review_after="2026-07-01",
+        sensitivity="private",
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"importance": 5},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["memory"]["importance"] == 5
+    assert payload["memory"]["content"] == memory.content
+    assert payload["memory"]["type"] == memory.type
+    assert payload["memory"]["confidence"] == memory.confidence
+    assert payload["memory"]["source_message"] == memory.source_message
+    assert payload["memory"]["source_conversation_id"] == memory.source_conversation_id
+    assert payload["memory"]["stability"] == memory.stability
+    assert payload["memory"]["valid_until"] == memory.valid_until
+    assert payload["memory"]["review_after"] == memory.review_after
+    assert payload["memory"]["sensitivity"] == memory.sensitivity
+    assert "embedding_json" not in payload["memory"]
+
+    stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert stored is not None
+    assert stored.embedding_json == "[0.3, 0.4]"
+
+
+def test_patch_memory_can_clear_nullable_fields(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User has a temporary testing note.",
+        source_message="Please remember this temporary note.",
+        source_conversation_id="conv-clear",
+        valid_until="2026-12-31",
+        review_after="2026-07-01",
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={
+            "source_message": None,
+            "source_conversation_id": None,
+            "valid_until": None,
+            "review_after": None,
+        },
+    )
+
+    assert response.status_code == 200
+    stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert stored is not None
+    assert stored.source_message is None
+    assert stored.source_conversation_id is None
+    assert stored.valid_until is None
+    assert stored.review_after is None
+
+
+def test_patch_memory_missing_id_returns_404(client, auth_headers):
+    response = client.patch(
+        "/memories/missing-memory-id",
+        headers=auth_headers,
+        json={"importance": 5},
+    )
+
+    assert response.status_code == 404
+
+
+def test_patch_deleted_memory_returns_404(client, auth_headers, memory_store: MemoryStore):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User used to like tea.",
+    )
+    memory_store.archive_memory(memory_id=memory.id, user_id="default")
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"importance": 5},
+    )
+
+    assert response.status_code == 404
+
+
+def test_patch_memory_rejects_empty_content(client, auth_headers, memory_store: MemoryStore):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User likes coffee.",
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"content": "   "},
+    )
+
+    assert response.status_code == 422
+    stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert stored is not None
+    assert stored.content == "User likes coffee."
+
+
+def test_patch_memory_requires_authorization(client, memory_store: MemoryStore):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User likes coffee.",
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        json={"importance": 5},
+    )
+
+    assert response.status_code == 401

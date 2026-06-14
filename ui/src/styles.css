@@ -546,6 +546,17 @@ button:disabled {
   gap: 7px;
 }
 
+.edit-form {
+  display: grid;
+  gap: 12px;
+}
+
+.edit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .field-inline {
   grid-template-columns: auto minmax(220px, 1fr);
   align-items: center;
@@ -760,6 +771,10 @@ button:disabled {
   padding: 8px 10px;
   border-radius: 7px;
   background: #f7f8fa;
+}
+
+.merge-preview-list {
+  margin: 12px 0;
 }
 
 .count-pill {
@@ -994,6 +1009,10 @@ code {
 
   .memory-layout,
   .memory-layout.has-detail {
+    grid-template-columns: 1fr;
+  }
+
+  .edit-grid {
     grid-template-columns: 1fr;
   }
 

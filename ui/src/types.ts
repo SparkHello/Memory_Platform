@@ -58,6 +58,24 @@ export interface MemoryRecord {
   archived?: number;
 }
 
+export interface MemoryUpdatePayload {
+  content?: string;
+  type?: MemoryType;
+  importance?: number;
+  confidence?: number;
+  stability?: MemoryStability;
+  valid_until?: string | null;
+  review_after?: string | null;
+  sensitivity?: MemorySensitivity;
+  source_message?: string | null;
+  source_conversation_id?: string | null;
+}
+
+export interface MemoryUpdateResult {
+  updated: boolean;
+  memory: MemoryRecord;
+}
+
 export interface MemorySourceExplanation {
   memory_id: string;
   content: string;

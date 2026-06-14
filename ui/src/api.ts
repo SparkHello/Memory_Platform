@@ -7,6 +7,8 @@ import type {
   MemoryRecord,
   MemoryReport,
   MemorySourceExplanation,
+  MemoryUpdatePayload,
+  MemoryUpdateResult,
   RecentContextSummary,
   RestoreResult,
   ReviewResult
@@ -80,6 +82,16 @@ export class MemoryApi {
   async restoreMemory(memoryId: string): Promise<void> {
     await this.request(`/memories/${encodeURIComponent(memoryId)}/restore`, {
       method: "POST"
+    });
+  }
+
+  async updateMemory(
+    memoryId: string,
+    payload: MemoryUpdatePayload
+  ): Promise<MemoryUpdateResult> {
+    return this.request(`/memories/${encodeURIComponent(memoryId)}`, {
+      method: "PATCH",
+      body: payload
     });
   }
 

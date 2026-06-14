@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Activity,
+  ArrowDown,
   ArchiveRestore,
   Clipboard,
   Database,
@@ -14,7 +15,9 @@ import {
   KeyRound,
   Layers3,
   ListChecks,
+  Pencil,
   RefreshCcw,
+  Save,
   Search,
   Settings as SettingsIcon,
   ShieldAlert,
@@ -39,6 +42,7 @@ import type {
   MemoryStability,
   MemorySensitivity,
   MemoryType,
+  MemoryUpdatePayload,
   PageKey,
   RecentContextSummary,
   RestoreResult,
@@ -128,7 +132,7 @@ const DISPLAY_TEXT: Record<string, string> = {
   keep: "保留",
   merge: "合并",
   lower: "降权",
-  delete: "删除",
+  delete: "移入回收站",
   review: "复核",
   none: "无",
   same: "重复",
@@ -445,6 +449,19 @@ type MemoryFilters = {
   hasReviewAfter: boolean;
 };
 
+type MemoryEditDraft = {
+  content: string;
+  type: MemoryType;
+  importance: number;
+  confidence: number;
+  stability: MemoryStability;
+  sensitivity: MemorySensitivity;
+  valid_until: string;
+  review_after: string;
+  source_message: string;
+  source_conversation_id: string;
+};
+
 function MemoriesPage({
   api,
   notify
@@ -460,6 +477,10 @@ function MemoriesPage({
   });
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<MemoryRecord | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState<MemoryEditDraft | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
   const [why, setWhy] = useState<LoadState<MemorySourceExplanation>>({
     loading: false,
     error: null,
@@ -502,6 +523,10 @@ function MemoriesPage({
 
   useEffect(() => {
     setWhy({ loading: false, error: null, data: null });
+    setEditing(false);
+    setEditDraft(null);
+    setEditError(null);
+    setSavingEdit(false);
   }, [selected?.id]);
 
   const memories = useMemo(() => {
@@ -548,6 +573,54 @@ function MemoriesPage({
       await load("deleted");
     } catch (error) {
       notify(errorMessage(error), "error");
+    }
+  };
+
+  const startEdit = () => {
+    if (!selected) return;
+    setEditDraft(memoryToEditDraft(selected));
+    setEditError(null);
+    setEditing(true);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setEditDraft(null);
+    setEditError(null);
+  };
+
+  const saveEdit = async () => {
+    if (!selected || !editDraft) return;
+    if (!editDraft.content.trim()) {
+      setEditError("content 不能为空");
+      return;
+    }
+    if (!window.confirm("确定要更新这条记忆吗？这会影响后续检索和回答注入。")) {
+      return;
+    }
+    setSavingEdit(true);
+    setEditError(null);
+    try {
+      const result = await api.updateMemory(selected.id, editDraftToPayload(editDraft));
+      setSelected(result.memory);
+      setState((current) =>
+        current.data
+          ? {
+              ...current,
+              data: current.data.map((memory) =>
+                memory.id === result.memory.id ? result.memory : memory
+              )
+            }
+          : current
+      );
+      notify("记忆已更新", "success");
+      setEditing(false);
+      setEditDraft(null);
+      await load("active");
+    } catch (error) {
+      setEditError(errorMessage(error));
+    } finally {
+      setSavingEdit(false);
     }
   };
 
@@ -766,29 +839,206 @@ function MemoriesPage({
                 <X size={18} />
               </button>
             </div>
-            <FieldList
-              entries={[
-                ["id", selected.id],
-                ["内容", selected.content],
-                ["类型", displayText(selected.type)],
-                ["重要度", selected.importance],
-                ["置信度", percent(selected.confidence)],
-                ["来源原文", selected.source_message],
-                ["来源对话 ID", selected.source_conversation_id],
-                ["使用次数", selected.usage_count],
-                ["最近使用", selected.last_used_at],
-                ["稳定性", displayText(selected.stability)],
-                ["有效期", selected.valid_until],
-                ["复核时间", selected.review_after],
-                ["敏感级别", displayText(selected.sensitivity)],
-                ["证据记忆 ID", selected.evidence_memory_ids],
-                ["创建时间", selected.created_at],
-                ["更新时间", selected.updated_at]
-              ]}
-            />
+            {editing && editDraft ? (
+              <div className="edit-form">
+                <label className="field-block">
+                  <span>内容</span>
+                  <textarea
+                    value={editDraft.content}
+                    rows={5}
+                    onChange={(event) =>
+                      setEditDraft({ ...editDraft, content: event.target.value })
+                    }
+                  />
+                </label>
+                {editDraft.content.trim() !== selected.content && (
+                  <div className="notice warning">
+                    修改内容后，旧 embedding 会失效；后续版本可提供重建 embedding。
+                  </div>
+                )}
+                <div className="edit-grid">
+                  <label className="field-block">
+                    <span>类型</span>
+                    <select
+                      value={editDraft.type}
+                      onChange={(event) =>
+                        setEditDraft({ ...editDraft, type: event.target.value as MemoryType })
+                      }
+                    >
+                      {MEMORY_TYPES.map((type) => (
+                        <option key={type} value={type}>
+                          {displayText(type)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field-block">
+                    <span>重要度</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={10}
+                      step={1}
+                      value={editDraft.importance}
+                      onChange={(event) =>
+                        setEditDraft({
+                          ...editDraft,
+                          importance: Math.round(clampNumber(Number(event.target.value), 1, 10))
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="field-block">
+                    <span>置信度</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={editDraft.confidence}
+                      onChange={(event) =>
+                        setEditDraft({
+                          ...editDraft,
+                          confidence: clampNumber(Number(event.target.value), 0, 1)
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="field-block">
+                    <span>稳定性</span>
+                    <select
+                      value={editDraft.stability}
+                      onChange={(event) =>
+                        setEditDraft({
+                          ...editDraft,
+                          stability: event.target.value as MemoryStability
+                        })
+                      }
+                    >
+                      {STABILITIES.map((stability) => (
+                        <option key={stability} value={stability}>
+                          {displayText(stability)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field-block">
+                    <span>敏感级别</span>
+                    <select
+                      value={editDraft.sensitivity}
+                      onChange={(event) =>
+                        setEditDraft({
+                          ...editDraft,
+                          sensitivity: event.target.value as MemorySensitivity
+                        })
+                      }
+                    >
+                      {SENSITIVITIES.map((sensitivity) => (
+                        <option key={sensitivity} value={sensitivity}>
+                          {displayText(sensitivity)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field-block">
+                    <span>有效期</span>
+                    <input
+                      value={editDraft.valid_until}
+                      onChange={(event) =>
+                        setEditDraft({ ...editDraft, valid_until: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label className="field-block">
+                    <span>复核时间</span>
+                    <input
+                      value={editDraft.review_after}
+                      onChange={(event) =>
+                        setEditDraft({ ...editDraft, review_after: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label className="field-block">
+                    <span>来源对话 ID</span>
+                    <input
+                      value={editDraft.source_conversation_id}
+                      onChange={(event) =>
+                        setEditDraft({
+                          ...editDraft,
+                          source_conversation_id: event.target.value
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+                <label className="field-block">
+                  <span>来源原文</span>
+                  <textarea
+                    value={editDraft.source_message}
+                    rows={3}
+                    onChange={(event) =>
+                      setEditDraft({ ...editDraft, source_message: event.target.value })
+                    }
+                  />
+                </label>
+                {editError && (
+                  <div className="notice warning">
+                    <ShieldAlert size={16} />
+                    {editError}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <FieldList
+                entries={[
+                  ["id", selected.id],
+                  ["内容", selected.content],
+                  ["类型", displayText(selected.type)],
+                  ["重要度", selected.importance],
+                  ["置信度", percent(selected.confidence)],
+                  ["来源原文", selected.source_message],
+                  ["来源对话 ID", selected.source_conversation_id],
+                  ["使用次数", selected.usage_count],
+                  ["最近使用", selected.last_used_at],
+                  ["稳定性", displayText(selected.stability)],
+                  ["有效期", selected.valid_until],
+                  ["复核时间", selected.review_after],
+                  ["敏感级别", displayText(selected.sensitivity)],
+                  ["证据记忆 ID", selected.evidence_memory_ids],
+                  ["创建时间", selected.created_at],
+                  ["更新时间", selected.updated_at]
+                ]}
+              />
+            )}
             <div className="drawer-actions">
-              {tab === "active" && (
+              {tab === "active" && editing && (
                 <>
+                  <button
+                    className="primary-button"
+                    type="button"
+                    disabled={savingEdit}
+                    onClick={saveEdit}
+                  >
+                    <Save size={16} />
+                    保存
+                  </button>
+                  <button
+                    className="ghost-button"
+                    type="button"
+                    disabled={savingEdit}
+                    onClick={cancelEdit}
+                  >
+                    <X size={16} />
+                    取消
+                  </button>
+                </>
+              )}
+              {tab === "active" && !editing && (
+                <>
+                  <button className="secondary-button" type="button" onClick={startEdit}>
+                    <Pencil size={16} />
+                    编辑
+                  </button>
                   <button
                     className="secondary-button"
                     type="button"
@@ -817,9 +1067,9 @@ function MemoriesPage({
                 </button>
               )}
             </div>
-            {why.loading && <LoadingBlock label="正在读取来源" />}
-            {why.error && <ErrorBlock message={why.error} />}
-            {why.data && (
+            {!editing && why.loading && <LoadingBlock label="正在读取来源" />}
+            {!editing && why.error && <ErrorBlock message={why.error} />}
+            {!editing && why.data && (
               <section className="subpanel">
                 <h3>为什么记得？</h3>
                 <FieldList
@@ -1123,6 +1373,33 @@ function ReviewPage({
     }
   };
 
+  const applyLower = async (recommendation: ReviewRecommendation) => {
+    if (recommendation.memory_ids.length !== 1) {
+      notify("降权建议需要只包含一条记忆", "error");
+      return;
+    }
+    const memoryId = recommendation.memory_ids[0];
+    const memory = memoryMap.get(memoryId);
+    if (!memory) {
+      notify("未在当前活跃记忆中找到这条记忆", "error");
+      return;
+    }
+    if (!window.confirm("确定要降低这条记忆的重要度吗？")) {
+      return;
+    }
+    setApplying(true);
+    try {
+      const nextImportance = Math.max(1, memory.importance - 1);
+      await api.updateMemory(memoryId, { importance: nextImportance });
+      notify("已降低记忆重要度", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setApplying(false);
+    }
+  };
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -1210,7 +1487,15 @@ function ReviewPage({
                             </button>
                           )}
                           {recommendation.action === "lower" && (
-                            <span className="muted">当前阶段仅展示建议</span>
+                            <button
+                              className="warning-button"
+                              type="button"
+                              disabled={applying || recommendation.memory_ids.length !== 1}
+                              onClick={() => applyLower(recommendation)}
+                            >
+                              <ArrowDown size={16} />
+                              应用降权
+                            </button>
                           )}
                         </div>
                       </article>
@@ -1224,7 +1509,24 @@ function ReviewPage({
       )}
       {mergeDraft && (
         <Modal title="合并预览" onClose={() => setMergeDraft(null)}>
-          <FieldList entries={[["记忆 ID", mergeDraft.memory_ids], ["原因", mergeDraft.reason]]} />
+          <FieldList
+            entries={[
+              ["记忆 ID", mergeDraft.memory_ids],
+              ["原因", mergeDraft.reason],
+              ["建议内容", mergeDraft.suggested_content || "未提供，确认后由后端默认拼接"]
+            ]}
+          />
+          <div className="linked-memories merge-preview-list">
+            {mergeDraft.memory_ids.map((id) => {
+              const memory = memoryMap.get(id);
+              return (
+                <div className="linked-memory" key={id}>
+                  <strong>{shortId(id)}</strong>
+                  <span>{memory?.content || "未在当前活跃记忆中找到"}</span>
+                </div>
+              );
+            })}
+          </div>
           <label className="field-block">
             <span>合并内容</span>
             <textarea
@@ -2032,6 +2334,46 @@ function valueText(value: unknown): string {
     return JSON.stringify(value, null, 2);
   }
   return String(value);
+}
+
+function memoryToEditDraft(memory: MemoryRecord): MemoryEditDraft {
+  return {
+    content: memory.content,
+    type: memory.type,
+    importance: memory.importance,
+    confidence: memory.confidence,
+    stability: memory.stability,
+    sensitivity: memory.sensitivity,
+    valid_until: memory.valid_until || "",
+    review_after: memory.review_after || "",
+    source_message: memory.source_message || "",
+    source_conversation_id: memory.source_conversation_id || ""
+  };
+}
+
+function editDraftToPayload(draft: MemoryEditDraft): MemoryUpdatePayload {
+  return {
+    content: draft.content.trim(),
+    type: draft.type,
+    importance: Math.round(clampNumber(draft.importance, 1, 10)),
+    confidence: clampNumber(draft.confidence, 0, 1),
+    stability: draft.stability,
+    sensitivity: draft.sensitivity,
+    valid_until: nullableText(draft.valid_until),
+    review_after: nullableText(draft.review_after),
+    source_message: nullableText(draft.source_message),
+    source_conversation_id: nullableText(draft.source_conversation_id)
+  };
+}
+
+function nullableText(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (Number.isNaN(value)) return min;
+  return Math.min(max, Math.max(min, value));
 }
 
 function sectionTitle(section: CoreSectionName): string {
