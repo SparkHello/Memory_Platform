@@ -189,7 +189,7 @@ Invoke-RestMethod `
 - 优先注入核心记忆，再注入近期会话摘要和普通长期记忆。
 - 调用上游 chat completions。
 - 返回前会移除 `reasoning_content`、`tool_calls` 等不适合透传给普通客户端的字段。
-- 回答完成后后台提取新记忆，不阻塞聊天响应。
+- 回答完成后后台提取新记忆；同一轮用户原文里有多条长期信息时，服务端会自动拆分、过滤、去重和落库，不阻塞聊天响应。
 - `stream=true` 当前返回 501，未实现流式转发。
 
 ## MCP 模式
@@ -218,7 +218,8 @@ X-User-Id: optional-user-id
 | 工具 | 说明 |
 | --- | --- |
 | `search_memory` | 按主题检索长期记忆，会更新 `usage_count` 和 `last_used_at`。 |
-| `save_memory` | 保存长期记忆，服务端会做门槛校验、去重和同主题更新。 |
+| `submit_memory_text` | 提交一段用户原文，服务端自动拆分、过滤、去重并保存多条长期记忆。推荐 iOS 客户端优先使用。 |
+| `save_memory` | 保存一条结构化长期记忆，服务端会做门槛校验、去重和同主题更新。通常只在模型已经能准确填写所有字段时使用。 |
 | `why_remember` | 解释某条记忆的来源、保存时间、置信度和核心记忆引用情况。 |
 | `merge_memories` | 合并多条同主题记忆，保留第一条，软删除其余条目。 |
 | `get_recent_context_summary` | 读取近期会话摘要。 |
@@ -234,13 +235,20 @@ X-User-Id: optional-user-id
 | `restore_memory` | 按 id 恢复软删除记忆。 |
 | `forget_memories` | 按自然语言主题搜索并软删除相关记忆。 |
 
-MCP 模式依赖模型主动调用工具。建议在客户端系统提示词里明确：
+MCP 模式依赖模型主动调用工具。iOS 客户端建议尽量保持简单：模型只判断是否需要调用工具，不要在客户端侧拆分、总结或评分记忆。可在客户端系统提示词里加入：
 
-- 与用户个人有关的问题先调用 `search_memory`。
-- 用户自然流露长期信息时调用 `save_memory`，不必等用户说“记住”。
-- 检索旧记忆和保存新记忆是两个独立判断，可以同一轮都发生。
-- 用户要求忘记一类信息时优先调用 `forget_memories`。
-- 用户要求检查或清理记忆时调用 `review_memories`，根据用户确认再删除或合并。
+```text
+你可以使用 memory-gateway 的 MCP 工具访问用户长期记忆。
+
+规则：
+- 聊到用户个人相关内容时，先用 search_memory 检索相关长期记忆，再结合结果回答。
+- 用户本轮自然流露了长期有用的信息时，调用 submit_memory_text，把用户原文完整传给 text；不要自己拆分成多条记忆，不要改写成总结，不要直接猜 importance/confidence。
+- 检索旧记忆和提交新记忆是两个独立判断，可以同一轮都发生；如果两者都需要，先 search_memory，再 submit_memory_text。
+- 用户明确说“记住”“别忘了”“以后记得”时，优先调用 submit_memory_text。
+- 当下情绪、玩笑、一次性安排、假设场景不要提交记忆。
+- 用户要求忘记某类信息时调用 forget_memories；要求忘记明确 id 时调用 delete_memory。
+- 用户要求检查或清理记忆时调用 review_memories，拿到建议后根据用户确认再删除或合并。
+```
 
 服务端也会通过 MCP `instructions` 下发简版规则。
 
@@ -310,6 +318,7 @@ X-User-Id: user-123
 | `POST` | `/v1/chat/completions` | OpenAI-compatible 聊天接口。 |
 | `GET` | `/memories` | 列出活跃长期记忆，不返回 embedding。 |
 | `POST` | `/memories/search` | 搜索长期记忆。 |
+| `POST` | `/memories/ingest` | 提交一段用户原文，服务端自动拆分并保存长期记忆。 |
 | `GET` | `/memories/deleted` | 列出软删除记忆。 |
 | `DELETE` | `/memories/{memory_id}` | 软删除记忆。 |
 | `POST` | `/memories/{memory_id}/restore` | 恢复软删除记忆。 |

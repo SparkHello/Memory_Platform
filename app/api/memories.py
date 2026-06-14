@@ -5,6 +5,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    get_embedding_client,
     get_llm_client,
     get_memory_search_service,
     get_memory_store,
@@ -13,6 +14,7 @@ from app.api.deps import (
 )
 from app.llm.client import OpenAICompatibleClient
 from app.memory.core import CoreMemoryConsolidator
+from app.memory.ingest import MemoryIngestService
 from app.memory.models import CoreMemorySectionName
 from app.memory.review import MemoryReviewer
 from app.memory.report import (
@@ -21,7 +23,7 @@ from app.memory.report import (
     format_memory_export,
     restore_memory_export,
 )
-from app.memory.search import MemorySearchService
+from app.memory.search import EmbeddingClient, MemorySearchService
 from app.memory.store import MemoryStore
 
 router = APIRouter(
@@ -45,6 +47,11 @@ class MemoryRestoreExportRequest(BaseModel):
     data: dict
     overwrite: bool = False
     include_deleted: bool = False
+
+
+class MemoryIngestRequest(BaseModel):
+    text: str = Field(min_length=1)
+    conversation_id: str | None = None
 
 
 @router.get("")
@@ -185,6 +192,28 @@ async def search_memories(
         limit=body.limit,
     )
     return {"data": [memory.model_dump(exclude={"embedding_json"}) for memory in memories]}
+
+
+@router.post("/ingest")
+async def ingest_memory_text(
+    body: MemoryIngestRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+    llm_client: Annotated[OpenAICompatibleClient, Depends(get_llm_client)],
+) -> dict:
+    ingester = MemoryIngestService(
+        store=store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+    )
+    result = await ingester.ingest(
+        user_id=user_id,
+        text=body.text,
+        conversation_id=body.conversation_id,
+        source="rest_ingest",
+    )
+    return result.model_dump()
 
 
 @router.post("/merge")

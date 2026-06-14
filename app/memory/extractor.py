@@ -1,10 +1,13 @@
 import json
 import re
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
-from app.llm.prompts import render_memory_extraction_messages
+from app.llm.prompts import (
+    render_memory_batch_extraction_messages,
+    render_memory_extraction_messages,
+)
 from app.memory.models import CandidateMemory
 from app.memory.utils import _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest
@@ -44,6 +47,14 @@ class ExtractionOutcome(BaseModel):
     accepted: bool = False
     reason: str
     candidate_json: str = ""
+
+
+class ExtractionBatchOutcome(BaseModel):
+    """一段文本拆分出的多条候选记忆结果。"""
+
+    outcomes: list[ExtractionOutcome] = Field(default_factory=list)
+    reason: str = ""
+    raw_output: str = ""
 
 
 class LLMMemoryExtractor:
@@ -93,6 +104,91 @@ class LLMMemoryExtractor:
             candidate_json=candidate_json,
         )
 
+    async def extract_many(
+        self,
+        *,
+        source_text: str,
+        assistant_message: str | None = None,
+    ) -> ExtractionBatchOutcome:
+        try:
+            raw_output = await self._call_llm_many(
+                source_text=source_text,
+                assistant_message=assistant_message,
+            )
+        except Exception as exc:
+            return ExtractionBatchOutcome(
+                outcomes=[ExtractionOutcome(reason=f"调用提取模型失败：{exc}")],
+                reason=f"调用提取模型失败：{exc}",
+            )
+
+        data = _parse_json_object(raw_output)
+        if data is None:
+            reason = "提取模型输出的不是合法 JSON"
+            return ExtractionBatchOutcome(
+                outcomes=[
+                    ExtractionOutcome(
+                        reason=reason,
+                        candidate_json=raw_output[:500],
+                    )
+                ],
+                reason=reason,
+                raw_output=raw_output[:500],
+            )
+
+        candidate_data = _candidate_payloads_from_data(data)
+        if not candidate_data:
+            return ExtractionBatchOutcome(
+                outcomes=[],
+                reason=str(data.get("reason") or "没有值得保存的长期记忆"),
+                raw_output=raw_output[:500],
+            )
+
+        outcomes: list[ExtractionOutcome] = []
+        for item in candidate_data:
+            candidate_json = json.dumps(item, ensure_ascii=False)[:500]
+            try:
+                candidate = CandidateMemory.model_validate(item)
+            except ValidationError as exc:
+                first_error = exc.errors()[0]
+                field = ".".join(str(part) for part in first_error.get("loc", ()))
+                outcomes.append(
+                    ExtractionOutcome(
+                        reason=f"提取输出不符合 schema（字段 {field}）",
+                        candidate_json=candidate_json,
+                    )
+                )
+                continue
+
+            normalized_candidate_json = json.dumps(candidate.model_dump(), ensure_ascii=False)
+            rejection = validate_candidate_for_save(
+                candidate,
+                user_message=source_text,
+                require_quote_in_user_message=True,
+            )
+            if rejection:
+                outcomes.append(
+                    ExtractionOutcome(
+                        candidate=candidate,
+                        reason=rejection,
+                        candidate_json=normalized_candidate_json,
+                    )
+                )
+                continue
+            outcomes.append(
+                ExtractionOutcome(
+                    candidate=candidate,
+                    accepted=True,
+                    reason=candidate.reason or "通过保存校验",
+                    candidate_json=normalized_candidate_json,
+                )
+            )
+
+        return ExtractionBatchOutcome(
+            outcomes=outcomes,
+            reason=str(data.get("reason") or "拆分完成"),
+            raw_output=raw_output[:500],
+        )
+
     async def _call_llm(self, *, user_message: str, assistant_message: str) -> str:
         messages = render_memory_extraction_messages(
             user_message=user_message,
@@ -110,6 +206,41 @@ class LLMMemoryExtractor:
         except (KeyError, IndexError, TypeError):
             return ""
         return content if isinstance(content, str) else ""
+
+    async def _call_llm_many(
+        self,
+        *,
+        source_text: str,
+        assistant_message: str | None,
+    ) -> str:
+        messages = render_memory_batch_extraction_messages(
+            source_text=source_text,
+            assistant_message=assistant_message,
+        )
+        request = ChatCompletionRequest(
+            model="memory-ingester",
+            messages=messages,
+            temperature=0.0,
+            stream=False,
+        )
+        response = await self.llm_client.create_chat_completion(request=request, messages=messages)
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        return content if isinstance(content, str) else ""
+
+
+def _candidate_payloads_from_data(data: dict) -> list[dict]:
+    memories = data.get("memories")
+    if isinstance(memories, list):
+        return [item for item in memories if isinstance(item, dict)]
+    candidates = data.get("candidates")
+    if isinstance(candidates, list):
+        return [item for item in candidates if isinstance(item, dict)]
+    if data.get("action") in {"create", "update", "ignore"}:
+        return [data]
+    return []
 
 
 def validate_candidate_for_save(

@@ -168,3 +168,19 @@ class MemoryMergeResult(BaseModel):
     merged_memory_ids: list[str] = Field(default_factory=list)
     archived_memory_ids: list[str] = Field(default_factory=list)
     reason: str
+
+
+class MemoryIngestItemResult(BaseModel):
+    action: MemoryAction
+    relation: MemoryRelation = "none"
+    reason: str
+    memory_id: str | None = None
+    content: str | None = None
+
+
+class MemoryIngestResult(BaseModel):
+    created: int = 0
+    updated: int = 0
+    ignored: int = 0
+    items: list[MemoryIngestItemResult] = Field(default_factory=list)
+    reason: str

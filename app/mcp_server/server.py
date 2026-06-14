@@ -9,6 +9,7 @@ from app.api.deps import get_embedding_client, get_llm_client, get_memory_store
 from app.config import get_settings
 from app.memory.core import CoreMemoryConsolidator
 from app.memory.extractor import validate_candidate_for_save
+from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
     CandidateMemory,
     CoreMemorySection,
@@ -35,9 +36,10 @@ SERVER_INSTRUCTIONS = """这是用户的长期记忆服务。
 - 核心记忆是从长期记忆整理出的稳定生活背景，用于日常聊天，不要默认按开发、职业或项目管理场景理解用户。
 - 当用户询问「核心记忆」「你对我的稳定了解」时，调用 get_core_memory；当用户明确要求整理核心记忆时，再调用 consolidate_core_memory。
 - 聊到与用户有关的事——喜好、习惯、家人朋友、宠物、健康、计划安排、长期事项，或此前聊过的话题——先调用 search_memory 检索再回答。
-- 用户在日常闲聊中自然流露的长期信息（口味与雷点、生活事实、重要的人、人物关系、目标与计划、生活背景与长期事项），即使没说「记住」也应调用 save_memory 保存。
-- 如果同一轮既需要检索旧记忆，又包含新的长期信息，先调用 search_memory 获取上下文，再调用 save_memory 保存新信息；不要因为已经检索就跳过保存。
-- 用户明确说「记住」时，优先调用 save_memory；人物和关系用 type=person 或 type=relationship。
+- 用户在日常闲聊中自然流露的长期信息（口味与雷点、生活事实、重要的人、人物关系、目标与计划、生活背景与长期事项），即使没说「记住」也应调用 submit_memory_text 保存。
+- iOS 或普通客户端优先调用 submit_memory_text，直接提交用户原文；服务端会自动拆分、过滤、去重和落库。save_memory 只在你已经能准确填写一条结构化记忆时使用。
+- 如果同一轮既需要检索旧记忆，又包含新的长期信息，先调用 search_memory 获取上下文，再调用 submit_memory_text 保存新信息；不要因为已经检索就跳过保存。
+- 用户明确说「记住」时，优先调用 submit_memory_text；人物和关系由服务端判断为 person 或 relationship。
 - 当下情绪、玩笑、一次性安排、假设场景不要保存。保存成功后不必每次向用户汇报，除非用户明确要求。
 - 用户要求回顾记忆时调用 list_memories；要求忘记某类记忆时优先调用 forget_memories，要求忘记某个明确 id 时调用 delete_memory。
 - 用户要求检查、清理、复核记忆库时调用 review_memories；它只返回建议，不会自动删除。
@@ -132,6 +134,7 @@ def _dump(payload: object) -> str:
 
 def _register_tools(mcp: FastMCP) -> None:
     mcp.tool()(search_memory)
+    mcp.tool()(submit_memory_text)
     mcp.tool()(save_memory)
     mcp.tool()(why_remember)
     mcp.tool()(merge_memories)
@@ -155,7 +158,7 @@ async def search_memory(query: str, limit: int = 8) -> str:
     聊到用户的喜好、习惯、家人朋友、健康、计划安排、长期事项，或过去聊过的
     话题时，先调用本工具再回答，让对话自然延续。
     调用本工具后，仍要检查本轮用户消息是否包含新的长期信息；如果有，继续调用
-    save_memory。检索旧记忆和保存新信息可以在同一轮连续发生，不要二选一。
+    submit_memory_text。检索旧记忆和保存新信息可以在同一轮连续发生，不要二选一。
     query 用一句话描述要查的主题，例如「用户的饮食偏好」。
     返回 JSON 数组，按相关度排序；空数组表示没有相关记忆，此时正常回答即可。
     被返回的记忆会自动增加 usage_count 并刷新 last_used_at，用来判断哪些记忆真正常用。
@@ -168,6 +171,36 @@ async def search_memory(query: str, limit: int = 8) -> str:
         limit=max(1, min(limit, 20)),
     )
     return _dump([_memory_to_dict(memory) for memory in memories])
+
+
+async def submit_memory_text(text: str, conversation_id: str | None = None) -> str:
+    """提交一段可能包含多条长期记忆的用户原文，由服务端自动整理保存。
+
+    这是 iOS 客户端的优先保存入口：客户端模型只需要判断本轮用户是否提供了
+    可能长期有用的信息，然后把用户原文放进 text。服务端会调用整理模型拆分为
+    多条候选记忆，并逐条执行 source_quote 校验、敏感信息门槛、假设场景拦截、
+    去重、更新或创建。不要在客户端手动把一大段内容拆成多次 save_memory。
+
+    text 应尽量使用用户原话，而不是模型改写后的总结；这样服务端才能验证
+    source_quote 是否真实来自用户。conversation_id 可选，用于决策日志追踪。
+    返回 JSON：{"created": 0, "updated": 0, "ignored": 1, "items": [...]}。
+    """
+    settings = get_settings()
+    store = get_memory_store(settings)
+    embedding_client = get_embedding_client(settings)
+    llm_client = get_llm_client(settings)
+    ingester = MemoryIngestService(
+        store=store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+    )
+    result = await ingester.ingest(
+        user_id=current_user_id.get(),
+        text=text,
+        conversation_id=conversation_id,
+        source="mcp_ingest",
+    )
+    return _dump(result.model_dump())
 
 
 async def why_remember(memory_id: str) -> str:

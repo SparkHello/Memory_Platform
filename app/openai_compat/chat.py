@@ -17,9 +17,8 @@ from app.llm.prompts import (
     render_memory_context,
     render_recent_context_summary_context,
 )
-from app.memory.extractor import LLMMemoryExtractor
+from app.memory.ingest import MemoryIngestService
 from app.memory.models import CoreMemorySection, MemoryRecord, RecentContextSummary
-from app.memory.resolver import MemoryResolver
 from app.memory.search import EmbeddingClient, MemorySearchService
 from app.memory.store import MemoryStore
 from app.openai_compat.schemas import ChatCompletionRequest, ChatMessage
@@ -164,34 +163,17 @@ async def _extract_and_resolve_memories(
 ) -> None:
     # 后台任务：无论提取、解析还是落库出错，都不能影响聊天接口本身
     try:
-        extractor = LLMMemoryExtractor(llm_client=llm_client)
-        outcome = await extractor.extract(
-            user_message=user_message,
+        ingester = MemoryIngestService(
+            store=store,
+            embedding_client=embedding_client,
+            llm_client=llm_client,
+        )
+        await ingester.ingest(
+            user_id=user_id,
+            text=user_message,
+            conversation_id=source_conversation_id,
             assistant_message=assistant_message,
-        )
-        if not outcome.accepted or outcome.candidate is None:
-            store.create_decision_log(
-                user_id=user_id,
-                conversation_id=source_conversation_id,
-                candidate_json=outcome.candidate_json,
-                decision="ignore",
-                reason=outcome.reason,
-            )
-            return
-
-        resolver = MemoryResolver(store=store, embedding_client=embedding_client)
-        result = await resolver.resolve(
-            user_id=user_id,
-            candidate=outcome.candidate,
-            source_message=outcome.candidate.source_quote,
-            conversation_id=source_conversation_id,
-        )
-        store.create_decision_log(
-            user_id=user_id,
-            conversation_id=source_conversation_id,
-            candidate_json=outcome.candidate_json,
-            decision=result.action,
-            reason=result.reason,
+            source="chat",
         )
     except Exception:
         logger.exception("记忆提取后台任务失败")

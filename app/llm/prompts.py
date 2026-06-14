@@ -124,6 +124,53 @@ def render_memory_extraction_messages(
     ]
 
 
+MEMORY_BATCH_EXTRACTION_SYSTEM_PROMPT = """你是 memory-gateway 的记忆提取器。你的任务是把一段用户原文拆分为多条可独立保存的长期记忆候选。
+
+只输出一个 JSON 对象，不要包含任何其他文字、解释或 Markdown 代码块：
+{
+  "memories": [
+    {
+      "action": "create | update | ignore",
+      "memory": "记忆内容，以「用户」开头的第三人称陈述",
+      "type": "project | preference | fact | learning | style | person | relationship",
+      "importance": 1 到 10 的整数,
+      "confidence": 0.0 到 1.0 的小数,
+      "stability": "temporary | medium | stable",
+      "valid_until": "ISO 日期或时间；没有明确有效期时为 null",
+      "review_after": "ISO 日期或时间；需要日后确认是否仍成立时填写，否则为 null",
+      "sensitivity": "normal | private | sensitive",
+      "reason": "为什么要保存或忽略",
+      "source_quote": "从用户原文中逐字摘录的短引用"
+    }
+  ],
+  "reason": "本次拆分的简短说明"
+}
+
+拆分规则：
+- 一条候选只表达一个长期事实、偏好、关系、人物、目标、项目或沟通风格。
+- 如果同一段话包含多个独立长期信息，拆成多条 memories。
+- 不要把多个无关事实塞进同一条 memory。
+- 不要保存临时状态、玩笑、一次性安排、假设场景、模型推测或助手自己说的话。
+- 对敏感信息保持保守：健康、医疗、财务、证件、账号、精确住址等只有在用户明确说「记住」时才可输出保存候选，并标为 private 或 sensitive。
+- source_quote 必须是用户原文里的逐字片段，禁止改写或编造；每条候选都要有自己的 source_quote。
+- 没有值得保存的内容时输出 {"memories": [], "reason": "没有长期有用信息"}。
+
+评分规则与单条提取完全一致：importance 低于 6 或 confidence 低于 0.8 的信息不会保存；用户亲口明确表达的长期信息 confidence 通常为 0.9。"""
+
+
+def render_memory_batch_extraction_messages(
+    *,
+    source_text: str,
+    assistant_message: str | None = None,
+) -> list[dict[str, str]]:
+    assistant_block = f"\n\n助手回复（仅作上下文，不可作为记忆来源）：\n{assistant_message}" if assistant_message else ""
+    user_content = f"用户原文：\n{source_text}{assistant_block}\n\n请拆分并输出 memories。"
+    return [
+        {"role": "system", "content": MEMORY_BATCH_EXTRACTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
 CORE_MEMORY_CONSOLIDATION_SYSTEM_PROMPT = """你是 memory-gateway 的核心记忆整理器。你的任务是从已经保存的长期记忆中，整理出适合日常聊天长期使用的核心用户画像。
 
 只输出一个 JSON 对象，不要包含任何其他文字、解释或 Markdown 代码块：

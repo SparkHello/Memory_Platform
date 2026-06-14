@@ -246,6 +246,66 @@ def test_invalid_extractor_json_does_not_break_chat(
     assert "JSON" in logs[0].reason
 
 
+def test_rest_ingest_splits_raw_text(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户喜欢黑咖啡。",
+                    "type": "preference",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "stable",
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "reason": "用户明确表达长期偏好",
+                    "source_quote": "我喜欢黑咖啡",
+                },
+                {
+                    "action": "create",
+                    "memory": "用户使用 iPhone。",
+                    "type": "fact",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "stable",
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "reason": "用户明确描述设备",
+                    "source_quote": "我现在用 iPhone",
+                },
+            ],
+            "reason": "拆分出两条长期信息",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/ingest",
+        headers=auth_headers,
+        json={
+            "text": "我喜欢黑咖啡，另外我现在用 iPhone。",
+            "conversation_id": "rest-conv",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created"] == 2
+    assert payload["ignored"] == 0
+    assert len(memory_store.list_memories(user_id="default")) == 2
+    logs = memory_store.list_decision_logs(conversation_id="rest-conv")
+    assert len(logs) == 2
+    assert {json.loads(log.candidate_json)["source"] for log in logs} == {"rest_ingest"}
+
+
 def test_decision_logs_record_create_update_ignore(
     client: TestClient,
     auth_headers: dict[str, str],

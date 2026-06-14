@@ -13,6 +13,7 @@ MCP_HEADERS = {
 
 EXPECTED_TOOLS = {
     "search_memory",
+    "submit_memory_text",
     "save_memory",
     "why_remember",
     "merge_memories",
@@ -127,6 +128,76 @@ def test_save_memory_creates_and_logs(client, auth_headers, memory_store):
     logs = memory_store.list_decision_logs()
     assert logs[0].decision == "create"
     assert json.loads(logs[0].candidate_json)["source"] == "mcp"
+
+
+def test_submit_memory_text_splits_and_saves(
+    client,
+    auth_headers,
+    memory_store,
+    fake_llm,
+    monkeypatch,
+):
+    import app.mcp_server.server as server_module
+
+    monkeypatch.setattr(server_module, "get_llm_client", lambda settings: fake_llm)
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户喜欢黑咖啡。",
+                    "type": "preference",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "stable",
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "reason": "用户明确表达长期偏好",
+                    "source_quote": "我喜欢黑咖啡",
+                },
+                {
+                    "action": "create",
+                    "memory": "用户使用 iPhone，并用 Kelivo 作为 AI 客户端。",
+                    "type": "fact",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "medium",
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "reason": "用户明确描述设备与客户端",
+                    "source_quote": "我现在用 iPhone 和 Kelivo 做 AI 客户端",
+                },
+            ],
+            "reason": "拆分出两条长期信息",
+        },
+        ensure_ascii=False,
+    )
+
+    outcome = _call_tool(
+        client,
+        auth_headers,
+        "submit_memory_text",
+        {
+            "text": "我喜欢黑咖啡。我现在用 iPhone 和 Kelivo 做 AI 客户端。",
+            "conversation_id": "conv-ingest",
+        },
+    )
+
+    assert outcome["created"] == 2
+    assert outcome["updated"] == 0
+    assert outcome["ignored"] == 0
+    assert len(outcome["items"]) == 2
+
+    contents = {memory.content for memory in memory_store.list_memories(user_id="default")}
+    assert "用户喜欢黑咖啡。" in contents
+    assert "用户使用 iPhone，并用 Kelivo 作为 AI 客户端。" in contents
+
+    logs = memory_store.list_decision_logs(conversation_id="conv-ingest")
+    assert len(logs) == 2
+    assert {log.decision for log in logs} == {"create"}
+    assert {json.loads(log.candidate_json)["source"] for log in logs} == {"mcp_ingest"}
 
 
 def test_save_memory_accepts_review_after(client, auth_headers, memory_store):
