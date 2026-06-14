@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.health import router as health_router
@@ -44,6 +44,11 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(chat_router)
     app.include_router(memories_router)
+
+    @app.get("/ui", include_in_schema=False)
+    def redirect_ui_root() -> RedirectResponse:
+        return RedirectResponse(url="/ui/")
+
     app.mount(
         "/ui",
         StaticFiles(directory=UI_DIST_DIR, html=True, check_dir=False),

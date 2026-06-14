@@ -59,15 +59,15 @@ type LoadState<T> = {
 };
 
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: typeof Gauge }> = [
-  { key: "dashboard", label: "Dashboard", icon: Gauge },
-  { key: "memories", label: "Memories", icon: Database },
-  { key: "core", label: "Core Memory", icon: Layers3 },
-  { key: "review", label: "Review", icon: ListChecks },
-  { key: "recent", label: "Recent Context", icon: History },
-  { key: "reports", label: "Reports", icon: FileText },
-  { key: "logs", label: "Decision Logs", icon: Activity },
-  { key: "settings", label: "Settings", icon: SettingsIcon },
-  { key: "developer", label: "Developer", icon: Wrench }
+  { key: "dashboard", label: "总览", icon: Gauge },
+  { key: "memories", label: "记忆库", icon: Database },
+  { key: "core", label: "核心记忆", icon: Layers3 },
+  { key: "review", label: "记忆体检", icon: ListChecks },
+  { key: "recent", label: "近期上下文", icon: History },
+  { key: "reports", label: "报告与备份", icon: FileText },
+  { key: "logs", label: "决策日志", icon: Activity },
+  { key: "settings", label: "设置", icon: SettingsIcon },
+  { key: "developer", label: "接入信息", icon: Wrench }
 ];
 
 const MEMORY_TYPES: MemoryType[] = [
@@ -106,6 +106,43 @@ const CONFIG_KEYS = [
   "DATABASE_PATH",
   "REQUEST_TIMEOUT_SECONDS"
 ];
+
+const DISPLAY_TEXT: Record<string, string> = {
+  all: "全部",
+  project: "项目",
+  preference: "偏好",
+  fact: "事实",
+  learning: "学习",
+  style: "风格",
+  person: "人物",
+  relationship: "关系",
+  temporary: "临时",
+  medium: "中期",
+  stable: "稳定",
+  normal: "普通",
+  private: "私密",
+  sensitive: "敏感",
+  create: "创建",
+  update: "更新",
+  ignore: "忽略",
+  keep: "保留",
+  merge: "合并",
+  lower: "降权",
+  delete: "删除",
+  review: "复核",
+  none: "无",
+  same: "重复",
+  supplement: "补充",
+  conflict: "冲突",
+  supersede: "替代",
+  profile: "个人背景",
+  preferences: "偏好",
+  relationships: "关系",
+  routines: "日常习惯",
+  goals: "目标计划",
+  communication: "沟通方式",
+  other: "其他记忆"
+};
 
 export function App() {
   const [settings, setSettings] = useState<ConnectionSettings>(() => loadSettings());
@@ -173,8 +210,8 @@ export function App() {
         <div className="brand">
           <div className="brand-mark">M</div>
           <div>
-            <div className="brand-title">Memory Console</div>
-            <div className="brand-subtitle">local gateway</div>
+            <div className="brand-title">记忆控制台</div>
+            <div className="brand-subtitle">本地网关</div>
           </div>
         </div>
         <nav className="nav-list" aria-label="Memory Console">
@@ -206,7 +243,7 @@ export function App() {
           </div>
           <div className="topbar-right">
             <label className="compact-field">
-              <span>User ID</span>
+              <span>用户 ID</span>
               <input
                 value={settings.userId}
                 onChange={(event) => updateTopbarUser(event.target.value)}
@@ -219,7 +256,7 @@ export function App() {
               onClick={() => setPage("settings")}
             >
               <SettingsIcon size={16} />
-              Settings
+              设置
             </button>
           </div>
         </header>
@@ -318,7 +355,7 @@ function DashboardPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Dashboard"
+        title="总览"
         subtitle="当前服务、用户记忆库和待处理建议概览。"
         action={
           <button className="secondary-button" type="button" onClick={load}>
@@ -327,16 +364,16 @@ function DashboardPage({
           </button>
         }
       />
-      {state.loading && <LoadingBlock label="正在加载 Dashboard" />}
+      {state.loading && <LoadingBlock label="正在加载总览" />}
       {state.error && <ErrorBlock message={state.error} onRetry={load} />}
       {data && (
         <>
           <div className="card-grid status-grid">
             <InfoCard label="服务状态" value={data.health === "ok" ? "正常" : data.health} />
-            <InfoCard label="API Base URL" value={settings.apiBaseUrl} />
-            <InfoCard label="当前 User ID" value={settings.userId} />
-            <InfoCard label="OpenAI-compatible Base URL" value={joinUrl(settings.apiBaseUrl, "/v1")} />
-            <InfoCard label="MCP URL" value={joinUrl(settings.apiBaseUrl, "/mcp")} />
+            <InfoCard label="API 基础地址" value={settings.apiBaseUrl} />
+            <InfoCard label="当前用户 ID" value={settings.userId} />
+            <InfoCard label="OpenAI 兼容地址" value={joinUrl(settings.apiBaseUrl, "/v1")} />
+            <InfoCard label="MCP 地址" value={joinUrl(settings.apiBaseUrl, "/mcp")} />
           </div>
 
           <div className="stats-grid">
@@ -517,7 +554,7 @@ function MemoriesPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Memories"
+        title="记忆库"
         subtitle="查看、搜索、筛选、解释、删除和恢复记忆。"
         action={
           <div className="button-row">
@@ -552,7 +589,7 @@ function MemoriesPage({
         </button>
       </div>
 
-      <div className="memory-layout">
+      <div className={`memory-layout ${selected ? "has-detail" : ""}`}>
         <aside className="filter-panel">
           <div className="search-box">
             <Search size={16} />
@@ -588,13 +625,13 @@ function MemoriesPage({
           </button>
 
           <FilterSelect
-            label="type"
+            label="类型"
             value={filters.type}
             options={["all", ...MEMORY_TYPES]}
             onChange={(value) => setFilters({ ...filters, type: value as MemoryFilters["type"] })}
           />
           <FilterSelect
-            label="sensitivity"
+            label="敏感级别"
             value={filters.sensitivity}
             options={["all", ...SENSITIVITIES]}
             onChange={(value) =>
@@ -602,7 +639,7 @@ function MemoriesPage({
             }
           />
           <FilterSelect
-            label="stability"
+            label="稳定性"
             value={filters.stability}
             options={["all", ...STABILITIES]}
             onChange={(value) =>
@@ -610,7 +647,7 @@ function MemoriesPage({
             }
           />
           <RangeFields
-            label="importance"
+            label="重要度"
             min={1}
             max={10}
             step={1}
@@ -621,7 +658,7 @@ function MemoriesPage({
             }
           />
           <RangeFields
-            label="confidence"
+            label="置信度"
             min={0}
             max={1}
             step={0.05}
@@ -637,7 +674,7 @@ function MemoriesPage({
               checked={filters.hasValidUntil}
               onChange={(event) => setFilters({ ...filters, hasValidUntil: event.target.checked })}
             />
-            有 valid_until
+            有有效期
           </label>
           <label className="checkbox-row">
             <input
@@ -645,7 +682,7 @@ function MemoriesPage({
               checked={filters.hasReviewAfter}
               onChange={(event) => setFilters({ ...filters, hasReviewAfter: event.target.checked })}
             />
-            有 review_after
+            有复核时间
           </label>
         </aside>
 
@@ -660,15 +697,15 @@ function MemoriesPage({
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>content</th>
-                    <th>type</th>
-                    <th>importance</th>
-                    <th>confidence</th>
-                    <th>stability</th>
-                    <th>sensitivity</th>
-                    <th>usage</th>
-                    <th>last_used_at</th>
-                    <th>updated_at</th>
+                    <th>内容</th>
+                    <th>类型</th>
+                    <th>重要度</th>
+                    <th>置信度</th>
+                    <th>稳定性</th>
+                    <th>敏感级别</th>
+                    <th>使用次数</th>
+                    <th>最近使用</th>
+                    <th>更新时间</th>
                     <th />
                   </tr>
                 </thead>
@@ -732,21 +769,21 @@ function MemoriesPage({
             <FieldList
               entries={[
                 ["id", selected.id],
-                ["content", selected.content],
-                ["type", selected.type],
-                ["importance", selected.importance],
-                ["confidence", percent(selected.confidence)],
-                ["source_message", selected.source_message],
-                ["source_conversation_id", selected.source_conversation_id],
-                ["usage_count", selected.usage_count],
-                ["last_used_at", selected.last_used_at],
-                ["stability", selected.stability],
-                ["valid_until", selected.valid_until],
-                ["review_after", selected.review_after],
-                ["sensitivity", selected.sensitivity],
-                ["evidence_memory_ids", selected.evidence_memory_ids],
-                ["created_at", selected.created_at],
-                ["updated_at", selected.updated_at]
+                ["内容", selected.content],
+                ["类型", displayText(selected.type)],
+                ["重要度", selected.importance],
+                ["置信度", percent(selected.confidence)],
+                ["来源原文", selected.source_message],
+                ["来源对话 ID", selected.source_conversation_id],
+                ["使用次数", selected.usage_count],
+                ["最近使用", selected.last_used_at],
+                ["稳定性", displayText(selected.stability)],
+                ["有效期", selected.valid_until],
+                ["复核时间", selected.review_after],
+                ["敏感级别", displayText(selected.sensitivity)],
+                ["证据记忆 ID", selected.evidence_memory_ids],
+                ["创建时间", selected.created_at],
+                ["更新时间", selected.updated_at]
               ]}
             />
             <div className="drawer-actions">
@@ -787,14 +824,14 @@ function MemoriesPage({
                 <h3>为什么记得？</h3>
                 <FieldList
                   entries={[
-                    ["source_excerpt", why.data.source_excerpt],
-                    ["source_conversation_id", why.data.source_conversation_id],
-                    ["saved_at", why.data.saved_at],
-                    ["updated_at", why.data.updated_at],
-                    ["confidence", percent(why.data.confidence)],
-                    ["is_core_memory_evidence", String(why.data.is_core_memory_evidence)],
-                    ["core_memory_sections", why.data.core_memory_sections],
-                    ["evidence_memory_ids", why.data.evidence_memory_ids]
+                    ["来源摘录", why.data.source_excerpt],
+                    ["来源对话 ID", why.data.source_conversation_id],
+                    ["保存时间", why.data.saved_at],
+                    ["更新时间", why.data.updated_at],
+                    ["置信度", percent(why.data.confidence)],
+                    ["是否核心记忆证据", why.data.is_core_memory_evidence ? "是" : "否"],
+                    ["核心记忆分区", why.data.core_memory_sections.map(displayText)],
+                    ["证据记忆 ID", why.data.evidence_memory_ids]
                   ]}
                 />
               </section>
@@ -881,7 +918,7 @@ function CoreMemoryPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Core Memory"
+        title="核心记忆"
         subtitle="按分区查看核心记忆和历史版本。"
         action={
           <button
@@ -908,7 +945,7 @@ function CoreMemoryPage({
           type="button"
           onClick={() => setTab("history")}
         >
-          History
+          历史版本
         </button>
       </div>
 
@@ -930,13 +967,13 @@ function CoreMemoryPage({
                       <>
                         <p>{item.content}</p>
                         <div className="meta-grid">
-                          <span>confidence</span>
+                          <span>置信度</span>
                           <strong>{percent(item.confidence)}</strong>
-                          <span>version</span>
+                          <span>版本</span>
                           <strong>{item.version}</strong>
-                          <span>evidence</span>
+                          <span>证据记忆</span>
                           <strong>{item.evidence_memory_ids.length}</strong>
-                          <span>updated_at</span>
+                          <span>更新时间</span>
                           <strong>{dateText(item.updated_at)}</strong>
                         </div>
                       </>
@@ -959,7 +996,7 @@ function CoreMemoryPage({
               value={sectionFilter}
               onChange={(event) => setSectionFilter(event.target.value as "all" | CoreSectionName)}
             >
-              <option value="all">all sections</option>
+              <option value="all">全部分区</option>
               {CORE_SECTIONS.map((section) => (
                 <option key={section.key} value={section.key}>
                   {section.title}
@@ -982,7 +1019,7 @@ function CoreMemoryPage({
                   </div>
                   <p>{item.content}</p>
                   <div className="muted">
-                    confidence {percent(item.confidence)} · replaced_at {dateText(item.replaced_at)}
+                    置信度 {percent(item.confidence)} · 替换时间 {dateText(item.replaced_at)}
                   </div>
                 </div>
               </article>
@@ -1008,7 +1045,7 @@ function ReviewPage({
   const [mergeContent, setMergeContent] = useState("");
   const [applying, setApplying] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (showToast = false) => {
     setState({ loading: true, error: null, data: null });
     try {
       const [review, memories] = await Promise.all([
@@ -1016,10 +1053,16 @@ function ReviewPage({
         api.listMemories()
       ]);
       setState({ loading: false, error: null, data: { review, memories } });
+      if (showToast) {
+        notify(`体检完成，共 ${review.recommendations.length} 条建议`, "success");
+      }
     } catch (error) {
       setState({ loading: false, error: errorMessage(error), data: null });
+      if (showToast) {
+        notify(errorMessage(error), "error");
+      }
     }
-  }, [api]);
+  }, [api, notify]);
 
   useEffect(() => {
     void load();
@@ -1083,12 +1126,17 @@ function ReviewPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Review"
+        title="记忆体检"
         subtitle="记忆体检只返回建议，不会自动修改数据。"
         action={
-          <button className="primary-button" type="button" onClick={load}>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={state.loading}
+            onClick={() => load(true)}
+          >
             <ListChecks size={16} />
-            运行体检
+            {state.loading ? "体检中" : "运行体检"}
           </button>
         }
       />
@@ -1108,7 +1156,7 @@ function ReviewPage({
               return (
                 <section className="panel" key={action}>
                   <div className="panel-header">
-                    <h2>{action}</h2>
+                    <h2>{reviewActionText(action)}</h2>
                     <span className="count-pill">{items.length}</span>
                   </div>
                   <div className="recommendation-list">
@@ -1122,8 +1170,8 @@ function ReviewPage({
                         <FieldList
                           compact
                           entries={[
-                            ["memory_ids", recommendation.memory_ids],
-                            ["suggested_content", recommendation.suggested_content]
+                            ["记忆 ID", recommendation.memory_ids],
+                            ["建议内容", recommendation.suggested_content]
                           ]}
                         />
                         <div className="linked-memories">
@@ -1176,7 +1224,7 @@ function ReviewPage({
       )}
       {mergeDraft && (
         <Modal title="合并预览" onClose={() => setMergeDraft(null)}>
-          <FieldList entries={[["memory_ids", mergeDraft.memory_ids], ["reason", mergeDraft.reason]]} />
+          <FieldList entries={[["记忆 ID", mergeDraft.memory_ids], ["原因", mergeDraft.reason]]} />
           <label className="field-block">
             <span>合并内容</span>
             <textarea
@@ -1222,7 +1270,7 @@ function RecentContextPage({ api }: { api: MemoryApi }) {
   return (
     <div className="page-stack">
       <PageHeader
-        title="Recent Context"
+        title="近期上下文"
         subtitle="近期上下文用于恢复最近对话，不属于长期记忆，也不会进入核心记忆。"
         action={
           <button className="secondary-button" type="button" onClick={load}>
@@ -1244,7 +1292,7 @@ function RecentContextPage({ api }: { api: MemoryApi }) {
               </div>
               <p>{item.summary}</p>
               <div className="muted">
-                created_at {dateText(item.created_at)} · updated_at {dateText(item.updated_at)}
+                创建时间 {dateText(item.created_at)} · 更新时间 {dateText(item.updated_at)}
               </div>
             </article>
           ))}
@@ -1345,7 +1393,7 @@ function ReportsPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Reports"
+        title="报告与备份"
         subtitle="查看报告、导出备份和谨慎导入。"
         action={
           <button className="secondary-button" type="button" onClick={load}>
@@ -1356,7 +1404,7 @@ function ReportsPage({
       />
       <section className="panel">
         <div className="panel-header">
-          <h2>Memory Report</h2>
+          <h2>记忆报告</h2>
           <button className="secondary-button" type="button" onClick={copyMarkdown}>
             <Clipboard size={16} />
             复制 Markdown
@@ -1367,18 +1415,18 @@ function ReportsPage({
         {state.data && (
           <>
             <div className="stats-grid">
-              <StatCard label="active" value={state.data.counts.active_memories} />
-              <StatCard label="deleted" value={state.data.counts.deleted_memories} />
-              <StatCard label="core sections" value={state.data.counts.core_sections} />
+              <StatCard label="活跃记忆" value={state.data.counts.active_memories} />
+              <StatCard label="回收站记忆" value={state.data.counts.deleted_memories} />
+              <StatCard label="核心分区" value={state.data.counts.core_sections} />
             </div>
             <div className="section-list">
               {state.data.sections.map((section) => (
                 <article className="section-summary" key={section.section}>
                   <div>
-                    <strong>{section.title}</strong>
+                    <strong>{reportSectionTitle(section.section, section.title)}</strong>
                     <span className="muted"> {section.section}</span>
                   </div>
-                  <span>{section.memories.length} memories</span>
+                  <span>{section.memories.length} 条记忆</span>
                 </article>
               ))}
             </div>
@@ -1386,9 +1434,9 @@ function ReportsPage({
         )}
       </section>
 
-      <section className="panel">
+      <section className="panel export-panel">
         <div className="panel-header">
-          <h2>Export</h2>
+          <h2>导出备份</h2>
         </div>
         <div className="button-row">
           <button className="primary-button" type="button" onClick={() => exportFile("json")}>
@@ -1402,9 +1450,9 @@ function ReportsPage({
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel restore-panel">
         <div className="panel-header">
-          <h2>Restore</h2>
+          <h2>恢复导入</h2>
         </div>
         <div className="notice warning">
           <ShieldAlert size={18} />
@@ -1421,9 +1469,9 @@ function ReportsPage({
         </label>
         {restorePreview && (
           <div className="restore-preview">
-            <StatCard label="memories" value={restorePreview.memories?.length || 0} />
-            <StatCard label="deleted_memories" value={restorePreview.deleted_memories?.length || 0} />
-            <StatCard label="core sections" value={restorePreview.core_memory_sections?.length || 0} />
+            <StatCard label="活跃记忆" value={restorePreview.memories?.length || 0} />
+            <StatCard label="回收站记忆" value={restorePreview.deleted_memories?.length || 0} />
+            <StatCard label="核心分区" value={restorePreview.core_memory_sections?.length || 0} />
           </div>
         )}
         <div className="button-row">
@@ -1433,7 +1481,7 @@ function ReportsPage({
               checked={overwrite}
               onChange={(event) => setOverwrite(event.target.checked)}
             />
-            overwrite
+            覆盖已有
           </label>
           <label className="checkbox-row">
             <input
@@ -1441,7 +1489,7 @@ function ReportsPage({
               checked={includeDeleted}
               onChange={(event) => setIncludeDeleted(event.target.checked)}
             />
-            include_deleted
+            包含回收站
           </label>
           <button
             className="warning-button"
@@ -1454,10 +1502,10 @@ function ReportsPage({
         </div>
         {restoreResult && (
           <div className="result-grid">
-            <StatCard label="created" value={restoreResult.created} />
-            <StatCard label="updated" value={restoreResult.updated} />
-            <StatCard label="skipped" value={restoreResult.skipped} />
-            <StatCard label="invalid" value={restoreResult.invalid} />
+            <StatCard label="新增" value={restoreResult.created} />
+            <StatCard label="更新" value={restoreResult.updated} />
+            <StatCard label="跳过" value={restoreResult.skipped} />
+            <StatCard label="无效" value={restoreResult.invalid} />
           </div>
         )}
       </section>
@@ -1501,7 +1549,7 @@ function DecisionLogsPage({ api }: { api: MemoryApi }) {
   return (
     <div className="page-stack">
       <PageHeader
-        title="Decision Logs"
+        title="决策日志"
         subtitle="查看记忆保存、更新和忽略决策。"
         action={
           <button className="secondary-button" type="button" onClick={load}>
@@ -1511,19 +1559,19 @@ function DecisionLogsPage({ api }: { api: MemoryApi }) {
         }
       />
       <section className="panel">
-        <div className="toolbar">
+        <div className="toolbar log-toolbar">
           <FilterSelect
-            label="decision"
+            label="决策"
             value={decision}
             options={["all", ...DECISIONS]}
             onChange={(value) => setDecision(value as "all" | MemoryAction)}
           />
-          <label className="field-inline">
-            <span>conversation_id</span>
+          <label className="field-block small log-conversation-field">
+            <span>对话 ID</span>
             <input
               value={conversationId}
               onChange={(event) => setConversationId(event.target.value)}
-              placeholder="过滤 conversation_id"
+              placeholder="过滤对话 ID"
             />
           </label>
         </div>
@@ -1535,11 +1583,11 @@ function DecisionLogsPage({ api }: { api: MemoryApi }) {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>decision</th>
-                  <th>reason</th>
-                  <th>conversation_id</th>
-                  <th>created_at</th>
-                  <th>candidate_json</th>
+                  <th>决策</th>
+                  <th>原因</th>
+                  <th>对话 ID</th>
+                  <th>创建时间</th>
+                  <th>候选记忆摘要</th>
                 </tr>
               </thead>
               <tbody>
@@ -1561,10 +1609,10 @@ function DecisionLogsPage({ api }: { api: MemoryApi }) {
         <Modal title="日志详情" onClose={() => setSelected(null)}>
           <FieldList
             entries={[
-              ["decision", selected.decision],
-              ["reason", selected.reason],
-              ["conversation_id", selected.conversation_id],
-              ["created_at", selected.created_at]
+              ["决策", selected.decision],
+              ["原因", selected.reason],
+              ["对话 ID", selected.conversation_id],
+              ["创建时间", selected.created_at]
             ]}
           />
           <pre className="json-block">{prettyJson(selected.candidate_json)}</pre>
@@ -1612,7 +1660,7 @@ function SettingsPage({
   return (
     <div className="page-stack">
       <PageHeader
-        title="Settings"
+        title="设置"
         subtitle="本地 UI 连接设置和项目配置说明。"
         action={
           <button className="primary-button" type="button" onClick={() => onSave(form)}>
@@ -1625,7 +1673,7 @@ function SettingsPage({
           <h2>连接设置</h2>
         </div>
         <label className="field-block">
-          <span>API Base URL</span>
+          <span>API 基础地址</span>
           <input
             value={form.apiBaseUrl}
             onChange={(event) => setForm({ ...form, apiBaseUrl: event.target.value })}
@@ -1633,7 +1681,7 @@ function SettingsPage({
           />
         </label>
         <label className="field-block">
-          <span>Gateway API Key</span>
+          <span>网关 API Key</span>
           <div className="secret-field">
             <input
               type={showKey ? "text" : "password"}
@@ -1652,7 +1700,7 @@ function SettingsPage({
           </div>
         </label>
         <label className="field-block">
-          <span>User ID</span>
+          <span>用户 ID</span>
           <input
             value={form.userId}
             onChange={(event) => setForm({ ...form, userId: event.target.value })}
@@ -1661,7 +1709,7 @@ function SettingsPage({
         </label>
         <div className="button-row">
           <button className="primary-button" type="button" onClick={() => onSave(form)}>
-            保存到 localStorage
+            保存到本机浏览器
           </button>
           <button
             className="secondary-button"
@@ -1717,20 +1765,20 @@ function DeveloperPage({
 
   return (
     <div className="page-stack">
-      <PageHeader title="Developer" subtitle="OpenAI-compatible、MCP 和 REST 接入信息。" />
+      <PageHeader title="接入信息" subtitle="OpenAI 兼容接口、MCP 和 REST 常用接入信息。" />
       <section className="panel access-card">
         <div className="panel-header">
           <h2>OpenAI-compatible</h2>
           <button className="secondary-button" type="button" onClick={() => copy(openAiBase)}>
             <Clipboard size={16} />
-            复制 Base URL
+            复制基础地址
           </button>
         </div>
         <FieldList
           entries={[
-            ["Base URL", openAiBase],
+            ["基础地址", openAiBase],
             ["API Key", maskSecret(settings.apiKey)],
-            ["Model", "任意，服务端会映射到 UPSTREAM_MODEL"]
+            ["模型", "任意，服务端会映射到 UPSTREAM_MODEL"]
           ]}
         />
       </section>
@@ -1743,7 +1791,7 @@ function DeveloperPage({
             复制
           </button>
         </div>
-        <FieldList entries={[["URL", mcpUrl], ["Headers", headers]]} />
+        <FieldList entries={[["地址", mcpUrl], ["请求头", headers]]} />
       </section>
 
       <section className="panel access-card">
@@ -1819,7 +1867,7 @@ function FilterSelect({
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {options.map((option) => (
           <option value={option} key={option}>
-            {option}
+            {displayText(option)}
           </option>
         ))}
       </select>
@@ -1944,7 +1992,19 @@ function ToastView({ toast }: { toast: Toast }) {
 }
 
 function badge(value: string) {
-  return <span className={`badge badge-${value}`}>{value}</span>;
+  return <span className={`badge badge-${value}`}>{displayText(value)}</span>;
+}
+
+function displayText(value: string): string {
+  return DISPLAY_TEXT[value] || value;
+}
+
+function reviewActionText(action: ReviewAction): string {
+  return `${displayText(action)}建议`;
+}
+
+function reportSectionTitle(section: string, fallback: string): string {
+  return DISPLAY_TEXT[section] || fallback;
 }
 
 function percent(value?: number | null) {

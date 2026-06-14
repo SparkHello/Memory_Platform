@@ -21,6 +21,7 @@
 - MCP Python SDK / FastMCP
 - SQLite
 - pytest / pytest-asyncio
+- TypeScript / React / Vite（本地 Memory Console）
 
 ## 常用命令
 
@@ -36,13 +37,13 @@ python -m pip install -e ".[dev]"
 启动开发服务：
 
 ```powershell
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
 ```
 
 健康检查：
 
 ```powershell
-curl http://localhost:8000/health
+curl http://localhost:2026/health
 ```
 
 运行测试：
@@ -66,7 +67,15 @@ pytest tests/test_memory_store.py
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1
-powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 8000
+powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
+```
+
+前端 UI 构建：
+
+```powershell
+cd ui
+npm install
+npm run build
 ```
 
 Windows 服务脚本：
@@ -75,6 +84,16 @@ Windows 服务脚本：
 powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
 powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 ```
+
+## 开发工作流
+
+- 项目根目录是 `C:\Users\spari\Documents\Memory\memory-gateway`，外层 `Memory` 目录不是仓库根。
+- 修改前先跑 `git status --short`。如果只看到 Git 读取用户级 ignore 的权限警告，但没有文件列表，通常表示工作区干净。
+- 搜索优先用 `rg` / `rg --files`，再按任务读取相关模块；不要只凭 README 推断实现。
+- 文档改动通常不需要跑完整测试；代码、接口、schema 或保存规则变更需要跑相关定向测试，风险较大时再跑完整 `pytest`。
+- UI 代码位于 `ui/`，改动后至少跑 `npm run build`；`ui/dist/` 只是构建产物，后端通过 `/ui` 挂载它。
+- 测试应继续使用 `tests/conftest.py` 里的 fake LLM、临时 SQLite 和空 embedding key，不要引入真实网络调用。
+- 不要通过测试或脚本污染 `data/memory.db`，真实运行数据与测试数据必须隔离。
 
 ## 代码风格
 
@@ -88,9 +107,18 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 中文内容要用 UTF-8；响应 JSON 应保持 `application/json; charset=utf-8`。
 - 测试里使用 fake LLM 和临时数据库，不依赖外部网络服务。
 
+## 接口与安全边界
+
+- FastAPI 自有路由先注册，`/ui` 静态目录必须放在 MCP 兜底挂载之前，随后再把 MCP 子应用挂载到 `/`；实际 MCP Streamable HTTP 端点仍是 `/mcp`。
+- REST 端通过 `app/api/deps.py` 校验 Bearer token；MCP 不走 FastAPI dependency，由 `app/mcp_server/auth.py` 的 `MCPAuthMiddleware` 校验。
+- `X-User-Id` 是用户隔离边界；未传时使用 `default`。新增查询、导出、恢复、日志或工具时都要确认按 user id 过滤。
+- MCP 使用 `stateless_http=True` 和 `json_response=True`，测试默认每个 POST 都是独立请求。
+- MCP 关闭 DNS rebinding protection 是为了让局域网/iPhone/Tailscale 访问可用；不要在没有替代接入方案的情况下改回默认。
+- `GATEWAY_API_KEY` 是本地服务的客户端密钥；`UPSTREAM_API_KEY` 和 `EMBEDDING_API_KEY` 只用于服务端调用上游模型，不应该透传给客户端。
+
 ## 重要文件说明
 
-- `app/main.py`：应用工厂。创建 FastAPI app，初始化 SQLite，启动 MCP session manager，挂载 `/mcp`。
+- `app/main.py`：应用工厂。创建 FastAPI app，初始化 SQLite，启动 MCP session manager，先挂载 `/ui` 静态目录，再兜底挂载 MCP 子应用。
 - `app/config.py`：配置入口。读取 `.env`，包含上游 chat、embedding、数据库和超时配置。
 - `app/api/deps.py`：REST 鉴权、`X-User-Id`、MemoryStore、LLM client 和 embedding client 依赖。
 - `app/api/memories.py`：记忆管理 REST API，包括列表、搜索、删除、恢复、导出、报告、合并、核心记忆和决策日志。
@@ -111,8 +139,22 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
 - `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测。
+- `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
 - `scripts/`：Windows PowerShell 辅助脚本。
+
+## 测试选择指南
+
+| 变更范围 | 优先测试 |
+| --- | --- |
+| REST 鉴权、路由、响应字段 | `pytest tests/test_chat_gateway.py tests/test_memory_management.py tests/test_response_charset.py` |
+| MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
+| 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
+| SQLite schema、迁移、CRUD、软删除 | `pytest tests/test_memory_store.py` |
+| 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
+| 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
+| LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_chat_gateway.py` |
+| 前端 UI、`/ui` 静态挂载 | `cd ui; npm run build`，必要时再启动后端访问 `http://localhost:2026/ui/` |
 
 ## 已知限制
 
@@ -129,6 +171,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 不要删除、覆盖或手工编辑 `data/memory.db`，这是用户真实记忆数据。
 - 不要删除 `logs/` 里的日志，除非用户明确要求。
 - 不要改 `.venv/`、`.pytest_cache/`、`__pycache__/`、`memory_gateway.egg-info/`。
+- 不要手工编辑或提交 `ui/node_modules/`、`ui/dist/`。
 - 不要把真实 API key、Tailscale 地址或私人路径写进公开文档。
 - 不要随意改变记忆保存门槛，尤其是敏感信息、假设场景和 `source_quote` 校验。
 - 不要把 MCP 的 DNS rebinding 设置改回默认，当前服务需要被局域网/iPhone 访问，鉴权由 `MCPAuthMiddleware` 负责。
@@ -145,5 +188,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改核心记忆整理时，重点跑 `tests/test_core_memory.py`。
 - 修改 `app/memory/utils.py` 里的共享工具函数时，要同时考虑搜索、提取、解析、体检、核心记忆和 prompt 注入路径，并优先跑相关定向测试后再跑完整 `pytest`。
 - 修改响应格式时，确保 `tests/test_response_charset.py` 和聊天网关测试仍通过。
+- 修改配置项时，同步更新 `app/config.py`、`.env.example`、README 的配置表和安装说明。
+- 修改 Windows 服务端口、NSSM 路径或访问脚本时，同步更新 README 的 Windows 服务模式和故障排查。
+- 修改 MCP 工具、REST 端点、记忆字段、保存门槛或当前限制时，同步更新 README 和本文件，避免下一位 agent 读到旧契约。
 - 测试应继续使用 fake LLM，不要引入真实网络调用。
 - 当前仓库可能存在用户未提交改动。修改前先看 `git status --short`，不要回滚用户改动。

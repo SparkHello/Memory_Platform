@@ -9,6 +9,12 @@
 
 两种模式共享同一个 SQLite 记忆库和同一套保存门槛。
 
+## 适用场景
+
+- 给 Kelivo、ChatWise、Cherry Studio 等可配置 OpenAI-compatible API 的客户端加一层本地长期记忆。
+- 给支持 MCP Streamable HTTP 的客户端暴露记忆工具，让模型自己决定何时检索、保存、整理或删除记忆。
+- 在 Windows 主机上常驻运行，并通过局域网或 Tailscale 给 iPhone 等设备访问。
+
 ## 技术栈
 
 - Python 3.12
@@ -19,6 +25,7 @@
 - MCP Python SDK / FastMCP
 - SQLite
 - pytest / pytest-asyncio
+- TypeScript / React / Vite（本地 Memory Console）
 
 ## 主要功能
 
@@ -77,13 +84,23 @@ REQUEST_TIMEOUT_SECONDS=60
 启动开发服务：
 
 ```powershell
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
 ```
 
 健康检查：
 
 ```powershell
-curl http://localhost:8000/health
+curl http://localhost:2026/health
+```
+
+首次启动会自动创建 `DATABASE_PATH` 的父目录和 SQLite 表。不要把真实 `.env`、`data/*.db` 或 `logs/` 提交到版本库。
+
+最小验证流程：
+
+```powershell
+$headers = @{ Authorization = "Bearer change-me" }
+Invoke-RestMethod -Uri "http://localhost:2026/health"
+Invoke-RestMethod -Uri "http://localhost:2026/memories" -Headers $headers
 ```
 
 ## 配置项
@@ -108,14 +125,22 @@ curl http://localhost:8000/health
 ### 开发模式
 
 ```powershell
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
 ```
 
 本地访问：
 
-- Health: `http://localhost:8000/health`
-- MCP: `http://localhost:8000/mcp`
-- OpenAI-compatible Base URL: `http://localhost:8000/v1`
+- Health: `http://localhost:2026/health`
+- MCP: `http://localhost:2026/mcp`
+- OpenAI-compatible Base URL: `http://localhost:2026/v1`
+
+客户端接入速查：
+
+| 客户端模式 | 地址 | 鉴权 |
+| --- | --- | --- |
+| OpenAI-compatible | `http://<host>:<port>/v1` | API Key 填 `.env` 中的 `GATEWAY_API_KEY` |
+| MCP Streamable HTTP | `http://<host>:<port>/mcp` | 请求头 `Authorization: Bearer <GATEWAY_API_KEY>` |
+| 多用户隔离 | 同上 | 可选请求头 `X-User-Id: <user-id>` |
 
 ### Windows 服务模式
 
@@ -143,17 +168,17 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1
 ```
 
-如果开发服务跑在 8000 端口：
+如果开发服务跑在 2026 端口：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 8000
+powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
 ```
 
 ## OpenAI-compatible 网关模式
 
 客户端配置：
 
-- Base URL: `http://<host>:8000/v1`
+- Base URL: `http://<host>:2026/v1`
 - API Key: `.env` 中的 `GATEWAY_API_KEY`
 - Model: 任意，服务端会改用 `UPSTREAM_MODEL`
 
@@ -178,7 +203,7 @@ $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "http://localhost:8000/v1/chat/completions" `
+  -Uri "http://localhost:2026/v1/chat/completions" `
   -Headers $headers `
   -Body $bytes
 ```
@@ -197,7 +222,7 @@ Invoke-RestMethod `
 MCP 端点：
 
 ```text
-http://<host>:8000/mcp
+http://<host>:2026/mcp
 ```
 
 请求头：
@@ -365,11 +390,21 @@ pytest tests/test_memory_store.py
 
 ## 构建
 
-项目没有前端，也没有定义单独的构建命令。日常开发使用 editable install：
+后端日常开发使用 editable install：
 
 ```powershell
 python -m pip install -e ".[dev]"
 ```
+
+前端 Memory Console 位于 `ui/`，需要 Node.js / npm：
+
+```powershell
+cd ui
+npm install
+npm run build
+```
+
+`npm run build` 会把静态产物写入 `ui/dist`，后端启动后会挂载到 `/ui`。`ui/node_modules/` 和 `ui/dist/` 是本地生成目录，已在 `.gitignore` 中忽略；`ui/package-lock.json` 用于锁定前端依赖版本。
 
 如需做 Python 包分发，可基于 `pyproject.toml` 的 setuptools 配置另行引入构建工具。
 
@@ -410,16 +445,23 @@ memory-gateway/
 │  ├─ show-access-urls.ps1
 │  └─ uninstall-service.ps1
 ├─ tests/
+├─ ui/
+│  ├─ src/
+│  ├─ package.json
+│  ├─ package-lock.json
+│  └─ vite.config.ts
 ├─ data/
 ├─ logs/
 ├─ .env.example
+├─ .gitignore
+├─ AGENTS.md
 ├─ pyproject.toml
 └─ README.md
 ```
 
 重要文件说明：
 
-- `app/main.py`：FastAPI 应用工厂，初始化数据库，挂载 MCP 子应用。
+- `app/main.py`：FastAPI 应用工厂，初始化数据库，先挂载 `/ui` 静态目录，再兜底挂载 MCP 子应用。
 - `app/config.py`：从 `.env` 读取配置。
 - `app/api/deps.py`：REST 鉴权、用户 id、依赖注入。
 - `app/api/memories.py`：记忆管理 REST API。
@@ -445,9 +487,20 @@ memory-gateway/
 - 导出接口不会导出 embedding，迁移后应重新生成。
 - 删除是软删除，`restore_memory` 或 REST restore 可以恢复。
 
+## 故障排查
+
+- `401 Unauthorized`：检查客户端 API Key 是否等于 `.env` 里的 `GATEWAY_API_KEY`，并确认请求头是 `Authorization: Bearer <key>`。
+- `500 GATEWAY_API_KEY 未配置`：服务进程没有读到 `.env`，确认启动目录是项目根目录，或在服务脚本里检查 `AppDirectory`。
+- 中文乱码：确认客户端按 UTF-8 读取响应；服务端 JSON 响应会声明 `application/json; charset=utf-8`。
+- `stream=true` 返回 501：当前网关未实现流式转发，客户端需要关闭流式请求。
+- 搜索结果不准或为空：如果未配置 `EMBEDDING_API_KEY`，服务会退回关键词搜索；配置 embedding 后新增或更新的记忆才会写入 embedding，旧记录和导出恢复的记录不会自动补齐。
+- iPhone / 局域网无法访问：确认服务使用 `--host 0.0.0.0`，防火墙放行端口，并用 `scripts\show-access-urls.ps1` 查看 LAN/Tailscale 地址。
+- Windows 服务启动失败：检查 `scripts\install-service.ps1` 中的 NSSM 路径、项目路径、虚拟环境 Python 路径和端口 `2026`。
+- 访问 `/ui` 出现 `Authorization Bearer token 无效`：确认后端已重启到包含 UI 挂载的最新代码，并优先访问 `http://localhost:2026/ui/`；旧进程或未带末尾斜杠的旧路由可能会落到 MCP 鉴权。
+
 ## Memory Console 本地 UI
 
-项目现在提供第一阶段 MVP 的本地 Web 管理界面，前端源码位于 `ui/`，构建产物输出到 `ui/dist`，后端会将其挂载到 `/ui`。
+项目现在提供第一阶段 MVP 的本地 Web 管理界面，前端源码位于 `ui/`，构建产物输出到 `ui/dist`，后端会将其挂载到 `/ui`。`/ui` 会重定向到 `/ui/`，直接访问 `http://localhost:2026/ui/` 也可以。
 
 安装前端依赖：
 
@@ -466,13 +519,13 @@ npm run build
 
 ```powershell
 cd C:\Users\spari\Documents\Memory\memory-gateway
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
 ```
 
 访问管理界面：
 
 ```text
-http://localhost:8000/ui
+http://localhost:2026/ui
 ```
 
 首次进入 `/ui` 时，在 Settings 页面填写：

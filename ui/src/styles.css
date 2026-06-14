@@ -136,6 +136,19 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.toolbar {
+  align-items: flex-end;
+  margin-bottom: 14px;
+}
+
+.log-toolbar {
+  gap: 14px;
+}
+
+.log-toolbar .field-block {
+  width: min(320px, 100%);
+}
+
 .button-row.end {
   justify-content: flex-end;
 }
@@ -397,9 +410,13 @@ button:disabled {
 
 .memory-layout {
   display: grid;
-  grid-template-columns: 250px minmax(0, 1fr) minmax(320px, 390px);
+  grid-template-columns: 300px minmax(0, 1fr);
   align-items: start;
   gap: 16px;
+}
+
+.memory-layout.has-detail {
+  grid-template-columns: 280px minmax(0, 1fr) minmax(320px, 390px);
 }
 
 .filter-panel {
@@ -837,6 +854,21 @@ code {
   margin-top: 14px;
 }
 
+.settings-panel .button-row {
+  margin-top: 18px;
+}
+
+.export-panel .button-row {
+  margin-top: 18px;
+}
+
+.restore-panel .notice,
+.restore-panel .button-row,
+.restore-preview,
+.result-grid {
+  margin-top: 14px;
+}
+
 .access-card {
   max-width: 900px;
 }
@@ -926,7 +958,8 @@ code {
 }
 
 @media (max-width: 1100px) {
-  .memory-layout {
+  .memory-layout,
+  .memory-layout.has-detail {
     grid-template-columns: 230px minmax(0, 1fr);
   }
 
@@ -959,7 +992,8 @@ code {
     padding: 16px;
   }
 
-  .memory-layout {
+  .memory-layout,
+  .memory-layout.has-detail {
     grid-template-columns: 1fr;
   }
 
