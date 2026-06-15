@@ -332,6 +332,15 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_memory(row) for row in rows]
 
+    def get_memories_max_updated_at(self, *, user_id: str) -> str | None:
+        """返回该用户所有活跃记忆的最新 updated_at，用于缓存失效比对。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MAX(updated_at) FROM memories WHERE user_id = ? AND archived = 0",
+                (user_id,),
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
     def list_archived_memories(
         self,
         *,

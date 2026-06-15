@@ -1,13 +1,43 @@
 from abc import ABC, abstractmethod
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import math
+import time
 
 import httpx
 
 from app.memory.models import MemoryRecord
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _terms
+
+
+# ---------------------------------------------------------------------------
+# 模块级缓存（跨请求存活）
+# ---------------------------------------------------------------------------
+_EMBEDDING_CACHE: dict[tuple, tuple[float, list[float]]] = {}
+"""L1: (user_id, normalized_query) -> (expires_at, embedding_vector)"""
+
+_SEARCH_CACHE: dict[tuple, tuple[float, str, list[str]]] = {}
+"""L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, [memory_id, ...])"""
+
+_EMBEDDING_CACHE_MAX = 512
+_SEARCH_CACHE_MAX = 256
+_EMBEDDING_CACHE_TTL = 300   # 5 分钟
+_SEARCH_CACHE_TTL = 120       # 2 分钟
+
+
+def _normalize_query(query: str) -> str:
+    """规范化 query 用于缓存 key：去空格、小写、截断至前 200 字符。"""
+    return " ".join(query.split()).lower()[:200]
+
+
+def _now() -> float:
+    return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Embedding client interfaces
+# ---------------------------------------------------------------------------
 
 
 class EmbeddingClient(ABC):
@@ -76,26 +106,88 @@ class MemorySearchService:
         limit: int = 8,
         record_usage: bool = True,
     ) -> list[MemoryRecord]:
+        normalized = _normalize_query(query)
+        now = _now()
+
+        # ---- L2 搜索结果缓存 ----
+        l2_key = (user_id, normalized, limit)
+        if l2_key in _SEARCH_CACHE:
+            l2_expires_at, l2_max_updated_at, l2_memory_ids = _SEARCH_CACHE[l2_key]
+            if now < l2_expires_at:
+                current_max = self.store.get_memories_max_updated_at(user_id=user_id)
+                if current_max and current_max == l2_max_updated_at:
+                    memories = self._load_by_ids(l2_memory_ids, user_id)
+                    if memories:
+                        return self._record_usage(memories, user_id=user_id, record_usage=record_usage)
+            del _SEARCH_CACHE[l2_key]
+
+        # ---- L1 query embedding 缓存 ----
+        l1_key = (user_id, normalized)
+        query_embedding = None
+        if l1_key in _EMBEDDING_CACHE:
+            l1_expires_at, l1_vector = _EMBEDDING_CACHE[l1_key]
+            if now < l1_expires_at:
+                query_embedding = l1_vector
+            else:
+                del _EMBEDDING_CACHE[l1_key]
+
+        if query_embedding is None:
+            query_embedding = await self.embedding_client.embed(query)
+            if query_embedding:
+                self._cache_embedding(l1_key, query_embedding, now)
+
+        # ---- 搜索 ----
         memories = self.store.list_memories(user_id=user_id, limit=200)
         if not memories:
             return []
 
-        query_embedding = await self.embedding_client.embed(query)
         if query_embedding:
             scored = self._score_by_embedding(memories, query_embedding)
             if scored:
-                return self._record_usage(
+                result = self._record_usage(
                     [memory for _, memory in scored[:limit]],
                     user_id=user_id,
                     record_usage=record_usage,
                 )
+                self._cache_search(l2_key, result, user_id, now)
+                return result
 
         scored = self._score_by_keywords(memories, query)
-        return self._record_usage(
+        result = self._record_usage(
             [memory for _, memory in scored[:limit]],
             user_id=user_id,
             record_usage=record_usage,
         )
+        self._cache_search(l2_key, result, user_id, now)
+        return result
+
+    def _load_by_ids(self, memory_ids: list[str], user_id: str) -> list[MemoryRecord]:
+        result: list[MemoryRecord] = []
+        for mid in memory_ids:
+            memory = self.store.get_memory(memory_id=mid, user_id=user_id)
+            if memory:
+                result.append(memory)
+        return result
+
+    def _cache_embedding(self, key: tuple, vector: list[float], now: float) -> None:
+        if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
+            _cleanup_expired(_EMBEDDING_CACHE, now)
+        if len(_EMBEDDING_CACHE) < _EMBEDDING_CACHE_MAX:
+            _EMBEDDING_CACHE[key] = (now + _EMBEDDING_CACHE_TTL, vector)
+
+    def _cache_search(self, key: tuple, memories: list[MemoryRecord], user_id: str, now: float) -> None:
+        if not memories:
+            return
+        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            _cleanup_expired(_SEARCH_CACHE, now)
+        if len(_SEARCH_CACHE) < _SEARCH_CACHE_MAX:
+            max_updated = self.store.get_memories_max_updated_at(user_id=user_id)
+            if max_updated:
+                _SEARCH_CACHE[key] = (
+                    now + _SEARCH_CACHE_TTL,
+                    max_updated,
+                    [m.id for m in memories],
+                )
 
     def _score_by_embedding(
         self,
@@ -164,6 +256,12 @@ class MemorySearchService:
         return memories
 
 
+def _cleanup_expired(cache: dict, now: float) -> None:
+    expired = [k for k, v in cache.items() if now >= v[0]]
+    for k in expired:
+        del cache[k]
+
+
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if len(left) != len(right) or not left:
         return 0.0
@@ -196,7 +294,6 @@ def _metadata_score(memory: MemoryRecord, now: datetime, *, embedding_mode: bool
 
 
 def _decay_penalty(memory: MemoryRecord, now: datetime) -> float:
-    # 关系、长期偏好、沟通风格不应因为少用就明显贬值；情景类事实自然下沉。
     rate, cap, grace_days = {
         "project": (0.0020, 0.40, 14),
         "learning": (0.0015, 0.30, 30),

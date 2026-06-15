@@ -1,7 +1,6 @@
 import {
   Activity,
   BarChart3,
-  CreditCard,
   Database,
   FileText,
   Gauge,
@@ -42,7 +41,6 @@ const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
   {
     title: "成本",
     items: [
-      { key: "billing", label: "余额账本", icon: CreditCard },
       { key: "usage", label: "用量统计", icon: BarChart3 }
     ]
   },

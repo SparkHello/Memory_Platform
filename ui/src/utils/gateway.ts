@@ -1,8 +1,4 @@
-import type {
-  ProviderModelSummary,
-  ProviderSummary,
-  RouteSummary
-} from "../types";
+import type { ProviderModelSummary, ProviderSummary, RouteSummary } from "../types";
 import { clampNumber, isRecord } from "./format";
 
 export type ProviderDraft = {
@@ -27,6 +23,7 @@ export type ProviderModelDraft = {
   pricing_tiers: PriceTierDraft[];
   input_price_per_million: string;
   output_price_per_million: string;
+  cache_hit_price_per_million: string;
   currency: string;
   enabled: boolean;
 };
@@ -35,6 +32,7 @@ export type PriceTierDraft = {
   up_to_tokens: string;
   input_price_per_million: string;
   output_price_per_million: string;
+  cache_hit_price_per_million: string;
 };
 
 export type RouteDraft = {
@@ -45,10 +43,6 @@ export type RouteDraft = {
   provider: string;
   upstream_model: string;
   priority: number;
-  input_price_per_million: string;
-  output_price_per_million: string;
-  currency: string;
-  min_balance: number;
   enabled: boolean;
 };
 
@@ -74,6 +68,7 @@ export const EMPTY_PROVIDER_MODEL_DRAFT: ProviderModelDraft = {
   pricing_tiers: createEmptyPriceTierDrafts(),
   input_price_per_million: "0",
   output_price_per_million: "0",
+  cache_hit_price_per_million: "0",
   currency: "CNY",
   enabled: true
 };
@@ -85,18 +80,14 @@ export const EMPTY_ROUTE_DRAFT: RouteDraft = {
   provider_model_id: "",
   provider: "",
   upstream_model: "",
-  priority: 100,
-  input_price_per_million: "0",
-  output_price_per_million: "0",
-  currency: "CNY",
-  min_balance: 0,
+  priority: 50,
   enabled: true
 };
 
 export function sourceText(source: string): string {
   if (source === "sqlite") return "SQLite UI 配置";
   if (source === "toml") return "providers.toml";
-  return "legacy UPSTREAM_*";
+  return "旧版 .env 单模型配置";
 }
 
 export function providerToDraft(provider: ProviderSummary): ProviderDraft {
@@ -124,6 +115,7 @@ export function providerModelToDraft(model: ProviderModelSummary): ProviderModel
     pricing_tiers: priceTierDraftsFromJson(model.pricing_tiers_json),
     input_price_per_million: decimalInputText(model.input_price_per_million),
     output_price_per_million: decimalInputText(model.output_price_per_million),
+    cache_hit_price_per_million: decimalInputText(model.cache_hit_price_per_million),
     currency: model.currency,
     enabled: model.enabled !== false
   };
@@ -138,10 +130,6 @@ export function routeToDraft(route: RouteSummary): RouteDraft {
     provider: route.provider,
     upstream_model: route.upstream_model,
     priority: route.priority,
-    input_price_per_million: decimalInputText(route.input_price_per_million),
-    output_price_per_million: decimalInputText(route.output_price_per_million),
-    currency: route.currency,
-    min_balance: route.min_balance,
     enabled: route.enabled !== false
   };
 }
@@ -166,12 +154,14 @@ export function createEmptyPriceTierDrafts(): PriceTierDraft[] {
     {
       up_to_tokens: "1000000",
       input_price_per_million: "0",
-      output_price_per_million: "0"
+      output_price_per_million: "0",
+      cache_hit_price_per_million: "0"
     },
     {
       up_to_tokens: "",
       input_price_per_million: "0",
-      output_price_per_million: "0"
+      output_price_per_million: "0",
+      cache_hit_price_per_million: "0"
     }
   ];
 }
@@ -211,6 +201,10 @@ export function priceTierDraftsFromJson(raw?: string | null): PriceTierDraft[] {
         output_price_per_million: decimalInputText(
           tier.output_price_per_million ?? tier.output,
           fallback.output_price_per_million
+        ),
+        cache_hit_price_per_million: decimalInputText(
+          tier.cache_hit_price_per_million ?? tier.cache_hit,
+          fallback.cache_hit_price_per_million
         )
       };
     });
@@ -226,7 +220,8 @@ export function priceTierDraftsToJson(tiers?: PriceTierDraft[] | null): string {
         ? Math.round(clampNumber(decimalInputValue(tier.up_to_tokens), 0, Number.MAX_SAFE_INTEGER))
         : null,
       input: clampNumber(decimalInputValue(tier.input_price_per_million), 0, 1_000_000),
-      output: clampNumber(decimalInputValue(tier.output_price_per_million), 0, 1_000_000)
+      output: clampNumber(decimalInputValue(tier.output_price_per_million), 0, 1_000_000),
+      cache_hit: clampNumber(decimalInputValue(tier.cache_hit_price_per_million), 0, 1_000_000)
     }))
   );
 }

@@ -1,4 +1,6 @@
-from app.providers.models import RouteConfig, UsageEvent
+import json
+
+from app.providers.models import ProviderModelConfig, RouteConfig, UsageEvent
 
 
 def build_success_usage_event(
@@ -6,9 +8,11 @@ def build_success_usage_event(
     response: dict,
     messages: list[dict],
     route: RouteConfig,
+    model: ProviderModelConfig,
     provider: str,
     user_id: str | None,
     conversation_id: str | None,
+    cache_hit_tokens: int = 0,
 ) -> UsageEvent:
     usage = response.get("usage") if isinstance(response, dict) else None
     estimated = not isinstance(usage, dict)
@@ -23,8 +27,11 @@ def build_success_usage_event(
         if total_tokens == 0:
             total_tokens = prompt_tokens + completion_tokens
 
-    input_cost = prompt_tokens / 1_000_000 * route.input_price_per_million
-    output_cost = completion_tokens / 1_000_000 * route.output_price_per_million
+    input_price, output_price, cache_hit_price = _resolve_pricing(model, prompt_tokens)
+    non_cached_prompt = max(0, prompt_tokens - cache_hit_tokens)
+    input_cost = (non_cached_prompt / 1_000_000 * input_price
+                  + cache_hit_tokens / 1_000_000 * cache_hit_price)
+    output_cost = completion_tokens / 1_000_000 * output_price
     total_cost = input_cost + output_cost
     return UsageEvent(
         user_id=user_id,
@@ -38,7 +45,7 @@ def build_success_usage_event(
         input_cost=input_cost,
         output_cost=output_cost,
         total_cost=total_cost,
-        currency=route.currency,
+        currency=model.currency,
         estimated=estimated,
         status="success",
     )
@@ -47,6 +54,7 @@ def build_success_usage_event(
 def build_error_usage_event(
     *,
     route: RouteConfig,
+    model: ProviderModelConfig,
     provider: str,
     user_id: str | None,
     conversation_id: str | None,
@@ -58,7 +66,7 @@ def build_error_usage_event(
         virtual_model=route.virtual_model,
         provider=provider,
         upstream_model=route.upstream_model,
-        currency=route.currency,
+        currency=model.currency,
         estimated=False,
         status="error",
         error_type=error_type,
@@ -78,6 +86,33 @@ def gateway_debug_payload(event: UsageEvent) -> dict:
             "currency": event.currency,
         },
     }
+
+
+def _resolve_pricing(model: ProviderModelConfig, prompt_tokens: int) -> tuple[float, float, float]:
+    """Resolve flat or tiered pricing. Returns (input_price, output_price, cache_hit_price)."""
+    if model.pricing_mode == "tiered" and model.pricing_tiers_json:
+        try:
+            tiers = json.loads(model.pricing_tiers_json)
+            if isinstance(tiers, list):
+                for tier in tiers:
+                    if not isinstance(tier, dict):
+                        continue
+                    up_to = tier.get("up_to_tokens")
+                    if up_to is None and prompt_tokens > 0:
+                        continue
+                    if up_to is not None and prompt_tokens > up_to:
+                        continue
+                    input_price = float(tier.get("input") or 0)
+                    output_price = float(tier.get("output") or 0)
+                    cache_hit_price = float(tier.get("cache_hit") or 0)
+                    return (input_price, output_price, cache_hit_price)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return (
+        model.input_price_per_million,
+        model.output_price_per_million,
+        model.cache_hit_price_per_million,
+    )
 
 
 def _estimate_prompt_tokens(messages: list[dict]) -> int:

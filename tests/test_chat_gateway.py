@@ -38,7 +38,9 @@ def test_chat_completion_injects_memory_context(
     )
 
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "好的，我会参考这些信息。"
+    content = response.json()["choices"][0]["message"]["content"]
+    assert "好的，我会参考这些信息。" in content
+    assert "黑咖啡" in content
     assert fake_llm.messages[0]["role"] == "system"
     assert "长期记忆" in fake_llm.messages[0]["content"]
     assert "黑咖啡" in fake_llm.messages[0]["content"]
@@ -181,3 +183,59 @@ def test_chat_completion_saves_preference_memory(
     assert "用户喜欢黑咖啡。" in contents
     # 列表接口不应再返回向量字段
     assert all("embedding_json" not in memory for memory in data)
+
+
+def test_chat_completion_includes_memory_hit_block(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    """验证：聊天回复中包含记忆命中块"""
+    memory_store.create_memory(
+        user_id="default",
+        content="用户使用 Windows 11 + WSL2 作为开发环境",
+        type="fact",
+        importance=7,
+    )
+    fake_llm.response["choices"][0]["message"]["content"] = "我了解你的开发环境偏好。"
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "ios-model",
+            "messages": [{"role": "user", "content": "我的开发环境是什么"}],
+        },
+    )
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert "【记忆命中】" in content
+    assert "search_memory" in content
+    assert "Windows 11" in content
+    assert "---" in content
+    assert "我了解你的开发环境偏好。" in content
+
+
+def test_chat_completion_no_memory_hit_when_empty(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    """验证：无匹配记忆时不插入命中块"""
+    fake_llm.response["choices"][0]["message"]["content"] = "你好！"
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "ios-model",
+            "messages": [{"role": "user", "content": "你好"}],
+        },
+    )
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert "【记忆命中】" not in content
+    assert "你好！" in content

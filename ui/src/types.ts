@@ -5,7 +5,6 @@ export type PageKey =
   | "gateway-import-export"
   | "providers"
   | "routes"
-  | "billing"
   | "usage"
   | "memories"
   | "core"
@@ -203,9 +202,6 @@ export interface RouteSummary {
   upstream_model: string;
   provider_model_id?: string | null;
   priority: number;
-  input_price_per_million: number;
-  output_price_per_million: number;
-  currency: string;
   min_balance: number;
   enabled?: boolean;
   created_at?: string | null;
@@ -245,6 +241,7 @@ export interface ProviderModelSummary {
   pricing_tiers_json: string;
   input_price_per_million: number;
   output_price_per_million: number;
+  cache_hit_price_per_million: number;
   currency: string;
   enabled: boolean;
   created_at?: string | null;
@@ -266,9 +263,6 @@ export interface RouteConfigPayload {
   provider?: string;
   upstream_model?: string;
   priority?: number;
-  input_price_per_million?: number;
-  output_price_per_million?: number;
-  currency?: string;
   min_balance?: number;
   enabled?: boolean;
 }
@@ -282,6 +276,7 @@ export interface ProviderModelConfigPayload {
   pricing_tiers_json?: string;
   input_price_per_million?: number;
   output_price_per_million?: number;
+  cache_hit_price_per_million?: number;
   currency?: string;
   enabled?: boolean;
 }
@@ -291,26 +286,6 @@ export interface ProviderTestResult {
   status?: number | null;
   error_type?: string | null;
   message: string;
-}
-
-export interface BalanceRecord {
-  provider: string;
-  currency: string;
-  balance: number;
-  updated_at?: string | null;
-}
-
-export interface BalanceAdjustmentResult {
-  balance: BalanceRecord;
-  adjustment: {
-    id: string;
-    provider: string;
-    amount_delta: number;
-    balance_after: number;
-    currency: string;
-    reason: string;
-    created_at: string;
-  };
 }
 
 export interface UsageEvent {

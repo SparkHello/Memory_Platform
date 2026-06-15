@@ -2,7 +2,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.api.deps import (
     get_embedding_client,
@@ -13,14 +13,23 @@ from app.api.deps import (
     require_api_key,
 )
 from app.llm.client import OpenAICompatibleClient
+from app.llm.prompts import (
+    render_core_memory_context,
+    render_memory_context,
+    render_recent_context_summary_context,
+)
 from app.memory.core import CoreMemoryConsolidator
+from app.memory.extractor import validate_candidate_for_save
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
+    CandidateMemory,
     CoreMemorySectionName,
     MemorySensitivity,
     MemoryStability,
     MemoryType,
+    RecentContextSummary,
 )
+from app.memory.resolver import MemoryResolver
 from app.memory.review import MemoryReviewer
 from app.memory.report import (
     build_memory_export,
@@ -70,6 +79,35 @@ class MemoryRestoreExportRequest(BaseModel):
 class MemoryIngestRequest(BaseModel):
     text: str = Field(min_length=1)
     conversation_id: str | None = None
+
+
+class MemorySaveRequest(BaseModel):
+    """直接保存一条结构化记忆，对齐 MCP save_memory。"""
+    content: str = Field(min_length=1)
+    type: MemoryType = "fact"
+    importance: int = Field(default=5, ge=1, le=10)
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+    stability: MemoryStability = "stable"
+    sensitivity: MemorySensitivity = "normal"
+    source_quote: str = ""
+    valid_until: str | None = None
+    review_after: str | None = None
+
+
+class MemoryForgetRequest(BaseModel):
+    """按自然语言搜索并批量软删除，对齐 MCP forget_memories。"""
+    query: str = ""
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class MemoryContextRequest(BaseModel):
+    """一站式上下文检索。"""
+    query: str = ""
+    include_core_memory: bool = True
+    include_recent_context: bool = True
+    search_limit: int = Field(default=5, ge=1, le=20)
+    conversation_id: str | None = None
+    format: Literal["json", "markdown"] = "json"
 
 
 @router.get("")
@@ -259,6 +297,153 @@ def review_memories(
 ) -> dict:
     reviewer = MemoryReviewer(store=store)
     return reviewer.review(user_id=user_id, limit=limit).model_dump()
+
+
+@router.post("")
+async def save_memory(
+    body: MemorySaveRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+) -> dict:
+    """直接保存一条结构化记忆，跳过 LLM 提取。对齐 MCP save_memory。"""
+    try:
+        candidate = CandidateMemory(
+            action="create",
+            memory=body.content.strip(),
+            type=body.type,
+            importance=body.importance,
+            confidence=body.confidence,
+            stability=body.stability,
+            sensitivity=body.sensitivity,
+            source_quote=body.source_quote.strip(),
+            valid_until=body.valid_until,
+            review_after=body.review_after,
+        )
+    except ValidationError as exc:
+        first_error = exc.errors()[0]
+        field = ".".join(str(p) for p in first_error.get("loc", ()))
+        return {"action": "ignore", "reason": f"参数不合法（字段 {field}）"}
+
+    rejection = validate_candidate_for_save(candidate)
+    if rejection:
+        return {"action": "ignore", "reason": rejection}
+
+    resolver = MemoryResolver(store=store, embedding_client=embedding_client)
+    result = await resolver.resolve(
+        user_id=user_id,
+        candidate=candidate,
+        source_message=candidate.source_quote,
+        conversation_id=None,
+    )
+    return {
+        "action": result.action,
+        "relation": result.relation,
+        "reason": result.reason,
+        "memory_id": result.memory.id if result.memory else None,
+    }
+
+
+@router.post("/forget")
+async def forget_memories(
+    body: MemoryForgetRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    search_service: Annotated[MemorySearchService, Depends(get_memory_search_service)],
+) -> dict:
+    """按自然语言搜索并批量软删除。对齐 MCP forget_memories。"""
+    normalized_query = body.query.strip()
+    if not normalized_query:
+        return {"deleted_count": 0, "deleted": [], "query": body.query}
+
+    matches = await search_service.search(
+        query=normalized_query,
+        user_id=user_id,
+        limit=body.limit,
+        record_usage=False,
+    )
+    deleted: list[dict] = []
+    for memory in matches:
+        if store.archive_memory(memory_id=memory.id, user_id=user_id):
+            deleted.append(memory.model_dump(exclude={"embedding_json"}))
+    return {
+        "deleted_count": len(deleted),
+        "deleted": deleted,
+        "query": normalized_query,
+    }
+
+
+@router.post("/context", response_model=None)
+async def get_memory_context(
+    body: MemoryContextRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    search_service: Annotated[MemorySearchService, Depends(get_memory_search_service)],
+) -> dict | PlainTextResponse:
+    """一站式上下文检索：核心记忆 + RAG 检索 + 近期上下文。"""
+    core_sections: list = []
+    search_results: list = []
+    search_results_raw: list = []
+    recent_context: dict = {"found": False, "summary": ""}
+
+    search_query = body.query.strip()
+    if not search_query and body.conversation_id:
+        recent = store.get_recent_context_summary(
+            user_id=user_id,
+            conversation_id=body.conversation_id,
+        )
+        if recent and recent.summary:
+            lines = recent.summary.splitlines()
+            if lines:
+                last_line = lines[-1].strip()
+                if last_line.startswith("用户："):
+                    search_query = last_line[len("用户："):].strip()
+
+    if search_query and body.include_core_memory is not False:
+        core_sections = store.list_core_memory_sections(user_id=user_id)
+
+    if search_query:
+        search_results_raw = await search_service.search(
+            query=search_query,
+            user_id=user_id,
+            limit=body.search_limit,
+            record_usage=False,
+        )
+        search_results = [
+            m.model_dump(exclude={"embedding_json"}) for m in search_results_raw
+        ]
+    elif body.include_core_memory:
+        core_sections = store.list_core_memory_sections(user_id=user_id)
+
+    if body.include_recent_context:
+        recent = store.get_recent_context_summary(
+            user_id=user_id,
+            conversation_id=body.conversation_id,
+        )
+        if recent:
+            recent_context = {"found": True, "summary": recent.summary}
+
+    if body.format == "markdown":
+        core_md = render_core_memory_context(core_sections) if core_sections else ""
+        recent_md = ""
+        if recent_context["found"]:
+            recent_obj = RecentContextSummary(
+                id="", user_id=user_id, conversation_id=body.conversation_id,
+                summary=recent_context["summary"],
+                created_at="", updated_at="", archived=0,
+            )
+            recent_md = render_recent_context_summary_context(recent_obj)
+        search_md = ""
+        if search_results_raw:
+            search_md = render_memory_context(search_results_raw)
+        blocks = [b for b in (core_md, recent_md, search_md) if b]
+        return PlainTextResponse("\n\n".join(blocks), media_type="text/markdown")
+
+    return {
+        "core_memory": [s.model_dump() for s in core_sections] if core_sections else [],
+        "search_results": search_results,
+        "recent_context": recent_context,
+    }
 
 
 @router.patch("/{memory_id}")

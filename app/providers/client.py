@@ -93,13 +93,25 @@ class ProviderRouterClient:
                 self._record_error(selection, request, "invalid_json")
                 raise _bad_gateway("provider 返回了无法解析的 JSON") from exc
 
+            provider_model = self.config.provider_models.get(selection.route.provider_model_id) if selection.route.provider_model_id else None
+            if provider_model is None:
+                logger.warning(
+                    "route %s has no linked ProviderModelConfig, skipping billing",
+                    selection.route.virtual_model,
+                )
+                data["gateway"] = {"skipped": True, "reason": "no pricing model"}
+                return data
+            usage_data = data.get("usage") if isinstance(data, dict) else None
+            cache_hit_tokens = _coerce_non_negative_int(usage_data.get("prompt_cache_hit_tokens")) if isinstance(usage_data, dict) else 0
             event = build_success_usage_event(
                 response=data,
                 messages=messages,
                 route=selection.route,
+                model=provider_model,
                 provider=selection.provider.id,
                 user_id=request.user,
                 conversation_id=request.conversation_id,
+                cache_hit_tokens=cache_hit_tokens,
             )
             self._record_success(event)
             data["gateway"] = gateway_debug_payload(event)
@@ -141,8 +153,16 @@ class ProviderRouterClient:
         error_type: str,
     ) -> None:
         try:
+            provider_model = self.config.provider_models.get(selection.route.provider_model_id) if selection.route.provider_model_id else None
+            if provider_model is None:
+                logger.warning(
+                    "route %s has no linked ProviderModelConfig, skipping error billing",
+                    selection.route.virtual_model,
+                )
+                return
             event = build_error_usage_event(
                 route=selection.route,
+                model=provider_model,
                 provider=selection.provider.id,
                 user_id=request.user,
                 conversation_id=request.conversation_id,
@@ -205,3 +225,11 @@ def _redact(text: str, secret: str) -> str:
     if secret:
         return text.replace(secret, "[redacted]")
     return text
+
+
+def _coerce_non_negative_int(value: object) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)

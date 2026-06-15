@@ -4,7 +4,6 @@ from uuid import uuid4
 
 from app.memory.models import utc_now_iso
 from app.providers.models import (
-    BalanceAdjustment,
     BalanceRecord,
     ProviderConfig,
     ProviderModelConfig,
@@ -151,6 +150,12 @@ class ProviderStore:
                 "pricing_tiers_json",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            _ensure_column(
+                connection,
+                "provider_model_configs",
+                "cache_hit_price_per_million",
+                "REAL NOT NULL DEFAULT 0",
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS provider_route_configs (
@@ -188,12 +193,13 @@ class ProviderStore:
         providers = {provider.id: provider for provider in self.list_provider_configs()}
         provider_models = {model.id: model for model in self.list_provider_model_configs()}
         routes = self.list_route_configs()
+        has_ui_config = bool(providers or provider_models or routes)
         enabled = _has_enabled_provider_route(providers, provider_models, routes)
         default_model = _first_enabled_route_model(providers, provider_models, routes)
         return ProvidersConfig(
             enabled=enabled,
             path=self.database_path,
-            source="sqlite" if enabled else "legacy",
+            source="sqlite" if has_ui_config else "legacy",
             router=RouterConfig(default_model=default_model, fallback_enabled=True),
             providers=providers,
             provider_models=provider_models,
@@ -292,6 +298,36 @@ class ProviderStore:
     def disable_provider_config(self, provider: str) -> ProviderConfig | None:
         return self.patch_provider_config(provider=provider, enabled=False)
 
+    def delete_provider_config(self, provider: str) -> dict[str, int] | None:
+        if self.get_provider_config(provider) is None:
+            return None
+        with self._connect() as connection:
+            route_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM provider_route_configs WHERE provider = ?",
+                (provider,),
+            ).fetchone()["count"]
+            model_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM provider_model_configs WHERE provider = ?",
+                (provider,),
+            ).fetchone()["count"]
+            connection.execute(
+                "DELETE FROM provider_route_configs WHERE provider = ?",
+                (provider,),
+            )
+            connection.execute(
+                "DELETE FROM provider_model_configs WHERE provider = ?",
+                (provider,),
+            )
+            connection.execute(
+                "DELETE FROM provider_configs WHERE provider = ?",
+                (provider,),
+            )
+        return {
+            "providers": 1,
+            "provider_models": int(model_count),
+            "routes": int(route_count),
+        }
+
     def list_provider_model_configs(self, provider: str | None = None) -> list[ProviderModelConfig]:
         query = "SELECT * FROM provider_model_configs"
         params: tuple[object, ...] = ()
@@ -322,6 +358,7 @@ class ProviderStore:
         pricing_tiers_json: str = "",
         input_price_per_million: float = 0.0,
         output_price_per_million: float = 0.0,
+        cache_hit_price_per_million: float = 0.0,
         currency: str = "CNY",
         enabled: bool = True,
         model_id: str | None = None,
@@ -335,9 +372,10 @@ class ProviderStore:
                     id, provider, upstream_model, display_name,
                     api_format, pricing_mode, pricing_tiers_json,
                     input_price_per_million, output_price_per_million,
+                    cache_hit_price_per_million,
                     currency, enabled, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     model_id,
@@ -349,6 +387,7 @@ class ProviderStore:
                     pricing_tiers_json,
                     input_price_per_million,
                     output_price_per_million,
+                    cache_hit_price_per_million,
                     currency,
                     1 if enabled else 0,
                     now,
@@ -369,6 +408,7 @@ class ProviderStore:
         pricing_tiers_json: str | None = None,
         input_price_per_million: float | None = None,
         output_price_per_million: float | None = None,
+        cache_hit_price_per_million: float | None = None,
         currency: str | None = None,
         enabled: bool | None = None,
     ) -> ProviderModelConfig | None:
@@ -398,6 +438,11 @@ class ProviderStore:
             if output_price_per_million is not None
             else current.output_price_per_million
         )
+        next_cache_hit_price = (
+            cache_hit_price_per_million
+            if cache_hit_price_per_million is not None
+            else current.cache_hit_price_per_million
+        )
         next_currency = currency if currency is not None else current.currency
         next_enabled = enabled if enabled is not None else current.enabled
         with self._connect() as connection:
@@ -407,6 +452,7 @@ class ProviderStore:
                 SET provider = ?, upstream_model = ?, display_name = ?,
                     api_format = ?, pricing_mode = ?, pricing_tiers_json = ?,
                     input_price_per_million = ?, output_price_per_million = ?,
+                    cache_hit_price_per_million = ?,
                     currency = ?, enabled = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -419,6 +465,7 @@ class ProviderStore:
                     next_pricing_tiers_json,
                     next_input_price,
                     next_output_price,
+                    next_cache_hit_price,
                     next_currency,
                     1 if next_enabled else 0,
                     now,
@@ -429,16 +476,12 @@ class ProviderStore:
                 """
                 UPDATE provider_route_configs
                 SET provider = ?, upstream_model = ?,
-                    input_price_per_million = ?, output_price_per_million = ?,
-                    currency = ?, updated_at = ?
+                    updated_at = ?
                 WHERE provider_model_id = ?
                 """,
                 (
                     next_provider,
                     next_upstream_model,
-                    next_input_price,
-                    next_output_price,
-                    next_currency,
                     now,
                     model_id,
                 ),
@@ -447,6 +490,24 @@ class ProviderStore:
 
     def disable_provider_model_config(self, model_id: str) -> ProviderModelConfig | None:
         return self.patch_provider_model_config(model_id=model_id, enabled=False)
+
+    def delete_provider_model_config(self, model_id: str) -> dict[str, int] | None:
+        if self.get_provider_model_config(model_id) is None:
+            return None
+        with self._connect() as connection:
+            route_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM provider_route_configs WHERE provider_model_id = ?",
+                (model_id,),
+            ).fetchone()["count"]
+            connection.execute(
+                "DELETE FROM provider_route_configs WHERE provider_model_id = ?",
+                (model_id,),
+            )
+            connection.execute(
+                "DELETE FROM provider_model_configs WHERE id = ?",
+                (model_id,),
+            )
+        return {"provider_models": 1, "routes": int(route_count)}
 
     def upsert_provider_model_by_identity(
         self,
@@ -469,6 +530,7 @@ class ProviderStore:
                 pricing_tiers_json=model.pricing_tiers_json,
                 input_price_per_million=model.input_price_per_million,
                 output_price_per_million=model.output_price_per_million,
+                cache_hit_price_per_million=model.cache_hit_price_per_million,
                 currency=model.currency,
                 enabled=model.enabled,
             )
@@ -483,6 +545,7 @@ class ProviderStore:
             pricing_tiers_json=model.pricing_tiers_json,
             input_price_per_million=model.input_price_per_million,
             output_price_per_million=model.output_price_per_million,
+            cache_hit_price_per_million=model.cache_hit_price_per_million,
             currency=model.currency,
             enabled=model.enabled,
         )
@@ -510,9 +573,6 @@ class ProviderStore:
         upstream_model: str,
         provider_model_id: str | None = None,
         priority: int = 100,
-        input_price_per_million: float = 0.0,
-        output_price_per_million: float = 0.0,
-        currency: str = "CNY",
         min_balance: float = 0.0,
         enabled: bool = True,
         route_id: str | None = None,
@@ -524,10 +584,9 @@ class ProviderStore:
                 """
                 INSERT INTO provider_route_configs(
                     id, virtual_model, provider, upstream_model, provider_model_id, priority,
-                    input_price_per_million, output_price_per_million,
-                    currency, min_balance, enabled, created_at, updated_at
+                    min_balance, enabled, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     route_id,
@@ -536,9 +595,6 @@ class ProviderStore:
                     upstream_model,
                     provider_model_id,
                     priority,
-                    input_price_per_million,
-                    output_price_per_million,
-                    currency,
                     min_balance,
                     1 if enabled else 0,
                     now,
@@ -556,9 +612,6 @@ class ProviderStore:
         upstream_model: str | None = None,
         provider_model_id: str | None = None,
         priority: int | None = None,
-        input_price_per_million: float | None = None,
-        output_price_per_million: float | None = None,
-        currency: str | None = None,
         min_balance: float | None = None,
         enabled: bool | None = None,
     ) -> RouteConfig | None:
@@ -572,8 +625,7 @@ class ProviderStore:
                 UPDATE provider_route_configs
                 SET virtual_model = ?, provider = ?, upstream_model = ?, provider_model_id = ?,
                     priority = ?,
-                    input_price_per_million = ?, output_price_per_million = ?,
-                    currency = ?, min_balance = ?, enabled = ?, updated_at = ?
+                    min_balance = ?, enabled = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -586,17 +638,6 @@ class ProviderStore:
                         else current.provider_model_id
                     ),
                     priority if priority is not None else current.priority,
-                    (
-                        input_price_per_million
-                        if input_price_per_million is not None
-                        else current.input_price_per_million
-                    ),
-                    (
-                        output_price_per_million
-                        if output_price_per_million is not None
-                        else current.output_price_per_million
-                    ),
-                    currency if currency is not None else current.currency,
                     min_balance if min_balance is not None else current.min_balance,
                     1 if (enabled if enabled is not None else current.enabled) else 0,
                     now,
@@ -626,9 +667,6 @@ class ProviderStore:
             updated = self.patch_route_config(
                 route_id=row["id"],
                 priority=route.priority,
-                input_price_per_million=route.input_price_per_million,
-                output_price_per_million=route.output_price_per_million,
-                currency=route.currency,
                 min_balance=route.min_balance,
                 enabled=route.enabled,
             )
@@ -639,9 +677,6 @@ class ProviderStore:
             upstream_model=route.upstream_model,
             provider_model_id=route.provider_model_id,
             priority=route.priority,
-            input_price_per_million=route.input_price_per_million,
-            output_price_per_million=route.output_price_per_million,
-            currency=route.currency,
             min_balance=route.min_balance,
             enabled=route.enabled,
         )
@@ -655,85 +690,6 @@ class ProviderStore:
         if row is None:
             return BalanceRecord(provider=provider, balance=0.0, currency="CNY")
         return BalanceRecord(**dict(row))
-
-    def list_balances(self, provider_ids: list[str] | None = None) -> list[BalanceRecord]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM provider_balances ORDER BY provider"
-            ).fetchall()
-        by_provider = {row["provider"]: BalanceRecord(**dict(row)) for row in rows}
-        if provider_ids is None:
-            return list(by_provider.values())
-
-        ordered: list[BalanceRecord] = []
-        seen: set[str] = set()
-        for provider in provider_ids:
-            seen.add(provider)
-            ordered.append(by_provider.get(provider) or BalanceRecord(provider=provider))
-        for provider, record in by_provider.items():
-            if provider not in seen:
-                ordered.append(record)
-        return ordered
-
-    def adjust_balance(
-        self,
-        *,
-        provider: str,
-        amount_delta: float,
-        currency: str = "CNY",
-        reason: str = "",
-    ) -> tuple[BalanceRecord, BalanceAdjustment]:
-        now = utc_now_iso()
-        adjustment = BalanceAdjustment(
-            provider=provider,
-            amount_delta=amount_delta,
-            balance_after=0.0,
-            currency=currency,
-            reason=reason,
-            created_at=now,
-        )
-        with self._connect() as connection:
-            current = connection.execute(
-                "SELECT balance FROM provider_balances WHERE provider = ?",
-                (provider,),
-            ).fetchone()
-            current_balance = float(current["balance"]) if current else 0.0
-            balance_after = current_balance + amount_delta
-            adjustment.balance_after = balance_after
-            connection.execute(
-                """
-                INSERT INTO provider_balances(provider, currency, balance, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(provider) DO UPDATE SET
-                    currency = excluded.currency,
-                    balance = excluded.balance,
-                    updated_at = excluded.updated_at
-                """,
-                (provider, currency, balance_after, now),
-            )
-            connection.execute(
-                """
-                INSERT INTO provider_balance_adjustments(
-                    id, provider, amount_delta, balance_after, currency, reason, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    adjustment.id,
-                    adjustment.provider,
-                    adjustment.amount_delta,
-                    adjustment.balance_after,
-                    adjustment.currency,
-                    adjustment.reason,
-                    adjustment.created_at,
-                ),
-            )
-        return BalanceRecord(
-            provider=provider,
-            currency=currency,
-            balance=balance_after,
-            updated_at=now,
-        ), adjustment
 
     def deduct_balance(self, *, provider: str, amount: float, currency: str) -> BalanceRecord:
         if amount <= 0:
@@ -886,6 +842,7 @@ def _provider_model_config_from_row(row: sqlite3.Row) -> ProviderModelConfig:
         pricing_tiers_json=data.get("pricing_tiers_json") or "",
         input_price_per_million=float(data.get("input_price_per_million") or 0.0),
         output_price_per_million=float(data.get("output_price_per_million") or 0.0),
+        cache_hit_price_per_million=float(data.get("cache_hit_price_per_million") or 0.0),
         currency=data.get("currency") or "CNY",
         enabled=bool(data.get("enabled")),
         created_at=data.get("created_at"),
@@ -902,9 +859,6 @@ def _route_config_from_row(row: sqlite3.Row) -> RouteConfig:
         upstream_model=data["upstream_model"],
         provider_model_id=data.get("provider_model_id"),
         priority=int(data.get("priority") or 0),
-        input_price_per_million=float(data.get("input_price_per_million") or 0.0),
-        output_price_per_million=float(data.get("output_price_per_million") or 0.0),
-        currency=data.get("currency") or "CNY",
         min_balance=float(data.get("min_balance") or 0.0),
         enabled=bool(data.get("enabled")),
         created_at=data.get("created_at"),

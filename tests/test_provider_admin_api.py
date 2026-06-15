@@ -1,4 +1,5 @@
-from fastapi.testclient import TestClient
+﻿from fastapi.testclient import TestClient
+import httpx
 
 from app.config import get_settings
 from app.main import create_app
@@ -9,28 +10,11 @@ from app.providers.router import ProviderRouter
 from app.providers.store import ProviderStore
 
 
-def test_admin_balance_adjustment_and_usage_summary(
+def test_admin_usage_summary(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
 ) -> None:
-    adjust = client.post(
-        "/admin/balances/zhipu/adjust",
-        headers=auth_headers,
-        json={
-            "amount_delta": 100.0,
-            "currency": "CNY",
-            "reason": "manual top up",
-        },
-    )
-
-    assert adjust.status_code == 200
-    assert adjust.json()["balance"]["balance"] == 100.0
-
-    balances = client.get("/admin/balances", headers=auth_headers)
-    assert balances.status_code == 200
-    assert balances.json()["data"][0]["provider"] == "zhipu"
-
     store = ProviderStore(memory_store.database_path)
     store.init_db()
     store.record_usage_event(
@@ -94,24 +78,46 @@ api_key_env = "ZHIPU_API_KEY"
 enabled = true
 timeout_seconds = 60
 
+[[provider_models]]
+id = "model-zhipu"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+display_name = "GLM 5.1"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+input_price_per_million = 0
+output_price_per_million = 0
+cache_hit_price_per_million = 0
+currency = "CNY"
+enabled = true
+
+[[provider_models]]
+id = "model-zhipu-flash"
+provider = "zhipu"
+upstream_model = "glm-4-flash"
+display_name = "GLM 4 Flash"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+input_price_per_million = 0
+output_price_per_million = 0
+cache_hit_price_per_million = 0
+currency = "CNY"
+enabled = true
+
 [[routes]]
 virtual_model = "glm-5.1"
 provider = "zhipu"
 upstream_model = "glm-5.1"
+provider_model_id = "model-zhipu"
 priority = 100
-input_price_per_million = 0.0
-output_price_per_million = 0.0
-currency = "CNY"
 min_balance = 0.0
 
 [[routes]]
 virtual_model = "memory-extractor"
 provider = "zhipu"
 upstream_model = "glm-4-flash"
+provider_model_id = "model-zhipu-flash"
 priority = 100
-input_price_per_million = 0.0
-output_price_per_million = 0.0
-currency = "CNY"
 min_balance = 0.0
 """,
         encoding="utf-8",
@@ -308,7 +314,7 @@ def test_route_can_select_provider_model(
     assert route_payload["provider"] == "zhipu"
     assert route_payload["upstream_model"] == "glm-5-1"
     assert route_payload["provider_model_id"] == model_id
-    assert route_payload["input_price_per_million"] == 1.0
+    assert route_payload["provider_model_id"] == model_id
 
     store = ProviderStore(memory_store.database_path)
     config = store.load_sqlite_providers_config()
@@ -457,6 +463,107 @@ def test_delete_provider_soft_disables(
     assert deleted.json()["provider"]["enabled"] is False
 
 
+def test_hard_delete_provider_removes_models_and_routes(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    client.post(
+        "/admin/provider-config/providers",
+        headers=auth_headers,
+        json={
+            "provider": "zhipu",
+            "name": "Zhipu",
+            "base_url": "https://zhipu.test/v1",
+            "api_key": "secret-key",
+            "enabled": True,
+            "timeout_seconds": 60,
+        },
+    )
+    provider_model = client.post(
+        "/admin/provider-config/models",
+        headers=auth_headers,
+        json={
+            "provider": "zhipu",
+            "upstream_model": "glm-5-1",
+            "enabled": True,
+        },
+    )
+    model_id = provider_model.json()["model"]["id"]
+    client.post(
+        "/admin/provider-config/routes",
+        headers=auth_headers,
+        json={
+            "virtual_model": "glm-5.1",
+            "provider_model_id": model_id,
+            "enabled": True,
+        },
+    )
+
+    deleted = client.delete("/admin/provider-config/providers/zhipu?hard=true", headers=auth_headers)
+
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["providers"] == 1
+    assert deleted.json()["provider_models"] == 1
+    assert deleted.json()["routes"] == 1
+
+    config = client.get("/admin/provider-config", headers=auth_headers)
+    assert config.status_code == 200
+    assert config.json()["providers"] == []
+    assert config.json()["provider_models"] == []
+    assert config.json()["routes"] == []
+
+
+def test_hard_delete_provider_model_removes_bound_routes(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    client.post(
+        "/admin/provider-config/providers",
+        headers=auth_headers,
+        json={
+            "provider": "zhipu",
+            "name": "Zhipu",
+            "base_url": "https://zhipu.test/v1",
+            "api_key": "secret-key",
+            "enabled": True,
+            "timeout_seconds": 60,
+        },
+    )
+    provider_model = client.post(
+        "/admin/provider-config/models",
+        headers=auth_headers,
+        json={
+            "provider": "zhipu",
+            "upstream_model": "glm-5-1",
+            "enabled": True,
+        },
+    )
+    model_id = provider_model.json()["model"]["id"]
+    client.post(
+        "/admin/provider-config/routes",
+        headers=auth_headers,
+        json={
+            "virtual_model": "glm-5.1",
+            "provider_model_id": model_id,
+            "enabled": True,
+        },
+    )
+
+    deleted = client.delete(f"/admin/provider-config/models/{model_id}?hard=true", headers=auth_headers)
+
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["provider_models"] == 1
+    assert deleted.json()["routes"] == 1
+
+    config = client.get("/admin/provider-config", headers=auth_headers)
+    assert config.status_code == 200
+    assert len(config.json()["providers"]) == 1
+    assert config.json()["provider_models"] == []
+    assert config.json()["routes"] == []
+
+
 def test_provider_test_endpoint_does_not_require_or_return_key_when_missing(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -493,3 +600,59 @@ def test_provider_test_endpoint_does_not_require_or_return_key_when_missing(
     assert response.json()["success"] is False
     assert response.json()["error_type"] == "missing_key"
     assert "api_key" not in response.text
+
+
+def test_provider_test_endpoint_can_use_sqlite_model_without_route(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: float):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url: str, json: dict, headers: dict) -> httpx.Response:
+            calls.append({"url": url, "json": json, "headers": headers})
+            return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("app.api.admin.httpx.AsyncClient", FakeAsyncClient)
+    client.post(
+        "/admin/provider-config/providers",
+        headers=auth_headers,
+        json={
+            "provider": "new-provider",
+            "name": "New Provider",
+            "base_url": "https://provider.test/v1",
+            "api_key": "secret-key",
+            "enabled": True,
+            "timeout_seconds": 60,
+        },
+    )
+    client.post(
+        "/admin/provider-config/models",
+        headers=auth_headers,
+        json={
+            "provider": "new-provider",
+            "upstream_model": "new-model",
+            "enabled": True,
+        },
+    )
+
+    response = client.post(
+        "/admin/provider-config/providers/new-provider/test",
+        headers=auth_headers,
+        json={},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert calls[0]["url"] == "https://provider.test/v1/chat/completions"
+    assert calls[0]["json"]["model"] == "new-model"

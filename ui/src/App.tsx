@@ -6,7 +6,6 @@ import { useConfirm } from "./hooks/useConfirm";
 import { useToast } from "./hooks/useToast";
 import { AppShell } from "./layout/AppShell";
 import { DashboardPage } from "./pages/DashboardPage";
-import { BillingPage } from "./pages/cost/BillingPage";
 import { UsagePage } from "./pages/cost/UsagePage";
 import { GatewayImportExportPage } from "./pages/gateway/GatewayImportExportPage";
 import { GatewayOverviewPage } from "./pages/gateway/GatewayOverviewPage";
@@ -103,7 +102,6 @@ export function App() {
         {activePage === "routes" && (
           <RoutesPage api={api} notify={notify} confirm={confirm} />
         )}
-        {activePage === "billing" && <BillingPage api={api} notify={notify} />}
         {activePage === "usage" && <UsagePage api={api} />}
         {activePage === "memories" && (
           <MemoriesPage api={api} notify={notify} confirm={confirm} />

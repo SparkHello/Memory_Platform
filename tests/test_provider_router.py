@@ -1,4 +1,4 @@
-import httpx
+﻿import httpx
 import pytest
 from fastapi import HTTPException
 
@@ -144,7 +144,13 @@ def test_balance_filters_routes_and_min_balance_zero_allows_zero(monkeypatch, tm
     assert store.get_balance("zhipu").balance == 0
     assert router.candidate_selections("glm-5.1") == []
 
-    store.adjust_balance(provider="zhipu", amount_delta=20, currency="CNY", reason="test")
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO provider_balances(provider, currency, balance, updated_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(provider) DO UPDATE SET balance = excluded.balance, updated_at = excluded.updated_at",
+            ("zhipu", "CNY", 20.0),
+        )
     assert len(router.candidate_selections("glm-5.1")) == 1
 
     zero_config_path = _write_config(tmp_path, filename="zero.toml")
@@ -179,12 +185,13 @@ def test_sqlite_balance_filter_still_applies(tmp_path):
 
     assert router.candidate_selections("sqlite-model") == []
 
-    store.adjust_balance(
-        provider="sqlite-provider",
-        amount_delta=10,
-        currency="CNY",
-        reason="test",
-    )
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO provider_balances(provider, currency, balance, updated_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(provider) DO UPDATE SET balance = excluded.balance, updated_at = excluded.updated_at",
+            ("sqlite-provider", "CNY", 10.0),
+        )
     assert len(router.candidate_selections("sqlite-model")) == 1
 
 
@@ -198,7 +205,13 @@ async def test_successful_provider_call_records_usage_and_deducts_balance(monkey
     monkeypatch.setenv("ZHIPU_API_KEY", "test-zhipu-key")
     store = ProviderStore(settings.database_path)
     store.init_db()
-    store.adjust_balance(provider="zhipu", amount_delta=100, currency="CNY", reason="top up")
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO provider_balances(provider, currency, balance, updated_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(provider) DO UPDATE SET balance = excluded.balance, updated_at = excluded.updated_at",
+            ("zhipu", "CNY", 100.0),
+        )
     client = SequenceProviderClient(
         settings,
         responses=[
@@ -336,10 +349,17 @@ async def test_sqlite_provider_uses_db_api_key_and_records_usage(tmp_path):
         base_url="https://sqlite.test",
         api_key="db-secret-key",
     )
+    store.create_provider_model_config(
+        provider="sqlite-provider",
+        upstream_model="sqlite-upstream",
+        display_name="SQLite Model",
+        model_id="model-sqlite",
+    )
     store.create_route_config(
         virtual_model="sqlite-model",
         provider="sqlite-provider",
         upstream_model="sqlite-upstream",
+        provider_model_id="model-sqlite",
     )
     client = SequenceProviderClient(
         settings,
@@ -491,14 +511,25 @@ api_key_env = "ZHIPU_API_KEY"
 timeout_seconds = 60
 {provider_extra}
 
+[[provider_models]]
+id = "model-zhipu"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+display_name = "GLM 5.1"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+input_price_per_million = {input_price}
+output_price_per_million = {output_price}
+cache_hit_price_per_million = 0
+currency = "CNY"
+enabled = true
+
 [[routes]]
 virtual_model = "glm-5.1"
 provider = "zhipu"
 upstream_model = "glm-5.1"
+provider_model_id = "model-zhipu"
 priority = 100
-input_price_per_million = {input_price}
-output_price_per_million = {output_price}
-currency = "CNY"
 min_balance = {min_balance}
 """,
         encoding="utf-8",
@@ -529,24 +560,46 @@ api_key_env = "DEEPSEEK_API_KEY"
 enabled = true
 timeout_seconds = 60
 
+[[provider_models]]
+id = "model-zhipu"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+display_name = "GLM 5.1"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+input_price_per_million = 0
+output_price_per_million = 0
+cache_hit_price_per_million = 0
+currency = "CNY"
+enabled = true
+
+[[provider_models]]
+id = "model-deepseek"
+provider = "deepseek"
+upstream_model = "deepseek-chat"
+display_name = "DeepSeek Chat"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+input_price_per_million = 0
+output_price_per_million = 0
+cache_hit_price_per_million = 0
+currency = "CNY"
+enabled = true
+
 [[routes]]
 virtual_model = "glm-5.1"
 provider = "zhipu"
 upstream_model = "glm-5.1"
+provider_model_id = "model-zhipu"
 priority = 100
-input_price_per_million = 0.0
-output_price_per_million = 0.0
-currency = "CNY"
 min_balance = 0.0
 
 [[routes]]
 virtual_model = "glm-5.1"
 provider = "deepseek"
 upstream_model = "deepseek-chat"
+provider_model_id = "model-deepseek"
 priority = 50
-input_price_per_million = 0.0
-output_price_per_million = 0.0
-currency = "CNY"
 min_balance = 0.0
 """,
         encoding="utf-8",

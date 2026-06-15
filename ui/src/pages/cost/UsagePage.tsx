@@ -1,7 +1,7 @@
 ﻿import { useCallback, useEffect, useState } from "react";
 import { RefreshCcw, Save } from "lucide-react";
 import { MemoryApi } from "../../api";
-import type { BalanceRecord, UsageEvent, UsageSummary } from "../../types";
+import type { UsageEvent, UsageSummary } from "../../types";
 import { badge } from "../../components/Badge";
 import { PageHeader } from "../../components/PageHeader";
 import { StatCard } from "../../components/StatCard";

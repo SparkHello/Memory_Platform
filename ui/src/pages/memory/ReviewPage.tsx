@@ -3,6 +3,7 @@ import {
   Activity,
   ArrowDown,
   ArchiveRestore,
+  CheckCircle,
   Clipboard,
   Download,
   Eye,
@@ -96,6 +97,7 @@ export function ReviewPage({
   const [mergeDraft, setMergeDraft] = useState<ReviewRecommendation | null>(null);
   const [mergeContent, setMergeContent] = useState("");
   const [applying, setApplying] = useState(false);
+  const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
 
   const load = useCallback(async (showToast = false) => {
     setState({ loading: true, error: null, data: null });
@@ -219,6 +221,37 @@ export function ReviewPage({
     }
   };
 
+  const applyConfirmReview = async (recommendation: ReviewRecommendation) => {
+    const dismissKey = `review-${recommendation.action}-${recommendation.memory_ids.join("-")}`;
+    if (
+      !(await confirm({
+        title: "确认记忆仍然有效",
+        message: "确认该记忆仍然有效？将 15 天后再次复核",
+        tone: "info",
+        confirmLabel: "确认"
+      }))
+    ) {
+      return;
+    }
+    setApplying(true);
+    try {
+      const reviewAfter = new Date(Date.now() + 15 * 86400 * 1000).toISOString();
+      for (const memoryId of recommendation.memory_ids) {
+        await api.updateMemory(memoryId, { review_after: reviewAfter });
+      }
+      notify("已确认，15 天后再次复核", "success");
+      setDismissedKeys((prev) => {
+        const next = new Set(prev);
+        next.add(dismissKey);
+        return next;
+      });
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setApplying(false);
+    }
+  };
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -256,7 +289,7 @@ export function ReviewPage({
                     <span className="count-pill">{items.length}</span>
                   </div>
                   <div className="recommendation-list">
-                    {items.map((recommendation, index) => (
+                    {items.filter((rec) => !dismissedKeys.has(`review-${rec.action}-${rec.memory_ids.join("-")}`)).map((recommendation, index) => (
                       <article className="recommendation-card" key={`${action}-${index}`}>
                         <div className="recommendation-topline">
                           {badge(recommendation.action)}
@@ -314,6 +347,17 @@ export function ReviewPage({
                             >
                               <ArrowDown size={16} />
                               应用降权
+                            </button>
+                          )}
+                          {(recommendation.action === "review" || recommendation.action === "keep") && (
+                            <button
+                              className="primary-button"
+                              type="button"
+                              disabled={applying}
+                              onClick={() => applyConfirmReview(recommendation)}
+                            >
+                              <CheckCircle size={16} />
+                              已确认，15天后复核
                             </button>
                           )}
                         </div>

@@ -28,6 +28,7 @@ class ProviderModelConfig(BaseModel):
     pricing_tiers_json: str = ""
     input_price_per_million: float = Field(default=0.0, ge=0.0)
     output_price_per_million: float = Field(default=0.0, ge=0.0)
+    cache_hit_price_per_million: float = Field(default=0.0, ge=0.0)
     currency: str = "CNY"
     enabled: bool = True
     created_at: str | None = None
@@ -41,9 +42,6 @@ class RouteConfig(BaseModel):
     upstream_model: str
     provider_model_id: str | None = None
     priority: int = 0
-    input_price_per_million: float = Field(default=0.0, ge=0.0)
-    output_price_per_million: float = Field(default=0.0, ge=0.0)
-    currency: str = "CNY"
     min_balance: float = Field(default=0.0, ge=0.0)
     enabled: bool = True
     created_at: str | None = None
@@ -99,16 +97,6 @@ class BalanceRecord(BaseModel):
     currency: str = "CNY"
     balance: float = 0.0
     updated_at: str | None = None
-
-
-class BalanceAdjustment(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    provider: str
-    amount_delta: float
-    balance_after: float
-    currency: str = "CNY"
-    reason: str = ""
-    created_at: str = Field(default_factory=utc_now_iso)
 
 
 class UsageEvent(BaseModel):

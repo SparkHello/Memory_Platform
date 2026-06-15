@@ -105,6 +105,10 @@ class FakeLLMClient:
 def memory_store(tmp_path) -> MemoryStore:
     store = MemoryStore(str(tmp_path / "memory.db"))
     store.init_db()
+    # 清除模块级搜索缓存，避免测试间残留
+    from app.memory.search import _EMBEDDING_CACHE, _SEARCH_CACHE
+    _EMBEDDING_CACHE.clear()
+    _SEARCH_CACHE.clear()
     return store
 
 

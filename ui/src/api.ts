@@ -1,7 +1,5 @@
 import type {
   ConnectionSettings,
-  BalanceAdjustmentResult,
-  BalanceRecord,
   CoreMemoryHistoryItem,
   CoreMemorySection,
   DecisionLog,
@@ -189,8 +187,14 @@ export class MemoryApi {
     });
   }
 
-  async deleteProviderConfig(provider: string): Promise<unknown> {
+  async disableProviderConfig(provider: string): Promise<unknown> {
     return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}`, {
+      method: "DELETE"
+    });
+  }
+
+  async deleteProviderConfig(provider: string): Promise<unknown> {
+    return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}?hard=true`, {
       method: "DELETE"
     });
   }
@@ -209,8 +213,14 @@ export class MemoryApi {
     });
   }
 
-  async deleteProviderModelConfig(modelId: string): Promise<unknown> {
+  async disableProviderModelConfig(modelId: string): Promise<unknown> {
     return this.request(`/admin/provider-config/models/${encodeURIComponent(modelId)}`, {
+      method: "DELETE"
+    });
+  }
+
+  async deleteProviderModelConfig(modelId: string): Promise<unknown> {
+    return this.request(`/admin/provider-config/models/${encodeURIComponent(modelId)}?hard=true`, {
       method: "DELETE"
     });
   }
@@ -250,21 +260,6 @@ export class MemoryApi {
 
   async exportProviderConfigToml(): Promise<string> {
     return this.request("/admin/provider-config/export-toml", { text: true });
-  }
-
-  async balances(): Promise<BalanceRecord[]> {
-    const payload = await this.request<{ data: BalanceRecord[] }>("/admin/balances");
-    return payload.data || [];
-  }
-
-  async adjustBalance(
-    provider: string,
-    payload: { amount_delta: number; currency: string; reason: string }
-  ): Promise<BalanceAdjustmentResult> {
-    return this.request(`/admin/balances/${encodeURIComponent(provider)}/adjust`, {
-      method: "POST",
-      body: payload
-    });
   }
 
   async usage(limit = 100): Promise<UsageEvent[]> {

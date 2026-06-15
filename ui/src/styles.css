@@ -392,6 +392,305 @@ button:disabled {
   letter-spacing: 0;
 }
 
+.compact-header {
+  align-items: center;
+}
+
+.provider-management-layout,
+.route-management-layout {
+  display: grid;
+  align-items: start;
+  gap: 16px;
+}
+
+.provider-management-layout {
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+}
+
+.route-management-layout {
+  grid-template-columns: minmax(360px, 470px) minmax(0, 1fr);
+}
+
+.provider-list-panel,
+.route-editor-panel {
+  position: sticky;
+  top: 90px;
+}
+
+.provider-search-box,
+.model-search-box,
+.model-picker-search,
+.route-search-box {
+  margin-top: 12px;
+}
+
+.provider-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.provider-list-item,
+.model-option {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 5px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+}
+
+.provider-list-item:hover,
+.provider-list-item.active,
+.model-option:hover,
+.model-option.selected {
+  border-color: #9db8e8;
+  background: #eef5ff;
+}
+
+.provider-list-item.active,
+.model-option.selected {
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.provider-list-title,
+.provider-model-main,
+.model-option-title,
+.route-card-main,
+.route-group-header,
+.model-picker-header,
+.model-list-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.provider-list-title strong,
+.provider-model-main strong,
+.model-option-title strong,
+.route-card-main strong,
+.route-group-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-list-id,
+.provider-list-meta,
+.provider-model-meta,
+.model-option-meta,
+.route-card-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.provider-list-id,
+.provider-list-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-pill,
+.selected-model-pill {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef1f5;
+  color: #46515f;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status-pill.ok {
+  background: #e5f7ef;
+  color: var(--success);
+}
+
+.status-pill.muted {
+  background: #eef1f5;
+  color: var(--muted-strong);
+}
+
+.provider-workspace {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+}
+
+.provider-form-toolbar {
+  align-items: flex-end;
+}
+
+.provider-detail-panel .panel-header {
+  align-items: flex-start;
+}
+
+.provider-detail-list {
+  grid-template-columns: minmax(0, 2fr) repeat(3, minmax(110px, 1fr));
+  margin-top: 14px;
+}
+
+.model-list-toolbar {
+  margin: 14px 0 10px;
+}
+
+.model-list-toolbar > div {
+  display: grid;
+  gap: 2px;
+}
+
+.model-search-box,
+.route-search-box {
+  width: min(420px, 100%);
+}
+
+.provider-model-list,
+.route-card-list,
+.route-group-list {
+  display: grid;
+  gap: 10px;
+}
+
+.provider-model-card,
+.route-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.provider-model-card.disabled,
+.route-card.disabled {
+  background: #f7f8fa;
+}
+
+.provider-model-main > div,
+.route-card-main > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-model-main code,
+.route-card-main code,
+.model-option code {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-model-meta,
+.route-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.route-draft-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(100px, 0.6fr) minmax(120px, 0.8fr);
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.route-enabled-row {
+  align-self: end;
+  min-height: 39px;
+}
+
+.model-picker {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.model-picker-header {
+  align-items: flex-start;
+}
+
+.model-picker-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.segmented-control {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.segmented-control button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted-strong);
+}
+
+.segmented-control button.active {
+  border-color: var(--primary);
+  background: #e8f0ff;
+  color: var(--primary);
+}
+
+.model-option-list {
+  display: grid;
+  max-height: 360px;
+  gap: 8px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.model-option-title span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.route-list-panel {
+  min-width: 0;
+}
+
+.route-list-panel .panel-header {
+  align-items: flex-start;
+}
+
+.route-group {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.route-group:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.route-group-header span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .primary-button,
 .secondary-button,
 .danger-button,
@@ -1149,6 +1448,16 @@ code {
     grid-template-columns: 230px minmax(0, 1fr);
   }
 
+  .provider-management-layout,
+  .route-management-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-list-panel,
+  .route-editor-panel {
+    position: static;
+  }
+
   .detail-drawer {
     grid-column: 1 / -1;
     position: static;
@@ -1203,6 +1512,34 @@ code {
 
   .edit-grid {
     grid-template-columns: 1fr;
+  }
+
+  .provider-detail-list,
+  .route-draft-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-list-title,
+  .provider-model-main,
+  .model-option-title,
+  .route-card-main,
+  .route-group-header,
+  .model-picker-header,
+  .model-list-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .provider-model-main > div,
+  .route-card-main > div {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .model-search-box,
+  .route-search-box,
+  .model-list-toolbar .search-box {
+    width: 100%;
   }
 
   .tier-row {

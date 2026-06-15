@@ -137,7 +137,39 @@ async def create_chat_completion(
             assistant_message=assistant_message,
         )
 
+    # 注入记忆命中块（非流式）
+    if memories and latest_user_message:
+        hit_block = _format_memory_hit_block(latest_user_message.content, memories)
+        if hit_block:
+            choices = client_response.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message", {})
+                if isinstance(msg, dict):
+                    original = msg.get("content", "") or ""
+                    msg["content"] = hit_block + "\n" + original
+
     return client_response
+
+
+def _format_memory_hit_block(
+    query: str,
+    memories: list[MemoryRecord],
+    tool_name: str = "search_memory",
+) -> str:
+    """Build an inline memory hit block for non-streaming responses."""
+    if not memories:
+        return ""
+    lines = [
+        "【记忆命中】",
+        f'🔍 {tool_name}("{query}") → {len(memories)} 条',
+    ]
+    for i, m in enumerate(memories, 1):
+        score = getattr(m, "score", None)
+        score_str = f" (相关度 {score:.2f})" if score is not None else ""
+        content_preview = m.content[:80].replace("\n", " ")
+        lines.append(f"{i}. {content_preview}{score_str}")
+    lines.append("---")
+    return "\n".join(lines)
 
 
 def _latest_user_message(messages: list[ChatMessage]) -> ChatMessage | None:

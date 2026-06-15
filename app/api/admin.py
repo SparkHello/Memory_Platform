@@ -1,4 +1,4 @@
-import os
+﻿import os
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -23,12 +23,6 @@ router = APIRouter(
     tags=["admin"],
     dependencies=[Depends(require_api_key)],
 )
-
-
-class BalanceAdjustmentRequest(BaseModel):
-    amount_delta: float
-    currency: str = Field(default="CNY", min_length=1)
-    reason: str = ""
 
 
 class ProviderCreateRequest(BaseModel):
@@ -57,6 +51,7 @@ class ProviderModelCreateRequest(BaseModel):
     pricing_tiers_json: str = ""
     input_price_per_million: float = Field(default=0.0, ge=0.0)
     output_price_per_million: float = Field(default=0.0, ge=0.0)
+    cache_hit_price_per_million: float = Field(default=0.0, ge=0.0)
     currency: str = Field(default="CNY", min_length=1)
     enabled: bool = True
 
@@ -70,6 +65,7 @@ class ProviderModelPatchRequest(BaseModel):
     pricing_tiers_json: str | None = None
     input_price_per_million: float | None = Field(default=None, ge=0.0)
     output_price_per_million: float | None = Field(default=None, ge=0.0)
+    cache_hit_price_per_million: float | None = Field(default=None, ge=0.0)
     currency: str | None = None
     enabled: bool | None = None
 
@@ -80,9 +76,6 @@ class RouteCreateRequest(BaseModel):
     provider: str | None = None
     upstream_model: str | None = None
     priority: int = 100
-    input_price_per_million: float = Field(default=0.0, ge=0.0)
-    output_price_per_million: float = Field(default=0.0, ge=0.0)
-    currency: str = Field(default="CNY", min_length=1)
     min_balance: float = Field(default=0.0, ge=0.0)
     enabled: bool = True
 
@@ -93,9 +86,6 @@ class RoutePatchRequest(BaseModel):
     provider: str | None = None
     upstream_model: str | None = None
     priority: int | None = None
-    input_price_per_million: float | None = Field(default=None, ge=0.0)
-    output_price_per_million: float | None = Field(default=None, ge=0.0)
-    currency: str | None = None
     min_balance: float | None = Field(default=None, ge=0.0)
     enabled: bool | None = None
 
@@ -129,9 +119,12 @@ def get_provider_config(
     store: Annotated[ProviderStore, Depends(get_provider_store)],
 ) -> dict:
     sqlite_config = store.load_sqlite_providers_config()
-    editable_config = sqlite_config if (sqlite_config.providers or sqlite_config.routes) else config
+    has_sqlite_config = bool(
+        sqlite_config.providers or sqlite_config.provider_models or sqlite_config.routes
+    )
+    editable_config = sqlite_config if has_sqlite_config else config
     return {
-        "source": config.source,
+        "source": editable_config.source if has_sqlite_config else config.source,
         "providers": [
             _provider_config_summary(provider)
             for provider in editable_config.providers.values()
@@ -187,7 +180,14 @@ def patch_provider_config(
 def delete_provider_config(
     provider: str,
     store: Annotated[ProviderStore, Depends(get_provider_store)],
+    hard: bool = Query(default=False),
 ) -> dict:
+    if hard:
+        deleted = store.delete_provider_config(provider)
+        if deleted is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider 不存在")
+        return {"deleted": True, **deleted}
+
     updated = store.disable_provider_config(provider)
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider 不存在")
@@ -209,6 +209,7 @@ def create_provider_model_config(
         pricing_tiers_json=request.pricing_tiers_json,
         input_price_per_million=request.input_price_per_million,
         output_price_per_million=request.output_price_per_million,
+        cache_hit_price_per_million=request.cache_hit_price_per_million,
         currency=request.currency,
         enabled=request.enabled,
     )
@@ -233,6 +234,7 @@ def patch_provider_model_config(
         pricing_tiers_json=request.pricing_tiers_json,
         input_price_per_million=request.input_price_per_million,
         output_price_per_million=request.output_price_per_million,
+        cache_hit_price_per_million=request.cache_hit_price_per_million,
         currency=request.currency,
         enabled=request.enabled,
     )
@@ -245,7 +247,14 @@ def patch_provider_model_config(
 def delete_provider_model_config(
     model_id: str,
     store: Annotated[ProviderStore, Depends(get_provider_store)],
+    hard: bool = Query(default=False),
 ) -> dict:
+    if hard:
+        deleted = store.delete_provider_model_config(model_id)
+        if deleted is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider model 不存在")
+        return {"deleted": True, **deleted}
+
     provider_model = store.disable_provider_model_config(model_id)
     if provider_model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider model 不存在")
@@ -257,18 +266,13 @@ def create_route_config(
     request: RouteCreateRequest,
     store: Annotated[ProviderStore, Depends(get_provider_store)],
 ) -> dict:
-    route_provider, route_upstream_model, route_input_price, route_output_price, route_currency = (
-        _resolve_route_provider_model(request, store)
-    )
+    route_provider, route_upstream_model = _resolve_route_provider_model(request, store)
     route = store.create_route_config(
         virtual_model=request.virtual_model,
         provider=route_provider,
         upstream_model=route_upstream_model,
         provider_model_id=request.provider_model_id,
         priority=request.priority,
-        input_price_per_million=route_input_price,
-        output_price_per_million=route_output_price,
-        currency=route_currency,
         min_balance=request.min_balance,
         enabled=request.enabled,
     )
@@ -289,15 +293,6 @@ def patch_route_config(
         upstream_model=route_updates.get("upstream_model", request.upstream_model),
         provider_model_id=route_updates.get("provider_model_id", request.provider_model_id),
         priority=request.priority,
-        input_price_per_million=route_updates.get(
-            "input_price_per_million",
-            request.input_price_per_million,
-        ),
-        output_price_per_million=route_updates.get(
-            "output_price_per_million",
-            request.output_price_per_million,
-        ),
-        currency=route_updates.get("currency", request.currency),
         min_balance=request.min_balance,
         enabled=request.enabled,
     )
@@ -370,8 +365,9 @@ async def test_provider_config(
     provider: str,
     request: ProviderTestRequest,
     config: Annotated[ProvidersConfig, Depends(get_providers_config)],
+    store: Annotated[ProviderStore, Depends(get_provider_store)],
 ) -> dict:
-    provider_config = config.providers.get(provider)
+    provider_config = store.get_provider_config(provider) or config.providers.get(provider)
     if provider_config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider 不存在")
     api_key = provider_config.api_key or os.getenv(provider_config.api_key_env, "")
@@ -383,7 +379,11 @@ async def test_provider_config(
             "message": "provider API key 未配置",
         }
 
-    upstream_model = request.upstream_model or _first_provider_route_model(provider, config.routes)
+    upstream_model = (
+        request.upstream_model
+        or _first_provider_route_model(provider, config.routes)
+        or _first_provider_model(provider, store, config.provider_models)
+    )
     if not upstream_model:
         return {
             "success": False,
@@ -433,34 +433,6 @@ async def test_provider_config(
         "status": response.status_code,
         "error_type": None,
         "message": "provider 连接测试成功",
-    }
-
-
-@router.get("/balances")
-def get_balances(
-    config: Annotated[ProvidersConfig, Depends(get_providers_config)],
-    store: Annotated[ProviderStore, Depends(get_provider_store)],
-) -> dict:
-    provider_ids = list(config.providers) if config.providers else None
-    balances = store.list_balances(provider_ids=provider_ids)
-    return {"data": [record.model_dump() for record in balances]}
-
-
-@router.post("/balances/{provider}/adjust")
-def adjust_balance(
-    provider: str,
-    request: BalanceAdjustmentRequest,
-    store: Annotated[ProviderStore, Depends(get_provider_store)],
-) -> dict:
-    balance, adjustment = store.adjust_balance(
-        provider=provider,
-        amount_delta=request.amount_delta,
-        currency=request.currency,
-        reason=request.reason,
-    )
-    return {
-        "balance": balance.model_dump(),
-        "adjustment": adjustment.model_dump(),
     }
 
 
@@ -526,6 +498,7 @@ def _provider_model_config_summary(model: ProviderModelConfig) -> dict:
         "pricing_tiers_json": model.pricing_tiers_json,
         "input_price_per_million": model.input_price_per_million,
         "output_price_per_million": model.output_price_per_million,
+        "cache_hit_price_per_million": model.cache_hit_price_per_million,
         "currency": model.currency,
         "enabled": model.enabled,
         "created_at": model.created_at,
@@ -541,9 +514,6 @@ def _route_config_summary(route: RouteConfig, index: int) -> dict:
         "upstream_model": route.upstream_model,
         "provider_model_id": route.provider_model_id,
         "priority": route.priority,
-        "input_price_per_million": route.input_price_per_million,
-        "output_price_per_million": route.output_price_per_million,
-        "currency": route.currency,
         "min_balance": route.min_balance,
         "enabled": route.enabled,
         "created_at": route.created_at,
@@ -569,16 +539,13 @@ def _ensure_provider_model_exists(
 def _resolve_route_provider_model(
     request: RouteCreateRequest,
     store: ProviderStore,
-) -> tuple[str, str, float, float, str]:
+) -> tuple[str, str]:
     if request.provider_model_id:
         provider_model = _ensure_provider_model_exists(store, request.provider_model_id)
         _ensure_provider_exists(store, provider_model.provider)
         return (
             provider_model.provider,
             provider_model.upstream_model,
-            provider_model.input_price_per_million,
-            provider_model.output_price_per_million,
-            provider_model.currency,
         )
     if not request.provider or not request.upstream_model:
         raise HTTPException(
@@ -589,9 +556,6 @@ def _resolve_route_provider_model(
     return (
         request.provider,
         request.upstream_model,
-        request.input_price_per_million,
-        request.output_price_per_million,
-        request.currency,
     )
 
 
@@ -623,6 +587,30 @@ def _first_provider_route_model(provider: str, routes: list[RouteConfig]) -> str
     ]
     provider_routes.sort(key=lambda route: route.priority, reverse=True)
     return provider_routes[0].upstream_model if provider_routes else None
+
+
+def _first_provider_model(
+    provider: str,
+    store: ProviderStore,
+    config_models: dict[str, ProviderModelConfig],
+) -> str | None:
+    sqlite_models = [
+        model
+        for model in store.list_provider_model_configs(provider=provider)
+        if model.enabled and model.api_format == "openai_compatible"
+    ]
+    if sqlite_models:
+        return sqlite_models[0].upstream_model
+
+    config_provider_models = [
+        model
+        for model in config_models.values()
+        if model.provider == provider
+        and model.enabled
+        and model.api_format == "openai_compatible"
+    ]
+    config_provider_models.sort(key=lambda model: model.upstream_model)
+    return config_provider_models[0].upstream_model if config_provider_models else None
 
 
 def _classify_provider_test_error(response: httpx.Response) -> str:
@@ -681,6 +669,7 @@ def _export_toml(config: ProvidersConfig) -> str:
                 f'pricing_tiers_json = "{_toml_escape(model.pricing_tiers_json)}"',
                 f"input_price_per_million = {model.input_price_per_million:g}",
                 f"output_price_per_million = {model.output_price_per_million:g}",
+                f"cache_hit_price_per_million = {model.cache_hit_price_per_million:g}",
                 f'currency = "{_toml_escape(model.currency)}"',
                 f"enabled = {str(model.enabled).lower()}",
                 "",
@@ -699,9 +688,6 @@ def _export_toml(config: ProvidersConfig) -> str:
                     else "# provider_model_id is optional for legacy route compatibility."
                 ),
                 f"priority = {route.priority}",
-                f"input_price_per_million = {route.input_price_per_million:g}",
-                f"output_price_per_million = {route.output_price_per_million:g}",
-                f'currency = "{_toml_escape(route.currency)}"',
                 f"min_balance = {route.min_balance:g}",
                 f"enabled = {str(route.enabled).lower()}",
                 "",
