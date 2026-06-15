@@ -1,6 +1,8 @@
 export type PageKey =
   | "dashboard"
+  | "gateway-overview"
   | "gateway-config"
+  | "gateway-import-export"
   | "providers"
   | "routes"
   | "billing"

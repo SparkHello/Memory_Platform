@@ -91,6 +91,13 @@ cd ..
 
 构建产物写入 `ui/dist/`，后端启动后会自动挂载到 `/ui/`。`ui/dist/` 和 `ui/node_modules/` 不提交到 Git。
 
+前端开发调试可使用：
+
+```powershell
+cd ui
+npm run dev -- --host 127.0.0.1
+```
+
 ### 4. 启动服务
 
 ```powershell
@@ -146,29 +153,41 @@ http://localhost:2026/ui/
 
 主要页面：
 
-- Gateway Config：导入/导出 provider TOML，查看当前配置来源。
-- Providers：新增服务商、设置 API key、维护真实模型、价格和分级价格。
-- Routes：把对外 virtual model 绑定到服务商模型。
-- Billing：查看和手动调整本地 provider 余额。
-- Usage：查看最近调用和按 provider / virtual model 聚合的 token 与成本。
-- Memories：查看、搜索、编辑、删除和恢复长期记忆。
-- Core：查看核心记忆和历史版本。
-- Review：运行记忆体检并按确认执行删除、合并、降权建议。
-- Recent：查看近期上下文摘要。
-- Reports：生成报告、导出备份、恢复导入。
-- Logs：查看记忆保存/忽略决策日志。
+- 总览：查看服务状态、当前用户、接入地址、记忆统计和快捷操作。
+- 网关概览：查看 provider 配置来源、服务商数量、模型数量、启用路由和已配置密钥数量。
+- 服务商与模型：新增服务商、设置 API key、维护真实上游模型、接口类型、价格和分级价格。
+- 路由：把对外 virtual model 绑定到某个服务商模型，并设置优先级、最低余额和启用状态。
+- 导入 / 导出：从 `providers.toml` 合并配置，或导出不含真实 API key 的 TOML。
+- 余额账本：查看和手动调整本地 provider 余额。
+- 用量统计：查看最近调用和按 provider / virtual model 聚合的 token 与成本。
+- 记忆库：查看、搜索、编辑、删除和恢复长期记忆。
+- 核心记忆：查看核心记忆和历史版本。
+- 记忆体检：运行记忆体检并按确认执行删除、合并、降权建议。
+- 近期上下文：查看近期上下文摘要。
+- 报告与备份：生成报告、导出备份、恢复导入。
+- 决策日志：查看记忆保存/忽略决策日志。
+- 设置：保存本地 UI 连接信息。
+- 接入信息：查看 OpenAI-compatible 和 MCP 客户端接入参数。
+
+侧边栏按“总览 / 网关 / 成本 / 记忆 / 系统”分组；配置概览、服务商 CRUD、路由 CRUD、导入导出已经拆到不同页面，避免在一个配置页里混杂所有操作。
 
 UI 中填写的 provider API key 会保存到本机 SQLite，不会在页面、admin API 响应或 TOML 导出中回显。编辑 provider 时，API key 输入框留空表示保留旧 key。
 
 ## Provider 路由
 
-推荐在 `/ui/` 的 Providers 和 Routes 页面配置。配置优先级是：
+推荐在 `/ui/` 的“服务商与模型”和“路由”页面配置；TOML 导入导出在“导入 / 导出”页面。配置优先级是：
 
 ```text
 SQLite UI 配置 > config/providers.toml > UPSTREAM_* fallback
 ```
 
-如果 SQLite 中有可用 provider 和 route，网关优先使用 UI 配置；否则尝试 `config/providers.toml`；再否则使用 `.env` 中的 `UPSTREAM_BASE_URL`、`UPSTREAM_API_KEY`、`UPSTREAM_MODEL`。
+如果 SQLite 中有可用 provider、provider model 和 route，网关优先使用 UI 配置；否则尝试 `config/providers.toml`；再否则使用 `.env` 中的 `UPSTREAM_BASE_URL`、`UPSTREAM_API_KEY`、`UPSTREAM_MODEL`。
+
+路由配置分三层：
+
+- `providers`：服务商级配置，包括基础地址、API key 环境变量、本地 UI key、启用状态和超时。
+- `provider_models`：服务商下面的真实上游模型，包括 `upstream_model`、显示名称、接口类型、价格和分级价格元数据。
+- `routes`：客户端看到的 `virtual_model` 到服务商模型的映射；推荐使用 `provider_model_id` 指向某个 `provider_models` 项。
 
 也可以从示例 TOML 开始：
 
@@ -185,6 +204,31 @@ base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 enabled = true
 timeout_seconds = 60
+
+[[provider_models]]
+id = "zhipu-glm-5-1"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+display_name = "GLM 5.1"
+api_format = "openai_compatible"
+pricing_mode = "flat"
+pricing_tiers_json = ""
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+enabled = true
+
+[[routes]]
+virtual_model = "glm-5.1"
+provider = "zhipu"
+upstream_model = "glm-5.1"
+provider_model_id = "zhipu-glm-5-1"
+priority = 100
+input_price_per_million = 0.0
+output_price_per_million = 0.0
+currency = "CNY"
+min_balance = 0.0
+enabled = true
 ```
 
 路由规则：
@@ -192,7 +236,8 @@ timeout_seconds = 60
 - 客户端传入的 `model` 会被当作 virtual model。
 - route 按 `priority` 降序选择。
 - 会过滤 disabled provider、缺少 API key 的 provider、余额低于 `min_balance` 的 provider 和短暂冷却中的 provider。
-- 目前实际代理调用只执行 `api_format = "openai_compatible"` 的模型。
+- 如果 route 设置了 `provider_model_id`，该 ID 必须存在、属于同一个 provider，并且模型本身处于启用状态。
+- 目前实际代理调用只执行 `api_format = "openai_compatible"` 的模型；`claude_sdk` 可记录元数据，但不会参与 OpenAI-compatible 网关转发。
 - `pricing_mode = "tiered"` 当前用于记录分级价格；实际扣费仍按 route 的输入/输出单价估算。
 
 本地余额账本只代表 memory-gateway 根据经过本代理的请求估算和扣减的余额，不等同于 provider 官网真实余额。
@@ -327,7 +372,7 @@ X-User-Id: user-123
 | `POST` | `/admin/provider-config/routes` | 新增 route。 |
 | `PATCH` | `/admin/provider-config/routes/{route_id}` | 更新 route。 |
 | `DELETE` | `/admin/provider-config/routes/{route_id}` | 删除 route。 |
-| `POST` | `/admin/provider-config/import-toml` | 从 TOML 导入 provider 和 route。 |
+| `POST` | `/admin/provider-config/import-toml` | 从 TOML 导入 provider、provider model 和 route。 |
 | `GET` | `/admin/provider-config/export-toml` | 导出不含真实 key 的 TOML。 |
 | `POST` | `/admin/provider-config/providers/{provider}/test` | 测试 provider 连接。 |
 | `GET` | `/admin/balances` | 查看本地 provider 余额。 |
@@ -450,6 +495,16 @@ memory-gateway/
 ├─ tests/
 ├─ ui/
 │  ├─ src/
+│  │  ├─ components/    # shared UI components
+│  │  ├─ hooks/         # React hooks
+│  │  ├─ layout/        # app shell and navigation
+│  │  ├─ pages/         # dashboard, gateway, memory, cost, system pages
+│  │  ├─ utils/         # frontend formatting, gateway and memory helpers
+│  │  ├─ App.tsx
+│  │  ├─ api.ts
+│  │  ├─ main.tsx
+│  │  ├─ storage.ts
+│  │  └─ types.ts
 │  ├─ package.json
 │  └─ vite.config.ts
 ├─ .env.example
