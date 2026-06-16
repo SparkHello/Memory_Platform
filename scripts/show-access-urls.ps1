@@ -217,7 +217,7 @@ function Write-EndpointGroup {
     foreach ($address in $Addresses) {
         Write-Host "Address:          $address"
         Write-Host "MCP URL:          $(New-AccessUrl -IPAddress $address -Path "/mcp")"
-        Write-Host "OpenAI Base URL:  $(New-AccessUrl -IPAddress $address -Path "/v1")"
+        Write-Host "Web console:      $(New-AccessUrl -IPAddress $address -Path "/ui")"
         Write-Host "Health:           $(Test-Health -IPAddress $address)"
         Write-Host ""
     }

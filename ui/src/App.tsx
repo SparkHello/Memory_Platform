@@ -6,11 +6,6 @@ import { useConfirm } from "./hooks/useConfirm";
 import { useToast } from "./hooks/useToast";
 import { AppShell } from "./layout/AppShell";
 import { DashboardPage } from "./pages/DashboardPage";
-import { UsagePage } from "./pages/cost/UsagePage";
-import { GatewayImportExportPage } from "./pages/gateway/GatewayImportExportPage";
-import { GatewayOverviewPage } from "./pages/gateway/GatewayOverviewPage";
-import { ProvidersPage } from "./pages/gateway/ProvidersPage";
-import { RoutesPage } from "./pages/gateway/RoutesPage";
 import { CoreMemoryPage } from "./pages/memory/CoreMemoryPage";
 import { DecisionLogsPage } from "./pages/memory/DecisionLogsPage";
 import { MemoriesPage } from "./pages/memory/MemoriesPage";
@@ -38,11 +33,7 @@ export function App() {
   const { toast, notify } = useToast();
   const { confirm, confirmState, resolveConfirm } = useConfirm();
 
-  const activePage: PageKey = !settings.apiKey
-    ? "settings"
-    : page === "gateway-config"
-      ? "gateway-overview"
-      : page;
+  const activePage: PageKey = !settings.apiKey ? "settings" : page;
 
   const pingService = useCallback(async () => {
     setServiceStatus((current) => ({ ...current, loading: true }));
@@ -90,19 +81,6 @@ export function App() {
         {activePage === "dashboard" && (
           <DashboardPage api={api} settings={settings} setPage={setPage} notify={notify} />
         )}
-        {activePage === "gateway-overview" && (
-          <GatewayOverviewPage api={api} setPage={setPage} />
-        )}
-        {activePage === "gateway-import-export" && (
-          <GatewayImportExportPage api={api} notify={notify} confirm={confirm} />
-        )}
-        {activePage === "providers" && (
-          <ProvidersPage api={api} notify={notify} confirm={confirm} />
-        )}
-        {activePage === "routes" && (
-          <RoutesPage api={api} notify={notify} confirm={confirm} />
-        )}
-        {activePage === "usage" && <UsagePage api={api} />}
         {activePage === "memories" && (
           <MemoriesPage api={api} notify={notify} confirm={confirm} />
         )}

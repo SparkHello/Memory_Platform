@@ -227,7 +227,7 @@ export function ReviewPage({
       !(await confirm({
         title: "确认记忆仍然有效",
         message: "确认该记忆仍然有效？将 15 天后再次复核",
-        tone: "info",
+        tone: "default",
         confirmLabel: "确认"
       }))
     ) {

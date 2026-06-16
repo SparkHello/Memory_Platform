@@ -6,12 +6,11 @@ import httpx
 
 from app.config import Settings
 from app.openai_compat.schemas import ChatCompletionRequest
-from app.providers.client import ProviderRouterClient, ProviderRoutingUnavailable
 
 logger = logging.getLogger(__name__)
 
 
-class LegacyOpenAICompatibleClient:
+class OpenAICompatibleClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
@@ -30,6 +29,12 @@ class LegacyOpenAICompatibleClient:
         payload["model"] = self.settings.upstream_model or request.model
         payload["messages"] = messages
         payload["stream"] = False
+
+        if _should_enable_zhipu_thinking(
+            base_url=self.settings.upstream_base_url,
+            upstream_model=payload["model"],
+        ):
+            payload["thinking"] = {"type": "enabled"}
 
         url = f"{self.settings.upstream_base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -62,28 +67,6 @@ class LegacyOpenAICompatibleClient:
             ) from exc
 
 
-class OpenAICompatibleClient:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.legacy_client = LegacyOpenAICompatibleClient(settings=settings)
-
-    async def create_chat_completion(
-        self,
-        request: ChatCompletionRequest,
-        messages: list[dict[str, str]],
-    ) -> dict:
-        try:
-            return await ProviderRouterClient(self.settings).create_chat_completion(
-                request=request,
-                messages=messages,
-            )
-        except ProviderRoutingUnavailable:
-            return await self.legacy_client.create_chat_completion(
-                request=request,
-                messages=messages,
-            )
-
-
 def _safe_error_detail(response: httpx.Response) -> str:
     try:
         data = _json_from_utf8_bytes(response)
@@ -99,3 +82,15 @@ def _json_from_utf8_bytes(response: httpx.Response) -> dict:
         logger.warning("上游响应不是合法 UTF-8，已使用替换字符解码。")
         raw_text = response.content.decode("utf-8", errors="replace")
     return json.loads(raw_text)
+
+
+def _should_enable_zhipu_thinking(
+    *,
+    base_url: str = "",
+    upstream_model: str = "",
+) -> bool:
+    provider_text = base_url.lower()
+    model = upstream_model.lower()
+    is_zhipu = any(marker in provider_text for marker in ("bigmodel", "z.ai", "zhipu"))
+    thinking_model = model.startswith(("glm-5", "glm-4.7", "glm-4.6", "glm-4.5"))
+    return is_zhipu and thinking_model

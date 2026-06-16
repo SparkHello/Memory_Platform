@@ -148,9 +148,8 @@ export function DashboardPage({
         <>
           <div className="card-grid status-grid">
             <InfoCard label="服务状态" value={data.health === "ok" ? "正常" : data.health} />
-            <InfoCard label="API 基础地址" value={settings.apiBaseUrl} />
+            <InfoCard label="服务地址" value={settings.apiBaseUrl} />
             <InfoCard label="当前用户 ID" value={settings.userId} />
-            <InfoCard label="OpenAI 兼容地址" value={joinUrl(settings.apiBaseUrl, "/v1")} />
             <InfoCard label="MCP 地址" value={joinUrl(settings.apiBaseUrl, "/mcp")} />
           </div>
 

@@ -130,7 +130,7 @@ export function SettingsPage({
           <h2>连接设置</h2>
         </div>
         <label className="field-block">
-          <span>API 基础地址</span>
+          <span>服务地址</span>
           <input
             value={form.apiBaseUrl}
             onChange={(event) => setForm({ ...form, apiBaseUrl: event.target.value })}
@@ -138,7 +138,7 @@ export function SettingsPage({
           />
         </label>
         <label className="field-block">
-          <span>网关 API Key</span>
+          <span>访问密钥</span>
           <div className="secret-field">
             <input
               type={showKey ? "text" : "password"}
@@ -150,7 +150,7 @@ export function SettingsPage({
               className="icon-button"
               type="button"
               onClick={() => setShowKey(!showKey)}
-              title={showKey ? "隐藏 API Key" : "显示 API Key"}
+              title={showKey ? "隐藏访问密钥" : "显示访问密钥"}
             >
               {showKey ? <EyeOff size={16} /> : <Eye size={16} />}
             </button>

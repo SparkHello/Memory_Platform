@@ -86,7 +86,6 @@ export function DeveloperPage({
   settings: ConnectionSettings;
   notify: Notify;
 }) {
-  const openAiBase = joinUrl(settings.apiBaseUrl, "/v1");
   const mcpUrl = joinUrl(settings.apiBaseUrl, "/mcp");
   const headers = `Authorization: Bearer ${settings.apiKey}\nX-User-Id: ${settings.userId}`;
   const endpoints = [
@@ -105,24 +104,7 @@ export function DeveloperPage({
 
   return (
     <div className="page-stack">
-      <PageHeader title="接入信息" subtitle="OpenAI 兼容接口、MCP 和 REST 常用接入信息。" />
-      <section className="panel access-card">
-        <div className="panel-header">
-          <h2>OpenAI-compatible</h2>
-          <button className="secondary-button" type="button" onClick={() => copy(openAiBase)}>
-            <Clipboard size={16} />
-            复制基础地址
-          </button>
-        </div>
-        <FieldList
-          entries={[
-            ["基础地址", openAiBase],
-            ["API Key", maskSecret(settings.apiKey)],
-            ["模型", "填写 providers.toml 中的 virtual model"]
-          ]}
-        />
-      </section>
-
+      <PageHeader title="接入信息" subtitle="MCP 和记忆管理 REST 常用接入信息。" />
       <section className="panel access-card">
         <div className="panel-header">
           <h2>MCP</h2>

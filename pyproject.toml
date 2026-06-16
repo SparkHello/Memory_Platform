@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "memory-gateway"
 version = "0.1.0"
-description = "OpenAI-compatible chat gateway with long-term memory."
+description = "Local long-term memory service with MCP and a Web console."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

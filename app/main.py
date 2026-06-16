@@ -5,15 +5,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.admin import router as admin_router
+from app.api.deprecated_v1 import router as deprecated_v1_router
 from app.api.health import router as health_router
 from app.api.memories import router as memories_router
 from app.config import get_settings
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
-from app.openai_compat.chat import router as chat_router
-from app.providers.store import ProviderStore
 
 
 UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
@@ -33,7 +31,6 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         settings = get_settings()
         MemoryStore(settings.database_path).init_db()
-        ProviderStore(settings.database_path).init_db()
         # mount 的子应用不会被 FastAPI 触发 lifespan，MCP 的 session manager 在这里启动
         async with mcp.session_manager.run():
             yield
@@ -45,9 +42,8 @@ def create_app() -> FastAPI:
         default_response_class=UTF8JSONResponse,
     )
     app.include_router(health_router)
-    app.include_router(chat_router)
+    app.include_router(deprecated_v1_router)
     app.include_router(memories_router)
-    app.include_router(admin_router)
 
     @app.get("/ui", include_in_schema=False)
     def redirect_ui_root() -> RedirectResponse:

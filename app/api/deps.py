@@ -12,9 +12,6 @@ from app.memory.search import (
     OpenAICompatibleEmbeddingClient,
 )
 from app.memory.store import MemoryStore
-from app.providers.config import load_effective_providers_config
-from app.providers.models import ProvidersConfig
-from app.providers.store import ProviderStore
 
 security = HTTPBearer(auto_error=False)
 
@@ -44,21 +41,6 @@ def get_memory_store(settings: Annotated[Settings, Depends(get_settings)]) -> Me
     store = MemoryStore(settings.database_path)
     store.init_db()
     return store
-
-
-def get_provider_store(settings: Annotated[Settings, Depends(get_settings)]) -> ProviderStore:
-    store = ProviderStore(settings.database_path)
-    store.init_db()
-    return store
-
-
-def get_providers_config(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> ProvidersConfig:
-    return load_effective_providers_config(
-        database_path=settings.database_path,
-        providers_config_path=settings.providers_config_path,
-    )
 
 
 def get_embedding_client(

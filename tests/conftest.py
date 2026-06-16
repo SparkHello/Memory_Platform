@@ -9,8 +9,6 @@ from app.config import get_settings
 from app.main import create_app
 from app.memory.search import NullEmbeddingClient
 from app.memory.store import MemoryStore
-from app.providers.config import clear_providers_config_cache
-from app.providers.router import ProviderRouter
 
 
 class FakeLLMClient:
@@ -121,13 +119,10 @@ def fake_llm() -> FakeLLMClient:
 def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> Iterator[TestClient]:
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
-    monkeypatch.setenv("PROVIDERS_CONFIG_PATH", str(memory_store.database_path + ".providers.toml"))
     monkeypatch.setenv("UPSTREAM_API_KEY", "")
     monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
     get_settings.cache_clear()
-    clear_providers_config_cache()
-    ProviderRouter.clear_cooldowns()
 
     # MCP 的 session manager 不允许重复启动，每个测试都构建全新应用实例
     app = create_app()
@@ -140,8 +135,6 @@ def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> I
 
     app.dependency_overrides.clear()
     get_settings.cache_clear()
-    clear_providers_config_cache()
-    ProviderRouter.clear_cooldowns()
 
 
 @pytest.fixture

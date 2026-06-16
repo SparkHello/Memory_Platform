@@ -1,6 +1,5 @@
 import {
   Activity,
-  BarChart3,
   Database,
   FileText,
   Gauge,
@@ -9,10 +8,7 @@ import {
   Layers3,
   ListChecks,
   RefreshCcw,
-  Server,
   Settings as SettingsIcon,
-  SlidersHorizontal,
-  Upload,
   Wrench
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -28,21 +24,6 @@ const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
   {
     title: "总览",
     items: [{ key: "dashboard", label: "总览", icon: Gauge }]
-  },
-  {
-    title: "网关",
-    items: [
-      { key: "gateway-overview", label: "网关概览", icon: SlidersHorizontal },
-      { key: "providers", label: "服务商与模型", icon: Server },
-      { key: "routes", label: "路由", icon: ListChecks },
-      { key: "gateway-import-export", label: "导入 / 导出", icon: Upload }
-    ]
-  },
-  {
-    title: "成本",
-    items: [
-      { key: "usage", label: "用量统计", icon: BarChart3 }
-    ]
   },
   {
     title: "记忆",
@@ -91,8 +72,8 @@ export function AppShell({
         <div className="brand">
           <div className="brand-mark">M</div>
           <div>
-            <div className="brand-title">网关控制台</div>
-            <div className="brand-subtitle">本地网关</div>
+            <div className="brand-title">记忆控制台</div>
+            <div className="brand-subtitle">本地记忆服务</div>
           </div>
         </div>
         <nav className="nav-list" aria-label="Memory Console">
@@ -156,7 +137,7 @@ export function AppShell({
           {!settings.apiKey && (
             <div className="notice warning">
               <KeyRound size={18} />
-              首次使用请先保存 Gateway API Key。
+              首次使用请先保存访问密钥。
             </div>
           )}
           {children}

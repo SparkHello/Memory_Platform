@@ -47,35 +47,6 @@ def test_core_memory_consolidation_creates_section(
     assert listed.json()["data"][0]["content"] == "- 用户长期喜欢黑咖啡。"
 
 
-def test_chat_completion_injects_core_memory(
-    client: TestClient,
-    auth_headers: dict[str, str],
-    memory_store: MemoryStore,
-    fake_llm,
-) -> None:
-    memory_store.upsert_core_memory_section(
-        user_id="default",
-        section="communication",
-        content="- 用户喜欢直接、实用的回答。",
-        evidence_memory_ids=[],
-        confidence=0.9,
-    )
-
-    response = client.post(
-        "/v1/chat/completions",
-        headers=auth_headers,
-        json={
-            "model": "ios-model",
-            "messages": [{"role": "user", "content": "随便聊聊天气。"}],
-        },
-    )
-
-    assert response.status_code == 200
-    assert fake_llm.messages[0]["role"] == "system"
-    assert "核心记忆" in fake_llm.messages[0]["content"]
-    assert "直接、实用" in fake_llm.messages[0]["content"]
-
-
 def test_core_memory_consolidation_excludes_sensitive_memory(
     client: TestClient,
     auth_headers: dict[str, str],

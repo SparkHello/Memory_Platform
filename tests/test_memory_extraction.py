@@ -25,19 +25,16 @@ def _extraction_json(**overrides) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _post_chat(
+def _post_ingest(
     client: TestClient,
     auth_headers: dict[str, str],
     content: str,
     conversation_id: str | None = None,
 ):
-    payload: dict = {
-        "model": "ios-model",
-        "messages": [{"role": "user", "content": content}],
-    }
+    payload: dict = {"text": content}
     if conversation_id:
         payload["conversation_id"] = conversation_id
-    return client.post("/v1/chat/completions", headers=auth_headers, json=payload)
+    return client.post("/memories/ingest", headers=auth_headers, json=payload)
 
 
 def test_low_importance_memory_is_not_saved(
@@ -52,7 +49,7 @@ def test_low_importance_memory_is_not_saved(
         source_quote="我今天有点困",
     )
 
-    response = _post_chat(client, auth_headers, "我今天有点困。")
+    response = _post_ingest(client, auth_headers, "我今天有点困。")
 
     assert response.status_code == 200
     assert memory_store.list_memories(user_id="default") == []
@@ -76,7 +73,7 @@ def test_hypothetical_scenario_is_not_saved(
         source_quote="我以后用 Mac",
     )
 
-    response = _post_chat(client, auth_headers, "如果我以后用 Mac，应该怎么配置？")
+    response = _post_ingest(client, auth_headers, "如果我以后用 Mac，应该怎么配置？")
 
     assert response.status_code == 200
     assert memory_store.list_memories(user_id="default") == []
@@ -93,7 +90,7 @@ def test_fabricated_source_quote_is_not_saved(
 ) -> None:
     fake_llm.extraction_content = _extraction_json(source_quote="我是 Mac 重度用户")
 
-    response = _post_chat(client, auth_headers, "帮我推荐一台笔记本。")
+    response = _post_ingest(client, auth_headers, "帮我推荐一台笔记本。")
 
     assert response.status_code == 200
     assert memory_store.list_memories(user_id="default") == []
@@ -117,7 +114,7 @@ def test_sensitive_memory_requires_explicit_memory_request(
         source_quote="我有一项健康隐私",
     )
 
-    response = _post_chat(client, auth_headers, "我有一项健康隐私。")
+    response = _post_ingest(client, auth_headers, "我有一项健康隐私。")
 
     assert response.status_code == 200
     assert memory_store.list_memories(user_id="default") == []
@@ -145,7 +142,7 @@ def test_similar_memory_is_not_duplicated(
         source_quote="我喜欢黑咖啡",
     )
 
-    response = _post_chat(client, auth_headers, "我喜欢黑咖啡。")
+    response = _post_ingest(client, auth_headers, "我喜欢黑咖啡。")
 
     assert response.status_code == 200
     memories = memory_store.list_memories(user_id="default")
@@ -155,7 +152,7 @@ def test_similar_memory_is_not_duplicated(
     assert "相同记忆" in logs[0].reason
 
 
-def test_new_detail_updates_existing_memory(
+def test_new_detail_creates_related_memory_without_overwriting(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
@@ -173,19 +170,21 @@ def test_new_detail_updates_existing_memory(
         source_quote="我现在用 iPhone 和 Kelivo 做 AI 客户端",
     )
 
-    response = _post_chat(client, auth_headers, "我现在用 iPhone 和 Kelivo 做 AI 客户端。")
+    response = _post_ingest(client, auth_headers, "我现在用 iPhone 和 Kelivo 做 AI 客户端。")
 
     assert response.status_code == 200
     memories = memory_store.list_memories(user_id="default")
-    assert len(memories) == 1
-    updated = memories[0]
-    assert updated.id == old.id
-    assert "Kelivo" in updated.content
-    assert updated.created_at == old.created_at
-    assert updated.updated_at != old.updated_at
+    assert len(memories) == 2
+    original = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert original is not None
+    assert original.content == "用户使用 iPhone。"
+    assert any("Kelivo" in memory.content for memory in memories if memory.id != old.id)
+    logs = memory_store.list_decision_logs()
+    assert logs[0].decision == "create"
+    assert "暂不自动合并" in logs[0].reason
 
 
-def test_conflicting_memory_updates_only_when_explicit(
+def test_conflicting_memory_creates_related_memory_when_explicit(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
@@ -205,27 +204,31 @@ def test_conflicting_memory_updates_only_when_explicit(
         confidence=0.5,
         source_quote="我可能会换 ChatWise",
     )
-    response = _post_chat(client, auth_headers, "我可能会换 ChatWise 吧，还没想好。")
+    response = _post_ingest(client, auth_headers, "我可能会换 ChatWise 吧，还没想好。")
 
     assert response.status_code == 200
     memories = memory_store.list_memories(user_id="default")
     assert memories[0].content == "用户的 AI 客户端是 Kelivo。"
     assert memory_store.list_decision_logs()[0].decision == "ignore"
 
-    # 用户明确表达了新事实：更新旧记忆而不是新建
+    # 用户明确表达了新事实：保留旧时间线，新建并交给体检建议确认
     fake_llm.extraction_content = _extraction_json(
         memory="用户的 AI 客户端是 ChatWise。",
         confidence=0.95,
         source_quote="我已经换成 ChatWise 了",
     )
-    response = _post_chat(client, auth_headers, "我已经换成 ChatWise 了。")
+    response = _post_ingest(client, auth_headers, "我已经换成 ChatWise 了。")
 
     assert response.status_code == 200
     memories = memory_store.list_memories(user_id="default")
-    assert len(memories) == 1
-    assert memories[0].id == old.id
-    assert "ChatWise" in memories[0].content
-    assert memories[0].created_at == old.created_at
+    assert len(memories) == 2
+    original = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert original is not None
+    assert original.content == "用户的 AI 客户端是 Kelivo。"
+    assert any("ChatWise" in memory.content for memory in memories if memory.id != old.id)
+    logs = memory_store.list_decision_logs()
+    assert logs[0].decision == "create"
+    assert "暂不自动合并" in logs[0].reason
 
 
 def test_invalid_extractor_json_does_not_break_chat(
@@ -236,10 +239,10 @@ def test_invalid_extractor_json_does_not_break_chat(
 ) -> None:
     fake_llm.extraction_content = "抱歉，我没法输出你要的格式。"
 
-    response = _post_chat(client, auth_headers, "随便聊聊天气吧。")
+    response = _post_ingest(client, auth_headers, "随便聊聊天气吧。")
 
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"]
+    assert response.json()["ignored"] == 1
     assert memory_store.list_memories(user_id="default") == []
     logs = memory_store.list_decision_logs()
     assert logs[0].decision == "ignore"
@@ -306,7 +309,7 @@ def test_rest_ingest_splits_raw_text(
     assert {json.loads(log.candidate_json)["source"] for log in logs} == {"rest_ingest"}
 
 
-def test_decision_logs_record_create_update_ignore(
+def test_decision_logs_record_create_related_create_ignore(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
@@ -314,14 +317,14 @@ def test_decision_logs_record_create_update_ignore(
 ) -> None:
     # 第一轮：全新信息 -> create
     fake_llm.extraction_content = _extraction_json()
-    _post_chat(client, auth_headers, "我现在用 iPhone。", conversation_id="conv-create")
+    _post_ingest(client, auth_headers, "我现在用 iPhone。", conversation_id="conv-create")
 
-    # 第二轮：补充细节 -> update
+    # 第二轮：补充细节 -> create，并提示人工确认
     fake_llm.extraction_content = _extraction_json(
         memory="用户使用 iPhone，并在尝试用 Kelivo 作为 AI 客户端前端。",
         source_quote="我现在用 iPhone 和 Kelivo 做 AI 客户端",
     )
-    _post_chat(
+    _post_ingest(
         client,
         auth_headers,
         "我现在用 iPhone 和 Kelivo 做 AI 客户端。",
@@ -329,7 +332,7 @@ def test_decision_logs_record_create_update_ignore(
     )
 
     # 第三轮：原样重复 -> ignore
-    _post_chat(
+    _post_ingest(
         client,
         auth_headers,
         "我现在用 iPhone 和 Kelivo 做 AI 客户端。",
@@ -340,7 +343,7 @@ def test_decision_logs_record_create_update_ignore(
     decisions = {log.conversation_id: log.decision for log in logs}
     assert decisions == {
         "conv-create": "create",
-        "conv-update": "update",
+        "conv-update": "create",
         "conv-ignore": "ignore",
     }
     # candidate_json 必须是可回放的合法 JSON，方便调试

@@ -1,5 +1,5 @@
-import { normalizeDecimalInput, normalizeDecimalInputOnBlur } from "../utils/gateway";
 import { displayText, valueText } from "../utils/format";
+import { normalizeDecimalInput, normalizeDecimalInputOnBlur } from "../utils/numberInput";
 
 export function FilterSelect({
   label,

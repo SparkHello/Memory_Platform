@@ -3,24 +3,15 @@ import type {
   CoreMemoryHistoryItem,
   CoreMemorySection,
   DecisionLog,
-  GatewayProvidersResponse,
   MemoryExport,
   MemoryRecord,
   MemoryReport,
   MemorySourceExplanation,
   MemoryUpdatePayload,
   MemoryUpdateResult,
-  ProviderConfigPayload,
-  ProviderConfigResponse,
-  ProviderModelConfigPayload,
-  ProviderTestResult,
   RecentContextSummary,
-  RouteConfigPayload,
-  RouteSummary,
   RestoreResult,
-  ReviewResult,
-  UsageEvent,
-  UsageSummary
+  ReviewResult
 } from "./types";
 import { normalizeBaseUrl } from "./storage";
 
@@ -163,113 +154,6 @@ export class MemoryApi {
     return this.request("/memories/core/consolidate", {
       method: "POST"
     });
-  }
-
-  async gatewayProviders(): Promise<GatewayProvidersResponse> {
-    return this.request("/admin/providers");
-  }
-
-  async providerConfig(): Promise<ProviderConfigResponse> {
-    return this.request("/admin/provider-config");
-  }
-
-  async createProviderConfig(payload: ProviderConfigPayload): Promise<unknown> {
-    return this.request("/admin/provider-config/providers", {
-      method: "POST",
-      body: payload
-    });
-  }
-
-  async updateProviderConfig(provider: string, payload: ProviderConfigPayload): Promise<unknown> {
-    return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}`, {
-      method: "PATCH",
-      body: payload
-    });
-  }
-
-  async disableProviderConfig(provider: string): Promise<unknown> {
-    return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}`, {
-      method: "DELETE"
-    });
-  }
-
-  async deleteProviderConfig(provider: string): Promise<unknown> {
-    return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}?hard=true`, {
-      method: "DELETE"
-    });
-  }
-
-  async createProviderModelConfig(payload: ProviderModelConfigPayload): Promise<unknown> {
-    return this.request("/admin/provider-config/models", {
-      method: "POST",
-      body: payload
-    });
-  }
-
-  async updateProviderModelConfig(modelId: string, payload: ProviderModelConfigPayload): Promise<unknown> {
-    return this.request(`/admin/provider-config/models/${encodeURIComponent(modelId)}`, {
-      method: "PATCH",
-      body: payload
-    });
-  }
-
-  async disableProviderModelConfig(modelId: string): Promise<unknown> {
-    return this.request(`/admin/provider-config/models/${encodeURIComponent(modelId)}`, {
-      method: "DELETE"
-    });
-  }
-
-  async deleteProviderModelConfig(modelId: string): Promise<unknown> {
-    return this.request(`/admin/provider-config/models/${encodeURIComponent(modelId)}?hard=true`, {
-      method: "DELETE"
-    });
-  }
-
-  async testProviderConfig(provider: string, upstreamModel?: string): Promise<ProviderTestResult> {
-    return this.request(`/admin/provider-config/providers/${encodeURIComponent(provider)}/test`, {
-      method: "POST",
-      body: upstreamModel ? { upstream_model: upstreamModel } : {}
-    });
-  }
-
-  async createRouteConfig(payload: RouteConfigPayload): Promise<{ route: RouteSummary }> {
-    return this.request("/admin/provider-config/routes", {
-      method: "POST",
-      body: payload
-    });
-  }
-
-  async updateRouteConfig(routeId: string, payload: RouteConfigPayload): Promise<{ route: RouteSummary }> {
-    return this.request(`/admin/provider-config/routes/${encodeURIComponent(routeId)}`, {
-      method: "PATCH",
-      body: payload
-    });
-  }
-
-  async deleteRouteConfig(routeId: string): Promise<unknown> {
-    return this.request(`/admin/provider-config/routes/${encodeURIComponent(routeId)}`, {
-      method: "DELETE"
-    });
-  }
-
-  async importProviderConfigToml(): Promise<{ providers: number; routes: number }> {
-    return this.request("/admin/provider-config/import-toml", {
-      method: "POST"
-    });
-  }
-
-  async exportProviderConfigToml(): Promise<string> {
-    return this.request("/admin/provider-config/export-toml", { text: true });
-  }
-
-  async usage(limit = 100): Promise<UsageEvent[]> {
-    const payload = await this.request<{ data: UsageEvent[] }>(`/admin/usage?limit=${limit}`);
-    return payload.data || [];
-  }
-
-  async usageSummary(): Promise<UsageSummary[]> {
-    const payload = await this.request<{ data: UsageSummary[] }>("/admin/usage/summary");
-    return payload.data || [];
   }
 
   async reviewMemories(): Promise<ReviewResult> {
