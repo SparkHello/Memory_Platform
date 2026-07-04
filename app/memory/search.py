@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
 import math
@@ -6,7 +7,8 @@ import time
 
 import httpx
 
-from app.memory.models import MemoryRecord
+from app.memory.decay import MemoryDecayScore, life_score, score_memory
+from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _terms
 
@@ -17,13 +19,27 @@ from app.memory.utils import _parse_iso_datetime, _terms
 _EMBEDDING_CACHE: dict[tuple, tuple[float, list[float]]] = {}
 """L1: (user_id, normalized_query) -> (expires_at, embedding_vector)"""
 
-_SEARCH_CACHE: dict[tuple, tuple[float, str, list[str]]] = {}
-"""L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, [memory_id, ...])"""
+_SEARCH_CACHE: dict[tuple, tuple[float, str, int, list[dict[str, object]]]] = {}
+"""L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, active_count, hit payloads)"""
 
 _EMBEDDING_CACHE_MAX = 512
 _SEARCH_CACHE_MAX = 256
 _EMBEDDING_CACHE_TTL = 300   # 5 分钟
 _SEARCH_CACHE_TTL = 120       # 2 分钟
+_RECALL_LIMIT = 20
+# 单次检索只把按 importance/updated_at 排序的前 N 条活跃记忆纳入排名。
+# 评测候选集也复用它，保证“能标注的”=“能被召回的”。
+RECALL_CANDIDATE_POOL = 200
+_SURFACE_MODES: set[MemorySurfaceMode] = {
+    "balanced",
+    "important",
+    "emotional",
+    "stale",
+    "review_due",
+}
+_STALE_DAYS = 90.0
+_NEAR_EXPIRY_DAYS = 14
+_LOW_LIFE_THRESHOLD = 30.0
 
 
 def _normalize_query(query: str) -> str:
@@ -33,6 +49,36 @@ def _normalize_query(query: str) -> str:
 
 def _now() -> float:
     return time.time()
+
+
+@dataclass
+class MemorySearchHit:
+    memory: MemoryRecord
+    relevance: float
+    channels: list[str] = field(default_factory=list)
+    topic_score: float = 0.0
+    total_score: float = 0.0
+    final_score: float = 0.0
+    score_breakdown: dict[str, float] = field(default_factory=dict)
+    activation_count: int = 0
+    last_active_at: str | None = None
+    freshness_bonus: float = 1.0
+
+
+@dataclass
+class MemorySurfaceHit:
+    memory: MemoryRecord
+    final_score: float
+    activation_count: int
+    last_active_at: str | None
+    freshness_bonus: float
+    surface_reason: str
+    surface_score: float
+    surface_mode: MemorySurfaceMode
+    surface_reason_text: str
+    life_score: float
+    days_since_last_active: float
+    review_signals: list[MemorySurfaceSignal]
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +140,22 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
 
 
 class MemorySearchService:
-    def __init__(self, *, store: MemoryStore, embedding_client: EmbeddingClient):
+    def __init__(
+        self,
+        *,
+        store: MemoryStore,
+        embedding_client: EmbeddingClient,
+        time_ripple_delta: float = 0.0,
+        time_ripple_window_hours: int = 48,
+        enable_cache: bool = True,
+    ):
         self.store = store
         self.embedding_client = embedding_client
+        # 评测等隔离场景关闭进程级缓存：缓存 key 只含 (user, query, limit)，
+        # 不区分数据源/检索模式，复用会让 keyword 与 embedding 基线互相污染。
+        self.enable_cache = enable_cache
+        self.time_ripple_delta = max(0.0, min(1.0, float(time_ripple_delta or 0.0)))
+        self.time_ripple_window_hours = max(1, min(720, int(time_ripple_window_hours or 48)))
 
     async def search(
         self,
@@ -106,68 +165,186 @@ class MemorySearchService:
         limit: int = 8,
         record_usage: bool = True,
     ) -> list[MemoryRecord]:
+        hits = await self.search_hits(
+            query=query,
+            user_id=user_id,
+            limit=limit,
+            record_usage=record_usage,
+        )
+        return [hit.memory for hit in hits]
+
+    async def search_hits(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        limit: int = 8,
+        record_usage: bool = True,
+    ) -> list[MemorySearchHit]:
         normalized = _normalize_query(query)
+        capped_limit = max(1, min(limit, 20))
         now = _now()
 
-        # ---- L2 搜索结果缓存 ----
-        l2_key = (user_id, normalized, limit)
-        if l2_key in _SEARCH_CACHE:
-            l2_expires_at, l2_max_updated_at, l2_memory_ids = _SEARCH_CACHE[l2_key]
-            if now < l2_expires_at:
-                current_max = self.store.get_memories_max_updated_at(user_id=user_id)
-                if current_max and current_max == l2_max_updated_at:
-                    memories = self._load_by_ids(l2_memory_ids, user_id)
-                    if memories:
-                        return self._record_usage(memories, user_id=user_id, record_usage=record_usage)
-            del _SEARCH_CACHE[l2_key]
-
-        # ---- L1 query embedding 缓存 ----
-        l1_key = (user_id, normalized)
-        query_embedding = None
-        if l1_key in _EMBEDDING_CACHE:
-            l1_expires_at, l1_vector = _EMBEDDING_CACHE[l1_key]
-            if now < l1_expires_at:
-                query_embedding = l1_vector
-            else:
-                del _EMBEDDING_CACHE[l1_key]
-
-        if query_embedding is None:
-            query_embedding = await self.embedding_client.embed(query)
-            if query_embedding:
-                self._cache_embedding(l1_key, query_embedding, now)
-
-        # ---- 搜索 ----
-        memories = self.store.list_memories(user_id=user_id, limit=200)
-        if not memories:
-            return []
-
-        if query_embedding:
-            scored = self._score_by_embedding(memories, query_embedding)
-            if scored:
-                result = self._record_usage(
-                    [memory for _, memory in scored[:limit]],
+        l2_key = (user_id, normalized, capped_limit)
+        if self.enable_cache:
+            cached_hits = self._cached_search_hits(l2_key, user_id=user_id, now=now)
+            if cached_hits is not None:
+                return self._record_hit_usage(
+                    cached_hits,
                     user_id=user_id,
                     record_usage=record_usage,
                 )
-                self._cache_search(l2_key, result, user_id, now)
-                return result
 
-        scored = self._score_by_keywords(memories, query)
-        result = self._record_usage(
-            [memory for _, memory in scored[:limit]],
+        query_embedding = await self._query_embedding(
+            query=query,
+            normalized_query=normalized,
             user_id=user_id,
-            record_usage=record_usage,
+            now=now,
         )
-        self._cache_search(l2_key, result, user_id, now)
-        return result
 
-    def _load_by_ids(self, memory_ids: list[str], user_id: str) -> list[MemoryRecord]:
-        result: list[MemoryRecord] = []
-        for mid in memory_ids:
-            memory = self.store.get_memory(memory_id=mid, user_id=user_id)
-            if memory:
-                result.append(memory)
-        return result
+        memories = self.store.list_memories(user_id=user_id, limit=RECALL_CANDIDATE_POOL)
+        if not memories:
+            return []
+
+        hits = self._rank_hits(
+            memories=memories,
+            query=query,
+            query_embedding=query_embedding,
+            limit=capped_limit,
+        )
+        hits = self._record_hit_usage(hits, user_id=user_id, record_usage=record_usage)
+        if self.enable_cache:
+            self._cache_search_hits(l2_key, hits, user_id=user_id, now=now)
+        return hits
+
+    def surface_memories(
+        self,
+        *,
+        user_id: str,
+        limit: int = 8,
+        mode: MemorySurfaceMode = "balanced",
+        include_archived: bool = False,
+    ) -> list[MemorySurfaceHit]:
+        capped_limit = max(1, min(limit, 20))
+        surface_mode = _normalize_surface_mode(mode)
+        memories = self.store.list_memories(
+            user_id=user_id,
+            limit=1000,
+            include_lifecycle_archived=include_archived,
+        )
+        if not memories:
+            return []
+
+        now = datetime.now(UTC)
+        scored = [
+            hit
+            for memory in memories
+            if getattr(memory, "status", None) != "pinned"
+            if include_archived or getattr(memory, "status", None) != "archived"
+            if (hit := _surface_hit(memory, now=now, mode=surface_mode)) is not None
+        ]
+        scored.sort(
+            key=lambda hit: (hit.surface_score, hit.final_score, hit.memory.updated_at),
+            reverse=True,
+        )
+        return scored[:capped_limit]
+
+    async def _query_embedding(
+        self,
+        *,
+        query: str,
+        normalized_query: str,
+        user_id: str,
+        now: float,
+    ) -> list[float] | None:
+        l1_key = (user_id, normalized_query)
+        if self.enable_cache and l1_key in _EMBEDDING_CACHE:
+            l1_expires_at, l1_vector = _EMBEDDING_CACHE[l1_key]
+            if now < l1_expires_at:
+                return l1_vector
+            del _EMBEDDING_CACHE[l1_key]
+
+        query_embedding = await self.embedding_client.embed(query)
+        if query_embedding and self.enable_cache:
+            self._cache_embedding(l1_key, query_embedding, now)
+        return query_embedding
+
+    def _rank_hits(
+        self,
+        *,
+        memories: list[MemoryRecord],
+        query: str,
+        query_embedding: list[float] | None,
+        limit: int,
+    ) -> list[MemorySearchHit]:
+        now = datetime.now(UTC)
+        combined: dict[str, MemorySearchHit] = {}
+
+        if query_embedding:
+            for topic_score, memory in self._score_by_embedding(memories, query_embedding)[:_RECALL_LIMIT]:
+                _upsert_hit(combined, memory, topic_score, "embedding", now=now)
+
+        for topic_score, memory in self._score_by_keywords(memories, query)[:_RECALL_LIMIT]:
+            _upsert_hit(combined, memory, topic_score, "keyword", now=now)
+
+        hits = list(combined.values())
+        hits.sort(
+            key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
+            reverse=True,
+        )
+        return hits[:limit]
+
+    def _cached_search_hits(
+        self,
+        key: tuple,
+        *,
+        user_id: str,
+        now: float,
+    ) -> list[MemorySearchHit] | None:
+        if key not in _SEARCH_CACHE:
+            return None
+
+        expires_at, max_updated_at, active_count, payloads = _SEARCH_CACHE[key]
+        if now >= expires_at:
+            del _SEARCH_CACHE[key]
+            return None
+
+        current_max = self.store.get_memories_max_updated_at(user_id=user_id)
+        current_count = self.store.get_active_memory_count(user_id=user_id)
+        if not current_max or current_max != max_updated_at or current_count != active_count:
+            del _SEARCH_CACHE[key]
+            return None
+
+        hits: list[MemorySearchHit] = []
+        for payload in payloads:
+            memory_id = payload.get("id")
+            if not isinstance(memory_id, str):
+                continue
+            memory = self.store.get_memory(memory_id=memory_id, user_id=user_id)
+            if memory is None:
+                continue
+            decay = score_memory(memory)
+            channels = payload.get("channels")
+            score_breakdown = payload.get("score_breakdown")
+            hits.append(
+                MemorySearchHit(
+                    memory=memory,
+                    relevance=_float_payload(payload.get("relevance")),
+                    channels=[str(channel) for channel in channels] if isinstance(channels, list) else ["cache"],
+                    topic_score=_float_payload(payload.get("topic_score")),
+                    total_score=_float_payload(payload.get("total_score")),
+                    final_score=decay.final_score,
+                    score_breakdown=_score_breakdown_payload(score_breakdown),
+                    activation_count=decay.activation_count,
+                    last_active_at=decay.last_active_at,
+                    freshness_bonus=decay.freshness_bonus,
+                )
+            )
+            _refresh_hit_ranking(hits[-1])
+        if not hits:
+            del _SEARCH_CACHE[key]
+            return None
+        return hits
 
     def _cache_embedding(self, key: tuple, vector: list[float], now: float) -> None:
         if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
@@ -175,18 +352,37 @@ class MemorySearchService:
         if len(_EMBEDDING_CACHE) < _EMBEDDING_CACHE_MAX:
             _EMBEDDING_CACHE[key] = (now + _EMBEDDING_CACHE_TTL, vector)
 
-    def _cache_search(self, key: tuple, memories: list[MemoryRecord], user_id: str, now: float) -> None:
-        if not memories:
+    def _cache_search_hits(
+        self,
+        key: tuple,
+        hits: list[MemorySearchHit],
+        *,
+        user_id: str,
+        now: float,
+    ) -> None:
+        if not hits:
             return
         if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
             _cleanup_expired(_SEARCH_CACHE, now)
         if len(_SEARCH_CACHE) < _SEARCH_CACHE_MAX:
             max_updated = self.store.get_memories_max_updated_at(user_id=user_id)
+            active_count = self.store.get_active_memory_count(user_id=user_id)
             if max_updated:
                 _SEARCH_CACHE[key] = (
                     now + _SEARCH_CACHE_TTL,
                     max_updated,
-                    [m.id for m in memories],
+                    active_count,
+                    [
+                        {
+                            "id": hit.memory.id,
+                            "relevance": hit.relevance,
+                            "channels": hit.channels,
+                            "topic_score": hit.topic_score,
+                            "total_score": hit.total_score,
+                            "score_breakdown": hit.score_breakdown,
+                        }
+                        for hit in hits
+                    ],
                 )
 
     def _score_by_embedding(
@@ -195,19 +391,13 @@ class MemorySearchService:
         query_embedding: list[float],
     ) -> list[tuple[float, MemoryRecord]]:
         scored: list[tuple[float, MemoryRecord]] = []
-        now = datetime.now(UTC)
         for memory in memories:
-            if not memory.embedding_json:
+            memory_embedding = _load_vector(memory.embedding_json)
+            if memory_embedding is None:
                 continue
-            try:
-                memory_embedding = json.loads(memory.embedding_json)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(memory_embedding, list):
-                continue
-            score = cosine_similarity(query_embedding, [float(value) for value in memory_embedding])
+            score = cosine_similarity(query_embedding, memory_embedding) * 100.0
             if score > 0:
-                scored.append((score + _metadata_score(memory, now, embedding_mode=True), memory))
+                scored.append((score, memory))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
@@ -219,41 +409,41 @@ class MemorySearchService:
         query_terms = _terms(query)
         scored: list[tuple[float, MemoryRecord]] = []
         query_lower = query.lower()
-        now = datetime.now(UTC)
 
         for memory in memories:
             content_lower = memory.content.lower()
             content_terms = _terms(memory.content)
-            text_score = (
-                len(query_terms & content_terms)
-                + (2 if query_lower and query_lower in content_lower else 0)
-                + _char_overlap_score(query_lower, content_lower)
-            )
-            if text_score > 0:
-                score = text_score + _metadata_score(memory, now, embedding_mode=False)
+            term_score = len(query_terms & content_terms) * 15.0
+            substring_score = 40.0 if query_lower and query_lower in content_lower else 0.0
+            char_score = _char_overlap_score(query_lower, content_lower) * 60.0
+            score = min(100.0, term_score + substring_score + char_score)
+            if score > 0:
                 scored.append((score, memory))
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
-    def _record_usage(
+    def _record_hit_usage(
         self,
-        memories: list[MemoryRecord],
+        hits: list[MemorySearchHit],
         *,
         user_id: str,
         record_usage: bool,
-    ) -> list[MemoryRecord]:
+    ) -> list[MemorySearchHit]:
         if not record_usage:
-            return memories
+            return hits
         used_at = self.store.mark_memories_used(
-            memory_ids=[memory.id for memory in memories],
+            memory_ids=[hit.memory.id for hit in hits],
             user_id=user_id,
+            time_ripple_delta=self.time_ripple_delta,
+            time_ripple_window_hours=self.time_ripple_window_hours,
         )
         if used_at:
-            for memory in memories:
-                memory.usage_count += 1
-                memory.last_used_at = used_at
-        return memories
+            for hit in hits:
+                hit.memory.usage_count += 1
+                hit.memory.last_used_at = used_at
+                _refresh_hit_decay(hit)
+        return hits
 
 
 def _cleanup_expired(cache: dict, now: float) -> None:
@@ -281,27 +471,392 @@ def _char_overlap_score(query: str, content: str) -> float:
     return len(query_chars & content_chars) / len(query_chars)
 
 
-def _metadata_score(memory: MemoryRecord, now: datetime, *, embedding_mode: bool) -> float:
-    importance_weight = 0.015 if embedding_mode else 0.05
-    usage_weight = 0.01 if embedding_mode else 0.02
-    return (
-        memory.importance * importance_weight
-        + min(memory.usage_count, 10) * usage_weight
-        - _decay_penalty(memory, now)
-        - _validity_penalty(memory, now, embedding_mode=embedding_mode)
-        - _sensitivity_penalty(memory, embedding_mode=embedding_mode)
+def _upsert_hit(
+    combined: dict[str, MemorySearchHit],
+    memory: MemoryRecord,
+    topic_score: float,
+    channel: str,
+    *,
+    now: datetime,
+) -> None:
+    existing = combined.get(memory.id)
+    if existing is None:
+        combined[memory.id] = _build_hit(
+            memory=memory,
+            channels=[channel],
+            semantic_score=topic_score if channel == "embedding" else 0.0,
+            keyword_score=topic_score if channel == "keyword" else 0.0,
+            now=now,
+        )
+        return
+
+    if channel not in existing.channels:
+        existing.channels.append(channel)
+    if channel == "embedding":
+        existing.score_breakdown["semantic_score"] = max(
+            existing.score_breakdown.get("semantic_score", 0.0),
+            topic_score,
+        )
+    elif channel == "keyword":
+        existing.score_breakdown["keyword_score"] = max(
+            existing.score_breakdown.get("keyword_score", 0.0),
+            topic_score,
+        )
+    _refresh_hit_ranking(existing, now=now)
+
+
+def _build_hit(
+    *,
+    memory: MemoryRecord,
+    channels: list[str],
+    semantic_score: float,
+    keyword_score: float,
+    now: datetime,
+) -> MemorySearchHit:
+    decay = score_memory(memory, now=now)
+    topic_score = max(semantic_score, keyword_score)
+    total = _total_rank_score(memory, topic_score=topic_score, decay=decay, now=now)
+    relevance = _final_relevance(total)
+    return MemorySearchHit(
+        memory=memory,
+        relevance=relevance,
+        channels=list(channels),
+        topic_score=topic_score,
+        total_score=total,
+        final_score=decay.final_score,
+        score_breakdown=_build_score_breakdown(
+            memory=memory,
+            semantic_score=semantic_score,
+            keyword_score=keyword_score,
+            decay=decay,
+            final_relevance=relevance,
+        ),
+        activation_count=decay.activation_count,
+        last_active_at=decay.last_active_at,
+        freshness_bonus=decay.freshness_bonus,
     )
+
+
+def _surface_hit(
+    memory: MemoryRecord,
+    *,
+    now: datetime,
+    mode: MemorySurfaceMode,
+) -> MemorySurfaceHit | None:
+    decay = score_memory(memory, now=now)
+    current_life_score = life_score(memory, now=now, decay=decay)
+    review_signals = _surface_review_signals(
+        memory,
+        decay=decay,
+        life=current_life_score,
+        now=now,
+    )
+    if mode == "stale" and "stale" not in review_signals:
+        return None
+    if mode == "review_due" and not review_signals:
+        return None
+
+    surface_score = _surface_mode_score(
+        memory,
+        mode=mode,
+        decay=decay,
+        life=current_life_score,
+        review_signals=review_signals,
+    )
+    surface_reason = _surface_reason(memory, decay, mode=mode, review_signals=review_signals)
+    return MemorySurfaceHit(
+        memory=memory,
+        final_score=decay.final_score,
+        activation_count=decay.activation_count,
+        last_active_at=decay.last_active_at,
+        freshness_bonus=decay.freshness_bonus,
+        surface_reason=surface_reason,
+        surface_score=surface_score,
+        surface_mode=mode,
+        surface_reason_text=_surface_reason_text(surface_reason, review_signals=review_signals),
+        life_score=current_life_score,
+        days_since_last_active=decay.days_since_last_active,
+        review_signals=review_signals,
+    )
+
+
+def _normalize_surface_mode(mode: str) -> MemorySurfaceMode:
+    return mode if mode in _SURFACE_MODES else "balanced"
+
+
+def _surface_reason(
+    memory: MemoryRecord,
+    decay: MemoryDecayScore,
+    *,
+    mode: MemorySurfaceMode,
+    review_signals: list[MemorySurfaceSignal],
+) -> str:
+    if mode == "review_due":
+        if "expired" in review_signals:
+            return "expired_review"
+        if "review_due" in review_signals:
+            return "review_due"
+        if "near_expiry" in review_signals:
+            return "near_expiry"
+        if "emotion_uncertain" in review_signals:
+            return "emotion_uncertain"
+        if "sensitive" in review_signals:
+            return "sensitive_review"
+        if "stale" in review_signals:
+            return "stale_review"
+        if "low_life" in review_signals:
+            return "low_life"
+    if mode == "stale":
+        return "stale_important"
+    if mode == "emotional":
+        return "emotional_signal"
+    if mode == "important":
+        return "important_memory"
+    if decay.activation_count == 0 and memory.importance >= 8 and decay.freshness_bonus > 1.1:
+        return "fresh_high_importance"
+    if memory.importance >= 8:
+        return "high_importance"
+    return "high_score"
+
+
+def _surface_reason_text(
+    reason: str,
+    *,
+    review_signals: list[MemorySurfaceSignal],
+) -> str:
+    labels = {
+        "fresh_high_importance": "新近且重要，适合重新看见",
+        "high_importance": "高重要度记忆",
+        "high_score": "活跃度和新鲜度较高",
+        "important_memory": "按重要度优先浮现",
+        "emotional_signal": "情绪唤起或情绪偏离较强",
+        "stale_important": "长期未被使用但仍有重要度",
+        "expired_review": "已经过有效期，建议复核",
+        "review_due": "已到复核时间",
+        "near_expiry": "即将到达有效期",
+        "emotion_uncertain": "高唤起但置信度偏低",
+        "sensitive_review": "隐私或敏感记忆需要更高保留门槛",
+        "stale_review": "长期未活跃，建议确认是否仍重要",
+        "low_life": "生命力偏低，建议整理",
+    }
+    if reason in labels:
+        return labels[reason]
+    if review_signals:
+        return "包含复核信号，建议检查"
+    return reason
+
+
+def _surface_mode_score(
+    memory: MemoryRecord,
+    *,
+    mode: MemorySurfaceMode,
+    decay: MemoryDecayScore,
+    life: float,
+    review_signals: list[MemorySurfaceSignal],
+) -> float:
+    if mode == "balanced":
+        return decay.final_score
+    if mode == "important":
+        return _clamp_score(float(memory.importance) * 7.0 + memory.confidence * 15.0 + life * 0.15)
+    if mode == "emotional":
+        emotion = max(0.0, min(1.0, memory.arousal)) * 70.0
+        emotion += abs(max(0.0, min(1.0, memory.valence)) - 0.5) * 60.0
+        return _clamp_score(emotion + float(memory.importance) * 2.0)
+    if mode == "stale":
+        return _clamp_score(
+            min(70.0, decay.days_since_last_active * 0.5)
+            + float(memory.importance) * 4.0
+            + (100.0 - life) * 0.15
+        )
+    if mode == "review_due":
+        signal_scores = {
+            "expired": 100.0,
+            "review_due": 95.0,
+            "near_expiry": 80.0,
+            "emotion_uncertain": 72.0,
+            "sensitive": 66.0,
+            "stale": 58.0,
+            "low_life": 48.0,
+        }
+        top_signal = max((signal_scores[signal] for signal in review_signals), default=0.0)
+        return _clamp_score(top_signal + float(memory.importance) * 2.0)
+    return decay.final_score
+
+
+def _surface_review_signals(
+    memory: MemoryRecord,
+    *,
+    decay: MemoryDecayScore,
+    life: float,
+    now: datetime,
+) -> list[MemorySurfaceSignal]:
+    signals: list[MemorySurfaceSignal] = []
+    valid_until = _parse_iso_datetime(memory.valid_until)
+    if valid_until is not None:
+        if valid_until < now:
+            signals.append("expired")
+        elif valid_until <= now + timedelta(days=_NEAR_EXPIRY_DAYS):
+            signals.append("near_expiry")
+
+    review_after = _parse_iso_datetime(memory.review_after)
+    if review_after is not None and review_after <= now:
+        signals.append("review_due")
+
+    if memory.sensitivity != "normal":
+        signals.append("sensitive")
+    if decay.days_since_last_active >= _STALE_DAYS and memory.importance >= 6:
+        signals.append("stale")
+    if memory.arousal >= 0.7 and memory.confidence <= 0.55:
+        signals.append("emotion_uncertain")
+    if life <= _LOW_LIFE_THRESHOLD:
+        signals.append("low_life")
+    return signals
+
+
+def _refresh_hit_decay(hit: MemorySearchHit) -> None:
+    _refresh_hit_ranking(hit)
+
+
+def _refresh_hit_ranking(
+    hit: MemorySearchHit,
+    *,
+    now: datetime | None = None,
+) -> None:
+    current = now or datetime.now(UTC)
+    semantic_score = hit.score_breakdown.get("semantic_score", 0.0)
+    keyword_score = hit.score_breakdown.get("keyword_score", 0.0)
+    decay = score_memory(hit.memory, now=current)
+    hit.topic_score = max(semantic_score, keyword_score, hit.topic_score)
+    hit.total_score = _total_rank_score(
+        hit.memory,
+        topic_score=hit.topic_score,
+        decay=decay,
+        now=current,
+    )
+    hit.relevance = _final_relevance(hit.total_score)
+    hit.final_score = decay.final_score
+    hit.activation_count = decay.activation_count
+    hit.last_active_at = decay.last_active_at
+    hit.freshness_bonus = decay.freshness_bonus
+    hit.score_breakdown = _build_score_breakdown(
+        memory=hit.memory,
+        semantic_score=semantic_score,
+        keyword_score=keyword_score,
+        decay=decay,
+        final_relevance=hit.relevance,
+    )
+
+
+def _build_score_breakdown(
+    *,
+    memory: MemoryRecord,
+    semantic_score: float,
+    keyword_score: float,
+    decay: MemoryDecayScore,
+    final_relevance: float,
+) -> dict[str, float]:
+    recency_score = math.exp(-0.05 * decay.days_since_last_active) * 100.0
+    usage_score = min(100.0, math.log1p(max(0, memory.usage_count or 0)) * 25.0)
+    emotion_score = (
+        max(0.0, min(1.0, memory.arousal)) * 70.0
+        + abs(max(0.0, min(1.0, memory.valence)) - 0.5) * 60.0
+    )
+    return {
+        "semantic_score": _clamp_score(semantic_score),
+        "keyword_score": _clamp_score(keyword_score),
+        "importance_score": _clamp_score(float(memory.importance) * 10.0),
+        "recency_score": _clamp_score(recency_score),
+        "usage_score": _clamp_score(usage_score),
+        "emotion_score": _clamp_score(emotion_score),
+        "final_score": _clamp_score(final_relevance),
+    }
+
+
+def _score_breakdown_payload(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return _empty_score_breakdown()
+    payload = _empty_score_breakdown()
+    for key in payload:
+        payload[key] = _clamp_score(_float_payload(value.get(key)))
+    return payload
+
+
+def _empty_score_breakdown() -> dict[str, float]:
+    return {
+        "semantic_score": 0.0,
+        "keyword_score": 0.0,
+        "importance_score": 0.0,
+        "recency_score": 0.0,
+        "usage_score": 0.0,
+        "emotion_score": 0.0,
+        "final_score": 0.0,
+    }
+
+
+def _final_relevance(total_score: float) -> float:
+    return _clamp_score(total_score / 4.5)
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def _total_rank_score(
+    memory: MemoryRecord,
+    *,
+    topic_score: float,
+    decay: MemoryDecayScore,
+    now: datetime,
+) -> float:
+    time_score = min(decay.final_score, 10.0)
+    freshness_score = max(0.0, decay.freshness_bonus - 1.0) * 10.0
+    penalty = _metadata_penalty(memory, now) * 20.0
+    return (
+        topic_score * 4.0
+        + time_score * 1.5
+        + float(memory.importance)
+        + freshness_score * 0.5
+        - penalty
+    )
+
+
+def _metadata_penalty(memory: MemoryRecord, now: datetime) -> float:
+    return (
+        _decay_penalty(memory, now)
+        + _validity_penalty(memory, now, embedding_mode=False)
+        + _sensitivity_penalty(memory, embedding_mode=False)
+    )
+
+
+def _load_vector(raw_json: str | None) -> list[float] | None:
+    if not raw_json:
+        return None
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    try:
+        return [float(value) for value in data]
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_payload(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _decay_penalty(memory: MemoryRecord, now: datetime) -> float:
     rate, cap, grace_days = {
-        "project": (0.0020, 0.40, 14),
-        "learning": (0.0015, 0.30, 30),
-        "fact": (0.0010, 0.25, 30),
-        "preference": (0.0003, 0.08, 60),
-        "style": (0.0002, 0.05, 60),
-        "person": (0.0, 0.0, 0),
-        "relationship": (0.0, 0.0, 0),
+        "episodic": (0.0020, 0.40, 14),
+        "semantic": (0.0010, 0.25, 30),
+        "procedural": (0.0005, 0.12, 60),
+        "emotional": (0.0003, 0.08, 60),
+        "reflective": (0.0004, 0.10, 60),
     }.get(memory.type, (0.0010, 0.20, 30))
     if rate <= 0:
         return 0.0
@@ -328,7 +883,7 @@ def _validity_penalty(memory: MemoryRecord, now: datetime, *, embedding_mode: bo
 
 def _sensitivity_penalty(memory: MemoryRecord, *, embedding_mode: bool) -> float:
     penalties = {
-        "private": 0.08 if embedding_mode else 0.25,
-        "sensitive": 0.18 if embedding_mode else 0.60,
+        "private": 0.12 if embedding_mode else 0.50,
+        "sensitive": 0.25 if embedding_mode else 1.20,
     }
     return penalties.get(memory.sensitivity, 0.0)

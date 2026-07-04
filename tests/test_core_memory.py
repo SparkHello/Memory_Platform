@@ -14,7 +14,7 @@ def test_core_memory_consolidation_creates_section(
     preference = memory_store.create_memory(
         user_id="default",
         content="用户长期喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         importance=8,
         confidence=0.9,
     )
@@ -56,14 +56,14 @@ def test_core_memory_consolidation_excludes_sensitive_memory(
     normal = memory_store.create_memory(
         user_id="default",
         content="用户长期喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         importance=8,
         confidence=0.9,
     )
     sensitive = memory_store.create_memory(
         user_id="default",
         content="用户有一项健康隐私。",
-        type="fact",
+        type="semantic",
         importance=10,
         confidence=0.95,
         sensitivity="sensitive",

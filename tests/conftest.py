@@ -1,5 +1,6 @@
-from collections.abc import Iterator
+﻿from collections.abc import Iterator
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,7 +38,7 @@ class FakeLLMClient:
             {
                 "action": "ignore",
                 "memory": "",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 1,
                 "confidence": 0.0,
                 "reason": "测试默认不保存",
@@ -47,6 +48,11 @@ class FakeLLMClient:
         )
         self.core_content = json.dumps(
             {"sections": [], "reason": "测试默认不整理核心记忆"},
+            ensure_ascii=False,
+        )
+        self.review_revision_messages: list[dict] = []
+        self.review_revision_content = json.dumps(
+            {"operations": [{"operation": "no_change", "reason": "测试默认不修改"}]},
             ensure_ascii=False,
         )
 
@@ -81,6 +87,21 @@ class FakeLLMClient:
                     }
                 ],
             }
+        if self._is_review_revision_call(messages):
+            self.review_revision_messages = messages
+            return {
+                "id": "chatcmpl-review-revision",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": self.review_revision_content},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
         self.messages = messages
         return self.response
 
@@ -97,6 +118,13 @@ class FakeLLMClient:
             return False
         first = messages[0]
         return first.get("role") == "system" and "核心记忆整理器" in first.get("content", "")
+
+    @staticmethod
+    def _is_review_revision_call(messages: list[dict]) -> bool:
+        if not messages:
+            return False
+        first = messages[0]
+        return first.get("role") == "system" and "记忆体检编辑器" in first.get("content", "")
 
 
 @pytest.fixture
@@ -119,9 +147,12 @@ def fake_llm() -> FakeLLMClient:
 def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> Iterator[TestClient]:
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
+    monkeypatch.setenv("EVAL_DIR", str(Path(memory_store.database_path).with_name("eval")))
     monkeypatch.setenv("UPSTREAM_API_KEY", "")
     monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")
     monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("TIME_RIPPLE_DELTA", "0.0")
+    monkeypatch.setenv("TIME_RIPPLE_WINDOW_HOURS", "48")
     get_settings.cache_clear()
 
     # MCP 的 session manager 不允许重复启动，每个测试都构建全新应用实例
@@ -140,3 +171,4 @@ def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> I
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-gateway-key"}
+

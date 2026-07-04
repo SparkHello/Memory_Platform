@@ -1,4 +1,6 @@
-"""测试新增的 3 个 REST 端点：POST /memories, POST /memories/forget, POST /memories/context"""
+﻿"""测试新增的 REST 端点：记忆保存、遗忘、上下文和召回解释。"""
+
+import json
 
 from app.memory.store import MemoryStore
 
@@ -11,7 +13,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户使用 Windows 11 + WSL2 作为开发环境",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 7,
                 "confidence": 0.95,
                 "stability": "stable",
@@ -31,10 +33,39 @@ class TestSaveMemoryEndpoint:
         assert memory.importance == 7
         assert memory.confidence == 0.95
 
+    def test_explicit_classification_is_preserved(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        response = client.post(
+            "/memories",
+            json={
+                "content": "用户使用 Kelivo 和 Windows 作为测试环境",
+                "type": "semantic",
+                "importance": 7,
+                "confidence": 0.95,
+                "source_quote": "我用 Kelivo 和 Windows 测试",
+                "topics": [" 自定义标签 ", "自定义标签"],
+                "entities": [" CustomEntity ", "CustomEntity"],
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["action"] == "create"
+        memory = memory_store.get_memory(memory_id=data["memory_id"], user_id="default")
+        assert memory is not None
+        assert memory.topics == ["自定义标签"]
+        assert memory.entities == ["CustomEntity"]
+        assert memory.space_ids == []
+
     def test_create_and_deduplicate(self, client, auth_headers, memory_store: MemoryStore):
         payload = {
             "content": "用户偏爱深色主题的编辑器",
-            "type": "preference",
+            "type": "emotional",
             "importance": 6,
             "confidence": 0.9,
             "source_quote": "我喜欢深色主题",
@@ -45,12 +76,77 @@ class TestSaveMemoryEndpoint:
         second = client.post("/memories", json=payload, headers=auth_headers)
         assert second.json()["action"] == "ignore"
 
+    def test_temporal_fields_timeline_and_restore(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        old = client.post(
+            "/memories",
+            json={
+                "content": "User uses Tool A as the primary notes app.",
+                "type": "semantic",
+                "importance": 7,
+                "confidence": 0.95,
+                "stability": "medium",
+                "source_quote": "I use Tool A",
+                "valid_from": "2025-01-01",
+                "temporal_subject": "user",
+                "temporal_predicate": "primary_notes_app",
+            },
+            headers=auth_headers,
+        )
+        assert old.status_code == 200
+        old_id = old.json()["memory_id"]
+
+        new = client.post(
+            "/memories",
+            json={
+                "content": "User uses Tool B as the primary notes app.",
+                "type": "semantic",
+                "importance": 7,
+                "confidence": 0.95,
+                "stability": "medium",
+                "source_quote": "I use Tool B",
+                "valid_from": "2026-01-01",
+                "temporal_subject": " user ",
+                "temporal_predicate": " primary_notes_app ",
+            },
+            headers=auth_headers,
+        )
+        assert new.status_code == 200
+        new_id = new.json()["memory_id"]
+
+        old_record = memory_store.get_memory(memory_id=old_id, user_id="default")
+        assert old_record is not None
+        assert old_record.valid_until == "2026-01-01"
+        assert old_record.superseded_by == new_id
+
+        timeline = client.get(
+            "/memories/timeline",
+            params={"subject": "user", "predicate": "primary_notes_app"},
+            headers=auth_headers,
+        )
+        assert timeline.status_code == 200
+        assert [memory["id"] for memory in timeline.json()["data"]] == [old_id, new_id]
+
+        restored = client.post(
+            f"/memories/{old_id}/temporal/restore",
+            headers=auth_headers,
+        )
+        assert restored.status_code == 200
+        restored_memory = restored.json()["memory"]
+        assert restored_memory["valid_until"] is None
+        assert restored_memory["status"] == "dynamic"
+        assert memory_store.get_memory(memory_id=new_id, user_id="default").supersedes is None
+
     def test_reject_low_importance(self, client, auth_headers):
         response = client.post(
             "/memories",
             json={
                 "content": "用户今天有点困",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 3,
                 "confidence": 0.95,
                 "source_quote": "今天有点困",
@@ -66,7 +162,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户可能喜欢 Rust",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 7,
                 "confidence": 0.5,
                 "source_quote": "也许我该学 Rust",
@@ -81,7 +177,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户喜欢咖啡",
-                "type": "preference",
+                "type": "emotional",
                 "importance": 7,
                 "confidence": 0.9,
                 "source_quote": "",
@@ -96,7 +192,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户使用 Mac",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 7,
                 "confidence": 0.9,
                 "source_quote": "如果我以后用 Mac 的话",
@@ -112,7 +208,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户喜欢黑咖啡",
-                "type": "preference",
+                "type": "emotional",
                 "importance": 7,
                 "confidence": 0.9,
                 "source_quote": "我喜欢黑咖啡",
@@ -124,7 +220,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "用户喜欢黑咖啡，不加糖不加奶，每天早上喝一杯",
-                "type": "preference",
+                "type": "emotional",
                 "importance": 8,
                 "confidence": 0.95,
                 "source_quote": "我每天早上喝一杯黑咖啡，不加糖不加奶",
@@ -139,7 +235,7 @@ class TestSaveMemoryEndpoint:
             "/memories",
             json={
                 "content": "test",
-                "type": "fact",
+                "type": "semantic",
                 "importance": 7,
                 "confidence": 0.9,
                 "source_quote": "test",
@@ -155,14 +251,14 @@ class TestForgetMemoriesEndpoint:
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢喝茶",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
@@ -194,7 +290,7 @@ class TestForgetMemoriesEndpoint:
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
@@ -211,7 +307,7 @@ class TestForgetMemoriesEndpoint:
             memory_store.create_memory(
                 user_id="default",
                 content=f"用户喜欢咖啡品牌{i}",
-                type="preference",
+                type="emotional",
                 importance=7,
                 confidence=0.9,
             )
@@ -227,11 +323,39 @@ class TestForgetMemoriesEndpoint:
 class TestMemoryContextEndpoint:
     """POST /memories/context — 一站式上下文检索"""
 
+    def test_recent_context_upsert_endpoint_and_limit_validation(self, client, auth_headers):
+        created = client.post(
+            "/memories/recent-context",
+            json={
+                "conversation_id": "ctx-rest",
+                "summary": "  用户：聊咖啡\n助手：继续整理  ",
+            },
+            headers=auth_headers,
+        )
+        assert created.status_code == 200
+        assert created.json()["data"]["summary"] == "用户：聊咖啡\n助手：继续整理"
+
+        updated = client.post(
+            "/memories/recent-context",
+            json={"conversation_id": "ctx-rest", "summary": "用户：聊早餐"},
+            headers=auth_headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["data"]["id"] == created.json()["data"]["id"]
+        assert updated.json()["data"]["summary"] == "用户：聊早餐"
+
+        listed = client.get("/memories/recent-context?limit=1", headers=auth_headers)
+        assert listed.status_code == 200
+        assert len(listed.json()["data"]) == 1
+
+        invalid_limit = client.get("/memories/recent-context?limit=0", headers=auth_headers)
+        assert invalid_limit.status_code == 422
+
     def test_json_format_returns_structured_data(self, client, auth_headers, memory_store: MemoryStore):
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
@@ -258,7 +382,7 @@ class TestMemoryContextEndpoint:
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
@@ -295,7 +419,7 @@ class TestMemoryContextEndpoint:
         memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=7,
             confidence=0.9,
         )
@@ -318,7 +442,7 @@ class TestMemoryContextEndpoint:
         mem = memory_store.create_memory(
             user_id="default",
             content="用户喜欢黑咖啡",
-            type="preference",
+            type="emotional",
             importance=8,
             confidence=0.95,
         )
@@ -346,6 +470,13 @@ class TestMemoryContextEndpoint:
         assert any(s["section"] == "preferences" for s in data["core_memory"])
 
     def test_recent_context_from_conversation(self, client, auth_headers, memory_store: MemoryStore):
+        memory = memory_store.create_memory(
+            user_id="default",
+            content="用户喜欢黑咖啡",
+            type="emotional",
+            importance=8,
+            confidence=0.95,
+        )
         memory_store.upsert_recent_context_summary(
             user_id="default",
             conversation_id="test-conv",
@@ -366,3 +497,361 @@ class TestMemoryContextEndpoint:
         data = response.json()
         assert data["recent_context"]["found"] is True
         assert "黑咖啡" in data["recent_context"]["summary"]
+        assert [item["id"] for item in data["search_results"]] == [memory.id]
+
+    def test_empty_query_uses_latest_recent_context_when_conversation_is_omitted(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        memory = memory_store.create_memory(
+            user_id="default",
+            content="用户喜欢浅烘咖啡豆",
+            type="emotional",
+            importance=8,
+            confidence=0.95,
+        )
+        memory_store.upsert_recent_context_summary(
+            user_id="default",
+            conversation_id="latest-conv",
+            summary="用户：继续聊浅烘咖啡豆\n助手：可以继续",
+        )
+
+        response = client.post(
+            "/memories/context",
+            json={
+                "query": "",
+                "include_core_memory": True,
+                "include_recent_context": True,
+                "format": "json",
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["recent_context"]["found"] is True
+        assert data["search_results"][0]["id"] == memory.id
+
+
+class TestMemoryContextExplainEndpoint:
+    """POST /memories/context/explain — 调试一次上下文召回"""
+
+    def test_explain_returns_context_package_and_does_not_record_usage(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        memory = memory_store.create_memory(
+            user_id="default",
+            content="用户喜欢黑咖啡",
+            type="emotional",
+            importance=8,
+            confidence=0.95,
+        )
+        memory_store.upsert_core_memory_section(
+            user_id="default",
+            section="preferences",
+            content="- 喜欢黑咖啡",
+            evidence_memory_ids=[memory.id],
+            confidence=0.9,
+        )
+        memory_store.upsert_recent_context_summary(
+            user_id="default",
+            conversation_id="coffee-conv",
+            summary="用户：最近在比较不同咖啡豆",
+        )
+
+        response = client.post(
+            "/memories/context/explain",
+            json={
+                "query": "咖啡",
+                "include_core_memory": True,
+                "include_recent_context": True,
+                "limit": 1,
+                "conversation_id": "coffee-conv",
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert set(data) >= {
+            "context_package",
+            "core_memory",
+            "search_results",
+            "recent_context",
+            "candidate_pool",
+            "excluded_candidates",
+        }
+        assert data["context_package"]["query"] == "咖啡"
+        assert data["core_memory"][0]["section"] == "preferences"
+        assert data["recent_context"]["found"] is True
+        assert data["search_results"][0]["id"] == memory.id
+        assert data["search_results"][0]["score_breakdown"]["keyword_score"] > 0
+
+        refreshed = memory_store.get_memory(memory_id=memory.id, user_id="default")
+        assert refreshed is not None
+        assert refreshed.usage_count == 0
+        assert refreshed.last_used_at is None
+
+    def test_explain_reports_candidates_excluded_by_limit(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        for index in range(3):
+            memory_store.create_memory(
+                user_id="default",
+                content=f"用户喜欢咖啡口味 {index}",
+                type="emotional",
+                importance=5 + index,
+            )
+
+        response = client.post(
+            "/memories/context/explain",
+            json={"query": "咖啡", "limit": 1},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["search_results"]) == 1
+        assert len(data["candidate_pool"]) >= 2
+        assert data["excluded_candidates"]
+        assert data["excluded_candidates"][0]["excluded_reason"] == "rank_below_limit"
+
+    def test_explain_redacts_sensitive_search_results(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        private = memory_store.create_memory(
+            user_id="default",
+            content="User passport number is PA-12345.",
+            source_message="My passport number is PA-12345.",
+            type="semantic",
+            importance=9,
+            sensitivity="sensitive",
+        )
+
+        response = client.post(
+            "/memories/context/explain",
+            json={"query": "passport", "limit": 1, "redact_sensitive": True},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        search_result = data["search_results"][0]
+        context_result = data["context_package"]["search_results"][0]
+        candidate = data["candidate_pool"][0]
+        assert search_result["id"] == private.id
+        assert search_result["redacted"] is True
+        assert search_result["content"] != private.content
+        assert search_result["source_message"] != private.source_message
+        assert context_result["redacted"] is True
+        assert candidate["redacted"] is True
+
+        stored = memory_store.get_memory(memory_id=private.id, user_id="default")
+        assert stored is not None
+        assert stored.content == private.content
+
+
+class TestSearchFeedbackEndpoint:
+    """POST /memories/search-feedback — 记录召回反馈到审计日志"""
+
+    def test_feedback_writes_decision_log(self, client, auth_headers, memory_store: MemoryStore):
+        memory = memory_store.create_memory(
+            user_id="default",
+            content="用户喜欢黑咖啡",
+            type="emotional",
+            importance=7,
+        )
+
+        response = client.post(
+            "/memories/search-feedback",
+            json={
+                "query": "咖啡",
+                "memory_id": memory.id,
+                "feedback": "useful",
+                "note": "命中准确",
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["recorded"] is True
+        logs = memory_store.list_decision_logs(user_id="default", limit=1)
+        assert len(logs) == 1
+        payload = json.loads(logs[0].candidate_json)
+        assert payload["source"] == "search_feedback"
+        assert payload["query"] == "咖啡"
+        assert payload["memory_id"] == memory.id
+        assert payload["feedback"] == "useful"
+        assert logs[0].decision == "ignore"
+        assert "useful" in logs[0].reason
+
+    def test_missing_feedback_allows_empty_memory_id(self, client, auth_headers):
+        response = client.post(
+            "/memories/search-feedback",
+            json={"query": "咖啡", "feedback": "missing"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["recorded"] is True
+
+    def test_non_missing_feedback_requires_memory_id(self, client, auth_headers):
+        response = client.post(
+            "/memories/search-feedback",
+            json={"query": "咖啡", "feedback": "wrong"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 422
+
+    def test_feedback_rejects_missing_memory(self, client, auth_headers):
+        response = client.post(
+            "/memories/search-feedback",
+            json={
+                "query": "咖啡",
+                "memory_id": "does-not-exist",
+                "feedback": "wrong",
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 404
+
+    def test_feedback_rejects_unknown_feedback_value(self, client, auth_headers):
+        response = client.post(
+            "/memories/search-feedback",
+            json={"query": "咖啡", "feedback": "maybe"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 422
+
+
+class TestReEmbedEndpoint:
+    """POST /memories/re-embed"""
+
+    def test_re_embed_rejects_without_embedding_config(self, client, auth_headers):
+        """未配置 embedding 服务时应返回 400。"""
+        response = client.post(
+            "/memories/re-embed",
+            json={"memory_ids": ["mem-test"]},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        assert "未配置 embedding" in response.json()["detail"]
+
+    def test_re_embed_requires_auth(self, client):
+        """未认证时返回 401。"""
+        response = client.post(
+            "/memories/re-embed",
+            json={"memory_ids": ["mem-test"]},
+        )
+        assert response.status_code == 401
+
+    def test_re_embed_rejects_empty_memory_ids(self, client, auth_headers):
+        """空 memory_ids 列表时先被 NullEmbeddingClient 拦截返回 400。"""
+        response = client.post(
+            "/memories/re-embed",
+            json={"memory_ids": []},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+
+    def test_re_embed_rejects_neither_mode(self, client, auth_headers):
+        """未指定模式时先被 NullEmbeddingClient 拦截返回 400。"""
+        response = client.post(
+            "/memories/re-embed",
+            json={},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+
+    def test_re_embed_scan_no_embedding(self, client, auth_headers):
+        """scan 模式无 embedding 配置时返回 400。"""
+        response = client.post(
+            "/memories/re-embed",
+            json={"scan": True},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+
+
+class TestArchiveExpiredEndpoint:
+    """POST /memories/archive-expired"""
+
+    def test_empty_store_returns_zero(self, client, auth_headers, memory_store):
+        response = client.post(
+            "/memories/archive-expired",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["archived"] == 0
+
+    def test_archives_expired_keeps_active(self, client, auth_headers, memory_store):
+        from datetime import UTC, datetime, timedelta
+
+        past = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+        future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+
+        m1 = memory_store.create_memory(
+            user_id="default",
+            content="expired",
+            type="semantic",
+            valid_until=past,
+        )
+        m2 = memory_store.create_memory(
+            user_id="default",
+            content="future",
+            type="semantic",
+            valid_until=future,
+        )
+        m3 = memory_store.create_memory(
+            user_id="default",
+            content="no expiry",
+            type="semantic",
+        )
+
+        response = client.post(
+            "/memories/archive-expired",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["archived"] == 1
+
+        # 验证 m1 已归档
+        res = client.get(f"/memories/{m1.id}", headers=auth_headers)
+        assert res.status_code == 404
+        # m2,m3 仍可访问
+        assert client.get(f"/memories/{m2.id}", headers=auth_headers).status_code == 200
+        assert client.get(f"/memories/{m3.id}", headers=auth_headers).status_code == 200
+
+    def test_idempotent(self, client, auth_headers, memory_store):
+        from datetime import UTC, datetime, timedelta
+
+        past = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+        memory_store.create_memory(
+            user_id="default", content="expired", type="semantic", valid_until=past,
+        )
+
+        r1 = client.post("/memories/archive-expired", headers=auth_headers)
+        assert r1.json()["archived"] == 1
+
+        r2 = client.post("/memories/archive-expired", headers=auth_headers)
+        assert r2.json()["archived"] == 0
+
+    def test_requires_auth(self, client):
+        response = client.post("/memories/archive-expired")
+        assert response.status_code == 401
+

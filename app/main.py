@@ -4,6 +4,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import Scope
 
 from app.api.deprecated_v1 import router as deprecated_v1_router
 from app.api.health import router as health_router
@@ -20,6 +22,18 @@ UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
 class UTF8JSONResponse(JSONResponse):
     # Windows PowerShell 5.1 等旧客户端在 Content-Type 缺少 charset 时按 ISO-8859-1 解码，中文会乱码
     media_type = "application/json; charset=utf-8"
+
+
+class UIStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            if Path(path).suffix or path.startswith("assets/"):
+                raise
+            return await super().get_response("index.html", scope)
 
 
 def create_app() -> FastAPI:
@@ -45,13 +59,21 @@ def create_app() -> FastAPI:
     app.include_router(deprecated_v1_router)
     app.include_router(memories_router)
 
+    @app.get("/", include_in_schema=False)
+    @app.get("/dashboard", include_in_schema=False)
+    @app.get("/studio", include_in_schema=False)
+    @app.get("/memory-studio", include_in_schema=False)
+    @app.get("/记忆工作室", include_in_schema=False)
+    def redirect_to_ui() -> RedirectResponse:
+        return RedirectResponse(url="/ui/")
+
     @app.get("/ui", include_in_schema=False)
     def redirect_ui_root() -> RedirectResponse:
         return RedirectResponse(url="/ui/")
 
     app.mount(
         "/ui",
-        StaticFiles(directory=UI_DIST_DIR, html=True, check_dir=False),
+        UIStaticFiles(directory=UI_DIST_DIR, html=True, check_dir=False),
         name="memory-console",
     )
     # MCP streamable HTTP 子应用兜底挂载在根路径，实际端点是 /mcp（FastAPI 自有路由优先匹配）

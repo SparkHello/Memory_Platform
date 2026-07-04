@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str
+    content: str | None
 
     model_config = ConfigDict(extra="allow")
 

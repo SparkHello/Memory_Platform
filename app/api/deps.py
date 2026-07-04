@@ -60,8 +60,14 @@ def get_embedding_client(
 def get_memory_search_service(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> MemorySearchService:
-    return MemorySearchService(store=store, embedding_client=embedding_client)
+    return MemorySearchService(
+        store=store,
+        embedding_client=embedding_client,
+        time_ripple_delta=settings.time_ripple_delta,
+        time_ripple_window_hours=settings.time_ripple_window_hours,
+    )
 
 
 def get_llm_client(

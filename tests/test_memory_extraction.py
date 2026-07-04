@@ -1,4 +1,4 @@
-"""记忆提取与解析的行为测试。
+﻿"""记忆提取与解析的行为测试。
 
 覆盖保存门槛（importance / confidence / source_quote / 假设场景）、
 去重与更新逻辑，以及 memory_decision_logs 的记录行为。
@@ -15,7 +15,7 @@ def _extraction_json(**overrides) -> str:
     data = {
         "action": "create",
         "memory": "用户使用 iPhone。",
-        "type": "fact",
+        "type": "semantic",
         "importance": 8,
         "confidence": 0.9,
         "reason": "用户明确表达的长期事实",
@@ -35,6 +35,14 @@ def _post_ingest(
     if conversation_id:
         payload["conversation_id"] = conversation_id
     return client.post("/memories/ingest", headers=auth_headers, json=payload)
+
+
+def _space_names_for(memory_store: MemoryStore, space_ids: list[str]) -> list[str]:
+    spaces = {
+        space.id: space.name
+        for space in memory_store.list_memory_spaces(user_id="default")
+    }
+    return [spaces[space_id] for space_id in space_ids]
 
 
 def test_low_importance_memory_is_not_saved(
@@ -107,7 +115,7 @@ def test_sensitive_memory_requires_explicit_memory_request(
 ) -> None:
     fake_llm.extraction_content = _extraction_json(
         memory="用户有一项健康隐私。",
-        type="fact",
+        type="semantic",
         importance=8,
         confidence=0.95,
         sensitivity="sensitive",
@@ -123,6 +131,85 @@ def test_sensitive_memory_requires_explicit_memory_request(
     assert "敏感信息" in logs[0].reason or "隐私" in logs[0].reason
 
 
+def test_llm_topics_entities_are_saved_and_normalized(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户现在主要用 Kelivo 做 AI 客户端。",
+        source_quote="我现在主要用 Kelivo 做 AI 客户端",
+        temporal_subject="用户",
+        temporal_predicate="primary_ai_client",
+        topics=[" AI 客户端 ", "AI 客户端", "工具"],
+        entities=[" Kelivo ", "Kelivo"],
+    )
+
+    response = _post_ingest(
+        client,
+        auth_headers,
+        "我现在主要用 Kelivo 做 AI 客户端。",
+    )
+
+    assert response.status_code == 200
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.topics.count("AI 客户端") == 1
+    assert "工具" in memory.topics
+    assert memory.entities.count("Kelivo") == 1
+    assert "工具与设备" in _space_names_for(memory_store, memory.space_ids)
+
+
+def test_rule_fallback_classifies_memory_without_llm_labels(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户喜欢黑咖啡。",
+        type="emotional",
+        source_quote="我喜欢黑咖啡",
+    )
+
+    response = _post_ingest(client, auth_headers, "我喜欢黑咖啡。")
+
+    assert response.status_code == 200
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert "偏好" in memory.topics
+    assert "饮食" in memory.topics
+    assert "个人偏好" in _space_names_for(memory_store, memory.space_ids)
+
+
+def test_sensitive_memory_drops_detailed_auto_entities(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户有一项证件信息。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="sensitive",
+        source_quote="记住，我的身份证号是 123456",
+        topics=["证件"],
+        entities=["123456"],
+    )
+
+    response = _post_ingest(
+        client,
+        auth_headers,
+        "记住，我的身份证号是 123456。",
+    )
+
+    assert response.status_code == 200
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.topics == ["私密信息"]
+    assert memory.entities == []
+    assert _space_names_for(memory_store, memory.space_ids) == ["私密信息"]
+
+
 def test_similar_memory_is_not_duplicated(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -132,13 +219,13 @@ def test_similar_memory_is_not_duplicated(
     memory_store.create_memory(
         user_id="default",
         content="用户喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         importance=7,
         confidence=0.9,
     )
     fake_llm.extraction_content = _extraction_json(
         memory="用户喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         source_quote="我喜欢黑咖啡",
     )
 
@@ -161,7 +248,7 @@ def test_new_detail_creates_related_memory_without_overwriting(
     old = memory_store.create_memory(
         user_id="default",
         content="用户使用 iPhone。",
-        type="fact",
+        type="semantic",
         importance=7,
         confidence=0.9,
     )
@@ -193,7 +280,7 @@ def test_conflicting_memory_creates_related_memory_when_explicit(
     old = memory_store.create_memory(
         user_id="default",
         content="用户的 AI 客户端是 Kelivo。",
-        type="fact",
+        type="semantic",
         importance=7,
         confidence=0.9,
     )
@@ -261,7 +348,7 @@ def test_rest_ingest_splits_raw_text(
                 {
                     "action": "create",
                     "memory": "用户喜欢黑咖啡。",
-                    "type": "preference",
+                    "type": "emotional",
                     "importance": 7,
                     "confidence": 0.9,
                     "stability": "stable",
@@ -274,7 +361,7 @@ def test_rest_ingest_splits_raw_text(
                 {
                     "action": "create",
                     "memory": "用户使用 iPhone。",
-                    "type": "fact",
+                    "type": "semantic",
                     "importance": 7,
                     "confidence": 0.9,
                     "stability": "stable",
@@ -307,6 +394,148 @@ def test_rest_ingest_splits_raw_text(
     logs = memory_store.list_decision_logs(conversation_id="rest-conv")
     assert len(logs) == 2
     assert {json.loads(log.candidate_json)["source"] for log in logs} == {"rest_ingest"}
+
+
+def test_rest_ingest_persists_temporal_fields(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "User works at Company B.",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "medium",
+                    "valid_from": "2026-01-01",
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "temporal_subject": " user ",
+                    "temporal_predicate": " current_employer ",
+                    "reason": "User explicitly described the current employer.",
+                    "source_quote": "I now work at Company B",
+                }
+            ],
+            "reason": "temporal fact",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/ingest",
+        headers=auth_headers,
+        json={
+            "text": "I now work at Company B",
+            "conversation_id": "temporal-ingest",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.valid_from == "2026-01-01"
+    assert memory.temporal_subject == "user"
+    assert memory.temporal_predicate == "current_employer"
+
+
+def test_ingest_autofills_whitelisted_temporal_profile_key(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户现在主要用 Kelivo 作为 AI 客户端。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "valence": 0.5,
+                    "arousal": 0.3,
+                    "stability": "medium",
+                    "valid_from": None,
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "temporal_subject": None,
+                    "temporal_predicate": None,
+                    "reason": "User described the current AI client.",
+                    "source_quote": "我现在主要用 Kelivo 做 AI 客户端",
+                }
+            ],
+            "reason": "profile slot",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/ingest",
+        headers=auth_headers,
+        json={
+            "text": "我现在主要用 Kelivo 做 AI 客户端",
+            "conversation_id": "temporal-profile-slot",
+        },
+    )
+
+    assert response.status_code == 200
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.temporal_subject == "用户"
+    assert memory.temporal_predicate == "primary_ai_client"
+
+
+def test_ingest_clears_non_whitelisted_temporal_key_and_hints_emotional(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户喜欢黑咖啡。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.8,
+                    "valence": 0.75,
+                    "arousal": 0.35,
+                    "stability": "stable",
+                    "valid_from": None,
+                    "valid_until": None,
+                    "review_after": None,
+                    "sensitivity": "normal",
+                    "temporal_subject": "用户",
+                    "temporal_predicate": "favorite_coffee",
+                    "reason": "User stated a preference.",
+                    "source_quote": "我喜欢黑咖啡",
+                }
+            ],
+            "reason": "preference",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/ingest",
+        headers=auth_headers,
+        json={"text": "我喜欢黑咖啡", "conversation_id": "type-hint"},
+    )
+
+    assert response.status_code == 200
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.type == "emotional"
+    assert memory.temporal_subject is None
+    assert memory.temporal_predicate is None
 
 
 def test_decision_logs_record_create_related_create_ignore(
@@ -355,3 +584,140 @@ def test_decision_logs_record_create_related_create_ignore(
     filtered = memory_store.list_decision_logs(conversation_id="conv-create")
     assert len(filtered) == 1
     assert filtered[0].decision == "create"
+
+
+def test_type_specific_threshold_reflective_lower():
+    """reflective 类型: importance=5, confidence=0.80 即可通过。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户认识张三",
+        type="reflective",
+        importance=5,
+        confidence=0.80,
+        reason="",
+        source_quote="我认识张三",
+    )
+    rejection = validate_candidate_for_save(c, user_message="我认识张三", require_quote_in_user_message=True)
+    assert rejection is None
+
+
+def test_type_specific_threshold_reflective_rejects_below_min():
+    """reflective 类型: importance=4 (<5) 应被拒绝。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户认识张三",
+        type="reflective",
+        importance=4,
+        confidence=0.90,
+        reason="",
+        source_quote="我认识张三",
+    )
+    rejection = validate_candidate_for_save(c, user_message="我认识张三", require_quote_in_user_message=True)
+    assert rejection is not None
+    assert "importance" in rejection
+    assert "4" in rejection
+
+
+def test_type_specific_threshold_emotional_accepts_standard_confidence():
+    """emotional 类型: importance=5, confidence=0.80 即可通过。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户喜欢摇滚乐",
+        type="emotional",
+        importance=5,
+        confidence=0.80,
+        reason="",
+        source_quote="我喜欢摇滚乐",
+    )
+    rejection = validate_candidate_for_save(c, user_message="我喜欢摇滚乐", require_quote_in_user_message=True)
+    assert rejection is None
+
+
+def test_sector_hints_promote_obvious_reflection() -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户发现先收口 P0 再扩展更适合这个项目。",
+        type="semantic",
+        importance=7,
+        confidence=0.9,
+        source_quote="我发现先收口 P0 再扩展更适合这个项目",
+    )
+
+    hinted = apply_extraction_hints(
+        candidate,
+        source_text="我发现先收口 P0 再扩展更适合这个项目",
+    )
+
+    assert hinted.type == "reflective"
+
+
+def test_temporal_profile_hint_accepts_present_state_without_now_marker() -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户住在上海。",
+        type="semantic",
+        importance=7,
+        confidence=0.9,
+        source_quote="我住在上海",
+    )
+
+    hinted = apply_extraction_hints(candidate, source_text="我住在上海")
+
+    assert hinted.temporal_subject == "用户"
+    assert hinted.temporal_predicate == "current_city"
+
+
+def test_type_specific_threshold_semantic_default():
+    """semantic 类型保持 threshold: importance=5 (<6) 应被拒。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户使用了 iPhone",
+        type="semantic",
+        importance=5,
+        confidence=0.90,
+        reason="",
+        source_quote="我用 iPhone",
+    )
+    rejection = validate_candidate_for_save(c, user_message="我用 iPhone", require_quote_in_user_message=True)
+    assert rejection is not None
+    assert "importance" in rejection
+    assert "6" in rejection
+
+
+def test_type_specific_threshold_unknown_type_falls_back():
+    """未注册的类型使用默认 MIN_IMPORTANCE/MIN_CONFIDENCE。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    # 直接构造 import 触发 fallback
+    c = CandidateMemory(
+        action="create",
+        memory="测试回退",
+        type="semantic",
+        importance=5,
+        confidence=0.80,
+        reason="",
+        source_quote="测试回退",
+    )
+    rejection = validate_candidate_for_save(c, user_message="测试回退", require_quote_in_user_message=True)
+    # semantic 类型 importance=5 < 6，应被拒
+    assert rejection is not None
+

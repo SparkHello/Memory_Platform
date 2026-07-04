@@ -1,11 +1,117 @@
+﻿import json
+
+from datetime import UTC, datetime, timedelta
+
 from app.memory.store import MemoryStore
+
+
+def test_existing_database_gets_default_emotion_columns(tmp_path) -> None:
+    db_path = tmp_path / "legacy-memory.db"
+    legacy = MemoryStore(str(db_path))
+    with legacy._connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                content TEXT,
+                type TEXT,
+                importance INTEGER,
+                confidence REAL,
+                source_message TEXT,
+                source_conversation_id TEXT,
+                embedding_json TEXT,
+                last_used_at TEXT,
+                usage_count INTEGER DEFAULT 0,
+                stability TEXT DEFAULT 'stable',
+                valid_until TEXT,
+                review_after TEXT,
+                sensitivity TEXT DEFAULT 'normal',
+                evidence_memory_ids_json TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                archived_at TEXT,
+                archived INTEGER DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO memories (
+                id, user_id, content, type, importance, confidence,
+                created_at, updated_at, archived
+            )
+            VALUES ('legacy-1', 'default', '用户喜欢安静的工作环境。', 'preference', 7, 0.9, 'now', 'now', 0)
+            """
+        )
+
+    store = MemoryStore(str(db_path))
+    store.init_db()
+
+    memory = store.get_memory(memory_id="legacy-1", user_id="default")
+    assert memory is not None
+    assert memory.valence == 0.5
+    assert memory.arousal == 0.3
+
+
+def test_existing_database_gets_default_classification_columns(tmp_path) -> None:
+    db_path = tmp_path / "legacy-classification.db"
+    legacy = MemoryStore(str(db_path))
+    with legacy._connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                content TEXT,
+                type TEXT,
+                importance INTEGER,
+                confidence REAL,
+                valence REAL DEFAULT 0.5,
+                arousal REAL DEFAULT 0.3,
+                source_message TEXT,
+                source_conversation_id TEXT,
+                embedding_json TEXT,
+                last_used_at TEXT,
+                usage_count INTEGER DEFAULT 0,
+                stability TEXT DEFAULT 'stable',
+                valid_until TEXT,
+                review_after TEXT,
+                sensitivity TEXT DEFAULT 'normal',
+                evidence_memory_ids_json TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                archived_at TEXT,
+                archived INTEGER DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO memories (
+                id, user_id, content, type, importance, confidence,
+                created_at, updated_at, archived
+            )
+            VALUES ('legacy-tags', 'default', '用户喜欢安静。', 'preference', 7, 0.9, 'now', 'now', 0)
+            """
+        )
+
+    store = MemoryStore(str(db_path))
+    store.init_db()
+
+    memory = store.get_memory(memory_id="legacy-tags", user_id="default")
+    assert memory is not None
+    assert memory.topics == []
+    assert memory.entities == []
+    assert memory.space_ids == []
+    assert store.list_memory_spaces(user_id="default") == []
 
 
 def test_create_list_and_archive_memory(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
         content="用户喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         importance=3,
         confidence=0.8,
     )
@@ -19,13 +125,84 @@ def test_create_list_and_archive_memory(memory_store: MemoryStore) -> None:
     assert memory_store.list_memories(user_id="default") == []
 
 
+def test_memory_classification_fields_and_spaces(memory_store: MemoryStore) -> None:
+    work = memory_store.upsert_memory_space(user_id="default", name=" 工作  空间 ")
+    reused = memory_store.upsert_memory_space(user_id="default", name="工作 空间")
+    private = memory_store.upsert_memory_space(user_id="default", name="私人")
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户正在整理记忆空间。",
+        topics=[" 分类 ", "分类", "工作流"],
+        entities=["Memory Gateway", "memory gateway"],
+        space_ids=[work.id],
+    )
+
+    assert reused.id == work.id
+    assert memory.topics == ["分类", "工作流"]
+    assert memory.entities == ["Memory Gateway"]
+    assert memory.space_ids == [work.id]
+
+    updated = memory_store.update_memory(
+        memory_id=memory.id,
+        user_id="default",
+        content=memory.content,
+        type=memory.type,
+        importance=memory.importance,
+        confidence=memory.confidence,
+        valence=memory.valence,
+        arousal=memory.arousal,
+        source_message=memory.source_message,
+        source_conversation_id=memory.source_conversation_id,
+        embedding_json=memory.embedding_json,
+        stability=memory.stability,
+        valid_until=memory.valid_until,
+        review_after=memory.review_after,
+        sensitivity=memory.sensitivity,
+        evidence_memory_ids=memory.evidence_memory_ids,
+        topics=["阶段四"],
+        entities=["Memory Gateway", "SQLite"],
+    )
+    assert updated is not None
+    replaced = memory_store.replace_memory_spaces(
+        memory_id=memory.id,
+        user_id="default",
+        space_ids=[private.id],
+        create_space_names=["工作 空间"],
+    )
+
+    assert replaced is not None
+    assert replaced.topics == ["阶段四"]
+    assert replaced.entities == ["Memory Gateway", "SQLite"]
+    assert replaced.space_ids == [private.id, work.id]
+
+    summaries = memory_store.list_memory_space_summaries(user_id="default")
+    counts = {space["id"]: space["active_memory_count"] for space in summaries}
+    assert counts[work.id] == 1
+    assert counts[private.id] == 1
+    assert [item.id for item in memory_store.list_memories_for_space(user_id="default", space_id=work.id)] == [memory.id]
+
+
+def test_memory_spaces_are_scoped_by_user(memory_store: MemoryStore) -> None:
+    default_space = memory_store.upsert_memory_space(user_id="default", name="工作")
+    other_space = memory_store.upsert_memory_space(user_id="other", name="工作")
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢本地优先。",
+        space_ids=[default_space.id],
+    )
+
+    assert default_space.id != other_space.id
+    assert memory_store.get_memory(memory_id=memory.id, user_id="default") is not None
+    assert memory_store.list_memories_for_space(user_id="other", space_id=default_space.id) == []
+
+
 def test_create_memory_default_type_is_valid(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
         content="用户正在测试默认记忆类型。",
     )
 
-    assert memory.type == "fact"
+    assert memory.type == "semantic"
     assert memory.stability == "stable"
     assert memory.valid_until is None
     assert memory.sensitivity == "normal"
@@ -35,7 +212,7 @@ def test_create_memory_with_validity_and_sensitivity(memory_store: MemoryStore) 
     memory = memory_store.create_memory(
         user_id="default",
         content="用户这个月在减少咖啡摄入。",
-        type="fact",
+        type="semantic",
         importance=7,
         confidence=0.9,
         stability="temporary",
@@ -51,11 +228,446 @@ def test_create_memory_with_validity_and_sensitivity(memory_store: MemoryStore) 
     assert stored.sensitivity == "private"
 
 
+def test_existing_database_gets_temporal_columns(tmp_path) -> None:
+    db_path = tmp_path / "legacy-temporal.db"
+    legacy = MemoryStore(str(db_path))
+    with legacy._connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                content TEXT,
+                type TEXT,
+                importance INTEGER,
+                confidence REAL,
+                valence REAL DEFAULT 0.5,
+                arousal REAL DEFAULT 0.3,
+                source_message TEXT,
+                source_conversation_id TEXT,
+                embedding_json TEXT,
+                last_used_at TEXT,
+                usage_count REAL DEFAULT 0.0,
+                stability TEXT DEFAULT 'stable',
+                valid_until TEXT,
+                review_after TEXT,
+                sensitivity TEXT DEFAULT 'normal',
+                evidence_memory_ids_json TEXT,
+                topics_json TEXT,
+                entities_json TEXT,
+                status TEXT DEFAULT 'dynamic',
+                digested INTEGER DEFAULT 0,
+                decay_lambda REAL,
+                created_at TEXT,
+                updated_at TEXT,
+                archived_at TEXT,
+                archived INTEGER DEFAULT 0
+            )
+            """
+        )
+
+    store = MemoryStore(str(db_path))
+    store.init_db()
+
+    with store._connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(memories)").fetchall()
+        }
+    assert {
+        "valid_from",
+        "temporal_subject",
+        "temporal_predicate",
+        "supersedes",
+        "superseded_by",
+    } <= columns
+
+
+def test_temporal_invalidation_closes_older_fact_and_logs(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company A.",
+        type="semantic",
+        valid_from="2025-01-01",
+        temporal_subject=" user ",
+        temporal_predicate=" current_employer ",
+    )
+
+    new = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company B.",
+        type="semantic",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    new_after = memory_store.get_memory(memory_id=new.id, user_id="default")
+    assert old_after is not None
+    assert new_after is not None
+    assert old_after.valid_until == "2026-01-01"
+    assert old_after.status == "resolved"
+    assert old_after.superseded_by == new.id
+    assert new_after.supersedes == old.id
+
+    logs = memory_store.list_decision_logs(user_id="default")
+    payload = json.loads(logs[0].candidate_json)
+    assert payload["source"] == "temporal_invalidation"
+    assert payload["new_memory_id"] == new.id
+    assert payload["superseded_memory_ids"] == [old.id]
+
+
+def test_temporal_invalidation_skips_unsafe_candidates(
+    memory_store: MemoryStore,
+) -> None:
+    missing_key = memory_store.create_memory(
+        user_id="default",
+        content="User works somewhere.",
+        temporal_subject="user",
+    )
+    other_user = memory_store.create_memory(
+        user_id="other",
+        content="Other user works at Company A.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    pinned = memory_store.create_memory(
+        user_id="default",
+        content="Pinned employer fact.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    memory_store.update_memory_statuses(
+        user_id="default",
+        memory_ids=[pinned.id],
+        status="pinned",
+    )
+    archived_status = memory_store.create_memory(
+        user_id="default",
+        content="Lifecycle archived employer fact.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    memory_store.update_memory_statuses(
+        user_id="default",
+        memory_ids=[archived_status.id],
+        status="archived",
+    )
+    soft_deleted = memory_store.create_memory(
+        user_id="default",
+        content="Deleted employer fact.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    assert memory_store.archive_memory(memory_id=soft_deleted.id, user_id="default")
+
+    memory_store.create_memory(
+        user_id="default",
+        content="User works at Company B.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+
+    assert memory_store.get_memory(memory_id=missing_key.id, user_id="default").superseded_by is None
+    assert memory_store.get_memory(memory_id=pinned.id, user_id="default").superseded_by is None
+    assert memory_store.get_memory(memory_id=archived_status.id, user_id="default").superseded_by is None
+    assert memory_store.get_memory(memory_id=other_user.id, user_id="other").superseded_by is None
+
+
+def test_temporal_timeline_and_restore(memory_store: MemoryStore) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User uses Tool A.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="primary_tool",
+    )
+    new = memory_store.create_memory(
+        user_id="default",
+        content="User uses Tool B.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="primary_tool",
+    )
+
+    timeline = memory_store.list_memory_timeline(
+        user_id="default",
+        subject=" user ",
+        predicate="primary_tool",
+    )
+    assert [memory.id for memory in timeline] == [old.id, new.id]
+
+    restored = memory_store.restore_temporal_memory(
+        memory_id=old.id,
+        user_id="default",
+    )
+    assert restored is not None
+    assert restored.valid_until is None
+    assert restored.status == "dynamic"
+    assert restored.superseded_by is None
+    assert memory_store.get_memory(memory_id=new.id, user_id="default").supersedes is None
+
+    logs = memory_store.list_decision_logs(user_id="default")
+    assert json.loads(logs[0].candidate_json)["source"] == "temporal_restore"
+
+
+def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
+    memory_store: MemoryStore,
+) -> None:
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="用户在推进记忆网关。",
+        type="semantic",
+        importance=7,
+        valid_from="2026-06-17T08:00:00+00:00",
+        topics=["memory"],
+    )
+    neighbor = memory_store.create_memory(
+        user_id="default",
+        content="用户在整理记忆召回体验。",
+        type="semantic",
+        importance=7,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+
+    used_at = memory_store.mark_memories_used(
+        memory_ids=[seed.id],
+        user_id="default",
+        time_ripple_delta=0.0,
+        time_ripple_window_hours=48,
+    )
+
+    assert used_at is not None
+    refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
+    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
+    assert refreshed_seed is not None
+    assert refreshed_neighbor is not None
+    assert refreshed_seed.usage_count == 1
+    assert refreshed_seed.last_used_at == used_at
+    assert refreshed_neighbor.usage_count == 0
+    assert refreshed_neighbor.last_used_at is None
+
+
+def test_time_ripple_activates_same_space_or_topic_within_window(
+    memory_store: MemoryStore,
+) -> None:
+    space = memory_store.upsert_memory_space(user_id="default", name="Work")
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="用户在推进 Kelivo 记忆体验。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T08:00:00+00:00",
+        topics=["kelivo"],
+        space_ids=[space.id],
+    )
+    topic_neighbor = memory_store.create_memory(
+        user_id="default",
+        content="用户在梳理长期记忆的召回规则。",
+        type="semantic",
+        importance=7,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["kelivo"],
+    )
+    space_neighbor = memory_store.create_memory(
+        user_id="default",
+        content="用户在工作空间记录产品决策。",
+        type="semantic",
+        importance=7,
+        valid_from="2026-06-17T10:00:00+00:00",
+        topics=["product"],
+        space_ids=[space.id],
+    )
+
+    used_at = memory_store.mark_memories_used(
+        memory_ids=[seed.id],
+        user_id="default",
+        time_ripple_delta=0.25,
+        time_ripple_window_hours=48,
+    )
+
+    assert used_at is not None
+    refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
+    refreshed_topic = memory_store.get_memory(memory_id=topic_neighbor.id, user_id="default")
+    refreshed_space = memory_store.get_memory(memory_id=space_neighbor.id, user_id="default")
+    assert refreshed_seed is not None
+    assert refreshed_topic is not None
+    assert refreshed_space is not None
+    assert refreshed_seed.usage_count == 1
+    assert refreshed_topic.usage_count == 0.25
+    assert refreshed_topic.last_used_at == used_at
+    assert refreshed_space.usage_count == 0.25
+    assert refreshed_space.last_used_at == used_at
+
+
+def test_time_ripple_skips_ineligible_neighbors(memory_store: MemoryStore) -> None:
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="用户在推进记忆系统。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T08:00:00+00:00",
+        topics=["memory"],
+    )
+    other_user = memory_store.create_memory(
+        user_id="other",
+        content="其他用户也在推进记忆系统。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    outside_window = memory_store.create_memory(
+        user_id="default",
+        content="用户很久以前整理过记忆系统。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-20T09:00:00+00:00",
+        topics=["memory"],
+    )
+    no_shared_tag = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢安静的阅读环境。",
+        type="emotional",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["reading"],
+    )
+    soft_deleted = memory_store.create_memory(
+        user_id="default",
+        content="用户删除前的记忆系统记录。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    status_archived = memory_store.create_memory(
+        user_id="default",
+        content="用户归档的记忆系统记录。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    pinned = memory_store.create_memory(
+        user_id="default",
+        content="用户钉选的记忆系统记录。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户的私密记忆系统记录。",
+        type="semantic",
+        importance=8,
+        sensitivity="private",
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    sensitive = memory_store.create_memory(
+        user_id="default",
+        content="用户的敏感记忆系统记录。",
+        type="semantic",
+        importance=8,
+        sensitivity="sensitive",
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["memory"],
+    )
+    memory_store.archive_memory(memory_id=soft_deleted.id, user_id="default")
+    _set_memory_status(memory_store, status_archived.id, "archived")
+    _set_memory_status(memory_store, pinned.id, "pinned")
+
+    memory_store.mark_memories_used(
+        memory_ids=[seed.id],
+        user_id="default",
+        time_ripple_delta=0.5,
+        time_ripple_window_hours=24,
+    )
+
+    assert memory_store.get_memory(memory_id=other_user.id, user_id="other").usage_count == 0
+    for memory_id in [
+        outside_window.id,
+        no_shared_tag.id,
+        status_archived.id,
+        pinned.id,
+        private.id,
+        sensitive.id,
+    ]:
+        memory = memory_store.get_memory(memory_id=memory_id, user_id="default")
+        assert memory is not None
+        assert memory.usage_count == 0
+
+    with memory_store._connect() as connection:
+        row = connection.execute(
+            "SELECT usage_count FROM memories WHERE id = ? AND user_id = ?",
+            (soft_deleted.id, "default"),
+        ).fetchone()
+    assert row is not None
+    assert row["usage_count"] == 0
+
+
+def test_time_ripple_deduplicates_neighbor_across_multiple_seeds(
+    memory_store: MemoryStore,
+) -> None:
+    first = memory_store.create_memory(
+        user_id="default",
+        content="用户在推进 A 计划。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T08:00:00+00:00",
+        topics=["alpha"],
+    )
+    second = memory_store.create_memory(
+        user_id="default",
+        content="用户在推进 B 计划。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T08:30:00+00:00",
+        topics=["beta"],
+    )
+    neighbor = memory_store.create_memory(
+        user_id="default",
+        content="用户在整合 A/B 计划。",
+        type="semantic",
+        importance=8,
+        valid_from="2026-06-17T09:00:00+00:00",
+        topics=["alpha", "beta"],
+    )
+
+    memory_store.mark_memories_used(
+        memory_ids=[first.id, second.id],
+        user_id="default",
+        time_ripple_delta=0.2,
+        time_ripple_window_hours=48,
+    )
+
+    refreshed_first = memory_store.get_memory(memory_id=first.id, user_id="default")
+    refreshed_second = memory_store.get_memory(memory_id=second.id, user_id="default")
+    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
+    assert refreshed_first is not None
+    assert refreshed_second is not None
+    assert refreshed_neighbor is not None
+    assert refreshed_first.usage_count == 1
+    assert refreshed_second.usage_count == 1
+    assert refreshed_neighbor.usage_count == 0.2
+
+
 def test_create_memory_with_review_after_and_evidence(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
         content="用户最近在准备旅行。",
-        type="fact",
+        type="semantic",
         importance=7,
         review_after="2026-07-01",
         evidence_memory_ids=["source-a"],
@@ -72,13 +684,13 @@ def test_merge_memories_archives_fragments_and_keeps_evidence(memory_store: Memo
     first = memory_store.create_memory(
         user_id="default",
         content="用户喜欢黑咖啡。",
-        type="preference",
+        type="emotional",
         importance=7,
     )
     second = memory_store.create_memory(
         user_id="default",
         content="用户喜欢浅烘咖啡豆。",
-        type="preference",
+        type="emotional",
         importance=6,
         evidence_memory_ids=["older-source"],
     )
@@ -102,7 +714,7 @@ def test_memory_source_explanation_marks_core_evidence(memory_store: MemoryStore
     memory = memory_store.create_memory(
         user_id="default",
         content="用户喜欢直接、实用的回答。",
-        type="style",
+        type="emotional",
         confidence=0.9,
         source_message="我喜欢你直接一点",
         source_conversation_id="conv-1",
@@ -179,7 +791,33 @@ def test_recent_context_summary_upsert(memory_store: MemoryStore) -> None:
     assert summary.summary == "用户：聊咖啡\n助手：推荐早餐"
 
 
-def test_person_and_relationship_memory_types_are_valid(memory_store: MemoryStore) -> None:
+def test_recent_context_default_reads_latest_and_exact_global_is_distinct(
+    memory_store: MemoryStore,
+) -> None:
+    global_summary = memory_store.upsert_recent_context_summary(
+        user_id="default",
+        conversation_id=None,
+        summary="用户：全局摘要",
+    )
+    conversation_summary = memory_store.upsert_recent_context_summary(
+        user_id="default",
+        conversation_id="conv-1",
+        summary="用户：会话摘要",
+    )
+
+    latest = memory_store.get_recent_context_summary(user_id="default")
+    exact_global = memory_store.get_recent_context_summary_for_conversation(
+        user_id="default",
+        conversation_id=None,
+    )
+
+    assert latest is not None
+    assert latest.id == conversation_summary.id
+    assert exact_global is not None
+    assert exact_global.id == global_summary.id
+
+
+def test_legacy_person_and_relationship_memory_types_migrate_to_semantic(memory_store: MemoryStore) -> None:
     person = memory_store.create_memory(
         user_id="default",
         content="用户的朋友小林正在准备考研。",
@@ -191,15 +829,15 @@ def test_person_and_relationship_memory_types_are_valid(memory_store: MemoryStor
         type="relationship",
     )
 
-    assert person.type == "person"
-    assert relationship.type == "relationship"
+    assert person.type == "semantic"
+    assert relationship.type == "semantic"
 
 
 def test_memory_is_scoped_by_user(memory_store: MemoryStore) -> None:
     memory_store.create_memory(
         user_id="user-a",
         content="用户喜欢茶。",
-        type="preference",
+        type="emotional",
     )
 
     assert len(memory_store.list_memories(user_id="user-a")) == 1
@@ -236,7 +874,7 @@ def test_archived_memory_can_be_listed_and_restored(memory_store: MemoryStore) -
     memory = memory_store.create_memory(
         user_id="default",
         content="User likes black coffee.",
-        type="preference",
+        type="emotional",
     )
 
     assert memory_store.archive_memory(memory_id=memory.id, user_id="default") is True
@@ -252,3 +890,216 @@ def test_archived_memory_can_be_listed_and_restored(memory_store: MemoryStore) -
     assert restored.id == memory.id
     assert restored.archived_at is None
     assert memory_store.list_archived_memories(user_id="default") == []
+
+
+def test_archived_memory_can_be_purged_with_audit(memory_store: MemoryStore) -> None:
+    space = memory_store.upsert_memory_space(user_id="default", name="Private")
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User private deletion target is SECRET-123.",
+        type="semantic",
+        sensitivity="private",
+        source_message="The source also says SECRET-123.",
+        space_ids=[space.id],
+    )
+    assert memory_store.archive_memory(memory_id=memory.id, user_id="default") is True
+
+    result = memory_store.purge_archived_memory(
+        memory_id=memory.id,
+        user_id="default",
+        affected_core_sections=[
+            {
+                "id": "core-1",
+                "section": "profile",
+                "content": "Do not copy this into purge audit.",
+                "evidence_memory_ids": [memory.id],
+                "version": 3,
+            }
+        ],
+        call_source="test",
+    )
+
+    assert result is not None
+    purged, log = result
+    assert purged.id == memory.id
+    assert memory_store.get_memory(memory_id=memory.id, user_id="default") is None
+    assert memory_store.list_archived_memories(user_id="default") == []
+    assert memory_store.restore_memory(memory_id=memory.id, user_id="default") is None
+    with memory_store._connect() as connection:
+        link_count = connection.execute(
+            "SELECT COUNT(*) FROM memory_space_links WHERE user_id = ? AND memory_id = ?",
+            ("default", memory.id),
+        ).fetchone()[0]
+    assert link_count == 0
+
+    assert log.decision == "purge"
+    audit = json.loads(log.candidate_json)
+    assert audit["source"] == "permanent_purge"
+    assert audit["memory_id"] == memory.id
+    assert audit["content_length"] == len(memory.content)
+    assert len(audit["content_sha256"]) == 64
+    assert audit["call_source"] == "test"
+    assert audit["affected_core_sections"] == [
+        {"section": "profile", "id": "core-1", "version": 3}
+    ]
+    assert "SECRET-123" not in log.candidate_json
+    assert "Do not copy" not in log.candidate_json
+
+
+def test_purge_rejects_active_memory(memory_store: MemoryStore) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User active memory should remain.",
+        type="semantic",
+    )
+
+    result = memory_store.purge_archived_memory(
+        memory_id=memory.id,
+        user_id="default",
+    )
+
+    assert result is None
+    assert memory_store.get_memory(memory_id=memory.id, user_id="default") is not None
+    assert [
+        log for log in memory_store.list_decision_logs(user_id="default") if log.decision == "purge"
+    ] == []
+
+
+def test_update_memory_embedding(memory_store: MemoryStore) -> None:
+    """update_memory_embedding 应更新活跃记忆的 embedding 并更新时间戳。"""
+    import json, time as _time
+
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡",
+        type="emotional",
+    )
+    assert memory.embedding_json is None
+
+    _time.sleep(0.01)
+    new_embedding = json.dumps([0.5, 0.5, 0.5])
+    result = memory_store.update_memory_embedding(
+        memory_id=memory.id,
+        user_id="default",
+        embedding_json=new_embedding,
+    )
+    assert result is True
+
+    updated = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert updated is not None
+    assert updated.embedding_json == new_embedding
+    assert updated.updated_at > memory.updated_at
+
+
+def test_update_memory_embedding_ignores_archived(memory_store: MemoryStore) -> None:
+    """对已归档记忆调用 update_memory_embedding 应返回 False。"""
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡",
+        type="emotional",
+    )
+    memory_store.archive_memory(memory_id=memory.id, user_id="default")
+
+    result = memory_store.update_memory_embedding(
+        memory_id=memory.id,
+        user_id="default",
+        embedding_json=json.dumps([0.5, 0.5, 0.5]),
+    )
+    assert result is False
+
+
+def test_get_active_memory_count(memory_store: MemoryStore) -> None:
+    """get_active_memory_count 应正确统计活跃记忆数量。"""
+    assert memory_store.get_active_memory_count(user_id="default") == 0
+
+    m1 = memory_store.create_memory(
+        user_id="default", content="记忆1", type="semantic",
+    )
+    assert memory_store.get_active_memory_count(user_id="default") == 1
+
+    m2 = memory_store.create_memory(
+        user_id="default", content="记忆2", type="semantic",
+    )
+    assert memory_store.get_active_memory_count(user_id="default") == 2
+
+    memory_store.archive_memory(memory_id=m1.id, user_id="default")
+    assert memory_store.get_active_memory_count(user_id="default") == 1
+
+    memory_store.archive_memory(memory_id=m2.id, user_id="default")
+    assert memory_store.get_active_memory_count(user_id="default") == 0
+
+
+def test_archive_expired_memories(memory_store: MemoryStore) -> None:
+    """archive_expired_memories 应归档 valid_until 已过期的记忆，保留未过期和无有效期的。"""
+    from datetime import UTC, datetime, timedelta
+
+    past = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+
+    m1 = memory_store.create_memory(
+        user_id="default",
+        content="expired memory",
+        type="semantic",
+        valid_until=past,
+    )
+    m2 = memory_store.create_memory(
+        user_id="default",
+        content="future expiry",
+        type="semantic",
+        valid_until=future,
+    )
+    m3 = memory_store.create_memory(
+        user_id="default",
+        content="no expiry",
+        type="semantic",
+    )
+
+    count = memory_store.archive_expired_memories(user_id="default")
+    assert count == 1
+
+    # m1 已归档
+    assert memory_store.get_memory(memory_id=m1.id, user_id="default") is None
+    # m2,m3 仍活跃
+    assert memory_store.get_memory(memory_id=m2.id, user_id="default") is not None
+    assert memory_store.get_memory(memory_id=m3.id, user_id="default") is not None
+
+    # 再次调用不应重复归档
+    count2 = memory_store.archive_expired_memories(user_id="default")
+    assert count2 == 0
+
+
+def test_archive_expired_memories_empty_store(memory_store: MemoryStore) -> None:
+    """空 store 调用返回 0。"""
+    assert memory_store.archive_expired_memories(user_id="default") == 0
+
+
+def test_archive_expired_memories_user_scoped(memory_store: MemoryStore) -> None:
+    """archive_expired 仅作用于指定用户。"""
+    from datetime import UTC, datetime, timedelta
+
+    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+
+    memory_store.create_memory(
+        user_id="user-a", content="a expired", type="semantic", valid_until=past,
+    )
+    memory_store.create_memory(
+        user_id="user-b", content="b expired", type="semantic", valid_until=past,
+    )
+
+    assert memory_store.archive_expired_memories(user_id="user-a") == 1
+    assert memory_store.archive_expired_memories(user_id="user-b") == 1
+    assert memory_store.archive_expired_memories(user_id="user-a") == 0
+
+
+def _set_memory_status(memory_store: MemoryStore, memory_id: str, status: str) -> None:
+    now = datetime.now(UTC).isoformat()
+    with memory_store._connect() as connection:
+        connection.execute(
+            """
+            UPDATE memories
+            SET status = ?, updated_at = ?
+            WHERE id = ? AND user_id = ? AND archived = 0
+            """,
+            (status, now, memory_id, "default"),
+        )
+

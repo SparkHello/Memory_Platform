@@ -8,7 +8,9 @@ from app.llm.prompts import (
     render_memory_batch_extraction_messages,
     render_memory_extraction_messages,
 )
+from app.memory.extraction_hints import apply_extraction_hints
 from app.memory.models import CandidateMemory
+from app.memory.review_policy import normalize_time_uncertain_candidate
 from app.memory.utils import _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest
 
@@ -24,8 +26,17 @@ ASSUMPTION_MARKERS = (
     "let's say",
 )
 
-MIN_IMPORTANCE = 6
-MIN_CONFIDENCE = 0.8
+MIN_IMPORTANCE = 6  # 默认回退值
+MIN_CONFIDENCE = 0.8  # 默认回退值
+
+_TYPE_THRESHOLDS: dict[str, tuple[int, float]] = {
+    "episodic": (6, 0.80),
+    "semantic": (6, 0.80),
+    "procedural": (5, 0.80),
+    "emotional": (5, 0.80),
+    "reflective": (5, 0.80),
+}
+
 SENSITIVE_MIN_IMPORTANCE = 8
 SENSITIVE_MIN_CONFIDENCE = 0.9
 
@@ -89,6 +100,8 @@ class LLMMemoryExtractor:
                 candidate_json=json.dumps(data, ensure_ascii=False)[:500],
             )
 
+        candidate = normalize_time_uncertain_candidate(candidate, source_text=user_message)
+        candidate = apply_extraction_hints(candidate, source_text=user_message)
         candidate_json = json.dumps(candidate.model_dump(), ensure_ascii=False)
         rejection = _gate_reason(candidate, user_message)
         if rejection:
@@ -159,6 +172,8 @@ class LLMMemoryExtractor:
                 )
                 continue
 
+            candidate = normalize_time_uncertain_candidate(candidate, source_text=source_text)
+            candidate = apply_extraction_hints(candidate, source_text=source_text)
             normalized_candidate_json = json.dumps(candidate.model_dump(), ensure_ascii=False)
             rejection = validate_candidate_for_save(
                 candidate,
@@ -249,15 +264,25 @@ def validate_candidate_for_save(
     user_message: str | None = None,
     require_quote_in_user_message: bool = False,
 ) -> str | None:
-    """逐条核对保存规则，返回拒绝原因；全部通过时返回 None。"""
+    """逐条核对保存规则，返回拒绝原因；全部通过时返回 None。
+
+    不同类型使用不同的 importance / confidence 阈值：
+    - episodic / semantic: importance≥6, confidence≥0.80
+    - procedural / reflective: importance≥5, confidence≥0.80
+    - emotional: importance≥5, confidence≥0.80
+    """
     if candidate.action == "ignore":
         return candidate.reason or "提取模型判定无需保存"
     if not candidate.memory.strip():
         return "memory 内容为空"
-    if candidate.importance < MIN_IMPORTANCE:
-        return f"importance {candidate.importance} 低于保存阈值 {MIN_IMPORTANCE}"
-    if candidate.confidence < MIN_CONFIDENCE:
-        return f"confidence {candidate.confidence} 低于保存阈值 {MIN_CONFIDENCE}"
+
+    min_imp, min_conf = _TYPE_THRESHOLDS.get(
+        candidate.type, (MIN_IMPORTANCE, MIN_CONFIDENCE)
+    )
+    if candidate.importance < min_imp:
+        return f"importance {candidate.importance} 低于保存阈值 {min_imp}（类型: {candidate.type}）"
+    if candidate.confidence < min_conf:
+        return f"confidence {candidate.confidence} 低于保存阈值 {min_conf}（类型: {candidate.type}）"
 
     quote = candidate.source_quote.strip()
     quote_rejection = _source_quote_gate_reason(

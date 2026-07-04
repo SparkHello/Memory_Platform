@@ -139,7 +139,7 @@ def _select_source_memories(memories: list[MemoryRecord]) -> list[MemoryRecord]:
     candidates = [
         memory
         for memory in memories
-        if memory.importance >= 7 or memory.usage_count >= 2 or memory.type in {"person", "relationship"}
+        if memory.importance >= 7 or memory.usage_count >= 2
     ]
     if not candidates:
         candidates = memories[:]
