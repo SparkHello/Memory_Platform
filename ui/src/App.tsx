@@ -8,7 +8,9 @@ import { AppShell } from "./layout/AppShell";
 import { DashboardPage } from "./pages/DashboardPage";
 import { CoreMemoryPage } from "./pages/memory/CoreMemoryPage";
 import { DecisionLogsPage } from "./pages/memory/DecisionLogsPage";
+import { EvaluationPage } from "./pages/memory/EvaluationPage";
 import { MemoriesPage } from "./pages/memory/MemoriesPage";
+import { RecallExplainPage } from "./pages/memory/RecallExplainPage";
 import { RecentContextPage } from "./pages/memory/RecentContextPage";
 import { ReportsPage } from "./pages/memory/ReportsPage";
 import { ReviewPage } from "./pages/memory/ReviewPage";
@@ -90,6 +92,8 @@ export function App() {
         {activePage === "review" && (
           <ReviewPage api={api} notify={notify} confirm={confirm} />
         )}
+        {activePage === "recall" && <RecallExplainPage api={api} notify={notify} />}
+        {activePage === "evaluation" && <EvaluationPage api={api} notify={notify} />}
         {activePage === "recent" && <RecentContextPage api={api} />}
         {activePage === "reports" && (
           <ReportsPage api={api} settings={settings} notify={notify} confirm={confirm} />

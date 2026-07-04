@@ -59,7 +59,7 @@ import {
   SENSITIVITIES,
   STABILITIES
 } from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
+import { downloadBlob, downloadFile, copyText } from "../../utils/files";
 import {
   candidateSummary,
   clampNumber,
@@ -99,6 +99,7 @@ export function ReportsPage({
   const [overwrite, setOverwrite] = useState(false);
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const exportUserId = safeExportUserId(settings.userId || "default");
 
   const load = useCallback(async () => {
     setState({ loading: true, error: null, data: null });
@@ -128,14 +129,24 @@ export function ReportsPage({
       const data = await api.exportMemories(format);
       if (format === "json") {
         downloadFile(
-          `memory-export-${settings.userId}.json`,
+          `memory-export-${exportUserId}.json`,
           JSON.stringify(data, null, 2),
           "application/json"
         );
       } else {
-        downloadFile(`memory-export-${settings.userId}.md`, String(data), "text/markdown");
+        downloadFile(`memory-export-${exportUserId}.md`, String(data), "text/markdown");
       }
       notify(`已下载 ${format.toUpperCase()} 导出`, "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
+  const exportObsidianZip = async () => {
+    try {
+      const blob = await api.exportObsidianZip();
+      downloadBlob(`memory-obsidian-export-${exportUserId}.zip`, blob);
+      notify("已下载 Obsidian Zip", "success");
     } catch (error) {
       notify(errorMessage(error), "error");
     }
@@ -224,6 +235,10 @@ export function ReportsPage({
         <div className="panel-header">
           <h2>导出备份</h2>
         </div>
+        <div className="notice warning">
+          <ShieldAlert size={18} />
+          导出的 JSON、Markdown 和 Obsidian Zip 会包含完整私密/敏感正文。
+        </div>
         <div className="button-row">
           <button className="primary-button" type="button" onClick={() => exportFile("json")}>
             <Download size={16} />
@@ -232,6 +247,10 @@ export function ReportsPage({
           <button className="secondary-button" type="button" onClick={() => exportFile("markdown")}>
             <Download size={16} />
             下载 Markdown
+          </button>
+          <button className="secondary-button" type="button" onClick={exportObsidianZip}>
+            <Download size={16} />
+            下载 Obsidian Zip
           </button>
         </div>
       </section>
@@ -297,6 +316,17 @@ export function ReportsPage({
       </section>
     </div>
   );
+}
+
+function safeExportUserId(value: string): string {
+  const cleaned = Array.from(value)
+    .map((character) =>
+      /^[A-Za-z0-9_-]$/.test(character) ? character : "-"
+    )
+    .join("")
+    .replace(/[-_]+$/g, "")
+    .replace(/^[-_]+/g, "");
+  return cleaned.slice(0, 80) || "default";
 }
 
 

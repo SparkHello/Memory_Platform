@@ -1,0 +1,537 @@
+import {
+  BarChart3,
+  Check,
+  DatabaseZap,
+  Eye,
+  EyeOff,
+  Play,
+  Plus,
+  RefreshCcw,
+  Save,
+  Trash2
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MemoryApi } from "../../api";
+import { PageHeader } from "../../components/PageHeader";
+import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import type {
+  MechanismDiagnosisResult,
+  MechanismVerdict,
+  MemoryRecord,
+  RecallEvalLabel,
+  RecallEvalRunResult,
+  RecallEvalValidationIssue,
+  RecallEvalWorkbench
+} from "../../types";
+import { displayText, errorMessage, numberText, shortId } from "../../utils/format";
+
+type Notify = (message: string, kind?: "success" | "error" | "info") => void;
+type RunMode = "keyword" | "embedding";
+
+type EvalState = {
+  loading: boolean;
+  error: string | null;
+  diagnosis: MechanismDiagnosisResult | null;
+  diagnosisError: string | null;
+  workbench: RecallEvalWorkbench | null;
+};
+
+const EMPTY_STATE: EvalState = {
+  loading: true,
+  error: null,
+  diagnosis: null,
+  diagnosisError: null,
+  workbench: null
+};
+
+export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify }) {
+  const [state, setState] = useState<EvalState>(EMPTY_STATE);
+  const [labels, setLabels] = useState<RecallEvalLabel[]>([]);
+  const [selectedLabelId, setSelectedLabelId] = useState<string | null>(null);
+  const [showFullCandidates, setShowFullCandidates] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [initializing, setInitializing] = useState(false);
+  const [runningMode, setRunningMode] = useState<RunMode | null>(null);
+  // load() 通过 ref 读取当前遮罩偏好，避免把它放进依赖里——否则切换遮罩会触发
+  // 整页重载并用服务器数据覆盖掉正在编辑、尚未保存的标注。
+  const showFullRef = useRef(showFullCandidates);
+  useEffect(() => {
+    showFullRef.current = showFullCandidates;
+  }, [showFullCandidates]);
+
+  const load = useCallback(async () => {
+    setState((current) => ({ ...current, loading: true, error: null }));
+    let diagnosisError: string | null = null;
+    try {
+      const [diagnosis, workbench] = await Promise.all([
+        api.evaluationDiagnosis().catch((error) => {
+          // 诊断失败不应连累整页：记下错误，仍渲染召回工作台。
+          diagnosisError = errorMessage(error);
+          return null;
+        }),
+        api.recallEvaluationWorkbench({ redactSensitive: !showFullRef.current }).catch((error) => {
+          if (String(errorMessage(error)).startsWith("404:")) return null;
+          throw error;
+        })
+      ]);
+      setState({ loading: false, error: null, diagnosis, diagnosisError, workbench });
+      setLabels(workbench?.labels || []);
+      setSelectedLabelId((current) => current || workbench?.labels[0]?.id || null);
+    } catch (error) {
+      setState({ loading: false, error: errorMessage(error), diagnosis: null, diagnosisError, workbench: null });
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const selectedLabel = useMemo(() => {
+    return labels.find((label) => label.id === selectedLabelId) || labels[0] || null;
+  }, [labels, selectedLabelId]);
+
+  const candidateMap = useMemo(() => {
+    return new Map((state.workbench?.candidates || []).map((candidate) => [candidate.id, candidate]));
+  }, [state.workbench?.candidates]);
+
+  const validationByLabel = useMemo(() => {
+    const map = new Map<string, RecallEvalValidationIssue[]>();
+    for (const issue of state.workbench?.validation_issues || []) {
+      const key = issue.label_id || "_global";
+      const bucket = map.get(key) || [];
+      bucket.push(issue);
+      map.set(key, bucket);
+    }
+    return map;
+  }, [state.workbench?.validation_issues]);
+
+  const gradedCount = labels.filter((label) => label.relevant_ids.length > 0).length;
+  const targetMin = state.workbench?.target_label_min || 20;
+  const targetMax = state.workbench?.target_label_max || 30;
+  const progress = Math.min(100, Math.round((gradedCount / targetMin) * 100));
+
+  const initialize = async () => {
+    setInitializing(true);
+    try {
+      await api.initRecallEvaluation();
+      notify("评测快照已刷新", "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setInitializing(false);
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const result = await api.saveRecallEvaluationLabels(labels);
+      notify(`已保存 ${result.summary.queries_total} 条 query 标注`, "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const run = async (mode: RunMode) => {
+    setRunningMode(mode);
+    try {
+      // 评测读取磁盘上的 labels.jsonl，先落盘当前标注，保证跑的就是界面所见。
+      await api.saveRecallEvaluationLabels(labels);
+      await api.runRecallEvaluation({ mode, k: 8 });
+      notify(`${displayText(mode)}基线已完成`, "success");
+      await load();
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setRunningMode(null);
+    }
+  };
+
+  const toggleCandidateRedaction = async () => {
+    const nextShowFull = !showFullCandidates;
+    setShowFullCandidates(nextShowFull);
+    if (!state.workbench) return;
+    try {
+      // 只刷新候选记忆的遮罩视图，保留正在编辑、尚未保存的标注。
+      const workbench = await api.recallEvaluationWorkbench({ redactSensitive: !nextShowFull });
+      setState((current) => (current.workbench ? { ...current, workbench } : current));
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
+  const addLabel = () => {
+    const used = new Set(labels.map((label) => label.id));
+    let nextIndex = labels.length + 1;
+    let id = `q${String(nextIndex).padStart(3, "0")}`;
+    while (used.has(id)) {
+      nextIndex += 1;
+      id = `q${String(nextIndex).padStart(3, "0")}`;
+    }
+    const next: RecallEvalLabel = { id, query: "", relevant_ids: [], note: "" };
+    setLabels((current) => [...current, next]);
+    setSelectedLabelId(id);
+  };
+
+  const removeLabel = (id: string) => {
+    setLabels((current) => current.filter((label) => label.id !== id));
+    setSelectedLabelId((current) => (current === id ? labels.find((label) => label.id !== id)?.id || null : current));
+  };
+
+  const updateSelected = (patch: Partial<RecallEvalLabel>) => {
+    if (!selectedLabel) return;
+    setLabels((current) =>
+      current.map((label) => (label.id === selectedLabel.id ? { ...label, ...patch } : label))
+    );
+  };
+
+  const toggleRelevant = (memoryId: string) => {
+    if (!selectedLabel) return;
+    const current = new Set(selectedLabel.relevant_ids);
+    if (current.has(memoryId)) {
+      current.delete(memoryId);
+    } else {
+      current.add(memoryId);
+    }
+    updateSelected({ relevant_ids: Array.from(current) });
+  };
+
+  const results = state.workbench?.last_results || {};
+
+  return (
+    <div className="page-stack evaluation-page">
+      <PageHeader
+        title="评测闭环"
+        subtitle="用真实 query 标注和机制诊断验证当前记忆系统是否真的被数据驱动。"
+        action={
+          <div className="button-row end">
+            <button className="secondary-button" type="button" onClick={() => void load()}>
+              <RefreshCcw size={16} />
+              刷新
+            </button>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={initialize}
+              disabled={initializing}
+            >
+              <DatabaseZap size={16} />
+              {initializing ? "初始化中" : "初始化快照"}
+            </button>
+          </div>
+        }
+      />
+
+      {state.loading && <LoadingBlock label="正在载入评测闭环" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
+      {state.diagnosisError && !state.diagnosis && (
+        <ErrorBlock message={`机制诊断加载失败：${state.diagnosisError}`} onRetry={() => void load()} />
+      )}
+
+      {state.diagnosis && (
+        <section className="evaluation-verdict-grid">
+          {state.diagnosis.verdicts.map((verdict) => (
+            <VerdictTile verdict={verdict} key={verdict.mechanism} />
+          ))}
+        </section>
+      )}
+
+      <section className="panel evaluation-progress-panel">
+        <div className="panel-header compact-header">
+          <div>
+            <h2>召回标注进度</h2>
+            <p className="muted-line">
+              已标注 {gradedCount} / {targetMin} 条，建议首批保持在 {targetMin}-{targetMax} 条。
+            </p>
+          </div>
+          <span className="count-pill">{progress}%</span>
+        </div>
+        <div className="evaluation-progress-bar" aria-label="召回标注进度">
+          <span style={{ width: `${progress}%` }} />
+        </div>
+        {(state.workbench?.validation_issues || []).length > 0 && (
+          <div className="evaluation-issues">
+            {state.workbench?.validation_issues.map((issue) => (
+              <span key={`${issue.code}-${issue.label_id}-${issue.memory_id}`}>
+                {issue.label_id ? `${issue.label_id}: ` : ""}
+                {issue.message}
+              </span>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {state.workbench ? (
+        <section className="evaluation-layout">
+          <div className="panel evaluation-label-panel">
+            <div className="panel-header compact-header">
+              <h2>Query 标注</h2>
+              <button className="secondary-button compact" type="button" onClick={addLabel}>
+                <Plus size={15} />
+                新增
+              </button>
+            </div>
+            {labels.length === 0 ? (
+              <EmptyBlock label="暂无 query，先新增一条标注" compact />
+            ) : (
+              <div className="evaluation-label-list">
+                {labels.map((label) => {
+                  const issues = validationByLabel.get(label.id) || [];
+                  return (
+                    <button
+                      className={`evaluation-label-item ${selectedLabel?.id === label.id ? "active" : ""}`}
+                      type="button"
+                      key={label.id}
+                      onClick={() => setSelectedLabelId(label.id)}
+                    >
+                      <strong>{label.id}</strong>
+                      <span>{label.query || "未填写 query"}</span>
+                      <em>{label.relevant_ids.length} 条相关记忆</em>
+                      {issues.length > 0 && <small>{issues.length} 个问题</small>}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="panel evaluation-editor-panel">
+            {selectedLabel ? (
+              <>
+                <div className="panel-header compact-header">
+                  <h2>{selectedLabel.id}</h2>
+                  <button
+                    className="danger-button compact"
+                    type="button"
+                    onClick={() => removeLabel(selectedLabel.id)}
+                  >
+                    <Trash2 size={15} />
+                    删除
+                  </button>
+                </div>
+                <label className="field-block">
+                  <span>检索意图</span>
+                  <textarea
+                    value={selectedLabel.query}
+                    rows={3}
+                    onChange={(event) => updateSelected({ query: event.target.value })}
+                    placeholder="例如：用户的饮食偏好"
+                  />
+                </label>
+                <label className="field-block">
+                  <span>说明</span>
+                  <input
+                    value={selectedLabel.note || ""}
+                    onChange={(event) => updateSelected({ note: event.target.value })}
+                    placeholder="可选"
+                  />
+                </label>
+                <div className="evaluation-selected-list">
+                  {(selectedLabel.relevant_ids || []).map((memoryId) => (
+                    <button
+                      className="count-pill"
+                      type="button"
+                      key={memoryId}
+                      onClick={() => toggleRelevant(memoryId)}
+                      title="移除相关记忆"
+                    >
+                      {shortId(memoryId)}
+                    </button>
+                  ))}
+                  {selectedLabel.relevant_ids.length === 0 && (
+                    <span className="muted-line">尚未选择相关记忆</span>
+                  )}
+                </div>
+              </>
+            ) : (
+              <EmptyBlock label="选择或新增一个 query" />
+            )}
+          </div>
+
+          <div className="panel evaluation-candidates-panel">
+            <div className="panel-header compact-header">
+              <div>
+                <h2>候选记忆</h2>
+                <p className="muted-line">{state.workbench.candidates.length} 条候选记忆 · 与检索可见范围一致</p>
+              </div>
+              <button
+                className="secondary-button compact"
+                type="button"
+                onClick={() => void toggleCandidateRedaction()}
+              >
+                {showFullCandidates ? <EyeOff size={15} /> : <Eye size={15} />}
+                {showFullCandidates ? "遮罩敏感" : "查看完整"}
+              </button>
+            </div>
+            <div className="evaluation-candidate-list">
+              {state.workbench.candidates.map((candidate) => (
+                <CandidateRow
+                  candidate={candidate}
+                  key={candidate.id}
+                  checked={Boolean(selectedLabel?.relevant_ids.includes(candidate.id))}
+                  onToggle={() => toggleRelevant(candidate.id)}
+                  disabled={!selectedLabel}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : (
+        !state.loading && (
+          <section className="panel">
+            <EmptyBlock label="尚未初始化召回评测快照" />
+          </section>
+        )
+      )}
+
+      {state.workbench && (
+        <section className="panel evaluation-run-panel">
+          <div className="panel-header compact-header">
+            <div>
+              <h2>基线运行</h2>
+              <p className="muted-line">
+                运行前会自动保存当前标注；评测在隔离快照上进行，强制 record_usage=false。语义基线为 embedding+关键词混合检索。
+              </p>
+            </div>
+            <div className="button-row end">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={save}
+                disabled={saving || runningMode !== null}
+              >
+                <Save size={16} />
+                {saving ? "保存中" : "保存标注"}
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => void run("keyword")}
+                disabled={runningMode !== null || saving}
+              >
+                <Play size={16} />
+                {runningMode === "keyword" ? "运行中" : "关键词基线"}
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => void run("embedding")}
+                disabled={runningMode !== null || saving}
+              >
+                <BarChart3 size={16} />
+                {runningMode === "embedding" ? "运行中" : "语义基线"}
+              </button>
+            </div>
+          </div>
+          <div className="evaluation-results-grid">
+            <ResultCard mode="keyword" result={results.keyword || null} candidateMap={candidateMap} />
+            <ResultCard mode="embedding" result={results.embedding || null} candidateMap={candidateMap} />
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function VerdictTile({ verdict }: { verdict: MechanismVerdict }) {
+  return (
+    <article className={`evaluation-verdict evaluation-verdict-${verdict.state}`}>
+      <div>
+        <span>{displayText(verdict.mechanism)}</span>
+        <strong>{displayText(verdict.state)}</strong>
+      </div>
+      <p>{verdict.message}</p>
+    </article>
+  );
+}
+
+function CandidateRow({
+  candidate,
+  checked,
+  disabled,
+  onToggle
+}: {
+  candidate: MemoryRecord;
+  checked: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <label className={`evaluation-candidate ${checked ? "selected" : ""}`}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={onToggle} />
+      <span>
+        <strong>{candidate.content}</strong>
+        <small>
+          {shortId(candidate.id)} · {displayText(candidate.type)} · 重要度 {candidate.importance}
+          {candidate.redacted ? " · 已遮罩" : ""}
+        </small>
+      </span>
+      {checked && <Check size={16} />}
+    </label>
+  );
+}
+
+function ResultCard({
+  mode,
+  result,
+  candidateMap
+}: {
+  mode: RunMode;
+  result: RecallEvalRunResult | null;
+  candidateMap: Map<string, MemoryRecord>;
+}) {
+  return (
+    <article className="evaluation-result-card">
+      <div className="panel-header compact-header">
+        <h3>{displayText(mode)}基线</h3>
+        {result && <span className="count-pill">k={result.summary.k || 8}</span>}
+      </div>
+      {!result ? (
+        <EmptyBlock label="暂无运行结果" compact />
+      ) : (
+        <>
+          <div className="evaluation-metrics">
+            <Metric label="Hit" value={result.summary.hit_rate} />
+            <Metric label="P@k" value={result.summary.precision_at_k} />
+            <Metric label="R@k" value={result.summary.recall_at_k} />
+            <Metric label="MRR" value={result.summary.mrr} />
+            <Metric label="nDCG" value={result.summary.ndcg_at_k} />
+          </div>
+          <div className="evaluation-query-results">
+            {result.per_query.map((row) => (
+              <details key={`${mode}-${row.id || row.query}`}>
+                <summary>
+                  <span>{row.query}</span>
+                  <em>
+                    hit={Math.round(row.hit)} · r={numberText(row.recall)} · ndcg={numberText(row.ndcg)}
+                  </em>
+                </summary>
+                <div className="evaluation-predictions">
+                  {row.predicted_ids.length === 0 && <span className="muted-line">无召回结果</span>}
+                  {row.predicted_ids.map((memoryId) => (
+                    <span className="count-pill" key={memoryId} title={candidateMap.get(memoryId)?.content || memoryId}>
+                      {shortId(memoryId)}
+                    </span>
+                  ))}
+                </div>
+              </details>
+            ))}
+          </div>
+        </>
+      )}
+    </article>
+  );
+}
+
+function Metric({ label, value }: { label: string; value?: number | null }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong>{numberText(value)}</strong>
+    </div>
+  );
+}

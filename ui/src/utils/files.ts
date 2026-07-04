@@ -15,6 +15,10 @@ export async function copyText(text: string): Promise<void> {
 
 export function downloadFile(filename: string, content: string, type: string) {
   const blob = new Blob([content], { type });
+  downloadBlob(filename, blob);
+}
+
+export function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

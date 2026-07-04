@@ -1,5 +1,6 @@
 import {
   Activity,
+  ClipboardCheck,
   Database,
   FileText,
   Gauge,
@@ -8,6 +9,7 @@ import {
   Layers3,
   ListChecks,
   RefreshCcw,
+  Search,
   Settings as SettingsIcon,
   Wrench
 } from "lucide-react";
@@ -22,8 +24,8 @@ type NavItem = {
 
 const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
   {
-    title: "总览",
-    items: [{ key: "dashboard", label: "总览", icon: Gauge }]
+    title: "工作室",
+    items: [{ key: "dashboard", label: "记忆工作室", icon: Gauge }]
   },
   {
     title: "记忆",
@@ -31,6 +33,8 @@ const NAV_GROUPS: Array<{ title: string; items: NavItem[] }> = [
       { key: "memories", label: "记忆库", icon: Database },
       { key: "core", label: "核心记忆", icon: Layers3 },
       { key: "review", label: "记忆体检", icon: ListChecks },
+      { key: "recall", label: "召回解释", icon: Search },
+      { key: "evaluation", label: "评测闭环", icon: ClipboardCheck },
       { key: "recent", label: "近期上下文", icon: History },
       { key: "reports", label: "报告与备份", icon: FileText },
       { key: "logs", label: "决策日志", icon: Activity }
@@ -72,8 +76,8 @@ export function AppShell({
         <div className="brand">
           <div className="brand-mark">M</div>
           <div>
-            <div className="brand-title">记忆控制台</div>
-            <div className="brand-subtitle">本地记忆服务</div>
+            <div className="brand-title">记忆工作室</div>
+            <div className="brand-subtitle">本地长期记忆</div>
           </div>
         </div>
         <nav className="nav-list" aria-label="Memory Console">

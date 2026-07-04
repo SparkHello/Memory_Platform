@@ -28,7 +28,7 @@ import type {
   CoreMemorySection,
   CoreSectionName,
   DecisionLog,
-  MemoryAction,
+  DecisionLogAction,
   MemoryExport,
   MemoryRecord,
   MemoryReport,
@@ -86,7 +86,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
     error: null,
     data: null
   });
-  const [decision, setDecision] = useState<"all" | MemoryAction>("all");
+  const [decision, setDecision] = useState<"all" | DecisionLogAction>("all");
   const [conversationId, setConversationId] = useState("");
   const [selected, setSelected] = useState<DecisionLog | null>(null);
 
@@ -131,7 +131,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
             label="决策"
             value={decision}
             options={["all", ...DECISIONS]}
-            onChange={(value) => setDecision(value as "all" | MemoryAction)}
+            onChange={(value) => setDecision(value as "all" | DecisionLogAction)}
           />
           <label className="field-block small log-conversation-field">
             <span>对话 ID</span>
