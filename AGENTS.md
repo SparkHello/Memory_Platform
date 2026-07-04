@@ -10,6 +10,7 @@
 - OpenAI-compatible 网关模式：客户端请求 `/v1/chat/completions`，服务端自动注入记忆、调用上游模型，并在响应后后台提取新记忆。
 
 项目目标不是“尽量多记”，而是“不乱记”：只保存长期有用、用户明确表达过、未来回答可能用到的信息。
+当前也支持轻量记忆空间、主题和实体标签，用于本地分类、过滤、网络图视图和导出恢复。
 
 ## 技术栈
 
@@ -62,6 +63,29 @@ pytest tests/test_chat_gateway.py
 pytest tests/test_memory_extraction.py
 pytest tests/test_memory_store.py
 ```
+
+真实库只读巡检：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --env-file .env
+.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --json
+```
+
+记忆机制健康度诊断（只读，判定扇区分化、生命周期、temporal KG、图结构是否被真实数据激活）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db
+```
+
+微型召回评测（只读快照真实库到 eval/，再用人工标注 query 给 search_memory 打分，record_usage=False 不污染数据）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\eval_recall.py --init --database data\memory.db
+# 编辑 eval\labels.jsonl 为每个 query 填 relevant_ids
+.\.venv\Scripts\python.exe scripts\eval_recall.py --run
+```
+
+同一套诊断/评测能力也暴露在 Web Console 的“评测闭环”页。该页只把真实库快照到 `EVAL_DIR`（默认 `eval/`，已 gitignore），标注和结果都留在本地工作区。
 
 查看 LAN / Tailscale 地址：
 
@@ -131,14 +155,20 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/mcp_server/context.py`：用 contextvar 保存当前 MCP 请求的 user id。
 - `app/mcp_server/server.py`：FastMCP server、instructions 和全部 MCP 工具。
 - `app/memory/models.py`：记忆、核心记忆、候选记忆、体检建议、决策日志等 Pydantic 模型。
-- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要和决策日志。
-- `app/memory/search.py`：embedding 搜索、关键词 fallback、排序衰减、敏感降权和使用统计。
+- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、空间/主题/实体分类、Time Ripple 邻近激活、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要和决策日志。
+- `app/memory/search.py`：embedding 搜索、关键词 fallback、排序衰减、多模式自然浮现、敏感降权、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
 - `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。
 - `app/memory/core.py`：核心记忆整理。只从已保存长期记忆中提炼，并要求 evidence ids。
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
+- `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
 - `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测。
+- `scripts/audit_memory_db.py`：真实 SQLite 记忆库的只读巡检工具。只检查 schema、旧 type 残留、Time Ripple 配置、JSON 字段和 usage_count/temporal 统计，不写入 `data/memory.db`，也不打印密钥。
+- `app/memory/evaluation.py`：机制诊断与召回评测共享实现，供 REST/Web 和 CLI 共同调用。
+- `scripts/diagnose_memory_health.py`：只读诊断各记忆机制是否被真实数据激活（扇区分化、生命周期状态、temporal KG、图结构），把原始计数翻译成 active/degenerate/dormant/sparse 判定。
+- `scripts/eval_recall.py`：微型召回评测。`--init` 用 SQLite backup API 只读快照真实库到 `eval/`，`--run` 在快照副本上以 `record_usage=False` 跑 search，输出 precision/recall/MRR/nDCG。真实库全程只读，`eval/` 已被 gitignore。
+- `docs/client_integration.md`：Kelivo/iOS 接入说明。维护 MCP 原文提交原则、temporal key 填写边界，以及对外把 `usage_count` 解释为 `activation_count` 的文案。
 - `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
 - `scripts/`：Windows PowerShell 辅助脚本。
@@ -150,8 +180,9 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | REST 鉴权、路由、响应字段 | `pytest tests/test_chat_gateway.py tests/test_memory_management.py tests/test_response_charset.py` |
 | MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
 | 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
-| SQLite schema、迁移、CRUD、软删除 | `pytest tests/test_memory_store.py` |
+| SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_memory_store.py` |
 | 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
+| 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts\audit_memory_db.py --database data\memory.db --env-file .env` |
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
 | LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_chat_gateway.py` |
 | 前端 UI、`/ui` 静态挂载 | `cd ui; npm run build`，必要时再启动后端访问 `http://localhost:2026/ui/` |
@@ -184,10 +215,13 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 新增 MCP 工具时，同步更新 `EXPECTED_TOOLS` 相关测试和 README。
 - 修改 REST 鉴权时，同步检查 MCP 鉴权，因为 MCP 子应用不走 FastAPI dependency。
 - 修改搜索排序时，重点跑 `tests/test_memory_search.py` 和 MCP 搜索相关测试。
+- 修改 `usage_count`、`mark_memories_used` 或 Time Ripple 时，确认默认 `TIME_RIPPLE_DELTA=0.0` 无副作用，且敏感/归档/钉选记忆不会被邻近激活。
+- 修改客户端接入文案、MCP instructions 或记忆提取 prompt 时，同步检查 `README.md`、`docs/client_integration.md`、`app/mcp_server/server.py` 和 `app/llm/prompts.py`，保持“提交原文、不猜 temporal key、activation_count 不是精确次数”的口径一致。
 - 修改保存门槛时，重点跑 `tests/test_memory_extraction.py` 和 `tests/test_mcp_server.py`。
 - 修改核心记忆整理时，重点跑 `tests/test_core_memory.py`。
 - 修改 `app/memory/utils.py` 里的共享工具函数时，要同时考虑搜索、提取、解析、体检、核心记忆和 prompt 注入路径，并优先跑相关定向测试后再跑完整 `pytest`。
 - 修改响应格式时，确保 `tests/test_response_charset.py` 和聊天网关测试仍通过。
+- 修改空间、主题、实体、导出恢复或网络图过滤时，重点跑 `pytest tests/test_memory_store.py tests/test_memory_management.py tests/test_memory_network.py tests/test_mcp_server.py`。
 - 修改配置项时，同步更新 `app/config.py`、`.env.example`、README 的配置表和安装说明。
 - 修改 Windows 服务端口、NSSM 路径或访问脚本时，同步更新 README 的 Windows 服务模式和故障排查。
 - 修改 MCP 工具、REST 端点、记忆字段、保存门槛或当前限制时，同步更新 README 和本文件，避免下一位 agent 读到旧契约。

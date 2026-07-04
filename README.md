@@ -1,46 +1,69 @@
 # memory-gateway
 
-`memory-gateway` is a local long-term memory service for AI clients. It keeps durable user memories in SQLite, exposes a small MCP tool surface, and provides a Web console for reviewing, editing, exporting, restoring, and consolidating memory.
+`memory-gateway` 是一个本地优先的长期记忆服务，面向 AI 客户端提供 MCP 工具、REST 管理接口和 Web 控制台。它把用户长期记忆保存在 SQLite 中，支持记忆提取、检索、自然浮现、核心记忆整理、治理体检、备份恢复、评估闭环和只读健康检查。
 
-The external OpenAI-compatible `/v1` gateway has been deprecated. `/v1/models` and `/v1/chat/completions` now return `410 Gone`. Use `/mcp` for AI-client integration and `/memories/*` for memory management.
+OpenAI 兼容的外部 `/v1` 聊天网关已经废弃。`/v1/models` 和 `/v1/chat/completions` 目前会返回 `410 Gone`。AI 客户端接入请使用 `/mcp`，管理和调试请使用 `/memories/*` 与 `/ui`。
 
-## Features
+## 主要能力
 
-- MCP Streamable HTTP endpoint at `/mcp` for searching, surfacing, saving, and reading memory.
-- Memory REST endpoints under `/memories` for the Web UI and local administration.
-- Web console at `/ui` for memory library, core memory, review suggestions, reports, backups, recent context, and decision logs.
-- Internal upstream LLM calls for memory extraction and core-memory consolidation through `UPSTREAM_*`.
-- Optional OpenAI-compatible embedding provider for semantic search through `EMBEDDING_*`.
+- MCP Streamable HTTP 入口 `/mcp`，暴露少量稳定工具：检索、浮现、保存原文、读取核心记忆、读取近期上下文、消化记忆。
+- REST 管理接口 `/memories/*`，覆盖记忆列表、搜索、保存、编辑、软删除、恢复、永久删除、合并、报告、导出、恢复导入、网络图、时间线、体检和评估。
+- Web 控制台 `/ui`，用于日常查看、治理、评估、备份和接入配置。
+- SQLite 本地存储，按 `X-User-Id` 做用户隔离，默认用户为 `default`。
+- 五类记忆扇区：`episodic`、`semantic`、`procedural`、`emotional`、`reflective`。
+- 生命周期状态：`dynamic`、`resolved`、`archived`、`pinned`，并带有遗忘曲线、消化标记和活跃度统计。
+- 记忆自动组织层：新 ingest 的记忆会自动获得 `topics`、`entities`，并保守绑定到少量 `memory_spaces`。
+- 记忆空间、主题、实体和网络图，用于轻量分类、过滤、可视化和导出。
+- 核心记忆、近期上下文、决策日志和来源解释，便于解释为什么记住、为什么召回。
+- 敏感内容响应期遮罩：`redact_sensitive=true` 只影响响应，不改写 SQLite 原文。
+- 回收站永久删除：仅允许删除已经软删除的记忆，要求完整 ID 确认，并先写审计日志。
+- 数据库健康检查：只读报告孤立证据、空间链接、embedding、导出一致性和历史引用问题。
+- 历史分类回填：对旧库一次性补齐主题、实体和空间，执行前自动 SQLite backup，并写决策日志。
+- 评估闭环：机制诊断、真实数据库快照、人工标注、关键词/embedding 召回指标。
+- Temporal KG 基础：`valid_from`、`temporal_subject`、`temporal_predicate`、保守旧事实失效、时间线查询和恢复。
+- 可选 OpenAI 兼容 embedding 服务；没有 embedding key 时自动回退到关键词检索。
 
-## Architecture
+## 技术栈
+
+| 层 | 主要技术 |
+| --- | --- |
+| 后端 | Python 3.12、FastAPI、Pydantic、MCP SDK、SQLite、httpx |
+| 前端 | React 18、TypeScript、Vite、lucide-react、d3-force |
+| 测试 | pytest、pytest-asyncio、FastAPI TestClient |
+
+## 项目结构
 
 ```text
-AI client
-  |
-  | MCP Streamable HTTP /mcp
-  v
-memory-gateway
-  |-- Bearer auth by GATEWAY_API_KEY
-  |-- SQLite memory store
-  |-- memory extraction and core-memory consolidation
-  |-- Web console /ui
-  |
-  v
-internal upstream LLM and embedding providers
+app/
+  api/              FastAPI 路由：健康检查、废弃 /v1、/memories 管理接口
+  llm/              上游 OpenAI 兼容模型调用和提示词
+  mcp_server/       MCP 服务、工具注册和 MCP 鉴权中间件
+  memory/           记忆模型、存储、检索、治理、评估、报告、网络、健康检查
+  openai_compat/    OpenAI 兼容 schema，保留给内部上游调用
+ui/
+  src/              React Web 控制台
+tests/              后端和接口测试
+scripts/            数据库审计、机制诊断、召回评估、历史分类回填、服务安装辅助脚本
+docs/               客户端接入和产品路线文档
 ```
 
-## Quick Start
+## 快速启动
 
 ```powershell
+cd C:\Users\spari\Documents\Memory\memory-gateway
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .[dev]
+
+Copy-Item .env.example .env
 ```
 
-Create `.env`:
+编辑 `.env`，至少设置：
 
 ```env
 GATEWAY_API_KEY=change-me
+DATABASE_PATH=data/memory.db
 
 UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 UPSTREAM_API_KEY=your-upstream-api-key
@@ -51,93 +74,20 @@ EMBEDDING_API_KEY=
 EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIMENSIONS=1024
 
-DATABASE_PATH=data/memory.db
+EVAL_DIR=eval
 REQUEST_TIMEOUT_SECONDS=60
+
+TIME_RIPPLE_DELTA=0.0
+TIME_RIPPLE_WINDOW_HOURS=48
 ```
 
-Start the service:
+启动后端：
 
 ```powershell
 uvicorn app.main:app --host 0.0.0.0 --port 2026
 ```
 
-Useful URLs:
-
-| Purpose | URL |
-| --- | --- |
-| Health | `http://localhost:2026/health` |
-| Web console | `http://localhost:2026/ui` |
-| MCP | `http://localhost:2026/mcp` |
-
-Except `/health`, protected endpoints require:
-
-```http
-Authorization: Bearer <GATEWAY_API_KEY>
-X-User-Id: default
-```
-
-## MCP Tools
-
-The MCP endpoint exposes a deliberately small tool set:
-
-| Tool | Purpose |
-| --- | --- |
-| `search_memory` | Search relevant long-term memories for a query. |
-| `surface_memories` | Surface high-value memories without a query. |
-| `submit_memory_text` | Submit user text for extraction and storage. |
-| `get_core_memory` | Read consolidated core-memory sections. |
-| `get_recent_context_summary` | Read recent conversation summaries. |
-
-## Web Console
-
-The console at `/ui` supports:
-
-- Memory library search, edit, soft-delete, restore, and source inspection.
-- Core-memory consolidation and history.
-- Memory review suggestions for merge, delete, lower priority, or manual review.
-- Recent context and decision log inspection.
-- JSON/Markdown export and JSON restore.
-- Local connection settings and MCP/REST access information.
-
-## REST Endpoints
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Health check. |
-| `GET` | `/memories` | List active memories. |
-| `GET` | `/memories/deleted` | List soft-deleted memories. |
-| `POST` | `/memories/search` | Search memories. |
-| `POST` | `/memories/surface` | Surface important memories. |
-| `POST` | `/memories/ingest` | Extract memories from raw user text. |
-| `POST` | `/memories` | Save one structured memory directly. |
-| `POST` | `/memories/forget` | Soft-delete memories matching a natural-language query. |
-| `POST` | `/memories/context` | Return core memory, search results, and recent context. |
-| `PATCH` | `/memories/{memory_id}` | Update a memory. |
-| `DELETE` | `/memories/{memory_id}` | Soft-delete a memory. |
-| `POST` | `/memories/{memory_id}/restore` | Restore a soft-deleted memory. |
-| `GET` | `/memories/{memory_id}/why` | Explain a memory source. |
-| `POST` | `/memories/merge` | Merge several memories. |
-| `POST` | `/memories/review` | Generate review suggestions. |
-| `GET` | `/memories/report?format=json\|markdown` | Build a memory report. |
-| `GET` | `/memories/export?format=json\|markdown` | Export memory backup data. |
-| `POST` | `/memories/restore` | Restore from exported JSON. |
-| `GET` | `/memories/core` | List current core-memory sections. |
-| `GET` | `/memories/core/history` | List core-memory history. |
-| `POST` | `/memories/core/consolidate` | Rebuild core memory from long-term memories. |
-| `GET` | `/memories/recent-context` | List recent context summaries. |
-| `GET` | `/memories/decision-logs` | List memory decision logs. |
-| `GET` | `/v1/models` | Deprecated; returns `410 Gone`. |
-| `POST` | `/v1/chat/completions` | Deprecated; returns `410 Gone`. |
-
-## Development
-
-Backend tests:
-
-```powershell
-pytest
-```
-
-Frontend:
+构建 Web 控制台：
 
 ```powershell
 cd ui
@@ -145,11 +95,286 @@ npm install
 npm run build
 ```
 
-The UI build output goes to `ui/dist` and is mounted by FastAPI at `/ui`.
+构建产物在 `ui/dist`，FastAPI 会挂载到 `/ui`。开发前端时也可以使用：
 
-## Security Notes
+```powershell
+cd ui
+npm run dev
+```
 
-- Do not commit `.env`, `data/*.db`, `logs/`, or real provider keys.
-- `data/memory.db` may contain long-term memories and should be treated as sensitive.
-- `GATEWAY_API_KEY` remains the shared local access token for MCP, REST, and the Web console.
-- User separation depends on `X-User-Id`; this is intended for trusted local or private-network deployments.
+常用地址：
+
+| 用途 | URL |
+| --- | --- |
+| 健康检查 | `http://localhost:2026/health` |
+| Web 控制台 | `http://localhost:2026/ui` |
+| MCP | `http://localhost:2026/mcp` |
+
+除 `/health` 外，受保护接口都需要：
+
+```http
+Authorization: Bearer <GATEWAY_API_KEY>
+X-User-Id: default
+```
+
+## 配置项
+
+当前后端读取的配置集中在 `app/config.py`。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `GATEWAY_API_KEY` | 空 | MCP、REST 和 Web 控制台共用访问令牌。未配置时受保护接口返回 500。 |
+| `UPSTREAM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 上游 OpenAI 兼容聊天接口 base URL。 |
+| `UPSTREAM_API_KEY` | 空 | 记忆提取、核心记忆整理、AI 体检修订需要。 |
+| `UPSTREAM_MODEL` | `glm-5.1` | 上游聊天模型名。智谱/BigModel 且 GLM 5/4.7/4.6/4.5 时会自动开启 thinking。 |
+| `EMBEDDING_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 embedding base URL。 |
+| `EMBEDDING_API_KEY` | 空 | 为空时使用关键词检索，不调用 embedding。 |
+| `EMBEDDING_MODEL` | `text-embedding-v4` | embedding 模型名。 |
+| `EMBEDDING_DIMENSIONS` | `1024` | embedding 向量维度。 |
+| `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
+| `EVAL_DIR` | `eval` | 召回评估快照、标注和结果目录。应保持 gitignored。 |
+| `REQUEST_TIMEOUT_SECONDS` | `60` | 上游 HTTP 请求超时。 |
+| `DECAY_*` | 见 `app/config.py` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数。 |
+| `TIME_RIPPLE_DELTA` | `0.0` | 实验性邻近记忆激活增量。`0.0` 表示关闭。 |
+| `TIME_RIPPLE_WINDOW_HOURS` | `48` | Time Ripple 的时间邻近窗口。 |
+
+## MCP 工具
+
+`/mcp` 只暴露面向 AI 客户端的稳定工具，不提供删除、永久删除、健康修复等高风险管理能力。
+
+| 工具 | 用途 |
+| --- | --- |
+| `search_memory(query, limit=8)` | 按问题检索相关长期记忆，并更新活跃度。 |
+| `surface_memories(limit=8, mode="balanced", include_archived=false)` | 无 query 浮现当前值得想起的记忆。`mode` 可为 `balanced`、`important`、`emotional`、`stale`、`review_due`。 |
+| `submit_memory_text(text, conversation_id="")` | 提交用户原文，由服务端提取、校验、去重并保存长期记忆。 |
+| `get_core_memory()` | 读取稳定核心记忆分区。 |
+| `get_recent_context_summary(conversation_id="")` | 读取近期会话摘要。 |
+| `update_recent_context_summary(conversation_id="", summary="")` | 提交或替换近期会话摘要；它只作为短期上下文，不进入长期记忆或核心记忆。 |
+| `digest_memories(...)` | 两阶段消化记忆：先读取未消化记忆，再提交 `reflection`、`feel` 和已处理 ID。 |
+
+推荐给 iOS/Kelivo 等 AI 客户端的系统提示片段：
+
+```text
+你可以使用 memory-gateway 的长期记忆 MCP 工具：
+search_memory、surface_memories、submit_memory_text、get_core_memory、get_recent_context_summary、update_recent_context_summary、digest_memories。
+
+- 当用户问题涉及个人背景、偏好、习惯、长期项目、关系、健康、计划、过去对话，或回答需要个性化上下文时，先调用 search_memory，再结合结果回答。
+- 新对话开始、用户让你主动回顾近况，或没有明确检索词但需要唤起重要长期事项时，调用 surface_memories。mode 可选 balanced、important、emotional、stale、review_due。
+- 需要了解用户稳定背景时调用 get_core_memory；需要接续最近对话上下文时调用 get_recent_context_summary。
+- 对话推进几轮或话题收束时，可调用 update_recent_context_summary 提交短期摘要；它不是长期记忆，也不会进入核心记忆。
+- 积累一定新记忆或新对话开始需要自省整理时，先调用 digest_memories 获取未消化记忆；形成 reflection/feel 后，再次调用并传入 source_ids、reflection、feel、resolved_ids。
+- 用户本轮自然流露了长期有用、未来可能反复有帮助的信息时，调用 submit_memory_text，把用户原文完整传给 text。
+- 不要拆分、改写、总结用户原文，也不要自行猜 type、importance、confidence、valid_from、temporal_subject 或 temporal_predicate。服务端会自动提取、去重和保存。
+- 不要自行传 `space_ids`；服务端会根据提取出的主题、实体和代码规则，保守绑定记忆空间。
+- 用户明确说“记住”“别忘了”“以后记得”时，优先调用 submit_memory_text。
+- 检索旧记忆和提交新记忆是两个独立判断；同一轮都需要时，先 search_memory，再 submit_memory_text。
+- 当前情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。敏感信息只有在用户明确希望保留且未来明显有用时才提交。
+- 搜索/浮现结果里的 activation_count 表示活跃度，不是精确搜索次数。Time Ripple 是默认关闭的实验能力，普通客户端不需要启用。
+- 用户要求忘记、删除或管理记忆时，MCP 没有删除或遗忘工具；引导用户在 Web 控制台 `/ui` 操作。
+- 除非记忆操作失败或用户明确询问，不主动暴露工具调用过程。
+```
+
+更完整的客户端接入说明见 `docs/client_integration.md`。
+
+## Web 控制台
+
+`/ui` 是一个本地管理和调试台，首次使用需要填写 API Base URL、访问密钥和用户 ID。
+
+| 页面 | 作用 |
+| --- | --- |
+| 记忆工作室 | 浮现记忆、情绪分布、空间概览、记忆网络和实验性图遍历入口。 |
+| 记忆库 | 搜索、过滤、查看、编辑、软删除、恢复、永久删除、标签/实体/空间管理。 |
+| 核心记忆 | 查看核心记忆、历史版本并触发重新整理。 |
+| 记忆体检 | 生成治理建议、风险标签、严重程度、手动动作和 AI 修订预览。 |
+| 召回解释 | 查看一次上下文组装中的核心记忆、搜索命中、候选池、排除原因和分数拆解。 |
+| 评测闭环 | 机制诊断、召回快照、人工标注、关键词/embedding 指标。 |
+| 近期上下文 | 查看最近会话摘要。 |
+| 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
+| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录。 |
+| 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
+
+## REST 接口概览
+
+所有 `/memories/*` 接口都需要 Bearer token 和 `X-User-Id`。
+
+### 基础与查询
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `GET` | `/health` | 健康检查，不需要鉴权。 |
+| `GET` | `/memories` | 列出活跃记忆，支持 `status=dynamic\|resolved\|archived\|pinned\|all` 和 `redact_sensitive=true`。 |
+| `GET` | `/memories/deleted` | 列出软删除记忆，支持 `redact_sensitive=true`。 |
+| `GET` | `/memories/{memory_id}` | 读取单条活跃记忆。 |
+| `POST` | `/memories/search` | 搜索记忆，返回分数拆解、活跃度、渠道等。 |
+| `POST` | `/memories/surface` | 自然浮现记忆，支持多种 `mode`。 |
+| `POST` | `/memories/context` | 一站式返回核心记忆、检索结果和近期上下文，可输出 JSON 或 Markdown。 |
+| `POST` | `/memories/context/explain` | 调试一次上下文组装，不记录使用次数。 |
+| `GET` | `/memories/{memory_id}/why` | 解释记忆来源和核心记忆证据关系。 |
+| `POST` | `/memories/search-feedback` | 记录召回反馈审计日志。 |
+
+### 写入与管理
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `POST` | `/memories/ingest` | 从用户原文提取并保存记忆；服务端会自动补 `topics`、`entities` 和 `space_ids`。 |
+| `POST` | `/memories` | 直接保存一条结构化记忆；显式传入的 `topics`/`entities` 会优先保留，否则自动分类。 |
+| `PATCH` | `/memories/{memory_id}` | 更新记忆内容、类型、重要度、情绪、时间、状态、主题和实体等。 |
+| `PATCH` | `/memories/{memory_id}/spaces` | 替换记忆空间绑定，可按名称创建新空间。 |
+| `POST` | `/memories/forget` | 按自然语言查询批量软删除。 |
+| `DELETE` | `/memories/{memory_id}` | 软删除。 |
+| `POST` | `/memories/{memory_id}/restore` | 从回收站恢复。 |
+| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆，需要 `confirm_memory_id` 完整匹配。 |
+| `POST` | `/memories/merge` | 合并多条记忆。 |
+| `POST` | `/memories/re-embed` | 对指定记忆或扫描出的缺失/无效 embedding 重新生成向量。 |
+| `POST` | `/memories/archive-expired` | 归档过期记忆。 |
+
+### 空间、网络、时间线
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `GET` | `/memories/spaces` | 列出记忆空间及活跃记忆计数。 |
+| `GET` | `/memories/spaces/{space_id}` | 读取空间详情和空间内记忆。 |
+| `POST` | `/memories/network` | 构建记忆网络图，可按空间、类型、敏感度、情绪范围过滤。 |
+| `POST` | `/memories/network/traverse` | 实验性：从种子记忆做 bounded-depth Personalized PageRank 遍历。 |
+| `GET` | `/memories/timeline` | 按 `subject` 和可选 `predicate` 查询时间线。 |
+| `POST` | `/memories/{memory_id}/temporal/restore` | 恢复被 Temporal 失效的记忆，并写审计日志。 |
+
+### 核心记忆、体检、评估、报告
+
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `GET` | `/memories/core` | 列出当前核心记忆分区。 |
+| `GET` | `/memories/core/history` | 列出核心记忆历史。 |
+| `POST` | `/memories/core/consolidate` | 从长期记忆重新整理核心记忆。 |
+| `GET` | `/memories/recent-context` | 列出近期上下文摘要。 |
+| `POST` | `/memories/recent-context` | 提交或替换近期上下文摘要，body 为 `conversation_id` 和 `summary`。 |
+| `GET` | `/memories/decision-logs` | 列出决策和审计日志。 |
+| `POST` | `/memories/review` | 生成治理体检建议。 |
+| `POST` | `/memories/review/actions` | 应用手动治理动作，如确认、延后、降权、移入回收站、合并。 |
+| `POST` | `/memories/review/revise/related` | AI 修订前查找相关记忆。 |
+| `POST` | `/memories/review/revise/preview` | 生成有范围约束的 AI 修订预览。 |
+| `POST` | `/memories/review/revise/apply` | 使用 preview token 应用 AI 修订。 |
+| `GET` | `/memories/health` | 只读数据库健康检查。 |
+| `GET` | `/memories/evaluation/diagnosis` | 机制激活诊断。 |
+| `POST` | `/memories/evaluation/recall/init` | 从真实数据库只读生成召回评估快照和标注文件。 |
+| `GET` | `/memories/evaluation/recall/workbench` | 读取召回评估工作台数据。 |
+| `PUT` | `/memories/evaluation/recall/labels` | 原子保存人工标注。 |
+| `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 召回评估。 |
+| `GET` | `/memories/report?format=json\|markdown` | 生成记忆报告。 |
+| `GET` | `/memories/export?format=json\|markdown\|obsidian_markdown` | 导出备份或 Obsidian zip 单向镜像。 |
+| `POST` | `/memories/restore` | 从 JSON 导出恢复数据。 |
+
+### 已废弃接口
+
+| Method | Path | 状态 |
+| --- | --- | --- |
+| `GET` | `/v1/models` | 返回 `410 Gone`。 |
+| `POST` | `/v1/chat/completions` | 返回 `410 Gone`。 |
+
+## 数据模型要点
+
+- `usage_count` 是底层列名；对外文案建议使用 `activation_count`，表示活跃度，不是精确搜索次数。
+- `sensitivity=private|sensitive` 的记忆在 `redact_sensitive=true` 的浏览响应中会被遮罩，导出和恢复仍保留完整内容。
+- `valid_from`、`temporal_subject`、`temporal_predicate` 用于可替换的当前状态事实，例如当前城市、当前雇主、首选称呼。普通 MCP 客户端不要自行填写这些字段。
+- `topics`、`entities`、`space_ids` 是轻量组织结构，不代表系统自动判断事实真伪。
+- `surface_score`、`life_score`、`review_signals` 是运行时解释信号，默认不持久化为权威事实。
+
+## 自动分类与空间
+
+新写入链路采用“LLM 语义标签 + 代码规则兜底”的混合方案：
+
+- LLM 提取候选记忆时可以返回 `topics` 和 `entities`，但不能返回 `space_ids`。
+- 服务端会清洗空标签、重复标签和过长标签，并在 LLM 没给标签时用规则兜底。
+- `/memories/ingest` 和 MCP `submit_memory_text` 会自动填充 `topics`、`entities`、`space_ids`。
+- `/memories` 直接保存时，如果调用方显式提供 `topics` 或 `entities`，服务端只清洗并保留这些输入，不自动扩写；未提供时才走自动分类。
+- private/sensitive 记忆只生成低泄露标签，自动实体会被清空；必要时放入 `私密信息` 空间。
+
+自动空间保持少量大类，不按细主题无限创建：
+
+| 空间 | 典型内容 |
+| --- | --- |
+| `工作与项目` | 项目、代码、测试、部署、客户、需求、PR/CI/API。 |
+| `工具与设备` | AI 客户端、软件、模型、手机、电脑、开发环境。 |
+| `个人偏好` | 喜好、雷点、长期口味、情绪倾向、价值取向。 |
+| `人际关系` | 家人、朋友、同事、伴侣、老师、同学等关系信息。 |
+| `生活与地点` | 城市、居住、旅行、饮食、日常生活和地点。 |
+| `沟通方式` | 称呼、回复风格、简洁/详细偏好、语气要求。 |
+| `私密信息` | private/sensitive 记忆的低泄露归类。 |
+
+## 开发与验证
+
+后端测试：
+
+```powershell
+pytest
+```
+
+前端构建：
+
+```powershell
+cd ui
+npm run build
+```
+
+只读真实数据库审计：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --env-file .env
+.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --json
+```
+
+机制健康诊断：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db
+.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db --json
+```
+
+历史记忆分类回填：
+
+```powershell
+# 先预览统计，不写库
+.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db --dry-run
+
+# 确认后执行；脚本会先生成 data\memory.backup.<timestamp>.db
+.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db
+
+# 可选：指定用户或限制本次处理数量
+.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db --user-id default --limit 50
+```
+
+回填会在事务内为缺少分类的 active + archived 记忆补 `topics`、`entities`、`space_ids`，并为每条更新写入 `memory_decision_logs`，`source=classification_backfill`。日志只记录 before/after 摘要、正文长度和 SHA-256，不写完整正文。
+
+微型召回评估：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\eval_recall.py --init --database data\memory.db
+# 编辑 eval\labels.jsonl，为每个 query 填 relevant_ids
+.\.venv\Scripts\python.exe scripts\eval_recall.py --run
+.\.venv\Scripts\python.exe scripts\eval_recall.py --run --use-embedding --json
+```
+
+Windows 服务辅助脚本：
+
+```powershell
+.\scripts\install-service.ps1
+.\scripts\show-access-urls.ps1
+.\scripts\uninstall-service.ps1
+```
+
+## 安全边界
+
+- 不要提交 `.env`、`data/*.db`、`eval/`、`logs/` 或真实 provider key。
+- `data/memory.db`、JSON/Markdown/Obsidian 导出都可能包含完整长期记忆，应按敏感数据处理。
+- `redact_sensitive=true` 只是响应期遮罩，不会改写数据库，也不会让备份变成脱敏备份。
+- 永久删除不可恢复，但只作用于已经在回收站的记忆，并且会先写不包含完整正文的审计日志。
+- 永久删除不会自动重写核心记忆 evidence 列表；孤立证据通过 `/memories/health` 报告。
+- 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
+- `GATEWAY_API_KEY` 是本地共享令牌；`X-User-Id` 适合可信本地或私有网络部署，不等同完整多租户权限系统。
+- Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。
+
+## 当前边界与后续方向
+
+- 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
+- 图遍历和 Time Ripple 保留为实验/兼容能力，不是默认产品路径。
+- 后续更适合优先做人工视觉验收、移动端微调、空间管理增强、近期对话批量导入、更丰富的版本历史、SDK 和外部连接器。
