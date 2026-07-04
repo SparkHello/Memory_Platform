@@ -7,8 +7,12 @@ __pycache__/
 .tools/
 .env
 .claude/
+.codegraph/
+.reasonix/
+.kunsdd/
 data/*.db
 data/*.db-*
 logs/
+eval/
 ui/node_modules/
 ui/dist/
