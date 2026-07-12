@@ -413,12 +413,167 @@ def test_digest_memories_two_phase_tool(client, auth_headers, memory_store):
     assert submitted["resolved_ids"] == [resolved.id]
     assert len(submitted["created"]) == 2
     assert {item["type"] for item in submitted["created"]} == {"reflective", "emotional"}
+    assert all(item["origin"] == "agent_derived" for item in submitted["created"])
+    assert all(item["sensitivity"] == "normal" for item in submitted["created"])
+    assert all(
+        item["evidence_memory_ids"] == [source.id, resolved.id]
+        for item in submitted["created"]
+    )
     feel = next(item for item in submitted["created"] if item["content"] == "我对这次收口形成了更稳定的协作节奏感。")
     assert feel["type"] == "emotional"
     assert feel["valence"] != 0.5
     assert feel["arousal"] != 0.4
     assert memory_store.get_memory(memory_id=source.id, user_id="default").digested is True
     assert memory_store.get_memory(memory_id=resolved.id, user_id="default").status == "resolved"
+
+
+def test_digest_memories_phase_one_excludes_sensitive_and_derived_by_default(
+    client,
+    auth_headers,
+    memory_store,
+):
+    eligible = memory_store.create_memory(
+        user_id="default",
+        content="用户正在验证默认消化候选。",
+    )
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户的私密消化候选。",
+        sensitivity="private",
+    )
+    sensitive = memory_store.create_memory(
+        user_id="default",
+        content="用户的敏感消化候选。",
+        sensitivity="sensitive",
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="模型基于来源形成的派生结论。",
+        type="reflective",
+        origin="agent_derived",
+        evidence_memory_ids=[eligible.id],
+    )
+    legacy_mislabeled = memory_store.create_memory(
+        user_id="default",
+        content="用户正在验证旧标签消化候选。",
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET content = ?, sensitivity = 'normal' WHERE id = ?",
+            (
+                "用户的身份证号是 123456789012345678。",
+                legacy_mislabeled.id,
+            ),
+        )
+
+    draft = _call_tool(client, auth_headers, "digest_memories", {"limit": 10})
+
+    returned_ids = {memory["id"] for memory in draft["memories"]}
+    assert returned_ids == {eligible.id}
+    assert returned_ids.isdisjoint(
+        {private.id, sensitive.id, derived.id, legacy_mislabeled.id}
+    )
+
+    submission = _call_tool(
+        client,
+        auth_headers,
+        "digest_memories",
+        {
+            "source_ids": [legacy_mislabeled.id],
+            "reflection": "不应创建的派生结论。",
+        },
+    )
+    assert submission["created"] == []
+    assert submission["digested_ids"] == []
+    assert submission["error"]
+
+
+def test_digest_memories_rejects_sensitive_opt_in_when_egress_is_disabled(
+    client,
+    auth_headers,
+    memory_store,
+    monkeypatch,
+):
+    monkeypatch.setenv("ALLOW_SENSITIVE_EGRESS", "false")
+    get_settings.cache_clear()
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户的私密消化候选。",
+        sensitivity="private",
+    )
+
+    result = _call_tool(
+        client,
+        auth_headers,
+        "digest_memories",
+        {"limit": 5, "include_sensitive": True},
+    )
+
+    assert result == {
+        "error": "Sensitive digestion requires ALLOW_SENSITIVE_EGRESS=true.",
+        "created": [],
+        "digested_ids": [],
+        "resolved_ids": [],
+    }
+    stored = memory_store.get_memory(memory_id=private.id, user_id="default")
+    assert stored is not None
+    assert stored.digested is False
+
+
+def test_digest_memories_rejects_invalid_source_sets(
+    client,
+    auth_headers,
+    memory_store,
+):
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户正在验证消化证据边界。",
+    )
+    other_user = memory_store.create_memory(
+        user_id="other",
+        content="其他用户的私有证据。",
+    )
+
+    invalid_submissions = [
+        {
+            "source_ids": [],
+            "reflection": "没有来源的派生结论。",
+        },
+        {
+            "source_ids": [source.id, "missing-memory"],
+            "reflection": "包含不存在来源的派生结论。",
+        },
+        {
+            "source_ids": [source.id, other_user.id],
+            "reflection": "包含跨用户来源的派生结论。",
+        },
+        {
+            "source_ids": [source.id],
+            "reflection": "resolved 越过证据集合。",
+            "resolved_ids": [other_user.id],
+        },
+    ]
+
+    for arguments in invalid_submissions:
+        result = _call_tool(
+            client,
+            auth_headers,
+            "digest_memories",
+            arguments,
+        )
+        assert result["error"]
+        assert result["created"] == []
+        assert result["digested_ids"] == []
+        assert result["resolved_ids"] == []
+
+    stored_source = memory_store.get_memory(memory_id=source.id, user_id="default")
+    assert stored_source is not None
+    assert stored_source.digested is False
+    assert stored_source.status == "dynamic"
+    assert all(
+        memory.origin != "agent_derived"
+        for memory in memory_store.list_memories(user_id="default")
+    )
 
 
 def test_review_memories_rest_endpoint(client, auth_headers, memory_store):
@@ -458,11 +613,16 @@ def test_search_memory_empty(client, auth_headers):
     assert found == []
 
 def test_get_core_memory(client, auth_headers, memory_store):
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢直接、实用的回答。",
+        importance=8,
+    )
     memory_store.upsert_core_memory_section(
         user_id="default",
         section="communication",
         content="- 用户喜欢直接、实用的回答。",
-        evidence_memory_ids=[],
+        evidence_memory_ids=[source.id],
         confidence=0.9,
     )
 
@@ -470,6 +630,61 @@ def test_get_core_memory(client, auth_headers, memory_store):
 
     assert core[0]["section"] == "communication"
     assert "直接、实用" in core[0]["content"]
+
+
+def test_get_core_memory_excludes_legacy_sensitive_section(
+    client,
+    auth_headers,
+    memory_store,
+):
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户长期喜欢黑咖啡。",
+        importance=8,
+    )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="preferences",
+        content="- 用户长期喜欢黑咖啡。",
+        evidence_memory_ids=[source.id],
+        confidence=0.9,
+    )
+    secret = "123456789012345678"
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="profile",
+        content=f"- 用户的身份证号是 {secret}。",
+        evidence_memory_ids=[source.id],
+        confidence=0.95,
+    )
+
+    core = _call_tool(client, auth_headers, "get_core_memory", {})
+
+    assert [section["section"] for section in core] == ["preferences"]
+    assert secret not in json.dumps(core, ensure_ascii=False)
+
+
+def test_get_core_memory_excludes_section_with_sensitive_evidence(
+    client,
+    auth_headers,
+    memory_store,
+):
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户确诊糖尿病。",
+        importance=10,
+    )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="profile",
+        content="- 用户需要控制血糖。",
+        evidence_memory_ids=[source.id],
+        confidence=0.95,
+    )
+
+    core = _call_tool(client, auth_headers, "get_core_memory", {})
+
+    assert core == []
 
 def test_get_recent_context_summary_tool(client, auth_headers, memory_store):
     memory_store.upsert_recent_context_summary(

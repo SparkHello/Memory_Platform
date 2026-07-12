@@ -16,7 +16,10 @@ OpenAI 兼容的外部 `/v1` 聊天网关已经废弃。`/v1/models` 和 `/v1/ch
 - 记忆空间、主题、实体和网络图，用于轻量分类、过滤、可视化和导出。
 - 核心记忆、近期上下文、决策日志和来源解释，便于解释为什么记住、为什么召回。
 - 敏感内容响应期遮罩：`redact_sensitive=true` 只影响响应，不改写 SQLite 原文。
-- 回收站永久删除：仅允许删除已经软删除的记忆，要求完整 ID 确认，并先写审计日志。
+- 决策日志不会复制完整 `source_quote`；敏感候选正文只保留长度、SHA-256、敏感级别和关联 memory ID。
+- 保存门槛会先验证逐字 `source_quote`，再检查候选与引用的事实锚点、否定一致性、敏感级别下限和子句级“记住”授权。
+- 敏感内容默认不进入远程提取、embedding、AI 体检、普通搜索或自然浮现；远程处理需显式配置。
+- 回收站永久删除：仅允许删除已经软删除的记忆，要求完整 ID 确认，并清理派生记忆、核心证据、旧日志和本地评测工作区。
 - 数据库健康检查：只读报告孤立证据、空间链接、embedding、导出一致性和历史引用问题。
 - 历史分类回填：对旧库一次性补齐主题、实体和空间，执行前自动 SQLite backup，并写决策日志。
 - 评估闭环：机制诊断、真实数据库快照、人工标注、关键词/embedding 召回指标。
@@ -68,6 +71,7 @@ DATABASE_PATH=data/memory.db
 UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 UPSTREAM_API_KEY=your-upstream-api-key
 UPSTREAM_MODEL=glm-5.1
+ALLOW_SENSITIVE_EGRESS=false
 
 EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_API_KEY=
@@ -127,12 +131,13 @@ X-User-Id: default
 | `UPSTREAM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 上游 OpenAI 兼容聊天接口 base URL。 |
 | `UPSTREAM_API_KEY` | 空 | 记忆提取、核心记忆整理、AI 体检修订需要。 |
 | `UPSTREAM_MODEL` | `glm-5.1` | 上游聊天模型名。智谱/BigModel 且 GLM 5/4.7/4.6/4.5 时会自动开启 thinking。 |
+| `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 private/sensitive 的文本发送给远程提取、embedding 或 AI 体检服务。仅在 provider 获准处理敏感数据时开启。 |
 | `EMBEDDING_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 embedding base URL。 |
 | `EMBEDDING_API_KEY` | 空 | 为空时使用关键词检索，不调用 embedding。 |
 | `EMBEDDING_MODEL` | `text-embedding-v4` | embedding 模型名。 |
 | `EMBEDDING_DIMENSIONS` | `1024` | embedding 向量维度。 |
 | `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
-| `EVAL_DIR` | `eval` | 召回评估快照、标注和结果目录。应保持 gitignored。 |
+| `EVAL_DIR` | `eval` | 按 user id 哈希分目录保存召回评估快照、标注和结果。应保持 gitignored。 |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | 上游 HTTP 请求超时。 |
 | `DECAY_*` | 见 `app/config.py` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数。 |
 | `TIME_RIPPLE_DELTA` | `0.0` | 实验性邻近记忆激活增量。`0.0` 表示关闭。 |
@@ -144,13 +149,13 @@ X-User-Id: default
 
 | 工具 | 用途 |
 | --- | --- |
-| `search_memory(query, limit=8)` | 按问题检索相关长期记忆，并更新活跃度。 |
-| `surface_memories(limit=8, mode="balanced", include_archived=false)` | 无 query 浮现当前值得想起的记忆。`mode` 可为 `balanced`、`important`、`emotional`、`stale`、`review_due`。 |
+| `search_memory(query, limit=8, include_sensitive=false)` | 按问题检索相关长期记忆，并更新活跃度。敏感记忆需用户本轮明确要求后显式开启。 |
+| `surface_memories(limit=8, mode="balanced", include_archived=false, include_sensitive=false)` | 无 query 浮现当前值得想起的记忆；默认排除敏感和 agent-derived 记忆。 |
 | `submit_memory_text(text, conversation_id="")` | 提交用户原文，由服务端提取、校验、去重并保存长期记忆。 |
 | `get_core_memory()` | 读取稳定核心记忆分区。 |
 | `get_recent_context_summary(conversation_id="")` | 读取近期会话摘要。 |
 | `update_recent_context_summary(conversation_id="", summary="")` | 提交或替换近期会话摘要；它只作为短期上下文，不进入长期记忆或核心记忆。 |
-| `digest_memories(...)` | 两阶段消化记忆：先读取未消化记忆，再提交 `reflection`、`feel` 和已处理 ID。 |
+| `digest_memories(...)` | 两阶段消化记忆：来源 ID 必须真实、未消化且同属当前用户；派生结果保存 evidence IDs，并按来源与派生正文取最高敏感等级；创建和状态更新原子提交。 |
 
 推荐给 iOS/Kelivo 等 AI 客户端的系统提示片段：
 
@@ -158,7 +163,7 @@ X-User-Id: default
 你可以使用 memory-gateway 的长期记忆 MCP 工具：
 search_memory、surface_memories、submit_memory_text、get_core_memory、get_recent_context_summary、update_recent_context_summary、digest_memories。
 
-- 当用户问题涉及个人背景、偏好、习惯、长期项目、关系、健康、计划、过去对话，或回答需要个性化上下文时，先调用 search_memory，再结合结果回答。
+- 当用户问题涉及个人背景、偏好、习惯、长期项目、关系、健康、计划、过去对话，或回答需要个性化上下文时，先调用 search_memory，再结合结果回答。只有用户本轮明确要求读取相关敏感信息时才设置 include_sensitive=true。
 - 新对话开始、用户让你主动回顾近况，或没有明确检索词但需要唤起重要长期事项时，调用 surface_memories。mode 可选 balanced、important、emotional、stale、review_due。
 - 需要了解用户稳定背景时调用 get_core_memory；需要接续最近对话上下文时调用 get_recent_context_summary。
 - 对话推进几轮或话题收束时，可调用 update_recent_context_summary 提交短期摘要；它不是长期记忆，也不会进入核心记忆。
@@ -169,6 +174,7 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 - 用户明确说“记住”“别忘了”“以后记得”时，优先调用 submit_memory_text。
 - 检索旧记忆和提交新记忆是两个独立判断；同一轮都需要时，先 search_memory，再 submit_memory_text。
 - 当前情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。敏感信息只有在用户明确希望保留且未来明显有用时才提交。
+- submit_memory_text 返回 retryable=true 时表示上游暂时失败，可稍后重试一次；规则拒绝不可重试。
 - 搜索/浮现结果里的 activation_count 表示活跃度，不是精确搜索次数。Time Ripple 是默认关闭的实验能力，普通客户端不需要启用。
 - 用户要求忘记、删除或管理记忆时，MCP 没有删除或遗忘工具；引导用户在 Web 控制台 `/ui` 操作。
 - 除非记忆操作失败或用户明确询问，不主动暴露工具调用过程。
@@ -205,8 +211,8 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 | `GET` | `/memories` | 列出活跃记忆，支持 `status=dynamic\|resolved\|archived\|pinned\|all` 和 `redact_sensitive=true`。 |
 | `GET` | `/memories/deleted` | 列出软删除记忆，支持 `redact_sensitive=true`。 |
 | `GET` | `/memories/{memory_id}` | 读取单条活跃记忆。 |
-| `POST` | `/memories/search` | 搜索记忆，返回分数拆解、活跃度、渠道等。 |
-| `POST` | `/memories/surface` | 自然浮现记忆，支持多种 `mode`。 |
+| `POST` | `/memories/search` | 搜索记忆，默认排除敏感内容；显式传 `include_sensitive=true` 才纳入。 |
+| `POST` | `/memories/surface` | 自然浮现记忆，默认排除敏感和 agent-derived 内容，支持多种 `mode`。 |
 | `POST` | `/memories/context` | 一站式返回核心记忆、检索结果和近期上下文，可输出 JSON 或 Markdown。 |
 | `POST` | `/memories/context/explain` | 调试一次上下文组装，不记录使用次数。 |
 | `GET` | `/memories/{memory_id}/why` | 解释记忆来源和核心记忆证据关系。 |
@@ -223,7 +229,7 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 | `POST` | `/memories/forget` | 按自然语言查询批量软删除。 |
 | `DELETE` | `/memories/{memory_id}` | 软删除。 |
 | `POST` | `/memories/{memory_id}/restore` | 从回收站恢复。 |
-| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆，需要 `confirm_memory_id` 完整匹配。 |
+| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆及其本地派生/审计副本，需要 `confirm_memory_id` 完整匹配。外部导出和用户自行复制的备份不受影响。 |
 | `POST` | `/memories/merge` | 合并多条记忆。 |
 | `POST` | `/memories/re-embed` | 对指定记忆或扫描出的缺失/无效 embedding 重新生成向量。 |
 | `POST` | `/memories/archive-expired` | 归档过期记忆。 |
@@ -258,11 +264,11 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 | `GET` | `/memories/evaluation/diagnosis` | 机制激活诊断。 |
 | `POST` | `/memories/evaluation/recall/init` | 从真实数据库只读生成召回评估快照和标注文件。 |
 | `GET` | `/memories/evaluation/recall/workbench` | 读取召回评估工作台数据。 |
-| `PUT` | `/memories/evaluation/recall/labels` | 原子保存人工标注。 |
-| `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 召回评估。 |
+| `PUT` | `/memories/evaluation/recall/labels` | 原子保存 `unlabeled/relevant/no_answer` 三态人工标注。 |
+| `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 评估，`k` 为 1–20，包含无答案误召、拒答及实际 fallback 信息。 |
 | `GET` | `/memories/report?format=json\|markdown` | 生成记忆报告。 |
 | `GET` | `/memories/export?format=json\|markdown\|obsidian_markdown` | 导出备份或 Obsidian zip 单向镜像。 |
-| `POST` | `/memories/restore` | 从 JSON 导出恢复数据。 |
+| `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆和近期摘要；核心历史与决策日志仅供审计，不写回，响应会显式列出。 |
 
 ### 已废弃接口
 
@@ -274,7 +280,8 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 ## 数据模型要点
 
 - `usage_count` 是底层列名；对外文案建议使用 `activation_count`，表示活跃度，不是精确搜索次数。
-- `sensitivity=private|sensitive` 的记忆在 `redact_sensitive=true` 的浏览响应中会被遮罩，导出和恢复仍保留完整内容。
+- `sensitivity=private|sensitive` 的记忆默认不参与搜索/浮现；管理请求显式 `include_sensitive=true` 后仍可结合 `redact_sensitive=true` 返回遮罩结果。
+- `origin=user_asserted|agent_derived` 区分用户事实和模型派生内容；agent-derived 默认不进入普通召回和核心整理。
 - `valid_from`、`temporal_subject`、`temporal_predicate` 用于可替换的当前状态事实，例如当前城市、当前雇主、首选称呼。普通 MCP 客户端不要自行填写这些字段。
 - `topics`、`entities`、`space_ids` 是轻量组织结构，不代表系统自动判断事实真伪。
 - `surface_score`、`life_score`、`review_signals` 是运行时解释信号，默认不持久化为权威事实。
@@ -367,8 +374,9 @@ Windows 服务辅助脚本：
 - 不要提交 `.env`、`data/*.db`、`eval/`、`logs/` 或真实 provider key。
 - `data/memory.db`、JSON/Markdown/Obsidian 导出都可能包含完整长期记忆，应按敏感数据处理。
 - `redact_sensitive=true` 只是响应期遮罩，不会改写数据库，也不会让备份变成脱敏备份。
-- 永久删除不可恢复，但只作用于已经在回收站的记忆，并且会先写不包含完整正文的审计日志。
-- 永久删除不会自动重写核心记忆 evidence 列表；孤立证据通过 `/memories/health` 报告。
+- 永久删除不可恢复，只作用于回收站记忆，并会清理依赖它的 agent-derived 记忆、脱敏相关核心历史和旧决策日志、删除该用户评测工作区。
+- 永久删除无法控制已经复制到工作区外的 JSON/Markdown/Obsidian 导出或第三方备份；这些副本必须按各自保留策略删除。
+- `ALLOW_SENSITIVE_EGRESS=false` 是默认安全边界；响应遮罩不能替代出站策略。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
 - `GATEWAY_API_KEY` 是本地共享令牌；`X-User-Id` 适合可信本地或私有网络部署，不等同完整多租户权限系统。
 - Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。

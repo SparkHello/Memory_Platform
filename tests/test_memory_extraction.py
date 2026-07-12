@@ -6,8 +6,12 @@
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.memory.extractor import LLMMemoryExtractor
+from app.memory.ingest import MemoryIngestService
+from app.memory.search import NullEmbeddingClient
 from app.memory.store import MemoryStore
 
 
@@ -23,6 +27,122 @@ def _extraction_json(**overrides) -> str:
     }
     data.update(overrides)
     return json.dumps(data, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_ingest_is_blocked_before_remote_extraction(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(
+        user_id="default",
+        text="记住，我的身份证号是 123456789012345678。",
+    )
+
+    assert result.ignored == 1
+    assert result.created == 0
+    assert fake_llm.extraction_messages == []
+    assert memory_store.list_memories(user_id="default") == []
+    audit = json.loads(memory_store.list_decision_logs(user_id="default")[0].candidate_json)
+    assert audit["sensitive_egress_blocked"] is True
+    assert "123456789012345678" not in json.dumps(audit, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_ingest_decision_log_keeps_only_hashes(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    source_quote = f"记住，我的身份证号是 {identifier}"
+    memory_text = f"用户的身份证号是 {identifier}。"
+    fake_llm.extraction_content = _extraction_json(
+        memory=memory_text,
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=source_quote,
+    )
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+        allow_sensitive_egress=True,
+    )
+
+    result = await service.ingest(user_id="default", text=f"{source_quote}。")
+
+    assert result.created == 1
+    log = memory_store.list_decision_logs(user_id="default")[0]
+    audit = json.loads(log.candidate_json)
+    assert audit["redacted"] is True
+    assert audit["sensitivity"] == "sensitive"
+    assert audit["memory_id"] == result.items[0].memory_id
+    assert audit["memory_length"] == len(memory_text)
+    assert audit["source_quote_length"] == len(source_quote)
+    assert len(audit["memory_sha256"]) == 64
+    assert len(audit["source_quote_sha256"]) == 64
+    assert identifier not in log.candidate_json
+    assert memory_text not in log.candidate_json
+    assert source_quote not in log.candidate_json
+
+
+@pytest.mark.asyncio
+async def test_malformed_sensitive_llm_output_is_hashed_in_decision_log(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    fake_llm.extraction_content = f"not-json: 身份证号是 {identifier}"
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+        allow_sensitive_egress=True,
+    )
+
+    result = await service.ingest(
+        user_id="default",
+        text=f"请记住，我的身份证号是 {identifier}。",
+    )
+
+    assert result.ignored == 1
+    log = memory_store.list_decision_logs(user_id="default")[0]
+    audit = json.loads(log.candidate_json)
+    assert audit["redacted"] is True
+    assert audit["raw_output_length"] > 0
+    assert len(audit["raw_output_sha256"]) == 64
+    assert identifier not in log.candidate_json
+
+
+@pytest.mark.asyncio
+async def test_upstream_extraction_failure_is_retryable_not_ignored(
+    memory_store: MemoryStore,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    async def fail_upstream(*args, **kwargs):
+        raise RuntimeError("temporary upstream failure")
+
+    monkeypatch.setattr(fake_llm, "create_chat_completion", fail_upstream)
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(user_id="default", text="我喜欢黑咖啡。")
+
+    assert result.status == "retryable_error"
+    assert result.retryable is True
+    assert result.ignored == 0
+    assert result.items == []
 
 
 def _post_ingest(
@@ -107,10 +227,8 @@ def test_fabricated_source_quote_is_not_saved(
     assert "source_quote" in logs[0].reason
 
 
-def test_sensitive_memory_requires_explicit_memory_request(
-    client: TestClient,
-    auth_headers: dict[str, str],
-    memory_store: MemoryStore,
+@pytest.mark.asyncio
+async def test_sensitive_memory_requires_explicit_memory_request(
     fake_llm,
 ) -> None:
     fake_llm.extraction_content = _extraction_json(
@@ -122,13 +240,13 @@ def test_sensitive_memory_requires_explicit_memory_request(
         source_quote="我有一项健康隐私",
     )
 
-    response = _post_ingest(client, auth_headers, "我有一项健康隐私。")
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text="我有一项健康隐私。",
+    )
 
-    assert response.status_code == 200
-    assert memory_store.list_memories(user_id="default") == []
-    logs = memory_store.list_decision_logs()
-    assert logs[0].decision == "ignore"
-    assert "敏感信息" in logs[0].reason or "隐私" in logs[0].reason
+    assert len(batch.outcomes) == 1
+    assert batch.outcomes[0].accepted is False
+    assert "敏感信息" in batch.outcomes[0].reason or "隐私" in batch.outcomes[0].reason
 
 
 def test_llm_topics_entities_are_saved_and_normalized(
@@ -181,9 +299,8 @@ def test_rule_fallback_classifies_memory_without_llm_labels(
     assert "个人偏好" in _space_names_for(memory_store, memory.space_ids)
 
 
-def test_sensitive_memory_drops_detailed_auto_entities(
-    client: TestClient,
-    auth_headers: dict[str, str],
+@pytest.mark.asyncio
+async def test_sensitive_memory_drops_detailed_auto_entities(
     memory_store: MemoryStore,
     fake_llm,
 ) -> None:
@@ -197,13 +314,17 @@ def test_sensitive_memory_drops_detailed_auto_entities(
         entities=["123456"],
     )
 
-    response = _post_ingest(
-        client,
-        auth_headers,
-        "记住，我的身份证号是 123456。",
+    result = await MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+        allow_sensitive_egress=True,
+    ).ingest(
+        user_id="default",
+        text="记住，我的身份证号是 123456。",
     )
 
-    assert response.status_code == 200
+    assert result.created == 1
     memory = memory_store.list_memories(user_id="default")[0]
     assert memory.topics == ["私密信息"]
     assert memory.entities == []
@@ -655,10 +776,7 @@ def test_sector_hints_promote_obvious_reflection() -> None:
         source_quote="我发现先收口 P0 再扩展更适合这个项目",
     )
 
-    hinted = apply_extraction_hints(
-        candidate,
-        source_text="我发现先收口 P0 再扩展更适合这个项目",
-    )
+    hinted = apply_extraction_hints(candidate)
 
     assert hinted.type == "reflective"
 
@@ -676,10 +794,31 @@ def test_temporal_profile_hint_accepts_present_state_without_now_marker() -> Non
         source_quote="我住在上海",
     )
 
-    hinted = apply_extraction_hints(candidate, source_text="我住在上海")
+    hinted = apply_extraction_hints(candidate)
 
     assert hinted.temporal_subject == "用户"
     assert hinted.temporal_predicate == "current_city"
+
+
+def test_temporal_profile_hint_clears_unsupported_llm_key() -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户喜欢咖啡。",
+        type="emotional",
+        importance=7,
+        confidence=0.9,
+        source_quote="我喜欢咖啡",
+        temporal_subject="用户",
+        temporal_predicate="current_city",
+    )
+
+    hinted = apply_extraction_hints(candidate, source_text="我现在住上海。我喜欢咖啡")
+
+    assert hinted.temporal_subject is None
+    assert hinted.temporal_predicate is None
 
 
 def test_type_specific_threshold_semantic_default():
@@ -720,4 +859,406 @@ def test_type_specific_threshold_unknown_type_falls_back():
     rejection = validate_candidate_for_save(c, user_message="测试回退", require_quote_in_user_message=True)
     # semantic 类型 importance=5 < 6，应被拒
     assert rejection is not None
+
+
+@pytest.mark.asyncio
+async def test_deterministic_sensitive_floor_overrides_normal_llm_label(
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    fake_llm.extraction_content = _extraction_json(
+        memory=f"用户的身份证号是 {identifier}。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=f"我的身份证号是 {identifier}",
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text=f"请记住，我的身份证号是 {identifier}。",
+    )
+
+    assert len(batch.outcomes) == 1
+    assert batch.outcomes[0].accepted is True
+    assert batch.outcomes[0].candidate is not None
+    assert batch.outcomes[0].candidate.sensitivity == "sensitive"
+
+
+def test_detect_text_sensitivity_is_reusable_without_llm() -> None:
+    from app.memory.extractor import detect_text_sensitivity
+
+    assert detect_text_sensitivity("我喜欢黑咖啡") == "normal"
+    assert detect_text_sensitivity("我的邮箱是 user@example.com") == "private"
+    assert detect_text_sensitivity("银行卡密码是 123456") == "sensitive"
+    assert detect_text_sensitivity("需要持续控制血糖") == "sensitive"
+
+
+@pytest.mark.asyncio
+async def test_sensitive_candidate_cannot_borrow_authorization_from_another_sentence(
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    fake_llm.extraction_content = _extraction_json(
+        memory=f"用户的身份证号是 {identifier}。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=f"我的身份证号是 {identifier}",
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text=f"记住我喜欢咖啡。我的身份证号是 {identifier}。",
+    )
+
+    assert batch.outcomes[0].accepted is False
+    assert "明确要求记住" in batch.outcomes[0].reason
+
+
+@pytest.mark.asyncio
+async def test_sensitive_candidate_cannot_use_a_multi_sentence_quote_to_bypass_scope(
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    source_text = f"记住我喜欢咖啡。我的身份证号是 {identifier}。"
+    fake_llm.extraction_content = _extraction_json(
+        memory=f"用户的身份证号是 {identifier}。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=source_text,
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text=source_text,
+    )
+
+    assert batch.outcomes[0].accepted is False
+    assert "明确要求记住" in batch.outcomes[0].reason
+
+
+@pytest.mark.asyncio
+async def test_sensitive_candidate_cannot_borrow_authorization_from_another_clause(
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    fake_llm.extraction_content = _extraction_json(
+        memory=f"用户的身份证号是 {identifier}。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=f"我的身份证号是 {identifier}",
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text=f"记住我喜欢咖啡，我的身份证号是 {identifier}。",
+    )
+
+    assert batch.outcomes[0].accepted is False
+    assert "明确要求记住" in batch.outcomes[0].reason
+
+
+@pytest.mark.asyncio
+async def test_sensitive_candidate_cannot_use_a_wide_clause_quote_to_bypass_scope(
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    source_text = f"记住我喜欢咖啡，我的身份证号是 {identifier}。"
+    fake_llm.extraction_content = _extraction_json(
+        memory=f"用户的身份证号是 {identifier}。",
+        importance=8,
+        confidence=0.95,
+        sensitivity="normal",
+        source_quote=source_text,
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text=source_text,
+    )
+
+    assert batch.outcomes[0].accepted is False
+    assert "明确要求记住" in batch.outcomes[0].reason
+
+
+def test_invented_sensitive_fact_is_not_grounded_by_unrelated_quote(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户的银行卡密码是 123456。",
+        importance=9,
+        confidence=0.99,
+        sensitivity="normal",
+        source_quote="记住我喜欢咖啡",
+    )
+
+    response = _post_ingest(client, auth_headers, "记住我喜欢咖啡。")
+
+    assert response.status_code == 200
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    log = memory_store.list_decision_logs()[0]
+    assert log.reason == "敏感候选未保存；详细理由已脱敏"
+    assert "123456" not in log.candidate_json
+
+
+def test_invented_entity_is_rejected_but_ordinary_paraphrase_remains_viable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户在 OpenAI 工作。",
+        importance=8,
+        confidence=0.95,
+        source_quote="我目前工作很忙",
+        entities=["OpenAI"],
+    )
+    rejected = _post_ingest(client, auth_headers, "我目前工作很忙。")
+
+    assert rejected.json()["ignored"] == 1
+    assert "candidate.entities" in memory_store.list_decision_logs()[0].reason
+
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户偏好无糖黑咖啡。",
+        type="emotional",
+        importance=7,
+        confidence=0.9,
+        source_quote="我喜欢不加糖的黑咖啡",
+        entities=[],
+    )
+    accepted = _post_ingest(client, auth_headers, "我喜欢不加糖的黑咖啡。")
+
+    assert accepted.json()["created"] == 1
+    assert memory_store.list_memories(user_id="default")[0].content == "用户偏好无糖黑咖啡。"
+
+
+def test_unrelated_non_sensitive_rewrite_is_not_grounded(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户喜欢绿茶。",
+        type="emotional",
+        importance=7,
+        confidence=0.95,
+        source_quote="我喜欢咖啡",
+    )
+
+    response = _post_ingest(client, auth_headers, "我喜欢咖啡。")
+
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "共同事实锚点" in memory_store.list_decision_logs()[0].reason
+
+
+def test_grounding_rejects_opposite_polarity(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户不喜欢咖啡。",
+        type="emotional",
+        importance=7,
+        confidence=0.95,
+        source_quote="我喜欢咖啡",
+    )
+
+    response = _post_ingest(client, auth_headers, "我喜欢咖啡。")
+
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "否定含义" in memory_store.list_decision_logs()[0].reason
+
+
+def test_grounding_does_not_accept_one_shared_han_character(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户住在上海。",
+        importance=7,
+        confidence=0.95,
+        source_quote="我看了海洋纪录片",
+    )
+
+    response = _post_ingest(client, auth_headers, "我看了海洋纪录片。")
+
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "共同事实锚点" in memory_store.list_decision_logs()[0].reason
+
+
+def test_grounding_scopes_negation_to_best_matching_clause(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    quote = "我不喜欢咖啡，但我喜欢绿茶"
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户不喜欢绿茶。",
+        type="emotional",
+        importance=7,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    response = _post_ingest(client, auth_headers, f"{quote}。")
+
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "否定含义" in memory_store.list_decision_logs()[0].reason
+
+
+def test_sensitive_rejected_candidate_does_not_leak_entity_in_log(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    phone = "13800138000"
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户住在上海。",
+        importance=7,
+        confidence=0.95,
+        source_quote="我住在上海",
+        entities=[phone],
+    )
+
+    response = _post_ingest(client, auth_headers, "我住在上海。")
+
+    assert response.json()["ignored"] == 1
+    log = memory_store.list_decision_logs()[0]
+    assert phone not in log.candidate_json
+    assert phone not in log.reason
+
+
+def test_empty_candidate_model_reason_is_hashed_in_decision_log(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    identifier = "123456789012345678"
+    fake_llm.extraction_content = json.dumps(
+        {"memories": [], "reason": f"身份证号是 {identifier}"},
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我喜欢咖啡。")
+
+    assert response.json()["ignored"] == 1
+    log = memory_store.list_decision_logs()[0]
+    audit = json.loads(log.candidate_json)
+    assert audit["model_reason_redacted"] is True
+    assert len(audit["model_reason_sha256"]) == 64
+    assert identifier not in log.candidate_json
+    assert identifier not in log.reason
+
+
+def test_batch_age_hint_does_not_overwrite_another_candidate(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户 30 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "source_quote": "我 30 岁",
+                },
+                {
+                    "action": "create",
+                    "memory": "用户喜欢咖啡。",
+                    "type": "emotional",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "source_quote": "我喜欢咖啡",
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我 30 岁。我喜欢咖啡。")
+
+    assert response.json()["created"] == 2
+    contents = [memory.content for memory in memory_store.list_memories(user_id="default")]
+    assert sum("30 岁" in content for content in contents) == 1
+    assert "用户喜欢咖啡。" in contents
+
+
+def test_batch_temporal_hint_does_not_leak_to_preference_candidate(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户现在住在上海。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "source_quote": "我现在住上海",
+                },
+                {
+                    "action": "create",
+                    "memory": "用户喜欢咖啡。",
+                    "type": "emotional",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "source_quote": "喜欢咖啡",
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我现在住上海，同时喜欢咖啡。")
+
+    assert response.json()["created"] == 2
+    memories = memory_store.list_memories(user_id="default")
+    city = next(memory for memory in memories if "上海" in memory.content)
+    coffee = next(memory for memory in memories if "咖啡" in memory.content)
+    assert city.temporal_predicate == "current_city"
+    assert coffee.temporal_subject is None
+    assert coffee.temporal_predicate is None
+
+
+def test_invalid_quote_is_rejected_before_age_normalization(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户喜欢咖啡。",
+        source_quote="我喜欢咖啡",
+    )
+
+    response = _post_ingest(client, auth_headers, "我 30 岁。")
+
+    assert response.json()["ignored"] == 1
+    log_payload = json.loads(memory_store.list_decision_logs()[0].candidate_json)
+    assert log_payload["memory"] == "用户喜欢咖啡。"
+    assert "source_quote" in memory_store.list_decision_logs()[0].reason
 

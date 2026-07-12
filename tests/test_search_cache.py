@@ -240,7 +240,7 @@ class TestEvalCacheBypass:
 
         # 投毒：手工塞入一个对该 (user, query, limit) 校验有效、但指向无关记忆的缓存条目，
         # 模拟另一种模式（或线上检索）先跑过、把结果留在了共享缓存里。
-        key = ("default", _normalize_query("咖啡"), 8)
+        key = ("default", _normalize_query("咖啡"), 8, False)
         _SEARCH_CACHE[key] = (
             _now() + 999,
             memory_store.get_memories_max_updated_at(user_id="default"),
@@ -276,4 +276,3 @@ class TestEvalCacheBypass:
         fresh_ids = [hit.memory.id for hit in fresh]
         assert coffee.id in fresh_ids
         assert typescript.id not in fresh_ids
-

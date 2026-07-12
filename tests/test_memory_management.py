@@ -1,5 +1,6 @@
 ﻿import io
 import json
+from pathlib import Path
 import zipfile
 
 from app.memory.store import MemoryStore
@@ -72,11 +73,11 @@ def test_sensitive_redaction_for_rest_views_does_not_change_stored_or_exported_c
     space = memory_store.upsert_memory_space(user_id="default", name="Private IDs")
     private = memory_store.create_memory(
         user_id="default",
-        content="User's private passport number is PA-12345.",
+        content="User's private email address is private@example.com.",
         type="semantic",
         importance=10,
         sensitivity="private",
-        source_message="My passport number is PA-12345.",
+        source_message="My email address is private@example.com.",
         space_ids=[space.id],
     )
     deleted_private = memory_store.create_memory(
@@ -114,7 +115,12 @@ def test_sensitive_redaction_for_rest_views_does_not_change_stored_or_exported_c
     search_response = client.post(
         "/memories/search",
         headers=auth_headers,
-        json={"query": "passport", "limit": 5, "redact_sensitive": True},
+        json={
+            "query": "email address",
+            "limit": 5,
+            "include_sensitive": True,
+            "redact_sensitive": True,
+        },
     )
     assert search_response.status_code == 200
     search_hit = next(
@@ -127,7 +133,7 @@ def test_sensitive_redaction_for_rest_views_does_not_change_stored_or_exported_c
     surface_response = client.post(
         "/memories/surface",
         headers=auth_headers,
-        json={"limit": 5, "redact_sensitive": True},
+        json={"limit": 5, "include_sensitive": True, "redact_sensitive": True},
     )
     assert surface_response.status_code == 200
     surfaced = {item["id"]: item for item in surface_response.json()["data"]}
@@ -331,10 +337,35 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     memory_store.upsert_core_memory_section(
         user_id="default",
         section="profile",
+        content="Earlier core fact includes SECRET-PURGE-123.",
+        evidence_memory_ids=[memory.id],
+        confidence=0.9,
+    )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="profile",
         content="User has a private purge target.",
         evidence_memory_ids=[memory.id],
         confidence=0.9,
     )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="Derived private fact SECRET-PURGE-123.",
+        origin="agent_derived",
+        evidence_memory_ids=[memory.id],
+        sensitivity="private",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id=None,
+        candidate_json=json.dumps({"memory": memory.content, "source_quote": memory.source_message}),
+        decision="create",
+        reason="Created SECRET-PURGE-123",
+    )
+    eval_init = client.post("/memories/evaluation/recall/init", headers=auth_headers)
+    assert eval_init.status_code == 200
+    snapshot_path = Path(eval_init.json()["snapshot"])
+    assert snapshot_path.exists()
     memory_store.archive_memory(memory_id=memory.id, user_id="default")
 
     response = client.request(
@@ -350,7 +381,10 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     assert payload["id"] == memory.id
     assert payload["audit_log_id"]
     assert payload["affected_core_memory_sections"][0]["section"] == "profile"
+    assert payload["evaluation_cleanup"]["workspace_removed"] is True
+    assert not snapshot_path.exists()
     assert memory_store.get_memory(memory_id=memory.id, user_id="default") is None
+    assert memory_store.get_memory(memory_id=derived.id, user_id="default") is None
     assert memory_store.list_archived_memories(user_id="default") == []
 
     restore_response = client.post(
@@ -359,8 +393,10 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     )
     assert restore_response.status_code == 404
 
-    [core_section] = memory_store.list_core_memory_sections(user_id="default")
-    assert core_section.evidence_memory_ids == [memory.id]
+    assert memory_store.list_core_memory_sections(user_id="default") == []
+    [core_history] = memory_store.list_core_memory_section_history(user_id="default")
+    assert core_history.content == "[redacted: purged evidence]"
+    assert core_history.evidence_memory_ids == []
 
     logs = memory_store.list_decision_logs(user_id="default", limit=5)
     purge_log = next(log for log in logs if log.id == payload["audit_log_id"])
@@ -371,8 +407,17 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     assert audit["affected_core_sections"][0]["section"] == "profile"
     assert "SECRET-PURGE-123" not in purge_log.candidate_json
     assert "User has a private purge target" not in purge_log.candidate_json
+    assert audit["scrubbed_artifacts"] == {
+        "derived_memories_deleted": 1,
+        "core_sections_scrubbed": 1,
+        "core_history_scrubbed": 1,
+        "decision_logs_scrubbed": 1,
+    }
 
     json_export = client.get("/memories/export", headers=auth_headers).json()
+    exported_text = json.dumps(json_export, ensure_ascii=False)
+    assert "SECRET-PURGE-123" not in exported_text
+    assert "User has a private purge target" not in exported_text
     assert memory.id not in {item["id"] for item in json_export["deleted_memories"]}
     markdown_export = client.get(
         "/memories/export?format=markdown",
@@ -492,6 +537,27 @@ def test_restore_export_imports_memories_for_current_user(
         type="semantic",
     )
     memory_store.archive_memory(memory_id=deleted.id, user_id="default")
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="preferences",
+        content="User likes pour-over coffee.",
+        evidence_memory_ids=[active.id],
+        confidence=0.9,
+    )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="preferences",
+        content="User strongly prefers pour-over coffee.",
+        evidence_memory_ids=[active.id],
+        confidence=0.95,
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id=None,
+        candidate_json="{}",
+        decision="create",
+        reason="test audit",
+    )
     export = client.get("/memories/export", headers=auth_headers).json()
     assert export["version"] == 2
     assert export["memory_spaces"][0]["name"] == "Coffee"
@@ -499,6 +565,11 @@ def test_restore_export_imports_memories_for_current_user(
     assert export["memories"][0]["valid_from"] == "2025-01-01"
     assert export["memories"][0]["temporal_subject"] == "user"
     assert export["memories"][0]["temporal_predicate"] == "coffee_method"
+    assert export["restore_contract"]["snapshot_only_sections"] == [
+        "core_memory_sections",
+        "core_memory_section_history",
+        "decision_logs",
+    ]
 
     target_headers = {**auth_headers, "X-User-Id": "restore-target"}
     restore_response = client.post(
@@ -511,6 +582,13 @@ def test_restore_export_imports_memories_for_current_user(
     payload = restore_response.json()
     assert payload["created"] == 2
     assert payload["invalid"] == 0
+    assert payload["not_restored_sections"] == [
+        "core_memory_sections",
+        "core_memory_section_history",
+        "decision_logs",
+    ]
+    assert payload["warnings"]
+    assert memory_store.list_core_memory_sections(user_id="restore-target") == []
 
     restored_active = memory_store.list_memories(user_id="restore-target")
     restored_deleted = memory_store.list_archived_memories(user_id="restore-target")
@@ -835,6 +913,24 @@ def test_patch_memory_rejects_invalid_valid_from(
     )
 
     assert response.status_code == 422
+
+
+def test_patch_memory_rejects_invalid_valid_until_and_review_after(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    for field in ("valid_until", "review_after"):
+        memory = memory_store.create_memory(
+            user_id="default",
+            content=f"User has an invalid {field} test.",
+        )
+        response = client.patch(
+            f"/memories/{memory.id}",
+            headers=auth_headers,
+            json={field: "not-a-date"},
+        )
+        assert response.status_code == 422
 
 
 def test_patch_memory_missing_id_returns_404(client, auth_headers):

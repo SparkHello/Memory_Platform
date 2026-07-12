@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import sqlite3
+
 from app.memory.store import MemoryStore
 
 
@@ -32,7 +36,7 @@ def test_evaluation_diagnosis_requires_auth_and_respects_user_scope(
     assert other.json()["metrics"]["type_distribution"] == {"emotional": 1}
 
 
-def test_recall_workbench_init_redacts_and_filters_user(
+def test_recall_workbench_candidates_match_default_search_eligibility(
     client,
     auth_headers,
     memory_store: MemoryStore,
@@ -46,6 +50,18 @@ def test_recall_workbench_init_redacts_and_filters_user(
         user_id="default",
         content="用户的私人计划。",
         sensitivity="private",
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="模型形成的派生反思。",
+        type="reflective",
+        origin="agent_derived",
+        evidence_memory_ids=[public.id],
+    )
+    legacy_mislabeled = memory_store.create_memory(
+        user_id="default",
+        content="用户的银行卡号是 6222021234567890。",
+        sensitivity="normal",
     )
     other = memory_store.create_memory(
         user_id="other",
@@ -61,16 +77,100 @@ def test_recall_workbench_init_redacts_and_filters_user(
 
     assert init_response.status_code == 200
     assert init_response.json()["labels_created"] is True
+    assert init_response.json()["memory_count"] == 1
     assert workbench_response.status_code == 200
     payload = workbench_response.json()
     candidate_ids = {candidate["id"] for candidate in payload["candidates"]}
-    assert public.id in candidate_ids
-    assert private.id in candidate_ids
-    assert other.id not in candidate_ids
+    assert candidate_ids == {public.id}
+    assert candidate_ids.isdisjoint(
+        {private.id, derived.id, legacy_mislabeled.id, other.id}
+    )
 
-    private_payload = next(candidate for candidate in payload["candidates"] if candidate["id"] == private.id)
-    assert private_payload["redacted"] is True
-    assert private_payload["content"] != private.content
+
+def test_recall_artifacts_are_isolated_per_user(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    default = memory_store.create_memory(user_id="default", content="DEFAULT_USER_ONLY")
+    other = memory_store.create_memory(user_id="other", content="OTHER_USER_ONLY")
+    other_headers = {**auth_headers, "X-User-Id": "other"}
+
+    default_init = client.post("/memories/evaluation/recall/init", headers=auth_headers)
+    other_init = client.post("/memories/evaluation/recall/init", headers=other_headers)
+
+    assert default_init.status_code == 200
+    assert other_init.status_code == 200
+    default_payload = default_init.json()
+    other_payload = other_init.json()
+    assert default_payload["user_id"] == "default"
+    assert other_payload["user_id"] == "other"
+    assert default_payload["snapshot"] != other_payload["snapshot"]
+    assert default_payload["labels"] != other_payload["labels"]
+    assert default_payload["user_counts"] == {"default": 1}
+    assert other_payload["user_counts"] == {"other": 1}
+
+    with sqlite3.connect(str(Path(default_payload["snapshot"]))) as connection:
+        assert connection.execute("SELECT id, user_id FROM memories").fetchall() == [
+            (default.id, "default")
+        ]
+    with sqlite3.connect(str(Path(other_payload["snapshot"]))) as connection:
+        assert connection.execute("SELECT id, user_id FROM memories").fetchall() == [
+            (other.id, "other")
+        ]
+
+    default_labels = client.put(
+        "/memories/evaluation/recall/labels",
+        headers=auth_headers,
+        json={
+            "labels": [
+                {
+                    "id": "default-q",
+                    "query": "default",
+                    "judgment": "relevant",
+                    "relevant_ids": [default.id],
+                }
+            ]
+        },
+    )
+    other_labels = client.put(
+        "/memories/evaluation/recall/labels",
+        headers=other_headers,
+        json={
+            "labels": [
+                {
+                    "id": "other-q",
+                    "query": "other",
+                    "judgment": "relevant",
+                    "relevant_ids": [other.id],
+                }
+            ]
+        },
+    )
+    assert default_labels.status_code == 200
+    assert other_labels.status_code == 200
+    assert client.get(
+        "/memories/evaluation/recall/workbench", headers=auth_headers
+    ).json()["labels"][0]["id"] == "default-q"
+    assert client.get(
+        "/memories/evaluation/recall/workbench", headers=other_headers
+    ).json()["labels"][0]["id"] == "other-q"
+
+    assert client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 8},
+    ).status_code == 200
+    assert client.post(
+        "/memories/evaluation/recall/run",
+        headers=other_headers,
+        json={"mode": "keyword", "k": 8},
+    ).status_code == 200
+    default_result_path = Path(default_payload["snapshot"]).parent / "last_keyword_result.json"
+    other_result_path = Path(other_payload["snapshot"]).parent / "last_keyword_result.json"
+    assert default_result_path != other_result_path
+    assert json.loads(default_result_path.read_text(encoding="utf-8"))["user_id"] == "default"
+    assert json.loads(other_result_path.read_text(encoding="utf-8"))["user_id"] == "other"
 
 
 def test_recall_labels_reject_cross_user_memory(
@@ -188,6 +288,80 @@ def test_recall_run_reports_missing_snapshot_and_embedding_config(
     assert "embedding" in embedding.json()["detail"]
 
 
+def test_recall_endpoints_return_422_for_malformed_labels_file(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡。")
+    initialized = client.post(
+        "/memories/evaluation/recall/init",
+        headers=auth_headers,
+    )
+    assert initialized.status_code == 200
+    Path(initialized.json()["labels"]).write_text("not json\n", encoding="utf-8")
+
+    workbench = client.get(
+        "/memories/evaluation/recall/workbench",
+        headers=auth_headers,
+    )
+    run = client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 8},
+    )
+
+    assert workbench.status_code == 422
+    assert run.status_code == 422
+    assert "Invalid label JSON on line 1" in workbench.json()["detail"]
+    assert "Invalid label JSON on line 1" in run.json()["detail"]
+
+
+def test_recall_run_enforces_and_reports_effective_k(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡。")
+    initialized = client.post(
+        "/memories/evaluation/recall/init",
+        headers=auth_headers,
+    )
+    assert initialized.status_code == 200
+    saved = client.put(
+        "/memories/evaluation/recall/labels",
+        headers=auth_headers,
+        json={
+            "labels": [
+                {
+                    "id": "q001",
+                    "query": "咖啡",
+                    "judgment": "no_answer",
+                    "relevant_ids": [],
+                }
+            ]
+        },
+    )
+    assert saved.status_code == 200
+
+    accepted = client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 20},
+    )
+    rejected = client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 21},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["summary"]["requested_k"] == 20
+    assert accepted.json()["summary"]["effective_k"] == 20
+    assert accepted.json()["summary"]["k"] == 20
+    assert rejected.status_code == 422
+
+
 def test_recall_run_keyword_does_not_touch_real_usage(
     client,
     auth_headers,
@@ -230,3 +404,43 @@ def test_recall_run_keyword_does_not_touch_real_usage(
     refreshed = memory_store.get_memory(memory_id=coffee.id, user_id="default")
     assert refreshed is not None
     assert refreshed.usage_count == 0
+
+
+def test_recall_run_grades_explicit_no_answer_labels(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡。")
+    assert client.post("/memories/evaluation/recall/init", headers=auth_headers).status_code == 200
+    labels = client.put(
+        "/memories/evaluation/recall/labels",
+        headers=auth_headers,
+        json={
+            "labels": [
+                {
+                    "id": "q-no-answer",
+                    "query": "咖啡",
+                    "judgment": "no_answer",
+                    "relevant_ids": [],
+                }
+            ]
+        },
+    )
+
+    assert labels.status_code == 200
+    assert labels.json()["summary"]["queries_graded"] == 1
+    assert labels.json()["summary"]["queries_no_answer"] == 1
+
+    run = client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 8},
+    )
+    assert run.status_code == 200
+    summary = run.json()["summary"]
+    assert summary["queries_graded"] == 1
+    assert summary["queries_no_answer"] == 1
+    assert summary["no_answer_false_positive_rate"] == 1.0
+    assert summary["no_answer_abstention_rate"] == 0.0
+    assert run.json()["per_query"][0]["false_positive"] is True

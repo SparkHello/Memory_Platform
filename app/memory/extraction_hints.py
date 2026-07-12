@@ -197,17 +197,24 @@ _SECTOR_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def apply_extraction_hints(candidate: CandidateMemory, *, source_text: str) -> CandidateMemory:
+def apply_extraction_hints(
+    candidate: CandidateMemory,
+    *,
+    source_text: str | None = None,
+) -> CandidateMemory:
     """Apply conservative post-extraction hints that are safer than broad guessing.
 
     The LLM still does the main extraction. This layer only nudges obvious sector
     collapses and fills temporal keys for a tiny whitelist of replaceable profile
     slots.
     """
+    # Kept as an ignored compatibility argument for older callers. Whole-batch
+    # source text must never participate in per-candidate inference.
+    del source_text
     if candidate.action == "ignore":
         return candidate
 
-    text = _hint_text(candidate, source_text)
+    text = _hint_text(candidate)
     _apply_sector_hint(candidate, text)
     _apply_temporal_profile_hint(candidate, text)
     return candidate
@@ -227,19 +234,23 @@ def _apply_temporal_profile_hint(candidate: CandidateMemory, text: str) -> None:
     predicate = (candidate.temporal_predicate or "").strip()
     if predicate:
         if predicate in TEMPORAL_PROFILE_PREDICATES:
-            candidate.temporal_subject = candidate.temporal_subject or "用户"
-            return
-        candidate.temporal_subject = None
-        candidate.temporal_predicate = None
-        _append_reason(candidate, "非白名单 temporal key 已清空，避免误触发自动失效。")
+            slot = next(slot for slot in _TEMPORAL_PROFILE_SLOTS if slot.predicate == predicate)
+            if _matches_temporal_slot(text, slot):
+                candidate.temporal_subject = candidate.temporal_subject or "用户"
+                return
+            candidate.temporal_subject = None
+            candidate.temporal_predicate = None
+            _append_reason(candidate, "temporal key 缺少候选引用支撑，已清空。")
+        else:
+            candidate.temporal_subject = None
+            candidate.temporal_predicate = None
+            _append_reason(candidate, "非白名单 temporal key 已清空，避免误触发自动失效。")
 
     if _matches_any(text, _PAST_MARKERS):
         return
 
     for slot in _TEMPORAL_PROFILE_SLOTS:
-        if slot.needs_current_marker and not _matches_any(text, _CURRENT_MARKERS):
-            continue
-        if not _matches_any(text, slot.patterns):
+        if not _matches_temporal_slot(text, slot):
             continue
         candidate.temporal_subject = "用户"
         candidate.temporal_predicate = slot.predicate
@@ -247,10 +258,18 @@ def _apply_temporal_profile_hint(candidate: CandidateMemory, text: str) -> None:
         return
 
 
-def _hint_text(candidate: CandidateMemory, source_text: str) -> str:
+def _matches_temporal_slot(text: str, slot: TemporalProfileSlot) -> bool:
+    if _matches_any(text, _PAST_MARKERS):
+        return False
+    if slot.needs_current_marker and not _matches_any(text, _CURRENT_MARKERS):
+        return False
+    return _matches_any(text, slot.patterns)
+
+
+def _hint_text(candidate: CandidateMemory) -> str:
     return "\n".join(
         part
-        for part in (source_text, candidate.source_quote, candidate.memory, candidate.reason)
+        for part in (candidate.source_quote, candidate.memory)
         if part
     )
 

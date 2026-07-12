@@ -46,7 +46,15 @@ def _term_jaccard(left: str, right: str) -> float:
 
 
 def _terms(text: str) -> set[str]:
-    return {term.lower() for term in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", text)}
+    terms = {term.lower() for term in re.findall(r"[A-Za-z0-9_]+", text)}
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(run) == 1:
+            terms.add(run)
+            continue
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+        if len(run) >= 3:
+            terms.update(run[index : index + 3] for index in range(len(run) - 2))
+    return terms
 
 
 def _char_overlap(left: str, right: str) -> float:

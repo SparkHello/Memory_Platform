@@ -6,6 +6,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from app.api.deps import get_embedding_client, get_llm_client, get_memory_store
 from app.config import get_settings
+from app.memory.core import safe_core_memory_sections
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
     CoreMemorySection,
@@ -27,7 +28,7 @@ SERVER_INSTRUCTIONS = """这是用户的长期记忆服务。你只有 6 个工�
 - **get_recent_context_summary**：需要恢复上一轮上下文时调用。
 - **digest_memories**：新对话开始时可先调用读取近期未消化记忆；完成反思后再次带 source_ids、reflection、feel、resolved_ids 提交消化结果。
 
-不要保存假设、玩笑、一次性安排。同一轮可以先 search 再 submit，两者不冲突。保存被拒绝时不要重试。
+不要保存假设、玩笑、一次性安排。同一轮可以先 search 再 submit，两者不冲突。保存因规则被拒绝时不要重试；若返回 retryable=true，可稍后重试一次。
 返回结果里的 activation_count 表示活跃度，不是精确搜索次数；Time Ripple 是默认关闭的实验能力，普通客户端不需要启用。
 用户要求忘记某条信息时，请引导用户在 Web 管理台（/ui/）操作，你没有删除或遗忘的工具。"""
 SERVER_INSTRUCTIONS = SERVER_INSTRUCTIONS.replace(
@@ -84,6 +85,7 @@ def _memory_to_dict(memory: MemoryRecord) -> dict:
         "confidence": memory.confidence,
         "valence": memory.valence,
         "arousal": memory.arousal,
+        "origin": memory.origin,
         "usage_count": memory.usage_count,
         "last_used_at": memory.last_used_at,
         "stability": memory.stability,
@@ -251,14 +253,15 @@ def _register_tools(mcp: FastMCP) -> None:
     mcp.tool()(digest_memories)
 
 
-async def search_memory(query: str, limit: int = 8) -> str:
+async def search_memory(query: str, limit: int = 8, include_sensitive: bool = False) -> str:
     """检索与当前话题相关的长期记忆。
 
     聊到用户的喜好、习惯、家人朋友、健康、计划安排、长期事项，或过去聊过的
     话题时，先调用本工具再回答，让对话自然延续。
     调用本工具后，仍要检查本轮用户消息是否包含新的长期信息；如果有，继续调用
     submit_memory_text。检索旧记忆和保存新信息可以在同一轮连续发生，不要二选一。
-    query 用一句话描述要查的主题，例如「用户的饮食偏好」。
+    query 用一句话描述要查的主题，例如「用户的饮食偏好」。敏感记忆默认不返回；
+    只有本轮用户明确要求读取相关敏感信息时，才可设置 include_sensitive=True。
     返回 JSON 数组，按相关度排序；空数组表示没有相关记忆，此时正常回答即可。
     被返回的记忆会自动增加底层 usage_count 并刷新 last_used_at；对外请解释为
     activation_count（活跃度），不是精确搜索次数。Time Ripple 是默认关闭的实验能力。
@@ -269,6 +272,7 @@ async def search_memory(query: str, limit: int = 8) -> str:
         query=query,
         user_id=current_user_id.get(),
         limit=max(1, min(limit, 20)),
+        include_sensitive=include_sensitive,
     )
     return _dump([_search_hit_to_dict(hit) for hit in hits])
 
@@ -277,13 +281,15 @@ async def surface_memories(
     limit: int = 8,
     mode: str = "balanced",
     include_archived: bool = False,
+    include_sensitive: bool = False,
 ) -> str:
     """无 query 浮现当前最值得想起的长期记忆。
 
     适用于新对话开场、用户让你主动回顾近况/长期事项，或当前没有明确检索词但需要
     带着长期背景进入对话时。mode 可选 balanced、important、emotional、stale、
     review_due；默认 balanced 按活跃度、新鲜度和重要度排序。
-    include_archived=True 时包含已归档记忆。
+    include_archived=True 时包含已归档记忆。敏感记忆默认不主动浮现，只有本轮用户
+    明确要求回顾敏感信息时，才可设置 include_sensitive=True。
     """
     store, embedding_client = _services()
     service = _search_service(store, embedding_client)
@@ -292,6 +298,7 @@ async def surface_memories(
         limit=max(1, min(limit, 20)),
         mode=mode,
         include_archived=include_archived,
+        include_sensitive=include_sensitive,
     )
     return _dump([_surface_hit_to_dict(hit) for hit in hits])
 
@@ -319,6 +326,7 @@ async def submit_memory_text(text: str, conversation_id: str = "") -> str:
         store=store,
         embedding_client=embedding_client,
         llm_client=llm_client,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
     )
     result = await ingester.ingest(
         user_id=current_user_id.get(),
@@ -369,7 +377,10 @@ async def get_core_memory() -> str:
     使用 search_memory 检索细节；核心记忆不是细节检索工具。
     """
     store, _ = _services()
-    sections = store.list_core_memory_sections(user_id=current_user_id.get())
+    sections = safe_core_memory_sections(
+        store=store,
+        user_id=current_user_id.get(),
+    )
     return _dump([_core_memory_to_dict(section) for section in sections])
 
 
@@ -382,6 +393,7 @@ async def digest_memories(
     reflection: str = "",
     feel: str = "",
     resolved_ids: list[str] = [],
+    include_sensitive: bool = False,
 ) -> str:
     """Two-phase memory digestion.
 
@@ -390,13 +402,26 @@ async def digest_memories(
     reflective and emotional outputs, mark source memories digested, and resolve
     selected memories.
     """
+    settings = get_settings()
     store, _ = _services()
     user_id = current_user_id.get()
+    allow_sensitive = bool(include_sensitive and settings.allow_sensitive_egress)
+    if include_sensitive and not settings.allow_sensitive_egress:
+        return _dump({
+            "error": "Sensitive digestion requires ALLOW_SENSITIVE_EGRESS=true.",
+            "created": [],
+            "digested_ids": [],
+            "resolved_ids": [],
+        })
 
     reflection_text = (reflection or "").strip()
     feel_text = (feel or "").strip()
-    source_ids = [memory_id for memory_id in (source_ids or []) if memory_id]
-    resolved_ids = [memory_id for memory_id in (resolved_ids or []) if memory_id]
+    source_ids = list(
+        dict.fromkeys(memory_id for memory_id in (source_ids or []) if memory_id)
+    )
+    resolved_ids = list(
+        dict.fromkeys(memory_id for memory_id in (resolved_ids or []) if memory_id)
+    )
 
     if reflection_text or feel_text or source_ids or resolved_ids:
         if not source_ids:
@@ -406,55 +431,57 @@ async def digest_memories(
                 "digested_ids": [],
                 "resolved_ids": [],
             })
-        created: list[MemoryRecord] = []
-        source_memories = [
-            memory
-            for memory_id in source_ids
-            if (memory := store.get_memory(memory_id=memory_id, user_id=user_id)) is not None
-        ]
-        if reflection_text:
-            reflection_valence, reflection_arousal = _digest_affect(
-                text=reflection_text,
-                source_memories=source_memories,
+        source_id_set = set(source_ids)
+        if any(memory_id not in source_id_set for memory_id in resolved_ids):
+            return _dump({
+                "error": "resolved_ids must be a subset of source_ids.",
+                "created": [],
+                "digested_ids": [],
+                "resolved_ids": [],
+            })
+        try:
+            source_memories = store.get_digest_source_memories(
+                memory_ids=source_ids,
+                user_id=user_id,
+                include_sensitive=allow_sensitive,
             )
-            created.append(
-                store.create_memory(
-                    user_id=user_id,
-                    content=reflection_text,
-                    type="reflective",
-                    importance=6,
-                    confidence=0.8,
-                    valence=reflection_valence,
-                    arousal=reflection_arousal,
-                    source_message="digest_memories:reflection",
-                    topics=["digestion", "reflection"],
-                )
-            )
-        if feel_text:
-            feel_valence, feel_arousal = _digest_affect(
-                text=feel_text,
-                source_memories=source_memories,
-                default_arousal=0.4,
-            )
-            created.append(
-                store.create_memory(
-                    user_id=user_id,
-                    content=feel_text,
-                    type="emotional",
-                    importance=5,
-                    confidence=0.8,
-                    valence=feel_valence,
-                    arousal=feel_arousal,
-                    source_message="digest_memories:feel",
-                    topics=["digestion", "feel"],
-                )
-            )
-        store.mark_digested(memory_ids=source_ids, user_id=user_id)
-        resolved_count = store.update_memory_statuses(
-            memory_ids=resolved_ids,
-            user_id=user_id,
-            status="resolved",
+        except ValueError as exc:
+            return _dump({
+                "error": str(exc),
+                "created": [],
+                "digested_ids": [],
+                "resolved_ids": [],
+            })
+
+        reflection_valence, reflection_arousal = _digest_affect(
+            text=reflection_text,
+            source_memories=source_memories,
         )
+        feel_valence, feel_arousal = _digest_affect(
+            text=feel_text,
+            source_memories=source_memories,
+            default_arousal=0.4,
+        )
+        try:
+            created, resolved_count = store.apply_memory_digest(
+                user_id=user_id,
+                source_ids=source_ids,
+                resolved_ids=resolved_ids,
+                reflection=reflection_text,
+                reflection_valence=reflection_valence,
+                reflection_arousal=reflection_arousal,
+                feel=feel_text,
+                feel_valence=feel_valence,
+                feel_arousal=feel_arousal,
+                include_sensitive=allow_sensitive,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return _dump({
+                "error": str(exc),
+                "created": [],
+                "digested_ids": [],
+                "resolved_ids": [],
+            })
         return _dump({
             "created": [_memory_to_dict(memory) for memory in created],
             "digested_ids": source_ids,
@@ -465,6 +492,7 @@ async def digest_memories(
     memories = store.list_undigested_memories(
         user_id=user_id,
         limit=max(1, min(limit, 20)),
+        include_sensitive=allow_sensitive,
     )
     if not memories:
         return _dump({

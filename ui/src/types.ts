@@ -291,9 +291,12 @@ export interface MechanismDiagnosisResult {
   verdicts: MechanismVerdict[];
 }
 
+export type RecallEvalJudgment = "unlabeled" | "relevant" | "no_answer";
+
 export interface RecallEvalLabel {
   id: string;
   query: string;
+  judgment: RecallEvalJudgment;
   relevant_ids: string[];
   note?: string | null;
 }
@@ -308,19 +311,30 @@ export interface RecallEvalValidationIssue {
 export interface RecallEvalSummary {
   queries_total: number;
   queries_graded: number;
+  queries_relevant?: number;
+  queries_no_answer?: number;
+  queries_unlabeled?: number;
   target_min?: number;
   target_max?: number;
   k?: number;
+  requested_mode?: "keyword" | "embedding";
   hit_rate?: number;
   precision_at_k?: number;
   recall_at_k?: number;
   mrr?: number;
   ndcg_at_k?: number;
+  no_answer_false_positive_rate?: number;
+  no_answer_abstention_rate?: number;
+  no_answer_mean_retrieved?: number;
+  retrieval_mode_counts?: Record<string, number>;
+  fallback_queries?: number;
 }
 
 export interface RecallEvalQueryResult {
   id?: string;
   query: string;
+  judgment: RecallEvalJudgment;
+  graded: boolean;
   relevant_count: number;
   retrieved: number;
   relevant_hits: number;
@@ -329,7 +343,13 @@ export interface RecallEvalQueryResult {
   recall: number;
   reciprocal_rank: number;
   ndcg: number;
+  false_positive: boolean;
+  requested_mode: "keyword" | "embedding";
+  retrieval_mode: "keyword" | "embedding" | "hybrid" | "keyword_fallback" | "none";
+  fallback_reason?: string | null;
+  embedding_available?: boolean | null;
   predicted_ids: string[];
+  predicted_channels?: Record<string, string[]>;
 }
 
 export interface RecallEvalRunResult {

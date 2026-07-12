@@ -44,7 +44,7 @@ def test_memory_health_reports_archived_core_evidence(
     assert payload["issues"][0]["related_id"] == memory.id
 
 
-def test_memory_health_reports_orphan_core_evidence_after_purge(
+def test_memory_health_has_no_orphan_core_evidence_after_purge(
     client,
     auth_headers,
     memory_store: MemoryStore,
@@ -72,11 +72,9 @@ def test_memory_health_reports_orphan_core_evidence_after_purge(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "warning"
-    assert any(
-        issue["type"] == "orphan_core_evidence" and issue["related_id"] == memory.id
-        for issue in payload["issues"]
-    )
+    assert payload["status"] == "ok"
+    assert not any(issue["type"] == "orphan_core_evidence" for issue in payload["issues"])
+    assert memory_store.list_core_memory_sections(user_id="default") == []
 
 
 def test_memory_health_reports_orphan_space_links_and_export_reference(

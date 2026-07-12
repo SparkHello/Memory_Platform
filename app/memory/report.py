@@ -82,6 +82,23 @@ def build_memory_export(
         "exported_at": utc_now_iso(),
         "user_id": user_id,
         "embedding_included": False,
+        "restore_contract": {
+            "restored_sections": [
+                "memory_spaces",
+                "memories",
+                "deleted_memories",
+                "recent_context_summaries",
+            ],
+            "snapshot_only_sections": [
+                "core_memory_sections",
+                "core_memory_section_history",
+                "decision_logs",
+            ],
+            "note": (
+                "核心记忆可从长期记忆重新整理；历史版本和决策日志仅供审计，"
+                "恢复时不会写回。"
+            ),
+        },
         "memory_spaces": [
             space.model_dump()
             for space in store.list_memory_spaces(user_id=user_id)
@@ -130,6 +147,15 @@ def restore_memory_export(
     deleted_records = export_data.get("deleted_memories", []) if include_deleted else []
     space_records = export_data.get("memory_spaces", [])
     recent_context_records = export_data.get("recent_context_summaries", [])
+    snapshot_only_sections = [
+        name
+        for name in (
+            "core_memory_sections",
+            "core_memory_section_history",
+            "decision_logs",
+        )
+        if export_data.get(name)
+    ]
     result = {
         "spaces_created": 0,
         "spaces_updated": 0,
@@ -146,6 +172,16 @@ def restore_memory_export(
         "restored_memories": [],
         "include_deleted": include_deleted,
         "overwrite": overwrite,
+        "not_restored_sections": snapshot_only_sections,
+        "warnings": (
+            [
+                "以下导出分区仅供审计，未写回："
+                + ", ".join(snapshot_only_sections)
+                + "。核心记忆应在恢复长期记忆后重新整理。"
+            ]
+            if snapshot_only_sections
+            else []
+        ),
     }
     space_id_map: dict[str, str] = {}
     if isinstance(space_records, list):

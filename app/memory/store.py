@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import hashlib
 import json
@@ -5,6 +6,7 @@ import sqlite3
 
 from pydantic import ValidationError
 
+from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import (
     CoreMemorySection,
     CoreMemorySectionHistory,
@@ -13,6 +15,7 @@ from app.memory.models import (
     DecisionLogAction,
     MemoryAction,
     MemoryMergeResult,
+    MemoryOrigin,
     MemoryRecord,
     MemorySensitivity,
     MemorySourceExplanation,
@@ -31,6 +34,24 @@ from app.memory.utils import _parse_iso_datetime
 
 _UNSET = object()
 _TIME_RIPPLE_MAX_CANDIDATES = 100
+_SENSITIVITY_RANK = {"normal": 0, "private": 1, "sensitive": 2}
+
+
+def _sensitivity_with_floor(
+    *,
+    declared: MemorySensitivity,
+    content: str,
+    source_message: str | None = None,
+    entities: list[str] | None = None,
+) -> MemorySensitivity:
+    detected = detect_text_sensitivity(
+        "\n".join(
+            part
+            for part in (content, source_message or "", *(entities or []))
+            if part
+        )
+    )
+    return max((declared, detected), key=_SENSITIVITY_RANK.__getitem__)
 
 
 class MemoryStore:
@@ -55,6 +76,7 @@ class MemoryStore:
                     arousal REAL DEFAULT 0.3,
                     source_message TEXT,
                     source_conversation_id TEXT,
+                    origin TEXT DEFAULT 'user_asserted',
                     embedding_json TEXT,
                     last_used_at TEXT,
                     usage_count REAL DEFAULT 0.0,
@@ -264,6 +286,7 @@ class MemoryStore:
         arousal: float = 0.3,
         source_message: str | None = None,
         source_conversation_id: str | None = None,
+        origin: MemoryOrigin = "user_asserted",
         embedding_json: str | None = None,
         stability: MemoryStability = "stable",
         valid_from: str | None = None,
@@ -281,6 +304,12 @@ class MemoryStore:
         evidence_memory_ids = evidence_memory_ids or []
         topics = normalize_classification_names(topics or [], max_items=20, field_name="topics")
         entities = normalize_classification_names(entities or [], max_items=20, field_name="entities")
+        sensitivity = _sensitivity_with_floor(
+            declared=sensitivity,
+            content=content,
+            source_message=source_message,
+            entities=entities,
+        )
         temporal_subject = normalize_optional_text(temporal_subject)
         temporal_predicate = normalize_optional_text(temporal_predicate)
         space_ids = _ordered_unique([str(space_id).strip() for space_id in (space_ids or []) if str(space_id).strip()])
@@ -297,6 +326,7 @@ class MemoryStore:
             arousal=arousal,
             source_message=source_message,
             source_conversation_id=source_conversation_id,
+            origin=origin,
             embedding_json=embedding_json,
             last_used_at=None,
             usage_count=0,
@@ -316,64 +346,13 @@ class MemoryStore:
             archived_at=None,
             archived=0,
         )
-        evidence_json = json.dumps(evidence_memory_ids, ensure_ascii=False)
-        topics_json = json.dumps(topics, ensure_ascii=False)
-        entities_json = json.dumps(entities, ensure_ascii=False)
         with self._connect() as connection:
             self._validate_space_ids(
                 connection=connection,
                 user_id=user_id,
                 space_ids=space_ids,
             )
-            connection.execute(
-                """
-                INSERT INTO memories (
-                    id, user_id, content, type, importance, confidence,
-                    valence, arousal,
-                    source_message, source_conversation_id, embedding_json,
-                    last_used_at, usage_count, stability, valid_from, valid_until, review_after,
-                    sensitivity, evidence_memory_ids_json, topics_json, entities_json,
-                    temporal_subject, temporal_predicate,
-                    status, digested, decay_lambda, supersedes, superseded_by,
-                    created_at, updated_at, archived_at, archived
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    memory.id,
-                    memory.user_id,
-                    memory.content,
-                    memory.type,
-                    memory.importance,
-                    memory.confidence,
-                    memory.valence,
-                    memory.arousal,
-                    memory.source_message,
-                    memory.source_conversation_id,
-                    memory.embedding_json,
-                    memory.last_used_at,
-                    memory.usage_count,
-                    memory.stability,
-                    memory.valid_from,
-                    memory.valid_until,
-                    memory.review_after,
-                    memory.sensitivity,
-                    evidence_json,
-                    topics_json,
-                    entities_json,
-                    memory.temporal_subject,
-                    memory.temporal_predicate,
-                    memory.status,
-                    int(memory.digested),
-                    memory.decay_lambda,
-                    memory.supersedes,
-                    memory.superseded_by,
-                    memory.created_at,
-                    memory.updated_at,
-                    memory.archived_at,
-                    memory.archived,
-                ),
-            )
+            self._insert_memory_row(connection=connection, memory=memory)
             self._replace_memory_space_links(
                 connection=connection,
                 user_id=user_id,
@@ -433,7 +412,15 @@ class MemoryStore:
             temporal_predicate = existing.temporal_predicate
         topics = normalize_classification_names(topics, max_items=20, field_name="topics")
         entities = normalize_classification_names(entities, max_items=20, field_name="entities")
+        sensitivity = _sensitivity_with_floor(
+            declared=sensitivity,
+            content=content,
+            source_message=source_message,
+            entities=entities,
+        )
         valid_from = normalize_iso_text(valid_from)
+        valid_until = normalize_iso_text(valid_until)
+        review_after = normalize_iso_text(review_after)
         temporal_subject = normalize_optional_text(temporal_subject)
         temporal_predicate = normalize_optional_text(temporal_predicate)
         evidence_json = json.dumps(evidence_memory_ids, ensure_ascii=False)
@@ -1146,18 +1133,36 @@ class MemoryStore:
     def archive_expired_memories(self, *, user_id: str) -> int:
         """归档所有 valid_until 已过期的活跃记忆，返回归档数量。"""
         now_iso = utc_now_iso()
+        now = _parse_iso_datetime(now_iso)
+        if now is None:
+            return 0
         with self._connect() as connection:
-            cursor = connection.execute(
+            rows = connection.execute(
                 """
+                SELECT id, valid_until
+                FROM memories
+                WHERE user_id = ? AND archived = 0 AND valid_until IS NOT NULL
+                """,
+                (user_id,),
+            ).fetchall()
+            expired_ids = [
+                str(row["id"])
+                for row in rows
+                if (expires := _parse_iso_datetime(row["valid_until"])) is not None
+                and expires < now
+            ]
+            if not expired_ids:
+                return 0
+            placeholders = ", ".join("?" for _ in expired_ids)
+            cursor = connection.execute(
+                f"""
                 UPDATE memories
                 SET archived = 1, archived_at = ?, updated_at = ?
-                WHERE user_id = ? AND archived = 0
-                    AND valid_until IS NOT NULL
-                    AND valid_until < ?
+                WHERE user_id = ? AND archived = 0 AND id IN ({placeholders})
                 """,
-                (now_iso, now_iso, user_id, now_iso),
+                (now_iso, now_iso, user_id, *expired_ids),
             )
-        return cursor.rowcount
+        return int(cursor.rowcount)
 
     def purge_archived_memory(
         self,
@@ -1169,6 +1174,7 @@ class MemoryStore:
     ) -> tuple[MemoryRecord, DecisionLog] | None:
         purged_at = utc_now_iso()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT * FROM memories
@@ -1192,6 +1198,11 @@ class MemoryStore:
                 row,
                 space_ids=[str(space_row["space_id"]) for space_row in space_rows],
             )
+            scrubbed_artifacts = _scrub_purged_memory_artifacts(
+                connection,
+                memory=memory,
+                purged_at=purged_at,
+            )
             log = DecisionLog(
                 id=new_memory_id(),
                 user_id=user_id,
@@ -1212,6 +1223,7 @@ class MemoryStore:
                         "affected_core_sections": _core_section_audit_summaries(
                             affected_core_sections or []
                         ),
+                        "scrubbed_artifacts": scrubbed_artifacts,
                     },
                     ensure_ascii=False,
                 ),
@@ -1612,6 +1624,7 @@ class MemoryStore:
                 arousal=_bounded_float(data.get("arousal"), default=0.3),
                 source_message=data.get("source_message"),
                 source_conversation_id=data.get("source_conversation_id"),
+                origin=data.get("origin", "user_asserted"),
                 embedding_json=None,
                 last_used_at=data.get("last_used_at"),
                 usage_count=max(0.0, _coerce_float(data.get("usage_count"), default=0.0)),
@@ -1636,6 +1649,12 @@ class MemoryStore:
                 archived_at=archived_at,
                 archived=archived_value,
             )
+            memory.sensitivity = _sensitivity_with_floor(
+                declared=memory.sensitivity,
+                content=memory.content,
+                source_message=memory.source_message,
+                entities=memory.entities,
+            )
         except ValidationError:
             return "invalid", None
 
@@ -1652,6 +1671,7 @@ class MemoryStore:
             memory.arousal,
             memory.source_message,
             memory.source_conversation_id,
+            memory.origin,
             memory.embedding_json,
             memory.last_used_at,
             memory.usage_count,
@@ -1692,7 +1712,7 @@ class MemoryStore:
                     UPDATE memories
                     SET user_id = ?, content = ?, type = ?, importance = ?,
                         confidence = ?, valence = ?, arousal = ?, source_message = ?,
-                        source_conversation_id = ?, embedding_json = ?,
+                        source_conversation_id = ?, origin = ?, embedding_json = ?,
                         last_used_at = ?, usage_count = ?, stability = ?,
                         valid_from = ?, valid_until = ?, review_after = ?, sensitivity = ?,
                         evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
@@ -1713,22 +1733,7 @@ class MemoryStore:
                     created_at=now,
                 )
                 return "updated", memory
-            connection.execute(
-                """
-                INSERT INTO memories (
-                    user_id, content, type, importance, confidence,
-                    valence, arousal,
-                    source_message, source_conversation_id, embedding_json,
-                    last_used_at, usage_count, stability, valid_from, valid_until,
-                    review_after, sensitivity, evidence_memory_ids_json,
-                    topics_json, entities_json, temporal_subject, temporal_predicate,
-                    status, digested, decay_lambda, supersedes, superseded_by,
-                    created_at, updated_at, archived_at, archived, id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
+            self._insert_memory_row(connection=connection, memory=memory)
             self._replace_memory_space_links(
                 connection=connection,
                 user_id=user_id,
@@ -1840,6 +1845,7 @@ class MemoryStore:
               AND id NOT IN ({seed_placeholders})
               AND COALESCE(status, 'dynamic') IN ('dynamic', 'resolved')
               AND COALESCE(sensitivity, 'normal') NOT IN ('private', 'sensitive')
+              AND COALESCE(origin, 'user_asserted') = 'user_asserted'
             """,
             (user_id, *seed_ids),
         ).fetchall()
@@ -1888,20 +1894,232 @@ class MemoryStore:
         )
 
     def list_undigested_memories(
-        self, *, user_id: str, limit: int = 10
+        self, *, user_id: str, limit: int = 10, include_sensitive: bool = False
     ) -> list[MemoryRecord]:
         """返回近期未消化的记忆，供 digest_memories 使用。"""
         with self._connect() as connection:
+            sensitivity_sql = "" if include_sensitive else "AND COALESCE(sensitivity, 'normal') = 'normal'"
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM memories
                 WHERE user_id = ? AND archived = 0 AND digested = 0
+                  AND COALESCE(origin, 'user_asserted') = 'user_asserted'
+                  {sensitivity_sql}
                 ORDER BY updated_at DESC
-                LIMIT ?
                 """,
-                (user_id, limit),
+                (user_id,),
             ).fetchall()
+        memories = self._rows_to_memories(rows)
+        if not include_sensitive:
+            memories = [
+                memory
+                for memory in memories
+                if _sensitivity_with_floor(
+                    declared=memory.sensitivity,
+                    content=memory.content,
+                    source_message=memory.source_message,
+                    entities=memory.entities,
+                )
+                == "normal"
+            ]
+        return memories[: max(0, limit)]
+
+    def get_digest_source_memories(
+        self,
+        *,
+        memory_ids: list[str],
+        user_id: str,
+        include_sensitive: bool = False,
+    ) -> list[MemoryRecord]:
+        """Return every requested digest source or reject the whole set."""
+        source_ids = _ordered_unique(
+            [str(memory_id) for memory_id in memory_ids if memory_id]
+        )
+        if not source_ids:
+            raise ValueError("source_ids must contain at least one memory ID")
+        with self._connect() as connection:
+            rows = self._validated_digest_source_rows(
+                connection=connection,
+                user_id=user_id,
+                source_ids=source_ids,
+                include_sensitive=include_sensitive,
+            )
         return self._rows_to_memories(rows)
+
+    def apply_memory_digest(
+        self,
+        *,
+        user_id: str,
+        source_ids: list[str],
+        resolved_ids: list[str],
+        reflection: str = "",
+        reflection_valence: float = 0.5,
+        reflection_arousal: float = 0.3,
+        feel: str = "",
+        feel_valence: float = 0.5,
+        feel_arousal: float = 0.4,
+        include_sensitive: bool = False,
+    ) -> tuple[list[MemoryRecord], int]:
+        """Persist a validated digestion result as one atomic change."""
+        source_ids = _ordered_unique(
+            [str(memory_id) for memory_id in source_ids if memory_id]
+        )
+        resolved_ids = _ordered_unique(
+            [str(memory_id) for memory_id in resolved_ids if memory_id]
+        )
+        if not source_ids:
+            raise ValueError("source_ids must contain at least one memory ID")
+        source_id_set = set(source_ids)
+        invalid_resolved_ids = [
+            memory_id for memory_id in resolved_ids if memory_id not in source_id_set
+        ]
+        if invalid_resolved_ids:
+            raise ValueError("resolved_ids must be a subset of source_ids")
+
+        reflection = reflection.strip()
+        feel = feel.strip()
+        now = utc_now_iso()
+        created: list[MemoryRecord] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source_rows = self._validated_digest_source_rows(
+                connection=connection,
+                user_id=user_id,
+                source_ids=source_ids,
+                include_sensitive=include_sensitive,
+            )
+            source_sensitivities = (
+                str(row["sensitivity"] or "normal") for row in source_rows
+            )
+            sensitivity = max(
+                (
+                    value if value in _SENSITIVITY_RANK else "sensitive"
+                    for value in source_sensitivities
+                ),
+                key=_SENSITIVITY_RANK.__getitem__,
+            )
+
+            derived_specs = (
+                (
+                    reflection,
+                    "reflective",
+                    6,
+                    reflection_valence,
+                    reflection_arousal,
+                    "digest_memories:reflection",
+                    ["digestion", "reflection"],
+                ),
+                (
+                    feel,
+                    "emotional",
+                    5,
+                    feel_valence,
+                    feel_arousal,
+                    "digest_memories:feel",
+                    ["digestion", "feel"],
+                ),
+            )
+            for (
+                content,
+                memory_type,
+                importance,
+                valence,
+                arousal,
+                source_message,
+                topics,
+            ) in derived_specs:
+                if not content:
+                    continue
+                derived_sensitivity = _sensitivity_with_floor(
+                    declared=sensitivity,
+                    content=content,
+                )
+                memory = MemoryRecord(
+                    id=new_memory_id(),
+                    user_id=user_id,
+                    content=content,
+                    type=memory_type,
+                    importance=importance,
+                    confidence=0.8,
+                    valence=valence,
+                    arousal=arousal,
+                    source_message=source_message,
+                    origin="agent_derived",
+                    sensitivity=derived_sensitivity,
+                    evidence_memory_ids=source_ids,
+                    topics=topics,
+                    created_at=now,
+                    updated_at=now,
+                    archived=0,
+                )
+                self._insert_memory_row(connection=connection, memory=memory)
+                created.append(memory)
+
+            source_placeholders = ", ".join("?" for _ in source_ids)
+            digested_cursor = connection.execute(
+                f"""
+                UPDATE memories
+                SET digested = 1, updated_at = ?
+                WHERE user_id = ? AND archived = 0 AND COALESCE(digested, 0) = 0
+                  AND id IN ({source_placeholders})
+                """,
+                (now, user_id, *source_ids),
+            )
+            if digested_cursor.rowcount != len(source_ids):
+                raise RuntimeError("digest source set changed during submission")
+
+            resolved_count = 0
+            if resolved_ids:
+                resolved_placeholders = ", ".join("?" for _ in resolved_ids)
+                resolved_cursor = connection.execute(
+                    f"""
+                    UPDATE memories
+                    SET status = 'resolved', updated_at = ?
+                    WHERE user_id = ? AND archived = 0 AND id IN ({resolved_placeholders})
+                    """,
+                    (now, user_id, *resolved_ids),
+                )
+                resolved_count = int(resolved_cursor.rowcount)
+                if resolved_count != len(resolved_ids):
+                    raise RuntimeError("resolved source set changed during submission")
+        return created, resolved_count
+
+    @staticmethod
+    def _validated_digest_source_rows(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        source_ids: list[str],
+        include_sensitive: bool = False,
+    ) -> list[sqlite3.Row]:
+        placeholders = ", ".join("?" for _ in source_ids)
+        sensitivity_sql = "" if include_sensitive else "AND COALESCE(sensitivity, 'normal') = 'normal'"
+        rows = connection.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE user_id = ? AND archived = 0 AND id IN ({placeholders})
+              AND COALESCE(origin, 'user_asserted') = 'user_asserted'
+              AND COALESCE(digested, 0) = 0
+              {sensitivity_sql}
+            """,
+            (user_id, *source_ids),
+        ).fetchall()
+        if not include_sensitive:
+            rows = [
+                row
+                for row in rows
+                if _sensitivity_with_floor(
+                    declared=str(row["sensitivity"] or "normal"),
+                    content=str(row["content"] or ""),
+                    source_message=str(row["source_message"] or "") or None,
+                    entities=_json_string_list(row["entities_json"]),
+                )
+                == "normal"
+            ]
+        rows_by_id = {str(row["id"]): row for row in rows}
+        if any(memory_id not in rows_by_id for memory_id in source_ids):
+            raise ValueError("source_ids contain missing or inaccessible memories")
+        return [rows_by_id[memory_id] for memory_id in source_ids]
 
     def mark_digested(self, *, memory_ids: list[str], user_id: str) -> None:
         """标记记忆为已消化。"""
@@ -1956,7 +2174,10 @@ class MemoryStore:
             return []
 
         effective_at = new_memory.valid_from or new_memory.created_at
-        rows = connection.execute(
+        effective_instant = _parse_iso_datetime(effective_at)
+        if effective_instant is None:
+            return []
+        candidate_rows = connection.execute(
             """
             SELECT * FROM memories
             WHERE user_id = ?
@@ -1965,19 +2186,28 @@ class MemoryStore:
               AND temporal_subject = ?
               AND temporal_predicate = ?
               AND COALESCE(status, 'dynamic') IN ('dynamic', 'resolved')
-              AND COALESCE(valid_from, created_at) <= ?
-              AND (valid_until IS NULL OR valid_until = '' OR valid_until >= ?)
-            ORDER BY COALESCE(valid_from, created_at) DESC, updated_at DESC
             """,
             (
                 user_id,
                 new_memory.id,
                 new_memory.temporal_subject,
                 new_memory.temporal_predicate,
-                effective_at,
-                effective_at,
             ),
         ).fetchall()
+        eligible_rows: list[tuple[datetime, datetime, str, sqlite3.Row]] = []
+        for row in candidate_rows:
+            starts_at = _parse_iso_datetime(row["valid_from"] or row["created_at"])
+            if starts_at is None or starts_at > effective_instant:
+                continue
+            valid_until = row["valid_until"]
+            if valid_until:
+                ends_at = _parse_iso_datetime(valid_until)
+                if ends_at is None or ends_at < effective_instant:
+                    continue
+            updated_at = _parse_iso_datetime(row["updated_at"]) or starts_at
+            eligible_rows.append((starts_at, updated_at, str(row["id"]), row))
+        eligible_rows.sort(key=lambda item: item[:3], reverse=True)
+        rows = [item[3] for item in eligible_rows]
         if not rows:
             return []
 
@@ -2173,6 +2403,63 @@ class MemoryStore:
         with self._connect() as owned_connection:
             owned_connection.execute(query, params)
 
+    def _insert_memory_row(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        memory: MemoryRecord,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO memories (
+                id, user_id, content, type, importance, confidence,
+                valence, arousal,
+                source_message, source_conversation_id, origin, embedding_json,
+                last_used_at, usage_count, stability, valid_from, valid_until, review_after,
+                sensitivity, evidence_memory_ids_json, topics_json, entities_json,
+                temporal_subject, temporal_predicate,
+                status, digested, decay_lambda, supersedes, superseded_by,
+                created_at, updated_at, archived_at, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.id,
+                memory.user_id,
+                memory.content,
+                memory.type,
+                memory.importance,
+                memory.confidence,
+                memory.valence,
+                memory.arousal,
+                memory.source_message,
+                memory.source_conversation_id,
+                memory.origin,
+                memory.embedding_json,
+                memory.last_used_at,
+                memory.usage_count,
+                memory.stability,
+                memory.valid_from,
+                memory.valid_until,
+                memory.review_after,
+                memory.sensitivity,
+                json.dumps(memory.evidence_memory_ids, ensure_ascii=False),
+                json.dumps(memory.topics, ensure_ascii=False),
+                json.dumps(memory.entities, ensure_ascii=False),
+                memory.temporal_subject,
+                memory.temporal_predicate,
+                memory.status,
+                int(memory.digested),
+                memory.decay_lambda,
+                memory.supersedes,
+                memory.superseded_by,
+                memory.created_at,
+                memory.updated_at,
+                memory.archived_at,
+                memory.archived,
+            ),
+        )
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
@@ -2235,6 +2522,10 @@ class MemoryStore:
             connection.execute("ALTER TABLE memories ADD COLUMN review_after TEXT")
         if "sensitivity" not in columns:
             connection.execute("ALTER TABLE memories ADD COLUMN sensitivity TEXT DEFAULT 'normal'")
+        if "origin" not in columns:
+            connection.execute(
+                "ALTER TABLE memories ADD COLUMN origin TEXT DEFAULT 'user_asserted'"
+            )
         if "evidence_memory_ids_json" not in columns:
             connection.execute("ALTER TABLE memories ADD COLUMN evidence_memory_ids_json TEXT")
         if "topics_json" not in columns:
@@ -2260,8 +2551,25 @@ class MemoryStore:
         connection.execute(
             """
             UPDATE memories
+            SET origin = 'agent_derived'
+            WHERE source_message IN (
+                'digest_memories:reflection',
+                'digest_memories:feel'
+            )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE memories
             SET status = 'dynamic'
             WHERE status IS NULL OR status = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE memories
+            SET origin = 'user_asserted'
+            WHERE origin IS NULL OR origin = ''
             """
         )
         connection.execute(
@@ -2423,6 +2731,7 @@ class MemoryStore:
         data["topics"] = _json_string_list(raw_topics)
         data["entities"] = _json_string_list(raw_entities)
         data["type"] = normalize_memory_type(data.get("type") or "semantic")
+        data["origin"] = data.get("origin") or "user_asserted"
         data["usage_count"] = float(data.get("usage_count") or 0)
         data["digested"] = bool(data.get("digested"))
         data["temporal_subject"] = normalize_optional_text(data.get("temporal_subject"))
@@ -2473,6 +2782,257 @@ def _json_string_list(raw_value: str | None) -> list[str]:
     if not isinstance(values, list):
         return []
     return [str(value) for value in values if value]
+
+
+def _scrub_purged_memory_artifacts(
+    connection: sqlite3.Connection,
+    *,
+    memory: MemoryRecord,
+    purged_at: str,
+) -> dict[str, int]:
+    derived_rows = connection.execute(
+        """
+        SELECT id, content, source_message, source_conversation_id,
+               evidence_memory_ids_json
+        FROM memories
+        WHERE user_id = ? AND COALESCE(origin, 'user_asserted') = 'agent_derived'
+        """,
+        (memory.user_id,),
+    ).fetchall()
+    dependent_rows = [
+        row
+        for row in derived_rows
+        if memory.id in _json_string_list(row["evidence_memory_ids_json"])
+    ]
+    dependent_ids = [str(row["id"]) for row in dependent_rows]
+    affected_ids = {memory.id, *dependent_ids}
+    affected_conversation_ids = {
+        conversation_id
+        for conversation_id in (
+            memory.source_conversation_id,
+            *(str(row["source_conversation_id"] or "") for row in dependent_rows),
+        )
+        if conversation_id
+    }
+
+    core_scrubbed = 0
+    core_rows = connection.execute(
+        """
+        SELECT id, evidence_memory_ids_json
+        FROM core_memory_sections
+        WHERE user_id = ?
+        """,
+        (memory.user_id,),
+    ).fetchall()
+    for row in core_rows:
+        if not affected_ids.intersection(_json_string_list(row["evidence_memory_ids_json"])):
+            continue
+        connection.execute(
+            """
+            UPDATE core_memory_sections
+            SET content = ?, evidence_memory_ids_json = '[]', archived = 1, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            ("[redacted: purged evidence]", purged_at, row["id"], memory.user_id),
+        )
+        core_scrubbed += 1
+
+    history_scrubbed = 0
+    history_rows = connection.execute(
+        """
+        SELECT id, evidence_memory_ids_json
+        FROM core_memory_section_history
+        WHERE user_id = ?
+        """,
+        (memory.user_id,),
+    ).fetchall()
+    for row in history_rows:
+        if not affected_ids.intersection(_json_string_list(row["evidence_memory_ids_json"])):
+            continue
+        connection.execute(
+            """
+            UPDATE core_memory_section_history
+            SET content = ?, evidence_memory_ids_json = '[]', updated_at = ?, replaced_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                "[redacted: purged evidence]",
+                purged_at,
+                purged_at,
+                row["id"],
+                memory.user_id,
+            ),
+        )
+        history_scrubbed += 1
+
+    log_scrubbed = 0
+    sensitive_fragments = {
+        memory.id,
+        memory.content,
+        memory.source_message or "",
+        *dependent_ids,
+        *(str(row["content"] or "") for row in dependent_rows),
+        *(str(row["source_message"] or "") for row in dependent_rows),
+    }
+    sensitive_fragments.discard("")
+    log_rows = connection.execute(
+        """
+        SELECT id, conversation_id, candidate_json, reason
+        FROM memory_decision_logs
+        WHERE user_id = ?
+        """,
+        (memory.user_id,),
+    ).fetchall()
+    for row in log_rows:
+        candidate_json = str(row["candidate_json"] or "")
+        reason = str(row["reason"] or "")
+        if not (
+            _decision_log_references_memory_ids(candidate_json, affected_ids)
+            or (
+                row["conversation_id"]
+                and str(row["conversation_id"]) in affected_conversation_ids
+            )
+            or _decision_log_contains_fragments(
+                candidate_json=candidate_json,
+                reason=reason,
+                fragments=sensitive_fragments,
+            )
+        ):
+            continue
+        replacement = json.dumps(
+            {
+                "source": "purged_memory_history",
+                "memory_id": memory.id,
+                "redacted": True,
+                "purged_at": purged_at,
+            },
+            ensure_ascii=False,
+        )
+        connection.execute(
+            """
+            UPDATE memory_decision_logs
+            SET candidate_json = ?, reason = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (replacement, "历史记录因永久删除已脱敏", row["id"], memory.user_id),
+        )
+        log_scrubbed += 1
+
+    if dependent_ids:
+        placeholders = ", ".join("?" for _ in dependent_ids)
+        connection.execute(
+            f"DELETE FROM memory_space_links WHERE user_id = ? AND memory_id IN ({placeholders})",
+            (memory.user_id, *dependent_ids),
+        )
+        connection.execute(
+            f"DELETE FROM memories WHERE user_id = ? AND id IN ({placeholders})",
+            (memory.user_id, *dependent_ids),
+        )
+
+    return {
+        "derived_memories_deleted": len(dependent_ids),
+        "core_sections_scrubbed": core_scrubbed,
+        "core_history_scrubbed": history_scrubbed,
+        "decision_logs_scrubbed": log_scrubbed,
+    }
+
+
+_DECISION_LOG_MEMORY_REFERENCE_KEYS = {
+    "allowed_memory_ids",
+    "archived_memory_ids",
+    "evidence_memory_ids",
+    "memory_id",
+    "memory_ids",
+    "new_memory_id",
+    "previous_superseded_by",
+    "primary_superseded_id",
+    "resolved_ids",
+    "source_ids",
+    "superseded_by",
+    "superseded_memory_ids",
+    "supersedes",
+    "target_memory_id",
+}
+
+
+def _decision_log_references_memory_ids(raw_json: str, memory_ids: set[str]) -> bool:
+    try:
+        payload = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return _payload_references_memory_ids(payload, memory_ids=memory_ids)
+
+
+def _payload_references_memory_ids(
+    value: object,
+    *,
+    memory_ids: set[str],
+    reference_context: bool = False,
+) -> bool:
+    if reference_context:
+        if isinstance(value, str):
+            return value in memory_ids
+        if isinstance(value, list):
+            return any(
+                _payload_references_memory_ids(
+                    item,
+                    memory_ids=memory_ids,
+                    reference_context=True,
+                )
+                for item in value
+            )
+    if isinstance(value, dict):
+        for raw_key, item in value.items():
+            key = str(raw_key).casefold()
+            is_reference = (
+                key in _DECISION_LOG_MEMORY_REFERENCE_KEYS
+                or key.endswith("_memory_id")
+                or key.endswith("_memory_ids")
+            )
+            if _payload_references_memory_ids(
+                item,
+                memory_ids=memory_ids,
+                reference_context=is_reference,
+            ):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _payload_references_memory_ids(item, memory_ids=memory_ids)
+            for item in value
+        )
+    return False
+
+
+def _decision_log_contains_fragments(
+    *,
+    candidate_json: str,
+    reason: str,
+    fragments: set[str],
+) -> bool:
+    try:
+        payload = json.loads(candidate_json)
+    except (json.JSONDecodeError, TypeError):
+        payload = candidate_json
+    values = [*_json_leaf_strings(payload), reason]
+    return any(
+        value == fragment or (len(fragment) >= 12 and fragment in value)
+        for value in values
+        for fragment in fragments
+    )
+
+
+def _json_leaf_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            leaf
+            for item in value.values()
+            for leaf in _json_leaf_strings(item)
+        ]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _json_leaf_strings(item)]
+    return []
 
 
 def _time_ripple_anchor(row: sqlite3.Row):

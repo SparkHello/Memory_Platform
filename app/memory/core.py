@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import render_core_memory_consolidation_messages
+from app.memory.extractor import detect_text_sensitivity, has_text_grounding_anchor
 from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRecord
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _parse_json_object
@@ -46,7 +47,10 @@ class CoreMemoryConsolidator:
         if not memories:
             return CoreMemoryConsolidationResult(reason="没有足够的长期记忆可整理")
 
-        current_sections = self.store.list_core_memory_sections(user_id=user_id)
+        current_sections = _select_current_sections(
+            self.store.list_core_memory_sections(user_id=user_id),
+            valid_memory_ids={memory.id for memory in memories},
+        )
         try:
             raw_output = await self._call_llm(
                 memories=memories,
@@ -66,18 +70,20 @@ class CoreMemoryConsolidator:
             field = ".".join(str(part) for part in first_error.get("loc", ()))
             return CoreMemoryConsolidationResult(reason=f"整理输出不符合 schema（字段 {field}）")
 
-        valid_memory_ids = {memory.id for memory in memories}
+        source_memories_by_id = {memory.id: memory for memory in memories}
         created = updated = ignored = 0
         touched_sections: list[CoreMemorySection] = []
 
         for candidate in output.sections:
-            rejection = _candidate_rejection(candidate, valid_memory_ids)
+            rejection = _candidate_rejection(candidate, source_memories_by_id)
             if rejection:
                 ignored += 1
                 continue
 
             evidence_memory_ids = [
-                memory_id for memory_id in candidate.evidence_memory_ids if memory_id in valid_memory_ids
+                memory_id
+                for memory_id in candidate.evidence_memory_ids
+                if memory_id in source_memories_by_id
             ]
             action, section = self.store.upsert_core_memory_section(
                 user_id=user_id,
@@ -131,11 +137,7 @@ class CoreMemoryConsolidator:
 
 
 def _select_source_memories(memories: list[MemoryRecord]) -> list[MemoryRecord]:
-    memories = [
-        memory
-        for memory in memories
-        if memory.sensitivity == "normal" and not _is_expired_non_stable(memory)
-    ]
+    memories = [memory for memory in memories if _is_safe_core_source(memory)]
     candidates = [
         memory
         for memory in memories
@@ -154,6 +156,50 @@ def _select_source_memories(memories: list[MemoryRecord]) -> list[MemoryRecord]:
     return candidates[:MAX_SOURCE_MEMORIES]
 
 
+def safe_core_memory_sections(
+    *,
+    store: MemoryStore,
+    user_id: str,
+) -> list[CoreMemorySection]:
+    safe_memory_ids = {
+        memory.id
+        for memory in store.list_memories(user_id=user_id, limit=10_000)
+        if _is_safe_core_source(memory)
+    }
+    return _select_current_sections(
+        store.list_core_memory_sections(user_id=user_id),
+        valid_memory_ids=safe_memory_ids,
+    )
+
+
+def _is_safe_core_source(memory: MemoryRecord) -> bool:
+    if memory.origin != "user_asserted" or memory.sensitivity != "normal":
+        return False
+    text = "\n".join(
+        part
+        for part in (memory.content, memory.source_message, *memory.entities)
+        if part
+    )
+    return (
+        detect_text_sensitivity(text) == "normal"
+        and not _is_expired_non_stable(memory)
+    )
+
+
+def _select_current_sections(
+    sections: list[CoreMemorySection],
+    *,
+    valid_memory_ids: set[str],
+) -> list[CoreMemorySection]:
+    return [
+        section
+        for section in sections
+        if section.evidence_memory_ids
+        and set(section.evidence_memory_ids).issubset(valid_memory_ids)
+        and detect_text_sensitivity(section.content) == "normal"
+    ]
+
+
 def _is_expired_non_stable(memory: MemoryRecord) -> bool:
     if memory.stability == "stable":
         return False
@@ -163,14 +209,25 @@ def _is_expired_non_stable(memory: MemoryRecord) -> bool:
 
 def _candidate_rejection(
     candidate: CoreMemorySectionCandidate,
-    valid_memory_ids: set[str],
+    source_memories_by_id: dict[str, MemoryRecord],
 ) -> str | None:
     if not candidate.content.strip():
         return "content 为空"
+    if detect_text_sensitivity(candidate.content) != "normal":
+        return "核心记忆候选包含敏感内容"
     if candidate.confidence < MIN_CORE_CONFIDENCE:
         return f"confidence {candidate.confidence} 低于核心记忆阈值 {MIN_CORE_CONFIDENCE}"
     if not candidate.evidence_memory_ids:
         return "缺少 evidence_memory_ids"
-    if not any(memory_id in valid_memory_ids for memory_id in candidate.evidence_memory_ids):
+    if any(
+        memory_id not in source_memories_by_id
+        for memory_id in candidate.evidence_memory_ids
+    ):
         return "evidence_memory_ids 不在输入记忆中"
+    evidence_text = "\n".join(
+        source_memories_by_id[memory_id].content
+        for memory_id in candidate.evidence_memory_ids
+    )
+    if not has_text_grounding_anchor(candidate.content, evidence_text):
+        return "核心记忆候选缺少 evidence 内容支撑"
     return None

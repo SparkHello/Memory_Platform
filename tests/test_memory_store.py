@@ -1,6 +1,8 @@
 ﻿import json
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
 
 from app.memory.store import MemoryStore
 
@@ -44,6 +46,18 @@ def test_existing_database_gets_default_emotion_columns(tmp_path) -> None:
             VALUES ('legacy-1', 'default', '用户喜欢安静的工作环境。', 'preference', 7, 0.9, 'now', 'now', 0)
             """
         )
+        connection.execute(
+            """
+            INSERT INTO memories (
+                id, user_id, content, type, importance, confidence,
+                source_message, created_at, updated_at, archived
+            )
+            VALUES (
+                'legacy-digest', 'default', '旧版模型生成的反思。', 'reflective',
+                6, 0.8, 'digest_memories:reflection', 'now', 'now', 0
+            )
+            """
+        )
 
     store = MemoryStore(str(db_path))
     store.init_db()
@@ -52,6 +66,10 @@ def test_existing_database_gets_default_emotion_columns(tmp_path) -> None:
     assert memory is not None
     assert memory.valence == 0.5
     assert memory.arousal == 0.3
+    assert memory.origin == "user_asserted"
+    legacy_digest = store.get_memory(memory_id="legacy-digest", user_id="default")
+    assert legacy_digest is not None
+    assert legacy_digest.origin == "agent_derived"
 
 
 def test_existing_database_gets_default_classification_columns(tmp_path) -> None:
@@ -206,6 +224,242 @@ def test_create_memory_default_type_is_valid(memory_store: MemoryStore) -> None:
     assert memory.stability == "stable"
     assert memory.valid_until is None
     assert memory.sensitivity == "normal"
+    assert memory.origin == "user_asserted"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"content": "用户的银行卡密码是 123456。"}, "sensitive"),
+        (
+            {
+                "content": "用户提供了联系方式。",
+                "source_message": "我的邮箱是 user@example.com",
+            },
+            "private",
+        ),
+        (
+            {
+                "content": "用户提供了一项账号资料。",
+                "entities": ["银行卡 6222021234567890"],
+            },
+            "sensitive",
+        ),
+    ],
+)
+def test_create_memory_enforces_local_sensitivity_floor(
+    memory_store: MemoryStore,
+    kwargs: dict,
+    expected: str,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        sensitivity="normal",
+        **kwargs,
+    )
+
+    assert memory.sensitivity == expected
+
+
+def test_update_memory_enforces_local_sensitivity_floor(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户提供了一条普通资料。",
+    )
+
+    updated = memory_store.update_memory(
+        memory_id=memory.id,
+        user_id="default",
+        content="用户的银行卡密码是 123456。",
+        type=memory.type,
+        importance=memory.importance,
+        confidence=memory.confidence,
+        valence=memory.valence,
+        arousal=memory.arousal,
+        sensitivity="normal",
+    )
+
+    assert updated is not None
+    assert updated.sensitivity == "sensitive"
+
+
+def test_apply_memory_digest_rolls_back_every_write_on_failure(
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户正在测试原子化消化。",
+    )
+    resolved = memory_store.create_memory(
+        user_id="default",
+        content="用户此前尚未完成原子化消化。",
+    )
+    original_insert = memory_store._insert_memory_row
+    insert_count = 0
+
+    def fail_second_insert(*, connection, memory) -> None:
+        nonlocal insert_count
+        insert_count += 1
+        if insert_count == 2:
+            raise RuntimeError("forced second insert failure")
+        original_insert(connection=connection, memory=memory)
+
+    monkeypatch.setattr(memory_store, "_insert_memory_row", fail_second_insert)
+
+    with pytest.raises(RuntimeError, match="forced second insert failure"):
+        memory_store.apply_memory_digest(
+            user_id="default",
+            source_ids=[source.id, resolved.id],
+            resolved_ids=[resolved.id],
+            reflection="派生反思。",
+            feel="派生感受。",
+        )
+
+    source_after = memory_store.get_memory(memory_id=source.id, user_id="default")
+    resolved_after = memory_store.get_memory(memory_id=resolved.id, user_id="default")
+    assert source_after is not None
+    assert resolved_after is not None
+    assert source_after.digested is False
+    assert resolved_after.digested is False
+    assert resolved_after.status == "dynamic"
+    assert all(
+        memory.origin != "agent_derived"
+        for memory in memory_store.list_memories(user_id="default")
+    )
+
+
+def test_apply_memory_digest_inherits_explicitly_allowed_sensitive_sources(
+    memory_store: MemoryStore,
+) -> None:
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户的私密消化来源。",
+        sensitivity="private",
+    )
+    sensitive = memory_store.create_memory(
+        user_id="default",
+        content="用户的敏感消化来源。",
+        sensitivity="sensitive",
+    )
+
+    with pytest.raises(ValueError, match="missing or inaccessible"):
+        memory_store.get_digest_source_memories(
+            user_id="default",
+            memory_ids=[private.id, sensitive.id],
+        )
+
+    created, resolved_count = memory_store.apply_memory_digest(
+        user_id="default",
+        source_ids=[private.id, sensitive.id],
+        resolved_ids=[],
+        reflection="基于敏感来源形成的派生反思。",
+        include_sensitive=True,
+    )
+
+    assert resolved_count == 0
+    assert len(created) == 1
+    assert created[0].origin == "agent_derived"
+    assert created[0].sensitivity == "sensitive"
+    assert created[0].evidence_memory_ids == [private.id, sensitive.id]
+
+
+def test_apply_memory_digest_rejects_replayed_sources(
+    memory_store: MemoryStore,
+) -> None:
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户提供了一条只应消化一次的事实。",
+    )
+    created, _ = memory_store.apply_memory_digest(
+        user_id="default",
+        source_ids=[source.id],
+        resolved_ids=[],
+        reflection="第一次派生反思。",
+    )
+
+    with pytest.raises(ValueError, match="missing or inaccessible"):
+        memory_store.apply_memory_digest(
+            user_id="default",
+            source_ids=[source.id],
+            resolved_ids=[],
+            reflection="重放后不应落库的派生反思。",
+        )
+
+    derived = [
+        memory
+        for memory in memory_store.list_memories(user_id="default")
+        if memory.origin == "agent_derived"
+    ]
+    assert [memory.id for memory in derived] == [created[0].id]
+
+
+def test_apply_memory_digest_upgrades_sensitivity_from_derived_content(
+    memory_store: MemoryStore,
+) -> None:
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户提供了一条普通来源。",
+    )
+
+    created, _ = memory_store.apply_memory_digest(
+        user_id="default",
+        source_ids=[source.id],
+        resolved_ids=[],
+        reflection="派生内容声称银行卡密码是 123456。",
+    )
+
+    assert len(created) == 1
+    assert created[0].origin == "agent_derived"
+    assert created[0].sensitivity == "sensitive"
+
+
+def test_import_memory_record_preserves_agent_derived_origin(
+    memory_store: MemoryStore,
+    tmp_path,
+) -> None:
+    source = memory_store.create_memory(
+        user_id="default",
+        content="用户提供的来源记忆。",
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="基于来源形成的派生记忆。",
+        type="reflective",
+        origin="agent_derived",
+        evidence_memory_ids=[source.id],
+    )
+    restored_store = MemoryStore(str(tmp_path / "restored-origin.db"))
+    restored_store.init_db()
+
+    action, restored = restored_store.import_memory_record(
+        user_id="default",
+        data=derived.model_dump(exclude={"embedding_json"}),
+    )
+
+    assert action == "created"
+    assert restored is not None
+    assert restored.origin == "agent_derived"
+    assert restored.evidence_memory_ids == [source.id]
+
+
+def test_import_memory_record_enforces_local_sensitivity_floor(
+    memory_store: MemoryStore,
+) -> None:
+    action, restored = memory_store.import_memory_record(
+        user_id="default",
+        data={
+            "id": "imported-sensitive",
+            "content": "用户的银行卡密码是 123456。",
+            "sensitivity": "normal",
+        },
+    )
+
+    assert action == "created"
+    assert restored is not None
+    assert restored.sensitivity == "sensitive"
 
 
 def test_create_memory_with_validity_and_sensitivity(memory_store: MemoryStore) -> None:
@@ -318,6 +572,33 @@ def test_temporal_invalidation_closes_older_fact_and_logs(
     assert payload["source"] == "temporal_invalidation"
     assert payload["new_memory_id"] == new.id
     assert payload["superseded_memory_ids"] == [old.id]
+
+
+def test_temporal_invalidation_compares_offset_datetimes_by_instant(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company A.",
+        valid_from="2026-01-01T12:00:00+08:00",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+
+    new = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company B.",
+        valid_from="2026-01-01T05:00:00+00:00",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.status == "resolved"
+    assert old_after.valid_until == new.valid_from
+    assert old_after.superseded_by == new.id
+    assert new.supersedes == old.id
 
 
 def test_temporal_invalidation_skips_unsafe_candidates(
@@ -946,6 +1227,70 @@ def test_archived_memory_can_be_purged_with_audit(memory_store: MemoryStore) -> 
     assert "Do not copy" not in log.candidate_json
 
 
+def test_purge_scrubs_logs_linked_by_memory_ids_and_source_conversation(
+    memory_store: MemoryStore,
+) -> None:
+    old_secret = "OLD-SECRET-DO-NOT-RETAIN"
+    memory = memory_store.create_memory(
+        user_id="default",
+        content=old_secret,
+        source_message="old source quote",
+        source_conversation_id="conversation-with-secret",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id="conversation-with-secret",
+        candidate_json=json.dumps({"memory": old_secret}),
+        decision="create",
+        reason="created before edit",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id="other-conversation",
+        candidate_json=json.dumps({"memory_id": memory.id, "note": old_secret}),
+        decision="update",
+        reason="explicit single reference",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id="other-conversation",
+        candidate_json=json.dumps({"memory_ids": [memory.id], "note": old_secret}),
+        decision="update",
+        reason="explicit list reference",
+    )
+    updated = memory_store.update_memory(
+        memory_id=memory.id,
+        user_id="default",
+        content="Edited replacement content.",
+        type=memory.type,
+        importance=memory.importance,
+        confidence=memory.confidence,
+        valence=memory.valence,
+        arousal=memory.arousal,
+        source_message="edited source quote",
+        source_conversation_id=memory.source_conversation_id,
+    )
+    assert updated is not None
+    assert memory_store.archive_memory(memory_id=memory.id, user_id="default")
+
+    result = memory_store.purge_archived_memory(
+        memory_id=memory.id,
+        user_id="default",
+    )
+
+    assert result is not None
+    logs = memory_store.list_decision_logs(user_id="default", limit=10)
+    serialized_logs = json.dumps(
+        [log.model_dump() for log in logs],
+        ensure_ascii=False,
+    )
+    assert old_secret not in serialized_logs
+    purge_log = next(log for log in logs if log.decision == "purge")
+    assert json.loads(purge_log.candidate_json)["scrubbed_artifacts"][
+        "decision_logs_scrubbed"
+    ] == 3
+
+
 def test_purge_rejects_active_memory(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
@@ -1066,6 +1411,35 @@ def test_archive_expired_memories(memory_store: MemoryStore) -> None:
     # 再次调用不应重复归档
     count2 = memory_store.archive_expired_memories(user_id="default")
     assert count2 == 0
+
+
+def test_archive_expired_memories_compares_instants_across_timezones(
+    memory_store: MemoryStore,
+) -> None:
+    past_with_positive_offset = (
+        datetime.now(UTC) - timedelta(hours=1)
+    ).astimezone(timezone(timedelta(hours=14))).isoformat()
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="expired in an offset timezone",
+        valid_until=past_with_positive_offset,
+    )
+
+    assert memory_store.archive_expired_memories(user_id="default") == 1
+    assert memory_store.get_memory(memory_id=memory.id, user_id="default") is None
+
+
+@pytest.mark.parametrize("field", ["valid_until", "review_after"])
+def test_create_memory_rejects_invalid_datetime_fields(
+    memory_store: MemoryStore,
+    field: str,
+) -> None:
+    with pytest.raises(ValueError):
+        memory_store.create_memory(
+            user_id="default",
+            content="invalid datetime",
+            **{field: "not-a-date"},
+        )
 
 
 def test_archive_expired_memories_empty_store(memory_store: MemoryStore) -> None:

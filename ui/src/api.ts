@@ -51,6 +51,7 @@ type RequestOptions = {
 
 type RedactionOptions = {
   redactSensitive?: boolean;
+  includeSensitive?: boolean;
 };
 
 type MemoryListOptions = RedactionOptions & {
@@ -123,7 +124,12 @@ export class MemoryApi {
   ): Promise<MemorySearchRecord[]> {
     const payload = await this.request<{ data: MemorySearchRecord[] }>("/memories/search", {
       method: "POST",
-      body: { query, limit, redact_sensitive: options.redactSensitive ?? false }
+      body: {
+        query,
+        limit,
+        include_sensitive: options.includeSensitive ?? false,
+        redact_sensitive: options.redactSensitive ?? false
+      }
     });
     return payload.data || [];
   }
@@ -173,7 +179,12 @@ export class MemoryApi {
   ): Promise<MemorySurfaceRecord[]> {
     const payload = await this.request<{ data: MemorySurfaceRecord[] }>("/memories/surface", {
       method: "POST",
-      body: { limit, mode, redact_sensitive: options.redactSensitive ?? false }
+      body: {
+        limit,
+        mode,
+        include_sensitive: options.includeSensitive ?? false,
+        redact_sensitive: options.redactSensitive ?? false
+      }
     });
     return payload.data || [];
   }
@@ -394,6 +405,7 @@ export class MemoryApi {
         labels: labels.map((label) => ({
           id: label.id,
           query: label.query,
+          judgment: label.judgment,
           relevant_ids: label.relevant_ids,
           note: label.note || undefined
         }))

@@ -8,6 +8,7 @@ import time
 import httpx
 
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
+from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _terms
@@ -27,9 +28,11 @@ _SEARCH_CACHE_MAX = 256
 _EMBEDDING_CACHE_TTL = 300   # 5 分钟
 _SEARCH_CACHE_TTL = 120       # 2 分钟
 _RECALL_LIMIT = 20
-# 单次检索只把按 importance/updated_at 排序的前 N 条活跃记忆纳入排名。
-# 评测候选集也复用它，保证“能标注的”=“能被召回的”。
-RECALL_CANDIDATE_POOL = 200
+# SQLite/FTS 候选生成接入前，宁可扫描当前个人库，也不能按重要度提前丢掉
+# 低频但精确匹配的旧记忆。该上限只是异常数据量保护，不参与相关性裁剪。
+RECALL_CANDIDATE_POOL = 10_000
+EMBEDDING_MIN_COSINE = 0.35
+KEYWORD_MIN_SCORE = 20.0
 _SURFACE_MODES: set[MemorySurfaceMode] = {
     "balanced",
     "important",
@@ -106,14 +109,18 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         model: str,
         dimensions: int = 1024,
         timeout_seconds: float = 60.0,
+        allow_sensitive_egress: bool = False,
     ):
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
         self.dimensions = dimensions
         self.timeout_seconds = timeout_seconds
+        self.allow_sensitive_egress = allow_sensitive_egress
 
     async def embed(self, text: str) -> list[float] | None:
+        if not self.allow_sensitive_egress and detect_text_sensitivity(text) != "normal":
+            return None
         url = f"{self.base_url.rstrip('/')}/embeddings"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {
@@ -164,12 +171,14 @@ class MemorySearchService:
         user_id: str,
         limit: int = 8,
         record_usage: bool = True,
+        include_sensitive: bool = False,
     ) -> list[MemoryRecord]:
         hits = await self.search_hits(
             query=query,
             user_id=user_id,
             limit=limit,
             record_usage=record_usage,
+            include_sensitive=include_sensitive,
         )
         return [hit.memory for hit in hits]
 
@@ -180,12 +189,15 @@ class MemorySearchService:
         user_id: str,
         limit: int = 8,
         record_usage: bool = True,
+        include_sensitive: bool = False,
     ) -> list[MemorySearchHit]:
         normalized = _normalize_query(query)
+        if not normalized:
+            return []
         capped_limit = max(1, min(limit, 20))
         now = _now()
 
-        l2_key = (user_id, normalized, capped_limit)
+        l2_key = (user_id, normalized, capped_limit, bool(include_sensitive))
         if self.enable_cache:
             cached_hits = self._cached_search_hits(l2_key, user_id=user_id, now=now)
             if cached_hits is not None:
@@ -203,6 +215,12 @@ class MemorySearchService:
         )
 
         memories = self.store.list_memories(user_id=user_id, limit=RECALL_CANDIDATE_POOL)
+        memories = [
+            memory
+            for memory in memories
+            if memory.origin == "user_asserted"
+            and (include_sensitive or not _memory_is_locally_sensitive(memory))
+        ]
         if not memories:
             return []
 
@@ -224,6 +242,7 @@ class MemorySearchService:
         limit: int = 8,
         mode: MemorySurfaceMode = "balanced",
         include_archived: bool = False,
+        include_sensitive: bool = False,
     ) -> list[MemorySurfaceHit]:
         capped_limit = max(1, min(limit, 20))
         surface_mode = _normalize_surface_mode(mode)
@@ -239,6 +258,8 @@ class MemorySearchService:
         scored = [
             hit
             for memory in memories
+            if memory.origin == "user_asserted"
+            if include_sensitive or not _memory_is_locally_sensitive(memory)
             if getattr(memory, "status", None) != "pinned"
             if include_archived or getattr(memory, "status", None) != "archived"
             if (hit := _surface_hit(memory, now=now, mode=surface_mode)) is not None
@@ -395,8 +416,9 @@ class MemorySearchService:
             memory_embedding = _load_vector(memory.embedding_json)
             if memory_embedding is None:
                 continue
-            score = cosine_similarity(query_embedding, memory_embedding) * 100.0
-            if score > 0:
+            cosine = cosine_similarity(query_embedding, memory_embedding)
+            score = cosine * 100.0
+            if cosine >= EMBEDDING_MIN_COSINE:
                 scored.append((score, memory))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
@@ -417,7 +439,7 @@ class MemorySearchService:
             substring_score = 40.0 if query_lower and query_lower in content_lower else 0.0
             char_score = _char_overlap_score(query_lower, content_lower) * 60.0
             score = min(100.0, term_score + substring_score + char_score)
-            if score > 0:
+            if score >= KEYWORD_MIN_SCORE:
                 scored.append((score, memory))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -826,6 +848,17 @@ def _metadata_penalty(memory: MemoryRecord, now: datetime) -> float:
         + _validity_penalty(memory, now, embedding_mode=False)
         + _sensitivity_penalty(memory, embedding_mode=False)
     )
+
+
+def _memory_is_locally_sensitive(memory: MemoryRecord) -> bool:
+    if memory.sensitivity != "normal":
+        return True
+    text = "\n".join(
+        part
+        for part in (memory.content, memory.source_message, *memory.entities)
+        if part
+    )
+    return detect_text_sensitivity(text) != "normal"
 
 
 def _load_vector(raw_json: str | None) -> list[float] | None:

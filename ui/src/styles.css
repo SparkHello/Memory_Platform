@@ -2218,9 +2218,50 @@ code {
   font-style: normal;
 }
 
+.evaluation-label-item .evaluation-label-status.graded {
+  color: var(--primary);
+  font-weight: 700;
+}
+
 .evaluation-editor-panel textarea {
   min-height: 92px;
   resize: vertical;
+}
+
+.evaluation-judgment-control {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-strong);
+}
+
+.evaluation-judgment-control button {
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  min-width: 0;
+  min-height: 52px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.evaluation-judgment-control button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface);
+}
+
+.evaluation-judgment-control button.active {
+  border-color: var(--primary);
+  background: #eef6f7;
+  color: var(--primary);
+  font-weight: 700;
 }
 
 .evaluation-selected-list,
@@ -2298,7 +2339,7 @@ code {
 
 .evaluation-metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(68px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
   gap: 8px;
 }
 

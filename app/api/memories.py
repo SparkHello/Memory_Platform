@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from typing import Annotated, Literal
 
@@ -21,16 +22,22 @@ from app.llm.prompts import (
     render_memory_context,
     render_recent_context_summary_context,
 )
-from app.memory.core import CoreMemoryConsolidator
+from app.memory.core import CoreMemoryConsolidator, safe_core_memory_sections
 from app.memory.evaluation import (
     EvaluationError,
+    MAX_RECALL_EVAL_K,
     build_recall_workbench,
+    delete_user_eval_workspace,
     init_eval,
     run_diagnosis,
     run_recall_eval,
     save_labels,
 )
-from app.memory.extractor import validate_candidate_for_save
+from app.memory.extractor import (
+    detect_text_sensitivity,
+    sensitivity_floor,
+    validate_candidate_for_save,
+)
 from app.memory.graph_traverse import traverse_memory_network
 from app.memory.health import MemoryHealthChecker, _embedding_vector
 from app.memory.ingest import MemoryIngestService
@@ -81,6 +88,7 @@ router = APIRouter(
 class MemorySearchRequest(BaseModel):
     query: str = Field(min_length=1)
     limit: int = Field(default=8, ge=1, le=50)
+    include_sensitive: bool = False
     redact_sensitive: bool = False
 
 
@@ -88,6 +96,7 @@ class MemorySurfaceRequest(BaseModel):
     limit: int = Field(default=8, ge=1, le=20)
     mode: MemorySurfaceMode = "balanced"
     include_archived: bool = False
+    include_sensitive: bool = False
     redact_sensitive: bool = False
 
 
@@ -254,6 +263,7 @@ class MemoryContextExplainRequest(BaseModel):
     include_recent_context: bool = True
     limit: int = Field(default=5, ge=1, le=20)
     conversation_id: str | None = None
+    include_sensitive: bool = False
     redact_sensitive: bool = False
 
 
@@ -271,6 +281,7 @@ class MemoryReEmbedRequest(BaseModel):
     """重新生成记忆 embedding。指定 memory_ids 或 scan 扫描缺失/无效/维度不匹配的 embedding。"""
     memory_ids: list[str] | None = None
     scan: bool = False
+    include_sensitive: bool = False
 
 
 class RecallEvalLabelRequest(BaseModel):
@@ -278,6 +289,7 @@ class RecallEvalLabelRequest(BaseModel):
     # 不在此处限制 query 非空：交给 save_labels 的领域校验，给出带 label id 的友好提示
     # （否则刚新增、query 仍为空的标注会被 Pydantic 拦下并返回原始 422）。
     query: str = ""
+    judgment: Literal["unlabeled", "relevant", "no_answer"] | None = None
     relevant_ids: list[str] = Field(default_factory=list)
     note: str | None = None
 
@@ -288,7 +300,7 @@ class RecallEvalLabelsRequest(BaseModel):
 
 class RecallEvalRunRequest(BaseModel):
     mode: Literal["keyword", "embedding"] = "keyword"
-    k: int = Field(default=8, ge=1, le=50)
+    k: int = Field(default=8, ge=1, le=MAX_RECALL_EVAL_K)
 
 
 @router.get("")
@@ -542,6 +554,7 @@ async def search_memories(
         query=body.query,
         user_id=user_id,
         limit=body.limit,
+        include_sensitive=body.include_sensitive,
     )
     return {
         "data": [
@@ -562,6 +575,7 @@ def surface_memories(
         limit=body.limit if body else 8,
         mode=body.mode if body else "balanced",
         include_archived=body.include_archived if body else False,
+        include_sensitive=body.include_sensitive if body else False,
     )
     return {
         "data": [
@@ -656,11 +670,13 @@ async def ingest_memory_text(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
     llm_client: Annotated[OpenAICompatibleClient, Depends(get_llm_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
     ingester = MemoryIngestService(
         store=store,
         embedding_client=embedding_client,
         llm_client=llm_client,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
     )
     result = await ingester.ingest(
         user_id=user_id,
@@ -728,9 +744,14 @@ def memory_evaluation_diagnosis(
 
 @router.post("/evaluation/recall/init")
 def memory_evaluation_recall_init(
+    user_id: Annotated[str, Depends(get_user_id)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
-    result = init_eval(source_db=settings.database_path, eval_dir=settings.eval_dir)
+    result = init_eval(
+        source_db=settings.database_path,
+        eval_dir=settings.eval_dir,
+        user_id=user_id,
+    )
     if result.get("error"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -753,6 +774,8 @@ def memory_evaluation_recall_workbench(
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except EvaluationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
 
 @router.put("/evaluation/recall/labels")
@@ -849,6 +872,9 @@ async def re_embed_memories(
         if memory is None:
             failed.append(memory_id)
             continue
+        if memory.sensitivity != "normal" and not body.include_sensitive:
+            failed.append(memory_id)
+            continue
         embedding = await embedding_client.embed(memory.content)
         if embedding is None:
             failed.append(memory_id)
@@ -877,7 +903,7 @@ def archive_expired_memories(
 ) -> dict:
     """归档所有 valid_until 已过期的活跃记忆。
 
-    ISO 8601 格式的 valid_until 字段按词法序比较，因此 SQL 字符串比较等同于时间比较。
+    valid_until 会按 ISO 8601 解析并统一比较实际时刻，支持不同时区偏移。
     """
     count = store.archive_expired_memories(user_id=user_id)
     return {"archived": count}
@@ -899,7 +925,7 @@ def apply_memory_review_action(
         user_id=user_id,
         memory_ids=[memory.id for memory in memories],
     )
-    before = [memory.model_dump(exclude={"embedding_json"}) for memory in memories]
+    before = [_memory_audit_payload(memory) for memory in memories]
     default_review_after = (datetime.now(UTC) + timedelta(days=15)).isoformat()
     review_after = body.review_after or default_review_after
     results: list[dict] = []
@@ -1043,6 +1069,40 @@ async def preview_memory_review_revision(
     llm_client: Annotated[OpenAICompatibleClient, Depends(get_llm_client)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
+    if not settings.allow_sensitive_egress:
+        selected = [
+            store.get_memory(memory_id=memory_id, user_id=user_id)
+            for memory_id in body.memory_ids
+        ]
+        review_text = "\n".join(
+            part
+            for part in (
+                body.user_note,
+                body.recommendation_reason or "",
+                body.suggested_content or "",
+                *(
+                    text
+                    for memory in selected
+                    if memory is not None
+                    for text in (
+                        memory.content,
+                        memory.source_message or "",
+                        *memory.entities,
+                    )
+                ),
+            )
+            if part
+        )
+        if any(memory and memory.sensitivity != "normal" for memory in selected) or (
+            detect_text_sensitivity(review_text) != "normal"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "敏感内容未发送给远程体检模型；如确需处理，请显式启用 "
+                    "ALLOW_SENSITIVE_EGRESS"
+                ),
+            )
     try:
         preview = await preview_review_revision(
             user_id=user_id,
@@ -1124,7 +1184,12 @@ async def save_memory(
             valence=body.valence,
             arousal=body.arousal,
             stability=body.stability,
-            sensitivity=body.sensitivity,
+            sensitivity=sensitivity_floor(
+                body.sensitivity,
+                body.content,
+                body.source_quote,
+                *(body.entities or []),
+            ),
             source_quote=body.source_quote.strip(),
             valid_from=body.valid_from,
             valid_until=body.valid_until,
@@ -1213,7 +1278,7 @@ async def get_memory_context(
     )
 
     if search_query and body.include_core_memory is not False:
-        core_sections = store.list_core_memory_sections(user_id=user_id)
+        core_sections = _safe_core_sections(store=store, user_id=user_id)
 
     if search_query:
         search_results_raw = await search_service.search(
@@ -1226,7 +1291,7 @@ async def get_memory_context(
             m.model_dump(exclude={"embedding_json"}) for m in search_results_raw
         ]
     elif body.include_core_memory:
-        core_sections = store.list_core_memory_sections(user_id=user_id)
+        core_sections = _safe_core_sections(store=store, user_id=user_id)
 
     if body.include_recent_context:
         recent = store.get_recent_context_summary(
@@ -1274,7 +1339,7 @@ async def explain_memory_context(
         conversation_id=body.conversation_id,
     )
     core_sections = (
-        store.list_core_memory_sections(user_id=user_id)
+        _safe_core_sections(store=store, user_id=user_id)
         if body.include_core_memory
         else []
     )
@@ -1294,6 +1359,7 @@ async def explain_memory_context(
             user_id=user_id,
             limit=explain_limit,
             record_usage=False,
+            include_sensitive=body.include_sensitive,
         )
 
     selected_hits = search_hits[: body.limit]
@@ -1572,6 +1638,7 @@ def purge_deleted_memory(
     body: MemoryPurgeRequest,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
     if body.confirm_memory_id != memory_id:
         raise HTTPException(
@@ -1579,6 +1646,14 @@ def purge_deleted_memory(
             detail="confirm_memory_id 必须与路径中的 memory_id 完全一致",
         )
 
+    archived = store.list_archived_memories(user_id=user_id, limit=10000)
+    if not any(memory.id == memory_id for memory in archived):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Memory does not exist or is not deleted.",
+        )
+
+    eval_cleanup = delete_user_eval_workspace(settings.eval_dir, user_id=user_id)
     affected_core_sections = _affected_core_sections_for_memory_ids(
         store=store,
         user_id=user_id,
@@ -1602,6 +1677,7 @@ def purge_deleted_memory(
         "id": memory_id,
         "audit_log_id": log.id,
         "affected_core_memory_sections": affected_payload,
+        "evaluation_cleanup": eval_cleanup,
     }
 
 
@@ -1779,6 +1855,10 @@ def _recent_context_payload(
     return {"found": False, "summary": ""}
 
 
+def _safe_core_sections(*, store: MemoryStore, user_id: str) -> list:
+    return safe_core_memory_sections(store=store, user_id=user_id)
+
+
 def _load_review_action_memories(
     *,
     store: MemoryStore,
@@ -1809,8 +1889,34 @@ def _review_action_after_payload(
         if memory is None:
             after.append({"id": memory_id, "archived": True})
             continue
-        after.append(memory.model_dump(exclude={"embedding_json"}))
+        after.append(_memory_audit_payload(memory))
     return after
+
+
+def _memory_audit_payload(memory: MemoryRecord) -> dict:
+    payload = memory.model_dump(exclude={"embedding_json", "source_message"})
+    if memory.source_message:
+        payload["source_message_length"] = len(memory.source_message)
+        payload["source_message_sha256"] = hashlib.sha256(
+            memory.source_message.encode("utf-8")
+        ).hexdigest()
+
+    text = "\n".join(
+        part
+        for part in (memory.content, memory.source_message, *memory.entities)
+        if part
+    )
+    if memory.sensitivity == "normal" and detect_text_sensitivity(text) == "normal":
+        return payload
+
+    payload.pop("content", None)
+    payload.pop("entities", None)
+    payload["content_length"] = len(memory.content)
+    payload["content_sha256"] = hashlib.sha256(
+        memory.content.encode("utf-8")
+    ).hexdigest()
+    payload["redacted"] = True
+    return payload
 
 
 def _affected_core_sections_for_memory_ids(

@@ -269,6 +269,36 @@ def test_review_action_confirm_valid_writes_audit_log(
     assert audit["after"][0]["id"] == memory.id
 
 
+def test_review_action_audit_hashes_sensitive_memory_text(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    secret = "123456789012345678"
+    memory = memory_store.create_memory(
+        user_id="default",
+        content=f"用户的身份证号是 {secret}。",
+        source_message=f"请记住，我的身份证号是 {secret}",
+        importance=8,
+        confidence=0.95,
+    )
+
+    response = client.post(
+        "/memories/review/actions",
+        headers=auth_headers,
+        json={"action": "confirm_valid", "memory_ids": [memory.id]},
+    )
+
+    assert response.status_code == 200
+    [log] = memory_store.list_decision_logs(user_id="default")
+    audit = json.loads(log.candidate_json)
+    assert audit["before"][0]["redacted"] is True
+    assert audit["after"][0]["redacted"] is True
+    assert len(audit["before"][0]["content_sha256"]) == 64
+    assert len(audit["before"][0]["source_message_sha256"]) == 64
+    assert secret not in log.candidate_json
+
+
 def test_review_action_rejects_cross_user_memory(
     client: TestClient,
     auth_headers: dict[str, str],

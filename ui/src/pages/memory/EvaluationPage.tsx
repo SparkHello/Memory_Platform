@@ -1,16 +1,17 @@
 import {
   BarChart3,
   Check,
+  CircleDashed,
   DatabaseZap,
-  Eye,
-  EyeOff,
+  ListChecks,
   Play,
   Plus,
   RefreshCcw,
   Save,
+  SearchX,
   Trash2
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MemoryApi } from "../../api";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
@@ -18,6 +19,7 @@ import type {
   MechanismDiagnosisResult,
   MechanismVerdict,
   MemoryRecord,
+  RecallEvalJudgment,
   RecallEvalLabel,
   RecallEvalRunResult,
   RecallEvalValidationIssue,
@@ -44,20 +46,52 @@ const EMPTY_STATE: EvalState = {
   workbench: null
 };
 
+const JUDGMENT_OPTIONS: Array<{
+  value: RecallEvalJudgment;
+  label: string;
+  icon: typeof CircleDashed;
+}> = [
+  { value: "unlabeled", label: "未标注", icon: CircleDashed },
+  { value: "relevant", label: "有相关记忆", icon: ListChecks },
+  { value: "no_answer", label: "无答案", icon: SearchX }
+];
+
+function normalizedJudgment(label: RecallEvalLabel): RecallEvalJudgment {
+  return label.judgment || (label.relevant_ids.length > 0 ? "relevant" : "unlabeled");
+}
+
+function isGraded(label: RecallEvalLabel): boolean {
+  const judgment = normalizedJudgment(label);
+  return judgment === "no_answer" || (judgment === "relevant" && label.relevant_ids.length > 0);
+}
+
+function labelStatusText(label: RecallEvalLabel): string {
+  const judgment = normalizedJudgment(label);
+  if (judgment === "no_answer") return "无答案";
+  if (judgment === "relevant") {
+    return label.relevant_ids.length > 0 ? `${label.relevant_ids.length} 条相关记忆` : "待选择相关记忆";
+  }
+  return "未标注";
+}
+
+function retrievalModeText(mode: string | undefined): string {
+  const labels: Record<string, string> = {
+    keyword: "关键词",
+    embedding: "语义",
+    hybrid: "混合",
+    keyword_fallback: "关键词回退",
+    none: "无结果"
+  };
+  return labels[mode || ""] || mode || "未知";
+}
+
 export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify }) {
   const [state, setState] = useState<EvalState>(EMPTY_STATE);
   const [labels, setLabels] = useState<RecallEvalLabel[]>([]);
   const [selectedLabelId, setSelectedLabelId] = useState<string | null>(null);
-  const [showFullCandidates, setShowFullCandidates] = useState(false);
   const [saving, setSaving] = useState(false);
   const [initializing, setInitializing] = useState(false);
   const [runningMode, setRunningMode] = useState<RunMode | null>(null);
-  // load() 通过 ref 读取当前遮罩偏好，避免把它放进依赖里——否则切换遮罩会触发
-  // 整页重载并用服务器数据覆盖掉正在编辑、尚未保存的标注。
-  const showFullRef = useRef(showFullCandidates);
-  useEffect(() => {
-    showFullRef.current = showFullCandidates;
-  }, [showFullCandidates]);
 
   const load = useCallback(async () => {
     setState((current) => ({ ...current, loading: true, error: null }));
@@ -69,7 +103,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
           diagnosisError = errorMessage(error);
           return null;
         }),
-        api.recallEvaluationWorkbench({ redactSensitive: !showFullRef.current }).catch((error) => {
+        api.recallEvaluationWorkbench().catch((error) => {
           if (String(errorMessage(error)).startsWith("404:")) return null;
           throw error;
         })
@@ -105,7 +139,11 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     return map;
   }, [state.workbench?.validation_issues]);
 
-  const gradedCount = labels.filter((label) => label.relevant_ids.length > 0).length;
+  const gradedCount = labels.filter(isGraded).length;
+  const relevantCount = labels.filter(
+    (label) => normalizedJudgment(label) === "relevant" && label.relevant_ids.length > 0
+  ).length;
+  const noAnswerCount = labels.filter((label) => normalizedJudgment(label) === "no_answer").length;
   const targetMin = state.workbench?.target_label_min || 20;
   const targetMax = state.workbench?.target_label_max || 30;
   const progress = Math.min(100, Math.round((gradedCount / targetMin) * 100));
@@ -151,19 +189,6 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     }
   };
 
-  const toggleCandidateRedaction = async () => {
-    const nextShowFull = !showFullCandidates;
-    setShowFullCandidates(nextShowFull);
-    if (!state.workbench) return;
-    try {
-      // 只刷新候选记忆的遮罩视图，保留正在编辑、尚未保存的标注。
-      const workbench = await api.recallEvaluationWorkbench({ redactSensitive: !nextShowFull });
-      setState((current) => (current.workbench ? { ...current, workbench } : current));
-    } catch (error) {
-      notify(errorMessage(error), "error");
-    }
-  };
-
   const addLabel = () => {
     const used = new Set(labels.map((label) => label.id));
     let nextIndex = labels.length + 1;
@@ -172,7 +197,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
       nextIndex += 1;
       id = `q${String(nextIndex).padStart(3, "0")}`;
     }
-    const next: RecallEvalLabel = { id, query: "", relevant_ids: [], note: "" };
+    const next: RecallEvalLabel = { id, query: "", judgment: "unlabeled", relevant_ids: [], note: "" };
     setLabels((current) => [...current, next]);
     setSelectedLabelId(id);
   };
@@ -189,6 +214,13 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     );
   };
 
+  const setJudgment = (judgment: RecallEvalJudgment) => {
+    updateSelected({
+      judgment,
+      relevant_ids: judgment === "relevant" ? selectedLabel?.relevant_ids || [] : []
+    });
+  };
+
   const toggleRelevant = (memoryId: string) => {
     if (!selectedLabel) return;
     const current = new Set(selectedLabel.relevant_ids);
@@ -197,7 +229,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     } else {
       current.add(memoryId);
     }
-    updateSelected({ relevant_ids: Array.from(current) });
+    updateSelected({ judgment: "relevant", relevant_ids: Array.from(current) });
   };
 
   const results = state.workbench?.last_results || {};
@@ -245,7 +277,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
           <div>
             <h2>召回标注进度</h2>
             <p className="muted-line">
-              已标注 {gradedCount} / {targetMin} 条，建议首批保持在 {targetMin}-{targetMax} 条。
+              已标注 {gradedCount} / {targetMin} 条（相关 {relevantCount}，无答案 {noAnswerCount}），建议首批保持在 {targetMin}-{targetMax} 条。
             </p>
           </div>
           <span className="count-pill">{progress}%</span>
@@ -290,7 +322,9 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
                     >
                       <strong>{label.id}</strong>
                       <span>{label.query || "未填写 query"}</span>
-                      <em>{label.relevant_ids.length} 条相关记忆</em>
+                      <em className={`evaluation-label-status ${isGraded(label) ? "graded" : ""}`}>
+                        {labelStatusText(label)}
+                      </em>
                       {issues.length > 0 && <small>{issues.length} 个问题</small>}
                     </button>
                   );
@@ -322,6 +356,28 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
                     placeholder="例如：用户的饮食偏好"
                   />
                 </label>
+                <div className="field-block">
+                  <span>标注判断</span>
+                  <div className="evaluation-judgment-control" role="radiogroup" aria-label="标注判断">
+                    {JUDGMENT_OPTIONS.map((option) => {
+                      const Icon = option.icon;
+                      const active = normalizedJudgment(selectedLabel) === option.value;
+                      return (
+                        <button
+                          className={active ? "active" : ""}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          key={option.value}
+                          onClick={() => setJudgment(option.value)}
+                        >
+                          <Icon size={15} />
+                          <span>{option.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
                 <label className="field-block">
                   <span>说明</span>
                   <input
@@ -342,7 +398,13 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
                       {shortId(memoryId)}
                     </button>
                   ))}
-                  {selectedLabel.relevant_ids.length === 0 && (
+                  {selectedLabel.relevant_ids.length === 0 && normalizedJudgment(selectedLabel) === "no_answer" && (
+                    <span className="muted-line">已标记为无答案</span>
+                  )}
+                  {selectedLabel.relevant_ids.length === 0 && normalizedJudgment(selectedLabel) === "unlabeled" && (
+                    <span className="muted-line">尚未标注</span>
+                  )}
+                  {selectedLabel.relevant_ids.length === 0 && normalizedJudgment(selectedLabel) === "relevant" && (
                     <span className="muted-line">尚未选择相关记忆</span>
                   )}
                 </div>
@@ -356,16 +418,10 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
             <div className="panel-header compact-header">
               <div>
                 <h2>候选记忆</h2>
-                <p className="muted-line">{state.workbench.candidates.length} 条候选记忆 · 与检索可见范围一致</p>
+                <p className="muted-line">
+                  {state.workbench.candidates.length} 条候选记忆 · 仅包含默认检索可见的普通用户事实
+                </p>
               </div>
-              <button
-                className="secondary-button compact"
-                type="button"
-                onClick={() => void toggleCandidateRedaction()}
-              >
-                {showFullCandidates ? <EyeOff size={15} /> : <Eye size={15} />}
-                {showFullCandidates ? "遮罩敏感" : "查看完整"}
-              </button>
             </div>
             <div className="evaluation-candidate-list">
               {state.workbench.candidates.map((candidate) => (
@@ -500,26 +556,48 @@ function ResultCard({
             <Metric label="R@k" value={result.summary.recall_at_k} />
             <Metric label="MRR" value={result.summary.mrr} />
             <Metric label="nDCG" value={result.summary.ndcg_at_k} />
+            {(result.summary.queries_no_answer || 0) > 0 && (
+              <>
+                <Metric label="无答案误召" value={result.summary.no_answer_false_positive_rate} />
+                <Metric label="无答案拒答" value={result.summary.no_answer_abstention_rate} />
+                <Metric label="平均误召" value={result.summary.no_answer_mean_retrieved} />
+              </>
+            )}
           </div>
           <div className="evaluation-query-results">
-            {result.per_query.map((row) => (
-              <details key={`${mode}-${row.id || row.query}`}>
-                <summary>
-                  <span>{row.query}</span>
-                  <em>
-                    hit={Math.round(row.hit)} · r={numberText(row.recall)} · ndcg={numberText(row.ndcg)}
-                  </em>
-                </summary>
-                <div className="evaluation-predictions">
-                  {row.predicted_ids.length === 0 && <span className="muted-line">无召回结果</span>}
-                  {row.predicted_ids.map((memoryId) => (
-                    <span className="count-pill" key={memoryId} title={candidateMap.get(memoryId)?.content || memoryId}>
-                      {shortId(memoryId)}
-                    </span>
-                  ))}
-                </div>
-              </details>
-            ))}
+            {result.per_query.map((row) => {
+              const judgment = row.judgment || (row.relevant_count > 0 ? "relevant" : "unlabeled");
+              return (
+                <details key={`${mode}-${row.id || row.query}`}>
+                  <summary>
+                    <span>{row.query}</span>
+                    <em>
+                      {judgment === "no_answer"
+                        ? row.false_positive
+                          ? `误召 ${row.retrieved} 条`
+                          : "正确拒答"
+                        : judgment === "unlabeled"
+                          ? `未标注 · 召回 ${row.retrieved} 条`
+                          : `hit=${Math.round(row.hit)} · r=${numberText(row.recall)} · ndcg=${numberText(row.ndcg)}`}
+                    </em>
+                  </summary>
+                  <div className="evaluation-predictions">
+                    <span className="muted-line">实际检索：{retrievalModeText(row.retrieval_mode)}</span>
+                    {row.fallback_reason && <span className="muted-line">回退：{row.fallback_reason}</span>}
+                    {row.predicted_ids.length === 0 && <span className="muted-line">无召回结果</span>}
+                    {row.predicted_ids.map((memoryId) => (
+                      <span
+                        className="count-pill"
+                        key={memoryId}
+                        title={candidateMap.get(memoryId)?.content || memoryId}
+                      >
+                        {shortId(memoryId)}
+                      </span>
+                    ))}
+                  </div>
+                </details>
+              );
+            })}
           </div>
         </>
       )}

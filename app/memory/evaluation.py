@@ -4,10 +4,12 @@ import argparse
 import asyncio
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 from pathlib import Path
 import sqlite3
+import shutil
 import sys
 from urllib.parse import quote
 
@@ -17,6 +19,7 @@ from app.memory.search import (
     MemorySearchService,
     NullEmbeddingClient,
     RECALL_CANDIDATE_POOL,
+    _memory_is_locally_sensitive,
 )
 from app.memory.store import MemoryStore
 
@@ -29,6 +32,18 @@ PREVIEW_NAME = "memories_preview.tsv"
 LABELS_NAME = "labels.jsonl"
 KEYWORD_RESULT_NAME = "last_keyword_result.json"
 EMBEDDING_RESULT_NAME = "last_embedding_result.json"
+USER_WORKSPACES_NAME = "users"
+
+LABEL_JUDGMENTS = {"unlabeled", "relevant", "no_answer"}
+BLOCKING_LABEL_ISSUE_CODES = {
+    "blank_query",
+    "duplicate_label_id",
+    "invalid_judgment",
+    "missing_relevant_ids",
+    "no_answer_with_relevant_ids",
+    "unlabeled_with_relevant_ids",
+    "unknown_memory_id",
+}
 
 SECTOR_TYPES = ("episodic", "semantic", "procedural", "emotional", "reflective")
 DEGENERATE_TYPE_SHARE = 0.90
@@ -40,13 +55,15 @@ RECALL_CONCENTRATION_WARN = 0.5
 MIN_MEANINGFUL_COUNT = 10
 TARGET_LABEL_MIN = 20
 TARGET_LABEL_MAX = 30
+MAX_RECALL_EVAL_K = 20
 
 LABELS_TEMPLATE = """# memory-gateway 召回评测标注文件
-# 每行一个 JSON 对象：{"id": "q001", "query": "一句话检索意图", "relevant_ids": ["应被召回的 memory id"], "note": "可选说明"}
+# 每行一个 JSON 对象：{"id": "q001", "query": "一句话检索意图", "judgment": "relevant|no_answer|unlabeled", "relevant_ids": ["应被召回的 memory id"], "note": "可选说明"}
 # - query 用自然的检索意图，模拟客户端调用 search_memory 时的 query。
 # - relevant_ids 从 memories_preview.tsv 或 Web 评测闭环页里挑选你认为这个 query 应该命中的记忆 id。
+# - 没有相关记忆时，将 judgment 明确设为 no_answer；空 relevant_ids 本身仍表示尚未标注。
 # - 以 # 开头的行和空行会被忽略。
-{"id": "q001", "query": "用户的饮食偏好", "relevant_ids": [], "note": "示例，请填入真实 id"}
+{"id": "q001", "query": "用户的饮食偏好", "judgment": "unlabeled", "relevant_ids": [], "note": "示例，请完成标注"}
 """
 
 
@@ -60,6 +77,75 @@ class Verdict:
 
 class EvaluationError(ValueError):
     pass
+
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+class _EvaluationMemoryStore(MemoryStore):
+    """Read-only store whose context-managed connections actually close."""
+
+    def _connect(self) -> sqlite3.Connection:
+        resolved = Path(self.database_path).resolve()
+        uri_path = quote(resolved.as_posix(), safe="/:")
+        connection = sqlite3.connect(
+            f"file:{uri_path}?mode=ro",
+            uri=True,
+            factory=_ClosingSQLiteConnection,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=5000")
+        return connection
+
+
+def delete_user_eval_workspace(
+    eval_dir: str | Path,
+    *,
+    user_id: str,
+) -> dict[str, int | bool]:
+    """Remove snapshots and labels that may retain a permanently deleted memory."""
+    eval_path = Path(eval_dir)
+    user_path = _user_eval_dir(eval_path, user_id=user_id)
+    workspace_removed = user_path.exists()
+    if workspace_removed:
+        shutil.rmtree(user_path)
+
+    legacy_names = {
+        SNAPSHOT_POINTER_NAME,
+        PREVIEW_NAME,
+        LABELS_NAME,
+        KEYWORD_RESULT_NAME,
+        EMBEDDING_RESULT_NAME,
+    }
+    legacy_removed = 0
+    for path in (eval_path / name for name in legacy_names):
+        if not path.is_file():
+            continue
+        path.unlink()
+        legacy_removed += 1
+
+    legacy_databases = {eval_path / SNAPSHOT_NAME}
+    for path in eval_path.glob(f"{SNAPSHOT_PREFIX}*.db*"):
+        raw_path = str(path)
+        for suffix in ("-wal", "-shm", "-journal"):
+            if raw_path.endswith(suffix):
+                raw_path = raw_path[: -len(suffix)]
+                break
+        legacy_databases.add(Path(raw_path))
+    for database_path in legacy_databases:
+        legacy_removed += _unlink_sqlite_database(
+            database_path,
+            ignore_permission_error=False,
+        )
+    return {
+        "workspace_removed": workspace_removed,
+        "legacy_artifacts_removed": legacy_removed,
+    }
 
 
 def run_diagnosis(
@@ -136,24 +222,29 @@ def init_eval(
     *,
     source_db: str | Path,
     eval_dir: str | Path = DEFAULT_EVAL_DIR,
+    user_id: str = "default",
 ) -> dict[str, object]:
-    """把真实库只读快照到 eval 目录，并生成预览和标注模板。"""
+    """创建只包含单个用户数据的快照，并生成该用户独立的评测工作区。"""
     source_path = Path(source_db)
     if not source_path.exists():
         return {"error": f"Source database does not exist: {source_path}"}
 
-    out_dir = Path(eval_dir)
+    out_dir = _user_eval_dir(eval_dir, user_id=user_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = _new_snapshot_path(out_dir)
     preview_path = out_dir / PREVIEW_NAME
     labels_path = out_dir / LABELS_NAME
 
-    _snapshot_readonly(source_path, snapshot_path)
+    _snapshot_readonly(source_path, snapshot_path, user_id=user_id)
 
-    user_counts, preview_rows = _read_snapshot_overview(snapshot_path)
+    user_counts, preview_rows = _read_snapshot_overview(
+        snapshot_path,
+        user_id=user_id,
+    )
     _write_preview(preview_path, preview_rows)
     _write_current_snapshot_pointer(out_dir, snapshot_path)
     _cleanup_old_snapshots(out_dir, current_snapshot=snapshot_path)
+    _invalidate_eval_results(out_dir)
 
     labels_created = False
     if not labels_path.exists():
@@ -167,21 +258,29 @@ def init_eval(
         "labels_created": labels_created,
         "memory_count": len(preview_rows),
         "user_counts": user_counts,
+        "user_id": user_id,
     }
 
 
 def load_labels(labels_path: str | Path) -> list[dict[str, object]]:
     path = Path(labels_path)
     labels: list[dict[str, object]] = []
-    for index, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise EvaluationError(f"Labels file is not valid UTF-8: {path}: {exc}") from exc
+    for index, raw_line in enumerate(raw_text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid label line: {line!r} ({exc})") from exc
-        labels.append(_normalize_label_entry(entry, index=index))
+            raise EvaluationError(f"Invalid label JSON on line {index}: {exc}") from exc
+        try:
+            labels.append(_normalize_label_entry(entry, index=index))
+        except EvaluationError as exc:
+            raise EvaluationError(f"Invalid label on line {index}: {exc}") from exc
     return labels
 
 
@@ -191,8 +290,9 @@ def save_labels(
     labels: list[dict[str, object]],
     user_id: str,
 ) -> dict[str, object]:
-    snapshot_path = _current_snapshot_path(eval_dir)
-    labels_path = Path(eval_dir) / LABELS_NAME
+    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
+    snapshot_path = _current_snapshot_path(eval_path)
+    labels_path = eval_path / LABELS_NAME
     valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
     normalized = _validate_labels(labels, valid_ids=valid_ids)
     _write_labels_atomic(labels_path, normalized)
@@ -209,7 +309,7 @@ def build_recall_workbench(
     user_id: str,
     redact_sensitive: bool = True,
 ) -> dict[str, object]:
-    eval_path = Path(eval_dir)
+    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
     snapshot_path = _current_snapshot_path(eval_path)
     labels_path = eval_path / LABELS_NAME
     if not snapshot_path.exists():
@@ -230,8 +330,22 @@ def build_recall_workbench(
         "summary": _label_summary(labels),
         "validation_issues": _label_validation_issues(labels, valid_ids=valid_ids),
         "candidates": memories,
-        "last_results": load_last_results(eval_path),
+        "last_results": load_last_results(eval_path, snapshot_path=snapshot_path),
     }
+
+
+class _TrackingEmbeddingClient(EmbeddingClient):
+    def __init__(self, delegate: EmbeddingClient):
+        self.delegate = delegate
+        self.available = False
+
+    def reset(self) -> None:
+        self.available = False
+
+    async def embed(self, text: str) -> list[float] | None:
+        vector = await self.delegate.embed(text)
+        self.available = bool(vector)
+        return vector
 
 
 def run_eval(
@@ -241,32 +355,81 @@ def run_eval(
     user_id: str = "default",
     k: int = 8,
     embedding_client: EmbeddingClient | None = None,
+    requested_mode: str | None = None,
 ) -> dict[str, object]:
     """对快照库跑召回评测，返回 per-query 指标和汇总。"""
-    graded = [label for label in labels if label.get("relevant_ids")]
-    store = MemoryStore(str(snapshot_db))
+    if not 1 <= k <= MAX_RECALL_EVAL_K:
+        raise EvaluationError(f"k must be between 1 and {MAX_RECALL_EVAL_K}")
+    effective_k = k
+    normalized_labels = [
+        _normalize_label_entry(label, index=index)
+        for index, label in enumerate(labels, start=1)
+    ]
+    requested_mode = requested_mode or (
+        "keyword" if embedding_client is None or isinstance(embedding_client, NullEmbeddingClient) else "embedding"
+    )
+    relevant_labels = [label for label in normalized_labels if label["judgment"] == "relevant"]
+    no_answer_labels = [label for label in normalized_labels if label["judgment"] == "no_answer"]
+    graded_count = len(relevant_labels) + len(no_answer_labels)
+    store = _EvaluationMemoryStore(str(snapshot_db))
+    tracking_embedding_client = _TrackingEmbeddingClient(embedding_client or NullEmbeddingClient())
     service = MemorySearchService(
         store=store,
-        embedding_client=embedding_client or NullEmbeddingClient(),
+        embedding_client=tracking_embedding_client,
         # 关闭进程级缓存：否则 keyword/embedding 两次基线会命中同一个
         # (user, query, limit) 缓存 key，第二次直接复用第一次的结果，
         # 还可能与线上实时检索互相串味。
         enable_cache=False,
     )
-    per_query = asyncio.run(_search_all(service, labels, user_id=user_id, k=k))
+    per_query = asyncio.run(
+        _search_all(
+            service,
+            normalized_labels,
+            user_id=user_id,
+            k=effective_k,
+            requested_mode=requested_mode,
+            embedding_tracker=tracking_embedding_client,
+        )
+    )
 
     summary: dict[str, object] = {
-        "queries_total": len(labels),
-        "queries_graded": len(graded),
-        "k": k,
+        "queries_total": len(normalized_labels),
+        "queries_graded": graded_count,
+        "queries_relevant": len(relevant_labels),
+        "queries_no_answer": len(no_answer_labels),
+        "queries_unlabeled": len(normalized_labels) - graded_count,
+        "requested_k": k,
+        "k": effective_k,
+        "effective_k": effective_k,
+        "requested_mode": requested_mode,
     }
-    if graded:
-        graded_results = [row for row in per_query if row["relevant_count"] > 0]
-        summary["hit_rate"] = round(_mean(row["hit"] for row in graded_results), 4)
-        summary["precision_at_k"] = round(_mean(row["precision"] for row in graded_results), 4)
-        summary["recall_at_k"] = round(_mean(row["recall"] for row in graded_results), 4)
-        summary["mrr"] = round(_mean(row["reciprocal_rank"] for row in graded_results), 4)
-        summary["ndcg_at_k"] = round(_mean(row["ndcg"] for row in graded_results), 4)
+    if relevant_labels:
+        relevant_results = [row for row in per_query if row["judgment"] == "relevant"]
+        summary["hit_rate"] = round(_mean(row["hit"] for row in relevant_results), 4)
+        summary["precision_at_k"] = round(_mean(row["precision"] for row in relevant_results), 4)
+        summary["recall_at_k"] = round(_mean(row["recall"] for row in relevant_results), 4)
+        summary["mrr"] = round(_mean(row["reciprocal_rank"] for row in relevant_results), 4)
+        summary["ndcg_at_k"] = round(_mean(row["ndcg"] for row in relevant_results), 4)
+    if no_answer_labels:
+        no_answer_results = [row for row in per_query if row["judgment"] == "no_answer"]
+        summary["no_answer_false_positive_rate"] = round(
+            _mean(1.0 if row["false_positive"] else 0.0 for row in no_answer_results),
+            4,
+        )
+        summary["no_answer_abstention_rate"] = round(
+            _mean(1.0 if row["retrieved"] == 0 else 0.0 for row in no_answer_results),
+            4,
+        )
+        summary["no_answer_mean_retrieved"] = round(
+            _mean(float(row["retrieved"]) for row in no_answer_results),
+            4,
+        )
+    retrieval_mode_counts: dict[str, int] = {}
+    for row in per_query:
+        retrieval_mode = str(row["retrieval_mode"])
+        retrieval_mode_counts[retrieval_mode] = retrieval_mode_counts.get(retrieval_mode, 0) + 1
+    summary["retrieval_mode_counts"] = retrieval_mode_counts
+    summary["fallback_queries"] = sum(1 for row in per_query if row["fallback_reason"] is not None)
     return {"summary": summary, "per_query": per_query}
 
 
@@ -278,7 +441,7 @@ def run_recall_eval(
     k: int = 8,
     embedding_client: EmbeddingClient | None = None,
 ) -> dict[str, object]:
-    eval_path = Path(eval_dir)
+    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
     snapshot_path = _current_snapshot_path(eval_path)
     labels_path = eval_path / LABELS_NAME
     if not snapshot_path.exists():
@@ -291,11 +454,7 @@ def run_recall_eval(
     labels = load_labels(labels_path)
     valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
     issues = _label_validation_issues(labels, valid_ids=valid_ids)
-    blocking = [
-        issue
-        for issue in issues
-        if issue["code"] in {"blank_query", "unknown_memory_id", "duplicate_label_id"}
-    ]
+    blocking = [issue for issue in issues if issue["code"] in BLOCKING_LABEL_ISSUE_CODES]
     if blocking:
         raise EvaluationError("; ".join(str(issue["message"]) for issue in blocking))
 
@@ -305,9 +464,11 @@ def run_recall_eval(
         user_id=user_id,
         k=k,
         embedding_client=embedding_client if mode == "embedding" else NullEmbeddingClient(),
+        requested_mode=mode,
     )
     result["mode"] = mode
     result["user_id"] = user_id
+    result["snapshot"] = str(snapshot_path)
     result["validation_issues"] = issues
     save_eval_result(eval_path, mode=mode, result=result)
     return result
@@ -319,11 +480,14 @@ async def _search_all(
     *,
     user_id: str,
     k: int,
+    requested_mode: str,
+    embedding_tracker: _TrackingEmbeddingClient,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for label in labels:
         query = str(label["query"])
         relevant = [str(memory_id) for memory_id in label.get("relevant_ids", [])]
+        embedding_tracker.reset()
         hits = await service.search_hits(
             query=query,
             user_id=user_id,
@@ -331,8 +495,61 @@ async def _search_all(
             record_usage=False,
         )
         predicted = [hit.memory.id for hit in hits]
-        rows.append(_score_query(query, relevant, predicted, k=k, label_id=str(label.get("id") or "")))
+        predicted_channels = {
+            hit.memory.id: list(hit.channels)
+            for hit in hits
+        }
+        retrieval_mode, fallback_reason = _actual_retrieval_mode(
+            requested_mode=requested_mode,
+            embedding_available=embedding_tracker.available,
+            predicted_channels=predicted_channels,
+        )
+        row = _score_query(
+            query,
+            relevant,
+            predicted,
+            k=k,
+            label_id=str(label.get("id") or ""),
+            judgment=str(label.get("judgment") or "unlabeled"),
+        )
+        row.update(
+            {
+                "requested_mode": requested_mode,
+                "retrieval_mode": retrieval_mode,
+                "fallback_reason": fallback_reason,
+                "embedding_available": embedding_tracker.available if requested_mode == "embedding" else None,
+                "predicted_channels": predicted_channels,
+            }
+        )
+        rows.append(row)
     return rows
+
+
+def _actual_retrieval_mode(
+    *,
+    requested_mode: str,
+    embedding_available: bool,
+    predicted_channels: dict[str, list[str]],
+) -> tuple[str, str | None]:
+    channels = {
+        channel
+        for hit_channels in predicted_channels.values()
+        for channel in hit_channels
+    }
+    if requested_mode == "keyword":
+        return ("keyword" if "keyword" in channels else "none", None)
+    if not embedding_available:
+        return (
+            "keyword_fallback" if "keyword" in channels else "none",
+            "embedding_unavailable",
+        )
+    if "embedding" in channels and "keyword" in channels:
+        return "hybrid", None
+    if "embedding" in channels:
+        return "embedding", None
+    if "keyword" in channels:
+        return "keyword_fallback", "no_embedding_hits"
+    return "none", "no_candidates_scored"
 
 
 def _score_query(
@@ -342,6 +559,7 @@ def _score_query(
     *,
     k: int,
     label_id: str = "",
+    judgment: str | None = None,
 ) -> dict[str, object]:
     relevant_set = set(relevant)
     top_k = predicted[:k]
@@ -356,10 +574,13 @@ def _score_query(
     ideal_hits = min(k, len(relevant_set))
     idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_hits + 1))
     ndcg = dcg / idcg if idcg else 0.0
+    normalized_judgment = judgment or ("relevant" if relevant_set else "unlabeled")
 
     return {
         "id": label_id,
         "query": query,
+        "judgment": normalized_judgment,
+        "graded": normalized_judgment in {"relevant", "no_answer"},
         "relevant_count": len(relevant_set),
         "retrieved": retrieved,
         "relevant_hits": relevant_hits,
@@ -368,6 +589,7 @@ def _score_query(
         "recall": round(recall, 4),
         "reciprocal_rank": round(reciprocal_rank, 4),
         "ndcg": round(ndcg, 4),
+        "false_positive": normalized_judgment == "no_answer" and retrieved > 0,
         "predicted_ids": top_k,
     }
 
@@ -379,8 +601,13 @@ def save_eval_result(eval_dir: str | Path, *, mode: str, result: dict[str, objec
     return path
 
 
-def load_last_results(eval_dir: str | Path) -> dict[str, object]:
+def load_last_results(
+    eval_dir: str | Path,
+    *,
+    snapshot_path: str | Path | None = None,
+) -> dict[str, object]:
     eval_path = Path(eval_dir)
+    expected_snapshot = str(Path(snapshot_path)) if snapshot_path is not None else None
     results: dict[str, object] = {}
     for mode in ("keyword", "embedding"):
         path = eval_path / _result_name(mode)
@@ -388,9 +615,16 @@ def load_last_results(eval_dir: str | Path) -> dict[str, object]:
             results[mode] = None
             continue
         try:
-            results[mode] = json.loads(path.read_text(encoding="utf-8"))
+            result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             results[mode] = None
+            continue
+        if not isinstance(result, dict) or (
+            expected_snapshot is not None and result.get("snapshot") != expected_snapshot
+        ):
+            results[mode] = None
+            continue
+        results[mode] = result
     return results
 
 
@@ -399,21 +633,37 @@ def format_text_report(result: dict[str, object]) -> str:
     lines = ["memory-gateway recall evaluation", ""]
     if isinstance(summary, dict):
         graded = summary.get("queries_graded", 0)
-        lines.append(f"Queries: {summary.get('queries_total')} total, {graded} graded (k={summary.get('k')})")
-        if graded:
+        lines.append(
+            f"Queries: {summary.get('queries_total')} total, {graded} graded "
+            f"({summary.get('queries_relevant', 0)} relevant, "
+            f"{summary.get('queries_no_answer', 0)} no-answer, "
+            f"k={summary.get('effective_k', summary.get('k'))})"
+        )
+        if summary.get("queries_relevant"):
             lines.append(f"- hit_rate@k:    {summary.get('hit_rate')}")
             lines.append(f"- precision@k:   {summary.get('precision_at_k')}")
             lines.append(f"- recall@k:      {summary.get('recall_at_k')}")
             lines.append(f"- MRR:           {summary.get('mrr')}")
             lines.append(f"- nDCG@k:        {summary.get('ndcg_at_k')}")
-        else:
-            lines.append("No graded queries yet. Fill relevant_ids in labels.jsonl, then re-run.")
+        if summary.get("queries_no_answer"):
+            lines.append(
+                f"- no-answer false-positive rate: {summary.get('no_answer_false_positive_rate')}"
+            )
+            lines.append(f"- no-answer abstention rate:     {summary.get('no_answer_abstention_rate')}")
+        if not graded:
+            lines.append("No graded queries yet. Set judgment to relevant or no_answer, then re-run.")
     lines.append("")
     lines.append("Per-query:")
     for row in result.get("per_query", []):
         if not isinstance(row, dict):
             continue
-        if row["relevant_count"] == 0:
+        if row.get("judgment") == "no_answer":
+            lines.append(
+                f"- no-answer false_positive={str(bool(row.get('false_positive'))).lower()} "
+                f"retrieved={row['retrieved']} mode={row.get('retrieval_mode')} :: {row['query']}"
+            )
+            continue
+        if row.get("judgment") == "unlabeled":
             lines.append(f"- (ungraded) {row['query']}")
             continue
         lines.append(
@@ -840,6 +1090,12 @@ def _new_snapshot_path(eval_dir: Path) -> Path:
             return path
 
 
+def _user_eval_dir(eval_dir: str | Path, *, user_id: str) -> Path:
+    normalized_user_id = user_id or "default"
+    digest = hashlib.sha256(normalized_user_id.encode("utf-8")).hexdigest()
+    return Path(eval_dir) / USER_WORKSPACES_NAME / digest
+
+
 def _current_snapshot_path(eval_dir: str | Path) -> Path:
     eval_path = Path(eval_dir)
     pointer_path = eval_path / SNAPSHOT_POINTER_NAME
@@ -887,32 +1143,103 @@ def _cleanup_old_snapshots(eval_dir: Path, *, current_snapshot: Path, keep: int 
         _unlink_sqlite_database(snapshot_path)
 
 
-def _unlink_sqlite_database(path: Path) -> None:
-    for target in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+def _invalidate_eval_results(eval_dir: Path) -> None:
+    for name in (KEYWORD_RESULT_NAME, EMBEDDING_RESULT_NAME):
+        (eval_dir / name).unlink(missing_ok=True)
+
+
+def _unlink_sqlite_database(
+    path: Path,
+    *,
+    ignore_permission_error: bool = True,
+) -> int:
+    removed = 0
+    for target in (
+        path,
+        Path(str(path) + "-wal"),
+        Path(str(path) + "-shm"),
+        Path(str(path) + "-journal"),
+    ):
         try:
-            target.unlink(missing_ok=True)
+            if target.is_file():
+                target.unlink()
+                removed += 1
         except PermissionError:
-            continue
+            if ignore_permission_error:
+                continue
+            raise
+    return removed
 
 
-def _snapshot_readonly(source_path: Path, snapshot_path: Path) -> None:
-    """用 backup API 做一致性只读快照（正确处理 WAL），不修改源库。"""
+def _snapshot_readonly(source_path: Path, snapshot_path: Path, *, user_id: str) -> None:
+    """用 backup API 建立临时副本，过滤完成后再原子发布单用户快照。"""
     resolved = source_path.resolve()
     uri_path = quote(resolved.as_posix(), safe="/:")
+    temp_path = snapshot_path.with_name(f".{snapshot_path.name}.tmp")
+    _unlink_sqlite_database(temp_path)
     source = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
     try:
-        if snapshot_path.exists():
-            _unlink_sqlite_database(snapshot_path)
-        dest = sqlite3.connect(str(snapshot_path))
+        dest = sqlite3.connect(str(temp_path))
         try:
             source.backup(dest)
+            dest.execute("PRAGMA journal_mode = DELETE")
+            _filter_snapshot_to_user(dest, user_id=user_id)
         finally:
             dest.close()
+        # Filtering is committed into the main temp file before publication. Any
+        # empty/stale sidecars must keep the temporary name and never accompany
+        # the atomically replaced snapshot.
+        for sidecar in (
+            Path(str(temp_path) + "-wal"),
+            Path(str(temp_path) + "-shm"),
+            Path(str(temp_path) + "-journal"),
+        ):
+            sidecar.unlink(missing_ok=True)
+        temp_path.replace(snapshot_path)
+    except Exception:
+        _unlink_sqlite_database(temp_path)
+        raise
     finally:
         source.close()
 
 
-def _read_snapshot_overview(snapshot_path: Path) -> tuple[dict[str, int], list[tuple[str, str, str]]]:
+def _filter_snapshot_to_user(connection: sqlite3.Connection, *, user_id: str) -> None:
+    connection.execute("PRAGMA secure_delete = ON")
+    table_rows = connection.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    for row in table_rows:
+        table_name = str(row[0])
+        quoted_table = _quote_identifier(table_name)
+        columns = {
+            str(column[1])
+            for column in connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+        }
+        if "user_id" in columns:
+            connection.execute(
+                f"DELETE FROM {quoted_table} WHERE COALESCE(user_id, 'default') <> ?",
+                (user_id,),
+            )
+            connection.execute(
+                f"UPDATE {quoted_table} SET user_id = 'default' WHERE user_id IS NULL"
+            )
+        else:
+            # 未声明用户边界的辅助表不能安全带入用户快照；保留 schema，清空其数据。
+            connection.execute(f"DELETE FROM {quoted_table}")
+    connection.commit()
+    connection.execute("VACUUM")
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _read_snapshot_overview(
+    snapshot_path: Path,
+    *,
+    user_id: str,
+) -> tuple[dict[str, int], list[tuple[str, str, str]]]:
     connection = sqlite3.connect(str(snapshot_path))
     try:
         connection.row_factory = sqlite3.Row
@@ -921,17 +1248,14 @@ def _read_snapshot_overview(snapshot_path: Path) -> tuple[dict[str, int], list[t
             "FROM memories WHERE COALESCE(archived, 0) = 0 GROUP BY user_id ORDER BY count DESC"
         ).fetchall()
         user_counts = {str(row["user_id"]): int(row["count"]) for row in user_rows}
-        rows = connection.execute(
-            "SELECT id, type, content FROM memories WHERE COALESCE(archived, 0) = 0 "
-            "ORDER BY importance DESC, updated_at DESC"
-        ).fetchall()
-        preview = [
-            (str(row["id"]), str(row["type"]), _one_line(str(row["content"] or "")))
-            for row in rows
-        ]
-        return user_counts, preview
     finally:
         connection.close()
+    memories = _eligible_snapshot_memories(snapshot_path, user_id=user_id)
+    preview = [
+        (memory.id, memory.type, _one_line(memory.content))
+        for memory in memories
+    ]
+    return user_counts, preview
 
 
 def _write_preview(preview_path: Path, rows: list[tuple[str, str, str]]) -> None:
@@ -946,19 +1270,28 @@ def _snapshot_memories(
     user_id: str,
     redact_sensitive: bool,
 ) -> list[dict[str, object]]:
-    store = MemoryStore(str(snapshot_path))
-    # 与检索口径对齐：只取检索真正会纳入排名的前 N 条活跃记忆，且排除 lifecycle-archived
-    # （检索默认看不到它们）。否则会让人标注/校验通过却永远召回不到，指标被悄悄拉低。
-    memories = store.list_memories(
-        user_id=user_id,
-        limit=RECALL_CANDIDATE_POOL,
-        include_lifecycle_archived=False,
-    )
+    memories = _eligible_snapshot_memories(snapshot_path, user_id=user_id)
     payloads: list[dict[str, object]] = []
     for memory in memories:
         payload = memory.model_dump(exclude={"embedding_json"})
         payloads.append(redact_memory_payload(payload, redact_sensitive=redact_sensitive))
     return payloads
+
+
+def _eligible_snapshot_memories(snapshot_path: Path, *, user_id: str):
+    """Mirror the default search candidate pool before scoring."""
+    store = _EvaluationMemoryStore(str(snapshot_path))
+    memories = store.list_memories(
+        user_id=user_id,
+        limit=RECALL_CANDIDATE_POOL,
+        include_lifecycle_archived=False,
+    )
+    return [
+        memory
+        for memory in memories
+        if memory.origin == "user_asserted"
+        and not _memory_is_locally_sensitive(memory)
+    ]
 
 
 def _snapshot_memory_ids(snapshot_path: Path, *, user_id: str) -> set[str]:
@@ -969,17 +1302,23 @@ def _snapshot_memory_ids(snapshot_path: Path, *, user_id: str) -> set[str]:
 
 def _normalize_label_entry(entry: object, *, index: int) -> dict[str, object]:
     if not isinstance(entry, dict):
-        raise ValueError(f"Label line must be a JSON object: {entry!r}")
+        raise EvaluationError(f"Label line must be a JSON object: {entry!r}")
     label_id = _one_line(str(entry.get("id") or f"q{index:03d}"), limit=80)
     query = str(entry.get("query") or "").strip()
     relevant_raw = entry.get("relevant_ids", [])
     if not isinstance(relevant_raw, list):
-        raise ValueError(f"Label relevant_ids must be a list: {entry!r}")
+        raise EvaluationError(f"Label relevant_ids must be a list: {entry!r}")
     relevant_ids = [str(memory_id).strip() for memory_id in relevant_raw if str(memory_id).strip()]
+    judgment_raw = entry.get("judgment")
+    if judgment_raw is None or not str(judgment_raw).strip():
+        judgment = "relevant" if relevant_ids else "unlabeled"
+    else:
+        judgment = str(judgment_raw).strip().lower()
     note_raw = entry.get("note")
     label: dict[str, object] = {
         "id": label_id or f"q{index:03d}",
         "query": query,
+        "judgment": judgment,
         "relevant_ids": list(dict.fromkeys(relevant_ids)),
     }
     if note_raw is not None:
@@ -990,21 +1329,22 @@ def _normalize_label_entry(entry: object, *, index: int) -> dict[str, object]:
 def _validate_labels(labels: list[dict[str, object]], *, valid_ids: set[str]) -> list[dict[str, object]]:
     normalized = [_normalize_label_entry(label, index=index) for index, label in enumerate(labels, start=1)]
     issues = _label_validation_issues(normalized, valid_ids=valid_ids)
-    blocking = [
-        issue
-        for issue in issues
-        if issue["code"] in {"blank_query", "unknown_memory_id", "duplicate_label_id"}
-    ]
+    blocking = [issue for issue in issues if issue["code"] in BLOCKING_LABEL_ISSUE_CODES]
     if blocking:
         raise EvaluationError("; ".join(str(issue["message"]) for issue in blocking))
     return normalized
 
 
 def _label_summary(labels: list[dict[str, object]]) -> dict[str, int]:
-    graded = sum(1 for label in labels if label.get("relevant_ids"))
+    relevant = sum(1 for label in labels if label.get("judgment") == "relevant")
+    no_answer = sum(1 for label in labels if label.get("judgment") == "no_answer")
+    graded = relevant + no_answer
     return {
         "queries_total": len(labels),
         "queries_graded": graded,
+        "queries_relevant": relevant,
+        "queries_no_answer": no_answer,
+        "queries_unlabeled": len(labels) - graded,
         "target_min": TARGET_LABEL_MIN,
         "target_max": TARGET_LABEL_MAX,
     }
@@ -1024,7 +1364,41 @@ def _label_validation_issues(
         if label_id in seen:
             issues.append({"code": "duplicate_label_id", "label_id": label_id, "message": f"Duplicate label id: {label_id}"})
         seen.add(label_id)
-        for memory_id in label.get("relevant_ids", []):
+        judgment = str(label.get("judgment") or "unlabeled")
+        relevant_ids = list(label.get("relevant_ids", []))
+        if judgment not in LABEL_JUDGMENTS:
+            issues.append(
+                {
+                    "code": "invalid_judgment",
+                    "label_id": label_id,
+                    "message": f"Invalid judgment for {label_id}: {judgment}",
+                }
+            )
+        elif judgment == "relevant" and not relevant_ids:
+            issues.append(
+                {
+                    "code": "missing_relevant_ids",
+                    "label_id": label_id,
+                    "message": f"Relevant label {label_id} must include at least one memory id.",
+                }
+            )
+        elif judgment == "no_answer" and relevant_ids:
+            issues.append(
+                {
+                    "code": "no_answer_with_relevant_ids",
+                    "label_id": label_id,
+                    "message": f"No-answer label {label_id} cannot include relevant memory ids.",
+                }
+            )
+        elif judgment == "unlabeled" and relevant_ids:
+            issues.append(
+                {
+                    "code": "unlabeled_with_relevant_ids",
+                    "label_id": label_id,
+                    "message": f"Unlabeled query {label_id} cannot include relevant memory ids.",
+                }
+            )
+        for memory_id in relevant_ids:
             memory_id_text = str(memory_id)
             if memory_id_text not in valid_ids:
                 issues.append(
@@ -1083,7 +1457,12 @@ def recall_cli_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", default="data/memory.db", help="Real SQLite database path (read-only).")
     parser.add_argument("--eval-dir", default=DEFAULT_EVAL_DIR, help="Directory for snapshot/preview/labels.")
     parser.add_argument("--user-id", default="default", help="X-User-Id scope to evaluate.")
-    parser.add_argument("--k", type=int, default=8, help="Top-k cutoff.")
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=8,
+        help=f"Top-k cutoff (1-{MAX_RECALL_EVAL_K}).",
+    )
     parser.add_argument("--use-embedding", action="store_true", help="Use the real embedding provider for queries.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args(argv)
@@ -1099,7 +1478,7 @@ def recall_cli_main(argv: list[str] | None = None) -> int:
     eval_dir = Path(args.eval_dir)
 
     if args.init:
-        result = init_eval(source_db=args.database, eval_dir=eval_dir)
+        result = init_eval(source_db=args.database, eval_dir=eval_dir, user_id=args.user_id)
         if result.get("error"):
             print(result["error"])
             return 1

@@ -28,6 +28,10 @@ class Settings(BaseSettings):
         default=60.0,
         validation_alias="REQUEST_TIMEOUT_SECONDS",
     )
+    allow_sensitive_egress: bool = Field(
+        default=False,
+        validation_alias="ALLOW_SENSITIVE_EGRESS",
+    )
 
     # 衰减引擎 (Ebbinghaus)
     decay_lambda_default: float = Field(default=0.02, validation_alias="DECAY_LAMBDA_DEFAULT")

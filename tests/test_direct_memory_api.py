@@ -76,6 +76,51 @@ class TestSaveMemoryEndpoint:
         second = client.post("/memories", json=payload, headers=auth_headers)
         assert second.json()["action"] == "ignore"
 
+    def test_local_sensitivity_floor_applies_before_direct_save_gate(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        identifier = "123456789012345678"
+        base_payload = {
+            "content": f"用户的身份证号是 {identifier}。",
+            "type": "semantic",
+            "importance": 8,
+            "confidence": 0.95,
+            "sensitivity": "normal",
+        }
+
+        rejected = client.post(
+            "/memories",
+            json={
+                **base_payload,
+                "source_quote": f"我的身份证号是 {identifier}",
+            },
+            headers=auth_headers,
+        )
+
+        assert rejected.status_code == 200
+        assert rejected.json()["action"] == "ignore"
+        assert "明确要求记住" in rejected.json()["reason"]
+
+        accepted = client.post(
+            "/memories",
+            json={
+                **base_payload,
+                "source_quote": f"请记住，我的身份证号是 {identifier}",
+            },
+            headers=auth_headers,
+        )
+
+        assert accepted.json()["action"] == "create"
+        memory = memory_store.get_memory(
+            memory_id=accepted.json()["memory_id"],
+            user_id="default",
+        )
+        assert memory is not None
+        assert memory.sensitivity == "sensitive"
+
     def test_temporal_fields_timeline_and_restore(
         self,
         client,
@@ -597,6 +642,36 @@ class TestMemoryContextExplainEndpoint:
         assert refreshed.usage_count == 0
         assert refreshed.last_used_at is None
 
+    def test_context_excludes_legacy_sensitive_core_section(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        source = memory_store.create_memory(
+            user_id="default",
+            content="用户长期喜欢黑咖啡。",
+            importance=8,
+        )
+        secret = "123456789012345678"
+        memory_store.upsert_core_memory_section(
+            user_id="default",
+            section="profile",
+            content=f"- 用户的身份证号是 {secret}。",
+            evidence_memory_ids=[source.id],
+            confidence=0.95,
+        )
+
+        response = client.post(
+            "/memories/context",
+            json={"query": "咖啡", "include_core_memory": True},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["core_memory"] == []
+        assert secret not in response.text
+
     def test_explain_reports_candidates_excluded_by_limit(
         self,
         client,
@@ -641,7 +716,12 @@ class TestMemoryContextExplainEndpoint:
 
         response = client.post(
             "/memories/context/explain",
-            json={"query": "passport", "limit": 1, "redact_sensitive": True},
+            json={
+                "query": "passport",
+                "limit": 1,
+                "include_sensitive": True,
+                "redact_sensitive": True,
+            },
             headers=auth_headers,
         )
 

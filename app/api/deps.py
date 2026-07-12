@@ -38,9 +38,8 @@ def get_user_id(x_user_id: Annotated[str | None, Header()] = None) -> str:
 
 
 def get_memory_store(settings: Annotated[Settings, Depends(get_settings)]) -> MemoryStore:
-    store = MemoryStore(settings.database_path)
-    store.init_db()
-    return store
+    # Schema initialization/migration runs once in the application lifespan.
+    return MemoryStore(settings.database_path)
 
 
 def get_embedding_client(
@@ -53,6 +52,7 @@ def get_embedding_client(
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
             timeout_seconds=settings.request_timeout_seconds,
+            allow_sensitive_egress=settings.allow_sensitive_egress,
         )
     return NullEmbeddingClient()
 

@@ -147,7 +147,10 @@ export function MemoriesPage({
           mode === "deleted"
             ? api.listDeletedMemories({ redactSensitive: true })
             : query.trim()
-              ? api.searchMemories(query.trim(), 20, { redactSensitive: true })
+              ? api.searchMemories(query.trim(), 20, {
+                  includeSensitive: true,
+                  redactSensitive: true
+                })
               : api.listMemories({ redactSensitive: true, status: "all" });
         const [memories, loadedSpaces] = await Promise.all([
           memoryPromise,
@@ -1216,5 +1219,4 @@ function recentActivityText(memory: MemoryRecord): string {
   if (days < 1) return "今天活跃";
   return `${Math.round(days)} 天未活跃`;
 }
-
 

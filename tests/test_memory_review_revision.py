@@ -6,6 +6,155 @@ from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime
 
 
+def test_sensitive_review_is_blocked_before_remote_llm(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户有一项健康隐私。",
+        sensitivity="sensitive",
+    )
+
+    response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "帮我检查这条记忆"},
+    )
+
+    assert response.status_code == 422
+    assert "ALLOW_SENSITIVE_EGRESS" in response.json()["detail"]
+    assert fake_llm.review_revision_messages == []
+
+
+def test_sensitive_recommendation_reason_is_blocked_before_remote_llm(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢深烘咖啡。",
+    )
+
+    response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={
+            "memory_ids": [memory.id],
+            "user_note": "帮我检查这条记忆",
+            "recommendation_reason": "身份证号是 123456789012345678",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "ALLOW_SENSITIVE_EGRESS" in response.json()["detail"]
+    assert fake_llm.review_revision_messages == []
+
+
+def test_legacy_mislabeled_sensitive_memory_is_blocked_before_remote_llm(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢深烘咖啡。",
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET content = ?, sensitivity = 'normal' WHERE id = ?",
+            ("用户的身份证号是 123456789012345678。", memory.id),
+        )
+
+    response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "帮我检查这条记忆"},
+    )
+
+    assert response.status_code == 422
+    assert "ALLOW_SENSITIVE_EGRESS" in response.json()["detail"]
+    assert fake_llm.review_revision_messages == []
+
+
+def test_review_preview_rejects_stale_memory_version(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(user_id="default", content="用户喜欢深烘咖啡。")
+    fake_llm.review_revision_content = json.dumps(
+        {"operations": [{"operation": "no_change", "memory_ids": [memory.id]}]}
+    )
+    preview = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "确认这条记忆"},
+    ).json()
+    updated = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"content": "用户现在喜欢浅烘咖啡。"},
+    )
+    assert updated.status_code == 200
+
+    applied = client.post(
+        "/memories/review/revise/apply",
+        headers=auth_headers,
+        json={
+            "memory_ids": [memory.id],
+            "operations": preview["operations"],
+            "preview_token": preview["preview_token"],
+        },
+    )
+
+    assert applied.status_code == 409
+    assert "预览后发生了变化" in applied.json()["detail"]
+
+
+def test_review_preview_token_expires(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    import json as _json
+    import app.memory.review_revision as revision
+
+    memory = memory_store.create_memory(user_id="default", content="用户喜欢咖啡。")
+    fake_llm.review_revision_content = json.dumps(
+        {"operations": [{"operation": "no_change", "memory_ids": [memory.id]}]}
+    )
+    preview = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "确认这条记忆"},
+    ).json()
+    payload_part, _ = preview["preview_token"].split(".", 1)
+    payload = _json.loads(revision._unb64(payload_part).decode("utf-8"))
+    payload["expires_at"] = "2000-01-01T00:00:00+00:00"
+    expired_token = revision._sign_preview(secret="test-gateway-key", payload=payload)
+
+    applied = client.post(
+        "/memories/review/revise/apply",
+        headers=auth_headers,
+        json={
+            "memory_ids": [memory.id],
+            "operations": preview["operations"],
+            "preview_token": expired_token,
+        },
+    )
+
+    assert applied.status_code == 409
+    assert "已过期" in applied.json()["detail"]
+
+
 def test_preview_and_apply_review_update_sets_review_after(
     client: TestClient,
     auth_headers: dict[str, str],

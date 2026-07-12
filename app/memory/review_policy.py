@@ -40,13 +40,18 @@ def build_review_policy(
 def normalize_time_uncertain_candidate(
     candidate: CandidateMemory,
     *,
-    source_text: str,
+    source_text: str | None = None,
     now: datetime | None = None,
 ) -> CandidateMemory:
+    # Kept only for call compatibility; age evidence must be candidate-scoped.
+    del source_text
     if candidate.action == "ignore":
         return candidate
 
-    age = _unanchored_age(source_text)
+    # Age is rewritten only when the candidate's exact quote carries the age.
+    # Reading the whole submitted message here can overwrite an unrelated
+    # candidate extracted from another sentence in the same batch.
+    age = _unanchored_age(candidate.source_quote)
     if age is None:
         return candidate
 

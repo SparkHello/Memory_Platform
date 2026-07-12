@@ -83,3 +83,31 @@ async def test_embedding_request_uses_openai_compatible_payload(monkeypatch) -> 
             "headers": {"Authorization": "Bearer dashscope-key"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sensitive_embedding_is_blocked_before_http(monkeypatch) -> None:
+    calls = []
+
+    class UnexpectedAsyncClient:
+        def __init__(self, *, timeout: float):
+            calls.append(timeout)
+
+    monkeypatch.setattr("app.memory.search.httpx.AsyncClient", UnexpectedAsyncClient)
+    client = OpenAICompatibleEmbeddingClient(
+        base_url="https://example.invalid/v1",
+        api_key="embedding-key",
+        model="embedding-model",
+    )
+
+    embedding = await client.embed("我的身份证号是 123456789012345678")
+
+    assert embedding is None
+    assert calls == []
+
+
+def test_sensitive_egress_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("ALLOW_SENSITIVE_EGRESS", raising=False)
+    get_settings.cache_clear()
+
+    assert get_settings().allow_sensitive_egress is False

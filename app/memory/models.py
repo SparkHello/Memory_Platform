@@ -63,11 +63,15 @@ def normalize_iso_text(value: object) -> object:
 
 MemoryAction = Literal["create", "update", "ignore"]
 
+MemoryIngestStatus = Literal["completed", "no_memory", "rejected", "retryable_error"]
+
 DecisionLogAction = Literal["create", "update", "ignore", "purge"]
 
 MemoryStability = Literal["temporary", "medium", "stable"]
 
 MemorySensitivity = Literal["normal", "private", "sensitive"]
+
+MemoryOrigin = Literal["user_asserted", "agent_derived"]
 
 MemoryRelation = Literal["none", "same", "supplement", "conflict", "supersede"]
 
@@ -176,6 +180,7 @@ class MemoryRecord(BaseModel):
     arousal: float = Field(default=0.3, ge=0.0, le=1.0)
     source_message: str | None = None
     source_conversation_id: str | None = None
+    origin: MemoryOrigin = "user_asserted"
     embedding_json: str | None = None
     last_used_at: str | None = None
     usage_count: float = Field(default=0.0, ge=0.0)
@@ -210,9 +215,9 @@ class MemoryRecord(BaseModel):
     def _normalize_temporal_key(cls, value: object) -> object:
         return normalize_optional_text(value)
 
-    @field_validator("valid_from", mode="before")
+    @field_validator("valid_from", "valid_until", "review_after", mode="before")
     @classmethod
-    def _normalize_valid_from(cls, value: object) -> object:
+    def _normalize_datetime_fields(cls, value: object) -> object:
         return normalize_iso_text(value)
 
 
@@ -295,9 +300,9 @@ class CandidateMemory(BaseModel):
     def _normalize_temporal_key(cls, value: object) -> object:
         return normalize_optional_text(value)
 
-    @field_validator("valid_from", mode="before")
+    @field_validator("valid_from", "valid_until", "review_after", mode="before")
     @classmethod
-    def _normalize_valid_from(cls, value: object) -> object:
+    def _normalize_datetime_fields(cls, value: object) -> object:
         return normalize_iso_text(value)
 
 
@@ -429,3 +434,5 @@ class MemoryIngestResult(BaseModel):
     ignored: int = 0
     items: list[MemoryIngestItemResult] = Field(default_factory=list)
     reason: str
+    status: MemoryIngestStatus = "completed"
+    retryable: bool = False

@@ -493,7 +493,7 @@ async def test_expired_temporary_memory_is_downranked(memory_store: MemoryStore)
 
 
 @pytest.mark.asyncio
-async def test_sensitive_memory_is_downranked(memory_store: MemoryStore) -> None:
+async def test_sensitive_memory_requires_explicit_search_opt_in(memory_store: MemoryStore) -> None:
     sensitive = memory_store.create_memory(
         user_id="default",
         content="用户的健康记录里提到咖啡因限制。",
@@ -509,14 +509,99 @@ async def test_sensitive_memory_is_downranked(memory_store: MemoryStore) -> None
     )
     service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
 
-    results = await service.search(
+    default_results = await service.search(
         query="咖啡",
         user_id="default",
         limit=2,
         record_usage=False,
     )
+    opted_in_results = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=2,
+        record_usage=False,
+        include_sensitive=True,
+    )
 
-    assert [memory.id for memory in results] == [normal.id, sensitive.id]
+    assert [memory.id for memory in default_results] == [normal.id]
+    assert [memory.id for memory in opted_in_results] == [normal.id, sensitive.id]
+
+
+@pytest.mark.asyncio
+async def test_legacy_mislabeled_sensitive_text_requires_search_opt_in(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢咖啡。",
+        importance=8,
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET content = ?, sensitivity = 'normal' WHERE id = ?",
+            ("用户的身份证号是 123456789012345678。", memory.id),
+        )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+    )
+
+    default_results = await service.search(
+        query="身份证号",
+        user_id="default",
+        record_usage=False,
+    )
+    opted_in_results = await service.search(
+        query="身份证号",
+        user_id="default",
+        record_usage=False,
+        include_sensitive=True,
+    )
+
+    assert default_results == []
+    assert [result.id for result in opted_in_results] == [memory.id]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_chinese_query_abstains(memory_store: MemoryStore) -> None:
+    memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡和爵士乐。")
+    memory_store.create_memory(user_id="default", content="用户住在上海。")
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    results = await service.search(
+        query="量子火箭发动机维护",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert results == []
+
+
+def test_surface_memories_excludes_sensitive_and_derived_by_default(
+    memory_store: MemoryStore,
+) -> None:
+    normal = memory_store.create_memory(user_id="default", content="用户喜欢咖啡。")
+    sensitive = memory_store.create_memory(
+        user_id="default",
+        content="用户有一项健康隐私。",
+        sensitivity="sensitive",
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="模型推导出的反思。",
+        origin="agent_derived",
+        evidence_memory_ids=[normal.id],
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    default_ids = [hit.memory.id for hit in service.surface_memories(user_id="default")]
+    opted_in_ids = [
+        hit.memory.id
+        for hit in service.surface_memories(user_id="default", include_sensitive=True)
+    ]
+
+    assert default_ids == [normal.id]
+    assert set(opted_in_ids) == {normal.id, sensitive.id}
 
 
 def _set_memory_times(

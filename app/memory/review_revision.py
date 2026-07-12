@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -199,6 +199,7 @@ async def preview_review_revision(
                 suggested_content=suggested_content,
                 risk_tags=risk_tags or [],
                 severity=severity,
+                memories=memories,
             ),
         ),
         reason=reason,
@@ -228,6 +229,10 @@ def apply_review_revision(
         raise ReviewRevisionError(409, "修改预览已失效或与提交内容不一致")
 
     memories = _load_memories(store=store, user_id=user_id, memory_ids=allowed_ids)
+    expected_versions = payload.get("memory_versions")
+    current_versions = {memory.id: memory.updated_at for memory in memories}
+    if expected_versions != current_versions:
+        raise ReviewRevisionError(409, "修改预览已过期：记忆在预览后发生了变化")
     memory_map = {memory.id: memory for memory in memories}
     _assert_operations_are_applicable(operations, allowed_ids=allowed_ids, memory_map=memory_map)
     affected_core_sections = _affected_core_sections(
@@ -887,11 +892,16 @@ def _token_payload(
     suggested_content: str | None,
     risk_tags: list[MemoryReviewRiskTag],
     severity: MemoryReviewSeverity | None,
+    memories: list[MemoryRecord],
 ) -> dict:
+    now = datetime.now(UTC)
     return {
-        "version": 1,
+        "version": 2,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=15)).isoformat(),
         "user_id": user_id,
         "allowed_memory_ids": allowed_ids,
+        "memory_versions": {memory.id: memory.updated_at for memory in memories},
         "operations": [_operation_payload(operation) for operation in operations],
         "user_note": user_note,
         "recommendation_reason": recommendation_reason,
@@ -926,8 +936,16 @@ def _verify_preview(*, secret: str, token: str) -> dict:
         payload = json.loads(payload_json.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise ReviewRevisionError(409, "修改预览 token 无效") from exc
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") != 2:
         raise ReviewRevisionError(409, "修改预览 token 无效")
+    try:
+        expires_at = datetime.fromisoformat(str(payload["expires_at"]))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReviewRevisionError(409, "修改预览 token 无效") from exc
+    if expires_at <= datetime.now(UTC):
+        raise ReviewRevisionError(409, "修改预览 token 已过期")
     return payload
 
 
