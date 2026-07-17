@@ -16,3 +16,5 @@ logs/
 eval/
 ui/node_modules/
 ui/dist/
+.pwshot/
+.DS_Store
