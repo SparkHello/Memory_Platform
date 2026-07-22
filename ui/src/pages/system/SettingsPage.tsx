@@ -1,82 +1,11 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Activity,
-  ArchiveRestore,
-  Clipboard,
-  Download,
-  Eye,
-  EyeOff,
-  FileText,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
-  Search,
-  ShieldAlert,
-  Trash2,
-  Upload,
-  Wrench,
-  X
-} from "lucide-react";
-import { MemoryApi } from "../../api";
+import { useEffect, useRef, useState } from "react";
+import { CheckCircle2, Eye, EyeOff, KeyRound, LoaderCircle, Server, XCircle } from "lucide-react";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
-import type {
-  ConnectionSettings,
-  CoreMemoryHistoryItem,
-  CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  MemoryAction,
-  MemoryExport,
-  MemoryRecord,
-  MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult
-} from "../../types";
-import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
+import type { ConnectionSettings } from "../../types";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
-import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
-import type { ConfirmFn } from "../../hooks/useConfirm";
-import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
+import { CONFIG_KEYS, CONFIG_KEY_HINTS } from "../../utils/constants";
+import { errorMessage } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
 export function SettingsPage({
@@ -91,34 +20,63 @@ export function SettingsPage({
   const [form, setForm] = useState(settings);
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [serviceCheck, setServiceCheck] = useState<"idle" | "checking" | "ok" | "error">("idle");
+  const [authCheck, setAuthCheck] = useState<"idle" | "checking" | "ok" | "error">("idle");
+  const [testMessage, setTestMessage] = useState("保存前可先确认服务和访问密钥都有效。");
+  const testRequestRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setForm(settings);
   }, [settings]);
 
+  // 卸载时取消在途的连接测试请求。
+  useEffect(() => () => testRequestRef.current?.abort(), []);
+
   const testConnection = async () => {
+    let serviceOnline = false;
+    testRequestRef.current?.abort();
+    const controller = new AbortController();
+    testRequestRef.current = controller;
     setTesting(true);
+    setServiceCheck("checking");
+    setAuthCheck("idle");
+    setTestMessage("正在检查服务…");
     try {
       const client = new MemoryApi({
         ...form,
         apiBaseUrl: normalizeBaseUrl(form.apiBaseUrl),
         userId: form.userId || "default"
       });
-      await client.health();
-      await client.memoryReport();
-      notify("连接测试通过", "success");
+      await client.health(controller.signal);
+      serviceOnline = true;
+      setServiceCheck("ok");
+      setAuthCheck("checking");
+      setTestMessage("服务在线，正在验证访问密钥…");
+      await client.memoryReport(controller.signal);
+      setAuthCheck("ok");
+      setTestMessage("服务与访问密钥均有效，连接信息已保存。");
+      onSave(form, "连接测试通过并已保存");
     } catch (error) {
-      notify(errorMessage(error), "error");
+      if (isAbortError(error)) return;
+      if (!serviceOnline) {
+        setServiceCheck("error");
+      } else {
+        setAuthCheck("error");
+      }
+      const message = errorMessage(error);
+      setTestMessage(message);
+      notify(message, "error");
     } finally {
-      setTesting(false);
+      if (testRequestRef.current === controller) setTesting(false);
     }
   };
 
   return (
-    <div className="page-stack">
+    <div className={`page-stack settings-page ${!settings.apiKey ? "onboarding-page" : ""}`}>
       <PageHeader
-        title="设置"
-        subtitle="本地 UI 连接设置和项目配置说明。"
+        eyebrow={!settings.apiKey ? "欢迎使用 Memory Console" : undefined}
+        title={!settings.apiKey ? "连接你的本地记忆服务" : "设置"}
+        subtitle={!settings.apiKey ? "信息只保存在当前浏览器，不会被上传。" : "连接信息与本机偏好。"}
         action={
           <button className="primary-button" type="button" onClick={() => onSave(form)}>
             保存设置
@@ -127,7 +85,10 @@ export function SettingsPage({
       />
       <section className="panel settings-panel">
         <div className="panel-header">
-          <h2>连接设置</h2>
+          <div>
+            <span className="panel-kicker">连接</span>
+            <h2>连接设置</h2>
+          </div>
         </div>
         <label className="field-block">
           <span>服务地址</span>
@@ -177,9 +138,14 @@ export function SettingsPage({
             测试连接
           </button>
         </div>
+        <div className="connection-checks" aria-live="polite">
+          <ConnectionCheck icon={Server} label="服务在线" state={serviceCheck} />
+          <ConnectionCheck icon={KeyRound} label="密钥鉴权有效" state={authCheck} />
+          <p>{testMessage}</p>
+        </div>
       </section>
 
-      <section className="panel">
+      <section className="panel panel--quiet settings-reference">
         <div className="panel-header">
           <h2>项目配置说明</h2>
         </div>
@@ -188,7 +154,10 @@ export function SettingsPage({
         </div>
         <div className="config-grid">
           {CONFIG_KEYS.map((key) => (
-            <code key={key}>{key}</code>
+            <div className="config-item" key={key}>
+              <code>{key}</code>
+              <span>{CONFIG_KEY_HINTS[key]}</span>
+            </div>
           ))}
         </div>
       </section>
@@ -196,5 +165,23 @@ export function SettingsPage({
   );
 }
 
-
+function ConnectionCheck({
+  icon: Icon,
+  label,
+  state
+}: {
+  icon: typeof Server;
+  label: string;
+  state: "idle" | "checking" | "ok" | "error";
+}) {
+  const StateIcon = state === "checking" ? LoaderCircle : state === "ok" ? CheckCircle2 : state === "error" ? XCircle : null;
+  return (
+    <div className={`connection-check state-${state}`}>
+      <Icon size={17} />
+      <span>{label}</span>
+      {StateIcon && <StateIcon className={state === "checking" ? "spin" : ""} size={17} />}
+      {!StateIcon && <small>待检查</small>}
+    </div>
+  );
+}
 

@@ -21,7 +21,7 @@ from app.memory.search import (
     RECALL_CANDIDATE_POOL,
     _memory_is_locally_sensitive,
 )
-from app.memory.store import MemoryStore
+from app.memory.store import MemoryStore, _ClosingSQLiteConnection
 
 
 DEFAULT_EVAL_DIR = "eval"
@@ -77,14 +77,6 @@ class Verdict:
 
 class EvaluationError(ValueError):
     pass
-
-
-class _ClosingSQLiteConnection(sqlite3.Connection):
-    def __exit__(self, exc_type, exc_value, traceback):
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
 
 
 class _EvaluationMemoryStore(MemoryStore):
@@ -714,13 +706,30 @@ def format_diagnosis_text_report(result: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+_ZH_KEY_TEXT = {
+    "episodic": "事件",
+    "semantic": "语义",
+    "procedural": "流程",
+    "emotional": "情绪",
+    "reflective": "反思",
+    "dynamic": "活跃",
+    "resolved": "已解决",
+    "archived": "归档",
+    "pinned": "钉选",
+}
+
+
+def _zh_key(key: str) -> str:
+    return _ZH_KEY_TEXT.get(key, key)
+
+
 def _sector_verdict(type_dist: dict[str, int], total: int) -> Verdict:
     metrics = {"distinct_types": len(type_dist), "distribution": type_dist}
     if total < MIN_MEANINGFUL_COUNT:
         return Verdict(
             "sector_typing",
             "insufficient_data",
-            f"Only {total} memories; sector distribution is not yet meaningful.",
+            f"仅 {total} 条记忆，扇区分布还不具参考意义。",
             metrics,
         )
     top_share = max(type_dist.values()) / total if type_dist else 0.0
@@ -730,34 +739,34 @@ def _sector_verdict(type_dist: dict[str, int], total: int) -> Verdict:
         return Verdict(
             "sector_typing",
             "degenerate",
-            f"{top_share:.0%} of memories are '{top_type}'. The five-sector split and "
-            f"per-sector decay lambdas collapse to a single sector.",
+            f"{top_share:.0%} 的记忆都是「{_zh_key(top_type)}」类型，"
+            f"五扇区划分和各扇区独立的衰减系数已退化为单一扇区。",
             metrics,
         )
     if top_share >= SKEWED_TYPE_SHARE:
         return Verdict(
             "sector_typing",
             "active",
-            f"Sector typing is in use but skewed (top share {top_share:.0%}).",
+            f"扇区分类已在使用，但分布偏斜（最大占比 {top_share:.0%}）。",
             metrics,
         )
-    return Verdict("sector_typing", "active", "Sector typing shows real diversity.", metrics)
+    return Verdict("sector_typing", "active", "扇区分类已真实分化。", metrics)
 
 
 def _lifecycle_verdict(status_dist: dict[str, int], total: int) -> Verdict:
     metrics = {"distinct_statuses": len(status_dist), "distribution": status_dist}
     if total == 0:
-        return Verdict("lifecycle_status", "insufficient_data", "No memories to evaluate.", metrics)
+        return Verdict("lifecycle_status", "insufficient_data", "暂无可评估的记忆。", metrics)
     if len(status_dist) <= 1:
         only = next(iter(status_dist), "dynamic")
         return Verdict(
             "lifecycle_status",
             "dormant",
-            f"All memories are '{only}'. Lifecycle status factors "
-            f"(resolved/pinned weighting) never differentiate scoring.",
+            f"所有记忆都处于「{_zh_key(only)}」状态，"
+            f"生命周期因子（已解决/钉选加权）从未参与区分打分。",
             metrics,
         )
-    return Verdict("lifecycle_status", "active", "Multiple lifecycle states are in use.", metrics)
+    return Verdict("lifecycle_status", "active", "多种生命周期状态已在使用。", metrics)
 
 
 def _temporal_verdict(temporal: dict[str, int]) -> Verdict:
@@ -767,18 +776,18 @@ def _temporal_verdict(temporal: dict[str, int]) -> Verdict:
         return Verdict(
             "temporal_kg",
             "dormant",
-            "No memory carries a temporal subject/predicate key. The bi-temporal KG "
-            "(invalidation, timeline, supersession) has never been triggered on real data.",
+            "没有记忆携带时间主语/谓语键，双时态知识图谱（失效、时间线、替代）"
+            "从未在真实数据上被触发。",
             temporal,
         )
     if supersession == 0:
         return Verdict(
             "temporal_kg",
             "active",
-            f"{key_count} memories carry temporal keys but no supersession has occurred yet.",
+            f"{key_count} 条记忆携带时间键，但尚未发生任何替代。",
             temporal,
         )
-    return Verdict("temporal_kg", "active", "Temporal keys and supersession links are present.", temporal)
+    return Verdict("temporal_kg", "active", "时间键与替代链路均已出现。", temporal)
 
 
 def _graph_verdict(tag_coverage: dict[str, object], total: int) -> Verdict:
@@ -786,7 +795,7 @@ def _graph_verdict(tag_coverage: dict[str, object], total: int) -> Verdict:
         return Verdict(
             "graph_structure",
             "insufficient_data",
-            f"Only {total} memories; tag/space coverage is not yet meaningful.",
+            f"仅 {total} 条记忆，标签/空间覆盖率还不具参考意义。",
             tag_coverage,
         )
     topic_cov = float(tag_coverage.get("topic_coverage", 0.0))  # type: ignore[arg-type]
@@ -794,11 +803,11 @@ def _graph_verdict(tag_coverage: dict[str, object], total: int) -> Verdict:
         return Verdict(
             "graph_structure",
             "sparse",
-            f"Only {topic_cov:.0%} of memories have topics. Network graph, traversal, "
-            f"and Time Ripple have almost no edges to work with.",
+            f"只有 {topic_cov:.0%} 的记忆带主题标签，"
+            f"记忆网络、图遍历和时间涟漪几乎没有可用的边。",
             tag_coverage,
         )
-    return Verdict("graph_structure", "active", "Topic/space tagging gives the graph real edges.", tag_coverage)
+    return Verdict("graph_structure", "active", "主题/空间标注让图谱拥有真实的边。", tag_coverage)
 
 
 def _affect_metrics(
@@ -851,14 +860,14 @@ def _affect_verdict(affect: dict[str, object], total: int) -> Verdict:
         return Verdict(
             "emotion_affect",
             "insufficient_data",
-            "valence/arousal columns are missing; affect cannot be diagnosed.",
+            "缺少 valence/arousal 字段，无法诊断情绪通道。",
             affect,
         )
     if total < MIN_MEANINGFUL_COUNT:
         return Verdict(
             "emotion_affect",
             "insufficient_data",
-            f"Only {total} memories; affect distribution is not yet meaningful.",
+            f"仅 {total} 条记忆，情绪分布还不具参考意义。",
             affect,
         )
     emotional = int(affect.get("emotional_sector_count", 0))  # type: ignore[arg-type]
@@ -870,23 +879,22 @@ def _affect_verdict(affect: dict[str, object], total: int) -> Verdict:
         return Verdict(
             "emotion_affect",
             "degenerate",
-            f"Emotional sector={emotional}; {default_share:.0%} of memories sit at default affect "
-            f"(valence≈0.5/arousal≈0.3). Emotion-weighted decay and mode=emotional surfacing "
-            f"never differentiate.",
+            f"情绪扇区仅 {emotional} 条，{default_share:.0%} 的记忆停在默认情绪值"
+            f"（正向度≈0.5 / 唤起度≈0.3），情绪加权衰减和情绪浮现模式无从区分。",
             affect,
         )
     if default_share >= DEFAULT_AFFECT_SKEWED_SHARE:
         return Verdict(
             "emotion_affect",
             "active",
-            f"Affect is in use but mostly default ({default_share:.0%} at 0.5/0.3, "
-            f"emotional sector={emotional}).",
+            f"情绪坐标已在使用，但大多停留在默认值"
+            f"（{default_share:.0%} 为 0.5/0.3，情绪扇区 {emotional} 条）。",
             affect,
         )
     return Verdict(
         "emotion_affect",
         "active",
-        f"Affect shows real spread (emotional sector={emotional}, {default_share:.0%} at default).",
+        f"情绪坐标已真实散开（情绪扇区 {emotional} 条，默认值占 {default_share:.0%}）。",
         affect,
     )
 
@@ -921,7 +929,7 @@ def _recall_metrics(
 
 def _recall_verdict(recall: dict[str, object], total: int) -> Verdict:
     if total == 0:
-        return Verdict("recall_health", "insufficient_data", "No memories to evaluate.", recall)
+        return Verdict("recall_health", "insufficient_data", "暂无可评估的记忆。", recall)
     recalled = int(recall.get("recalled_count", 0))  # type: ignore[arg-type]
     total_recalls = int(recall.get("total_recalls", 0))  # type: ignore[arg-type]
     concentration = float(recall.get("top1_concentration", 0.0))  # type: ignore[arg-type]
@@ -929,21 +937,21 @@ def _recall_verdict(recall: dict[str, object], total: int) -> Verdict:
         return Verdict(
             "recall_health",
             "dormant",
-            "No memory has ever been recalled; search/surface have not driven any activation.",
+            "还没有记忆被召回过，搜索/浮现尚未带来任何激活。",
             recall,
         )
     if concentration >= RECALL_CONCENTRATION_WARN:
         return Verdict(
             "recall_health",
             "active",
-            f"Recall is concentrated: the top memory holds {concentration:.0%} of all activations "
-            f"({recalled}/{total} memories recalled).",
+            f"召回高度集中：最热的一条记忆占了全部激活的 {concentration:.0%}"
+            f"（{recalled}/{total} 条被召回过）。",
             recall,
         )
     return Verdict(
         "recall_health",
         "active",
-        f"{recalled}/{total} memories have been recalled; activation is reasonably spread.",
+        f"{recalled}/{total} 条记忆被召回过，激活分布比较均匀。",
         recall,
     )
 
@@ -1360,9 +1368,9 @@ def _label_validation_issues(
     for label in labels:
         label_id = str(label.get("id") or "")
         if not str(label.get("query") or "").strip():
-            issues.append({"code": "blank_query", "label_id": label_id, "message": "Query cannot be blank."})
+            issues.append({"code": "blank_query", "label_id": label_id, "message": "query 不能为空。"})
         if label_id in seen:
-            issues.append({"code": "duplicate_label_id", "label_id": label_id, "message": f"Duplicate label id: {label_id}"})
+            issues.append({"code": "duplicate_label_id", "label_id": label_id, "message": f"标注 ID 重复:{label_id}"})
         seen.add(label_id)
         judgment = str(label.get("judgment") or "unlabeled")
         relevant_ids = list(label.get("relevant_ids", []))
@@ -1371,7 +1379,7 @@ def _label_validation_issues(
                 {
                     "code": "invalid_judgment",
                     "label_id": label_id,
-                    "message": f"Invalid judgment for {label_id}: {judgment}",
+                    "message": f"{label_id} 的标注判断无效:{judgment}",
                 }
             )
         elif judgment == "relevant" and not relevant_ids:
@@ -1379,7 +1387,7 @@ def _label_validation_issues(
                 {
                     "code": "missing_relevant_ids",
                     "label_id": label_id,
-                    "message": f"Relevant label {label_id} must include at least one memory id.",
+                    "message": f"{label_id} 标为「有相关记忆」时至少要选择一条记忆。",
                 }
             )
         elif judgment == "no_answer" and relevant_ids:
@@ -1387,7 +1395,7 @@ def _label_validation_issues(
                 {
                     "code": "no_answer_with_relevant_ids",
                     "label_id": label_id,
-                    "message": f"No-answer label {label_id} cannot include relevant memory ids.",
+                    "message": f"{label_id} 标为「无答案」时不能勾选相关记忆。",
                 }
             )
         elif judgment == "unlabeled" and relevant_ids:
@@ -1395,7 +1403,7 @@ def _label_validation_issues(
                 {
                     "code": "unlabeled_with_relevant_ids",
                     "label_id": label_id,
-                    "message": f"Unlabeled query {label_id} cannot include relevant memory ids.",
+                    "message": f"{label_id} 尚未标注，不应勾选相关记忆。",
                 }
             )
         for memory_id in relevant_ids:
@@ -1406,7 +1414,7 @@ def _label_validation_issues(
                         "code": "unknown_memory_id",
                         "label_id": label_id,
                         "memory_id": memory_id_text,
-                        "message": f"Memory id is not in the current snapshot/user scope: {memory_id_text}",
+                        "message": f"记忆 ID 不在当前快照/用户范围内:{memory_id_text}",
                     }
                 )
     return issues

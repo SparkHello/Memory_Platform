@@ -153,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/mcp_server/context.py`：用 contextvar 保存当前 MCP 请求的 user id。
 - `app/mcp_server/server.py`：FastMCP server、instructions 和全部 MCP 工具。
 - `app/memory/models.py`：记忆、核心记忆、候选记忆、体检建议、决策日志等 Pydantic 模型。
-- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、空间/主题/实体分类、Time Ripple 邻近激活、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要和决策日志。
+- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、空间/主题/实体分类、Time Ripple 邻近激活、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要和决策日志。决策日志写入时按每用户保留最近 5000 条（`_DECISION_LOG_RETENTION_LIMIT`），超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`_ClosingSQLiteConnection`）。
 - `app/memory/search.py`：embedding/中文关键词召回、拒绝阈值、多模式自然浮现、敏感硬过滤、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
 - `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。
@@ -161,7 +161,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
 - `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
-- `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测。
+- `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测，以及按 `(memory_id, updated_at)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
 - `scripts/audit_memory_db.py`：真实 SQLite 记忆库的只读巡检工具。只检查 schema、旧 type 残留、Time Ripple 配置、JSON 字段和 usage_count/temporal 统计，不写入 `data/memory.db`，也不打印密钥。
 - `app/memory/evaluation.py`：机制诊断与召回评测共享实现，供 REST/Web 和 CLI 共同调用。
 - `scripts/diagnose_memory_health.py`：只读诊断各记忆机制是否被真实数据激活（扇区分化、生命周期状态、temporal KG、图结构），把原始计数翻译成 active/degenerate/dormant/sparse 判定。

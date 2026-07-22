@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 export type ConfirmTone = "default" | "danger" | "warning";
@@ -20,6 +20,16 @@ type PendingConfirm = Required<Pick<ConfirmOptions, "confirmLabel" | "cancelLabe
 
 export function useConfirm() {
   const [pending, setPending] = useState<PendingConfirm | null>(null);
+  const pendingRef = useRef<PendingConfirm | null>(null);
+  pendingRef.current = pending;
+
+  // 组件卸载时把挂起的确认视为取消，避免 await confirm(...) 永不 settle。
+  useEffect(
+    () => () => {
+      pendingRef.current?.resolve(false);
+    },
+    []
+  );
 
   const confirm: ConfirmFn = useCallback((options) => {
     const normalized: ConfirmOptions =

@@ -186,9 +186,11 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 
 `/ui` 是一个本地管理和调试台，首次使用需要填写 API Base URL、访问密钥和用户 ID。
 
+控制台按“工作室 / 记忆 / 治理 / 数据 / 系统”五个分区组织，侧栏直接展示分区内的全部页面，并为待处理事项显示角标（体检建议、待标注 query、回收站）。工作室首页是汇总各分区待办的枢纽。
+
 | 页面 | 作用 |
 | --- | --- |
-| 记忆工作室 | 浮现记忆、情绪分布、空间概览、记忆网络和实验性图遍历入口。 |
+| 记忆工作室 | 今日待办、浮现记忆、今日精选、情绪分布、空间概览、记忆网络和实验性图遍历入口。 |
 | 记忆库 | 搜索、过滤、查看、编辑、软删除、恢复、永久删除、标签/实体/空间管理。 |
 | 核心记忆 | 查看核心记忆、历史版本并触发重新整理。 |
 | 记忆体检 | 生成治理建议、风险标签、严重程度、手动动作和 AI 修订预览。 |
@@ -196,7 +198,7 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 | 评测闭环 | 机制诊断、召回快照、人工标注、关键词/embedding 指标。 |
 | 近期上下文 | 查看最近会话摘要。 |
 | 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
-| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录。 |
+| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
 | 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
 
 ## REST 接口概览
@@ -254,7 +256,7 @@ search_memory、surface_memories、submit_memory_text、get_core_memory、get_re
 | `POST` | `/memories/core/consolidate` | 从长期记忆重新整理核心记忆。 |
 | `GET` | `/memories/recent-context` | 列出近期上下文摘要。 |
 | `POST` | `/memories/recent-context` | 提交或替换近期上下文摘要，body 为 `conversation_id` 和 `summary`。 |
-| `GET` | `/memories/decision-logs` | 列出决策和审计日志。 |
+| `GET` | `/memories/decision-logs` | 列出决策和审计日志，支持 `conversation_id`、`memory_id` 和 `limit` 过滤。 |
 | `POST` | `/memories/review` | 生成治理体检建议。 |
 | `POST` | `/memories/review/actions` | 应用手动治理动作，如确认、延后、降权、移入回收站、合并。 |
 | `POST` | `/memories/review/revise/related` | AI 修订前查找相关记忆。 |

@@ -1,0 +1,12 @@
+Memory Console 工作室 Hero 背景
+
+"Prairie Lightning" — Tim Mossholder
+来源: https://unsplash.com/photos/a-large-field-with-a-lightning-bolt-in-the-sky-Obpget_fY8U
+许可: Unsplash License — https://unsplash.com/license
+用途: 仅用于记忆工作室约 360px 高的 Hero，并随本地应用发布；摄影师署名保留于此。
+
+Vite 资源（位于 ui/src/assets/）：
+- studio-storm-1600.webp（1600 × 1067，普通屏与移动端）
+- studio-storm-3840.webp（3840 × 2560，高像素密度桌面）
+- studio-storm-1600.jpg（1600 × 1066，移动端 JPEG fallback）
+- studio-storm.jpg（3840 × 2560，JPEG fallback）

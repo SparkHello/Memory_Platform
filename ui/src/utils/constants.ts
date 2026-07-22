@@ -19,6 +19,14 @@ export const MEMORY_TYPES: MemoryType[] = [
   "reflective"
 ];
 
+export const MEMORY_TYPE_COLOR_VAR: Record<MemoryType, string> = {
+  episodic: "var(--type-episodic)",
+  semantic: "var(--type-semantic)",
+  procedural: "var(--type-procedural)",
+  emotional: "var(--type-emotional)",
+  reflective: "var(--type-reflective)"
+};
+
 export const MEMORY_STATUSES: MemoryStatus[] = ["dynamic", "resolved", "archived", "pinned"];
 export const STABILITIES: MemoryStability[] = ["temporary", "medium", "stable"];
 export const SENSITIVITIES: MemorySensitivity[] = ["normal", "private", "sensitive"];
@@ -53,6 +61,15 @@ export const CORE_SECTIONS: Array<{ key: CoreSectionName; title: string }> = [
   { key: "communication", title: "沟通方式" }
 ];
 
+export const CORE_SECTION_COLOR_VAR: Record<CoreSectionName, string> = {
+  profile: "var(--type-semantic)",
+  preferences: "var(--type-emotional)",
+  relationships: "var(--type-episodic)",
+  routines: "var(--type-procedural)",
+  goals: "var(--emo-mid)",
+  communication: "var(--type-reflective)"
+};
+
 export const CONFIG_KEYS = [
   "GATEWAY_API_KEY",
   "UPSTREAM_BASE_URL",
@@ -66,6 +83,20 @@ export const CONFIG_KEYS = [
   "EVAL_DIR",
   "REQUEST_TIMEOUT_SECONDS"
 ];
+
+export const CONFIG_KEY_HINTS: Record<string, string> = {
+  GATEWAY_API_KEY: "服务端 .env 中配置的服务访问密钥；上方「连接设置」需填写相同的值",
+  UPSTREAM_BASE_URL: "上游聊天模型的 OpenAI 兼容接口地址",
+  UPSTREAM_API_KEY: "服务端调用上游模型的密钥，只在服务端使用，不会透传给客户端",
+  UPSTREAM_MODEL: "记忆提取与整理所使用的模型名称",
+  EMBEDDING_BASE_URL: "向量化（embedding）服务的接口地址",
+  EMBEDDING_API_KEY: "服务端调用向量化服务的密钥，不会透传给客户端",
+  EMBEDDING_MODEL: "搜索召回所使用的向量模型名称",
+  EMBEDDING_DIMENSIONS: "向量维度，需与模型输出保持一致",
+  DATABASE_PATH: "SQLite 记忆数据库文件路径",
+  EVAL_DIR: "召回评测的快照与标注工作目录",
+  REQUEST_TIMEOUT_SECONDS: "服务端调用上游模型的超时秒数"
+};
 
 export const DISPLAY_TEXT: Record<string, string> = {
   all: "全部",
@@ -119,8 +150,10 @@ export const DISPLAY_TEXT: Record<string, string> = {
   insufficient_data: "样本不足",
   sector_typing: "扇区分化",
   lifecycle_status: "生命周期",
-  temporal_kg: "Temporal KG",
+  temporal_kg: "时序知识图谱",
   graph_structure: "图结构",
+  emotion_affect: "情绪通道",
+  recall_health: "召回健康",
   keyword: "关键词",
   embedding: "语义",
   orphan_core_evidence: "核心证据缺失",

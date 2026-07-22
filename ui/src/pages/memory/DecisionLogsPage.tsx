@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArchiveRestore,
@@ -20,7 +20,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
@@ -90,17 +90,21 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
   const [conversationId, setConversationId] = useState("");
   const [selected, setSelected] = useState<DecisionLog | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setState({ loading: true, error: null, data: null });
     try {
-      setState({ loading: false, error: null, data: await api.decisionLogs(100) });
+      setState({ loading: false, error: null, data: await api.decisionLogs(100, {}, signal) });
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
     }
   }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   const logs = useMemo(() => {
@@ -119,7 +123,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
         title="决策日志"
         subtitle="查看记忆保存、更新和忽略决策。"
         action={
-          <button className="secondary-button" type="button" onClick={load}>
+          <button className="secondary-button" type="button" onClick={() => void load()}>
             <RefreshCcw size={16} />
             刷新
           </button>
@@ -143,8 +147,24 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
           </label>
         </div>
         {state.loading && <LoadingBlock label="正在加载决策日志" />}
-        {state.error && <ErrorBlock message={state.error} onRetry={load} />}
-        {!state.loading && !state.error && logs.length === 0 && <EmptyBlock label="暂无决策日志" />}
+        {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
+        {!state.loading && !state.error && logs.length === 0 && (
+          <EmptyBlock
+            label="暂无决策日志"
+            hint="记忆每一次被保存、更新或忽略的决策都会记录在这里。"
+            action={
+              decision !== "all" || conversationId.trim()
+                ? {
+                    label: "清除筛选",
+                    onClick: () => {
+                      setDecision("all");
+                      setConversationId("");
+                    }
+                  }
+                : undefined
+            }
+          />
+        )}
         {logs.length > 0 && (
           <div className="table-wrap">
             <table className="data-table">
@@ -182,12 +202,14 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
               ["创建时间", selected.created_at]
             ]}
           />
-          <pre className="json-block">{prettyJson(selected.candidate_json)}</pre>
+          <details className="raw-json-details">
+            <summary>查看原始 JSON</summary>
+            <pre className="json-block">{prettyJson(selected.candidate_json)}</pre>
+          </details>
         </Modal>
       )}
     </div>
   );
 }
-
 
 

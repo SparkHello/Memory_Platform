@@ -1,0 +1,51 @@
+:where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 3px solid var(--focus-outline);
+  outline-offset: 3px;
+}
+
+:where(button, input, select, textarea) {
+  min-height: 44px;
+}
+
+.icon-button {
+  min-width: 44px;
+}
+
+[aria-busy="true"] {
+  cursor: progress;
+}
+
+[aria-busy="true"] > :not(.state-block) {
+  opacity: 0.72;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 780px) {
+  button {
+    min-height: 44px !important;
+  }
+
+  :where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline-offset: 2px;
+  }
+
+  .compact,
+  .icon-button.compact,
+  .tabs button,
+  .network-density-tabs button,
+  .topbar .status-pill,
+  .topbar .icon-button,
+  .topbar .avatar-chip {
+    min-height: 44px;
+  }
+}

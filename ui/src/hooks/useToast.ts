@@ -22,6 +22,10 @@ export function useToast() {
     if (!toast) {
       return;
     }
+    // 错误提示停留到用户手动关闭，避免还没读完就消失
+    if (toast.kind === "error") {
+      return;
+    }
     const timer = window.setTimeout(clearToast, 3200);
     return () => window.clearTimeout(timer);
   }, [clearToast, toast]);

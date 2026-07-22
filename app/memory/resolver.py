@@ -1,10 +1,19 @@
 import json
+from functools import partial
+
+import anyio
 
 from app.memory.classification import classify_memory, normalize_classification_values
 from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
 from app.memory.search import EmbeddingClient, cosine_similarity
 from app.memory.store import MemoryStore
-from app.memory.utils import _char_overlap, _has_negation, _normalize, _term_jaccard
+from app.memory.utils import (
+    _char_overlap,
+    _has_negation,
+    _memory_embedding_vector,
+    _normalize,
+    _term_jaccard,
+)
 
 # embedding 余弦相似度达到该值即视为同主题旧记忆
 EMBEDDING_SIMILARITY_THRESHOLD = 0.80
@@ -33,7 +42,9 @@ class MemoryResolver:
         conversation_id: str | None = None,
         auto_classify: bool = True,
     ) -> ResolveResult:
-        existing = self.store.list_memories(user_id=user_id, limit=200)
+        existing = await anyio.to_thread.run_sync(
+            partial(self.store.list_memories, user_id=user_id, limit=200)
+        )
         normalized_new = _normalize(candidate.memory)
 
         for memory in existing:
@@ -56,17 +67,21 @@ class MemoryResolver:
         vector = await self.embedding_client.embed(candidate.memory)
         embedding_json = json.dumps(vector, ensure_ascii=False) if vector else None
 
-        target, related_reason, relation = _find_related_memory(
-            candidate, existing, vector, normalized_new
+        target, related_reason, relation = await anyio.to_thread.run_sync(
+            partial(_find_related_memory, candidate, existing, vector, normalized_new)
         )
-        classification_kwargs = self._classification_kwargs(
-            user_id=user_id,
-            candidate=candidate,
-            source_text=source_message or candidate.source_quote or candidate.memory,
-            auto_classify=auto_classify,
+        classification_kwargs = await anyio.to_thread.run_sync(
+            partial(
+                self._classification_kwargs,
+                user_id=user_id,
+                candidate=candidate,
+                source_text=source_message or candidate.source_quote or candidate.memory,
+                auto_classify=auto_classify,
+            )
         )
-        if target:
-            created = self.store.create_memory(
+        created = await anyio.to_thread.run_sync(
+            partial(
+                self.store.create_memory,
                 user_id=user_id,
                 content=candidate.memory,
                 type=candidate.type,
@@ -86,33 +101,14 @@ class MemoryResolver:
                 temporal_predicate=candidate.temporal_predicate,
                 **classification_kwargs,
             )
+        )
+        if target:
             return ResolveResult(
                 action="create",
                 memory=created,
                 relation=relation,
                 reason=f"{related_reason}，暂不自动合并，建议体检确认",
             )
-
-        created = self.store.create_memory(
-            user_id=user_id,
-            content=candidate.memory,
-            type=candidate.type,
-            importance=candidate.importance,
-            confidence=candidate.confidence,
-            valence=candidate.valence,
-            arousal=candidate.arousal,
-            source_message=source_message,
-            source_conversation_id=conversation_id,
-            embedding_json=embedding_json,
-            stability=candidate.stability,
-            valid_from=candidate.valid_from,
-            valid_until=candidate.valid_until,
-            review_after=candidate.review_after,
-            sensitivity=candidate.sensitivity,
-            temporal_subject=candidate.temporal_subject,
-            temporal_predicate=candidate.temporal_predicate,
-            **classification_kwargs,
-        )
         return ResolveResult(action="create", memory=created, reason="没有相似旧记忆，创建新记忆")
 
 
@@ -167,7 +163,7 @@ def _find_related_memory(
     if vector:
         best, best_score = None, 0.0
         for memory in existing:
-            old_vector = _load_vector(memory.embedding_json)
+            old_vector = _memory_embedding_vector(memory)
             if old_vector is None:
                 continue
             score = cosine_similarity(vector, old_vector)
@@ -190,21 +186,6 @@ def _find_related_memory(
         return best, _related_reason_for_relation(relation), relation
 
     return None, "", "none"
-
-
-def _load_vector(embedding_json: str | None) -> list[float] | None:
-    if not embedding_json:
-        return None
-    try:
-        data = json.loads(embedding_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, list):
-        return None
-    try:
-        return [float(value) for value in data]
-    except (TypeError, ValueError):
-        return None
 
 
 def _related_content_relation(new_content: str, old_content: str) -> MemoryRelation:

@@ -1,4 +1,4 @@
-﻿import json
+import json
 
 from app.memory.health import MemoryHealthChecker
 from app.memory.search import _SEARCH_CACHE
@@ -196,6 +196,7 @@ def test_memory_health_reports_search_cache_and_decision_log_info(
     _SEARCH_CACHE[("default", "coffee", 5)] = (
         9999999999.0,
         "2026-06-16T00:00:00+00:00",
+        1,
         [{"id": "missing-cache-memory"}],
     )
     memory_store.create_decision_log(

@@ -1,0 +1,225 @@
+:root {
+  color-scheme: dark;
+
+  /* ── 暮色琥珀基底：夜里调暗的房间，玻璃后面有一片暖光场 ── */
+  --bg: #131016;
+  --bg-deep: #0d0a10;
+  --surface: rgba(40, 34, 38, 0.5);
+  --surface-muted: rgba(255, 255, 255, 0.045);
+  --surface-strong: rgba(255, 255, 255, 0.09);
+  --solid-bg: #201b20;
+  --th-bg: rgba(32, 27, 31, 0.9);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f1ebe2;
+  --muted: #a49b91;
+  --muted-strong: #c6bdb2;
+  --primary: #d8b078;
+  --primary-hover: #e6c48e;
+  --primary-soft: rgba(216, 176, 120, 0.12);
+  --on-primary: #251a0a;
+  --mid: #d8b078;
+  --on-vivid: #251a0a;
+  --accent: #dcab7c;
+  --accent-soft: rgba(220, 171, 124, 0.11);
+  --success: #86c2a3;
+  --warning: #dcb274;
+  --danger: #dc939c;
+  --info: #93bccd;
+  --field-bg: rgba(0, 0, 0, 0.24);
+  --field-bg-focus: rgba(0, 0, 0, 0.38);
+
+  /* ── 玻璃材质：磨砂玻璃 + 顶部受光 + 深投影 ── */
+  --sidebar-text: #f1ebe2;
+  --sidebar-muted: #9a9188;
+  --sidebar-surface: rgba(255, 255, 255, 0.06);
+  --glass-bg: rgba(34, 29, 33, 0.62);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-blur: blur(26px) saturate(1.45);
+  --glass-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 22px 54px -16px rgba(5, 3, 9, 0.6),
+    0 4px 16px rgba(5, 3, 9, 0.3);
+
+  /* 面板玻璃：带一点斜向光感的渐变底 */
+  --glass-panel-bg: linear-gradient(155deg, rgba(48, 41, 45, 0.58), rgba(28, 23, 28, 0.44));
+  --glass-panel-hover: linear-gradient(155deg, rgba(58, 50, 54, 0.64), rgba(36, 30, 35, 0.52));
+
+  /* 兼容旧名：水晶 = 玻璃 */
+  --crystal-bg: var(--glass-panel-bg);
+  --crystal-bg-hover: var(--glass-panel-hover);
+  --crystal-ink: var(--text);
+  --crystal-muted: var(--sidebar-muted);
+  --crystal-border: var(--glass-border);
+  --crystal-shadow: var(--glass-shadow);
+
+  --focus-ring: rgba(230, 196, 142, 0.45);
+  --focus-outline: #e6c48e;
+
+  /* ── 网络图 ── */
+  --network-core: #dcab7c;
+  --network-core-stroke: #f4e2c8;
+  --network-node-stroke: #f1ebe2;
+  --network-hot-stroke: #2b2126;
+
+  --scrim: none;
+  --brand-bg: linear-gradient(150deg, #3a2f26, #241c1e);
+  --brand-color: #e6c48e;
+  --eq-dot-fill: #e6c48e;
+
+  /* ── 圆角 ── */
+  --radius-sm: 9px;
+  --radius-md: 14px;
+  --radius-lg: 22px;
+  --radius-button: 11px;
+
+  --shadow-sm: 0 2px 8px rgba(5, 3, 9, 0.25);
+  --shadow-md: 0 24px 64px -12px rgba(5, 3, 9, 0.6);
+  --shadow-card: 0 1px 3px rgba(5, 3, 9, 0.18), 0 10px 28px -10px rgba(5, 3, 9, 0.38);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ── 动效：指数缓出，不弹跳 ── */
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --t-fast: 160ms;
+  --t-med: 260ms;
+  --t-slow: 480ms;
+
+  /* ── 字体：界面用系统无衬线，记忆正文与问候用衬线 ── */
+  --serif: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Segoe UI", "Microsoft YaHei", sans-serif;
+  --serif-display: "Georgia", "Songti SC", "Noto Serif SC", "Source Han Serif SC", "STSong", serif;
+  --mono: "SF Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, monospace;
+
+  --text-display: clamp(32px, 3.8vw, 48px);
+  --text-title: clamp(24px, 2.2vw, 34px);
+  --text-section: 15px;
+  --text-caption: 12px;
+
+  --tier1-bg: var(--surface);
+  --tier1-border: var(--border);
+  --tier2-bg: transparent;
+  --tier2-border: var(--border);
+  --tier3-bg: var(--surface-muted);
+
+  --sidebar-width: 220px;
+  --sidebar-offset: calc(var(--sidebar-width) + 28px);
+
+  /* ── 类型色谱：暮色下的五种记忆 ── */
+  --type-episodic: #85b4d8;
+  --type-semantic: #9dabde;
+  --type-procedural: #86c2a3;
+  --type-emotional: #dc9db0;
+  --type-reflective: #b8a3dc;
+  --emo-neg: #dc939c;
+  --emo-mid: #dcb274;
+  --emo-pos: #86c2a3;
+
+  /* ── 光场颜色：琥珀余烬 / 暮色玫瑰 / 远处的暮蓝 ── */
+  --ambient-a: rgba(219, 160, 88, 0.23);
+  --ambient-b: rgba(172, 102, 130, 0.17);
+  --ambient-c: rgba(100, 138, 178, 0.16);
+  --ambient-glow: rgba(230, 196, 142, 0.12);
+  --ambient-vignette: rgba(7, 5, 10, 0.38);
+  --grain-opacity: 0.05;
+
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--serif);
+  font-size: 14px;
+  line-height: 1.65;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* ── 晨窗玻璃：清晨的光透过磨砂玻璃 ── */
+  --bg: #ebe6de;
+  --bg-deep: #e2dcd2;
+  --surface: rgba(255, 255, 255, 0.55);
+  --surface-muted: rgba(70, 56, 42, 0.05);
+  --surface-strong: rgba(70, 56, 42, 0.1);
+  --solid-bg: #fdfbf7;
+  --th-bg: rgba(250, 247, 241, 0.94);
+  --border: rgba(70, 56, 42, 0.1);
+  --border-strong: rgba(70, 56, 42, 0.2);
+  --text: #211c17;
+  --muted: #6c665c;
+  --muted-strong: #47423b;
+  --primary: #7c5f28;
+  --primary-hover: #6d5322;
+  --primary-soft: rgba(139, 111, 58, 0.1);
+  --on-primary: #ffffff;
+  --mid: #8a6a33;
+  --on-vivid: #ffffff;
+  --accent: #86592e;
+  --accent-soft: rgba(155, 112, 64, 0.09);
+  --success: #2e7354;
+  --warning: #78591a;
+  --danger: #a84858;
+  --info: #35606e;
+  --field-bg: rgba(255, 255, 255, 0.55);
+  --field-bg-focus: #ffffff;
+  --focus-ring: rgba(124, 95, 40, 0.35);
+  --focus-outline: #6d5322;
+
+  --sidebar-text: #241f18;
+  --sidebar-muted: #6c665c;
+  --sidebar-surface: rgba(70, 56, 42, 0.07);
+  --glass-bg: rgba(255, 255, 255, 0.6);
+  --glass-border: rgba(70, 56, 42, 0.12);
+  --glass-blur: blur(26px) saturate(1.5);
+  --glass-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    0 20px 48px -18px rgba(96, 74, 50, 0.28),
+    0 3px 12px rgba(96, 74, 50, 0.08);
+  --glass-panel-bg: linear-gradient(155deg, rgba(255, 255, 255, 0.74), rgba(255, 253, 248, 0.52));
+  --glass-panel-hover: linear-gradient(155deg, rgba(255, 255, 255, 0.85), rgba(255, 253, 248, 0.65));
+
+  --crystal-bg: var(--glass-panel-bg);
+  --crystal-bg-hover: var(--glass-panel-hover);
+  --crystal-ink: var(--text);
+  --crystal-muted: var(--sidebar-muted);
+  --crystal-border: var(--glass-border);
+  --crystal-shadow: var(--glass-shadow);
+
+  --shadow-sm: 0 2px 8px rgba(96, 74, 50, 0.1);
+  --shadow-md: 0 24px 60px -14px rgba(96, 74, 50, 0.3);
+  --shadow-card: 0 1px 3px rgba(96, 74, 50, 0.07), 0 10px 26px -12px rgba(96, 74, 50, 0.16);
+
+  --brand-bg: linear-gradient(150deg, #f3e6cf, #e7d5b6);
+  --brand-color: #6d5322;
+  --eq-dot-fill: #8a6a33;
+
+  --network-core: #8b6f3a;
+  --network-core-stroke: #3a2f1a;
+  --network-node-stroke: #ffffff;
+  --network-hot-stroke: #2b2126;
+
+  --type-episodic: #33709e;
+  --type-semantic: #4f60ae;
+  --type-procedural: #2e7d5e;
+  --type-emotional: #9e4a68;
+  --type-reflective: #6f51a0;
+  --emo-neg: #a84858;
+  --emo-mid: #7d6026;
+  --emo-pos: #2e7d5e;
+
+  /* ── 晨光光场：暖金 / 晨空蓝 / 一点桃色 ── */
+  --ambient-a: rgba(228, 178, 100, 0.34);
+  --ambient-b: rgba(150, 178, 210, 0.3);
+  --ambient-c: rgba(222, 160, 142, 0.22);
+  --ambient-glow: rgba(255, 244, 218, 0.55);
+  --ambient-vignette: rgba(120, 96, 66, 0.12);
+  --grain-opacity: 0.035;
+}

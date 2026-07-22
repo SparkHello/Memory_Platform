@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArchiveRestore,
@@ -20,7 +20,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
@@ -101,17 +101,21 @@ export function ReportsPage({
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const exportUserId = safeExportUserId(settings.userId || "default");
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setState({ loading: true, error: null, data: null });
     try {
-      setState({ loading: false, error: null, data: await api.memoryReport() });
+      setState({ loading: false, error: null, data: await api.memoryReport(signal) });
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
     }
   }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   const copyMarkdown = async () => {
@@ -193,7 +197,7 @@ export function ReportsPage({
         title="报告与备份"
         subtitle="查看报告、导出备份和谨慎导入。"
         action={
-          <button className="secondary-button" type="button" onClick={load}>
+          <button className="secondary-button" type="button" onClick={() => void load()}>
             <RefreshCcw size={16} />
             刷新
           </button>
@@ -208,7 +212,7 @@ export function ReportsPage({
           </button>
         </div>
         {state.loading && <LoadingBlock label="正在加载报告" />}
-        {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+        {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
         {state.data && (
           <>
             <div className="stats-grid">

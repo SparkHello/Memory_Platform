@@ -1,0 +1,331 @@
+/* Memory Console · 基础布局与全局元素 */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--primary) 32%, transparent);
+}
+
+::placeholder {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--primary);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* 重置 UA 默认按钮外观：漏样式的按钮在 Safari 也不会露出灰底 */
+button {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    background var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+/* ---- 侧栏骨架样式已并入 morning-crystal.css 的层级侧栏 ---- */
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 15px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--sidebar-text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.avatar-chip {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  background: var(--brand-bg);
+  color: var(--brand-color);
+  font-size: 15px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.topbar-right,
+.button-row,
+.quick-actions,
+.toolbar,
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.toolbar {
+  align-items: flex-end;
+  margin-bottom: 14px;
+}
+
+.panel.form-panel {
+  background: var(--surface);
+}
+
+.field-group {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 0 14px 0 0;
+  margin: 0;
+  border: 0;
+}
+
+.field-group legend {
+  width: 100%;
+  margin-bottom: 4px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.field-group + .field-group {
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
+
+.field-group .field-block.small {
+  flex: 1 1 150px;
+}
+
+.field-group .wide-field {
+  flex-basis: 280px;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.breadcrumb button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.breadcrumb button:hover {
+  text-decoration: underline;
+}
+
+.breadcrumb .separator {
+  color: var(--muted);
+}
+
+.link-inline {
+  padding: 0;
+  margin-left: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font-size: inherit;
+  cursor: pointer;
+}
+
+.link-inline:hover {
+  text-decoration: underline;
+}
+
+.tier-editor {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.tier-row {
+  display: grid;
+  grid-template-columns: 76px repeat(3, minmax(150px, 1fr));
+  align-items: end;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 7px;
+  background: var(--surface-muted);
+}
+
+.tier-row strong {
+  align-self: center;
+  color: var(--muted-strong);
+  font-size: 13px;
+}
+
+.log-toolbar {
+  gap: 14px;
+}
+
+.log-toolbar .field-block {
+  width: min(320px, 100%);
+}
+
+.button-row.end {
+  justify-content: flex-end;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--danger);
+}
+
+.status-dot.ok {
+  background: var(--success);
+  box-shadow: 0 0 8px rgba(127, 202, 156, 0.75);
+}
+
+.status-dot.bad {
+  background: var(--danger);
+  box-shadow: 0 0 8px rgba(227, 154, 166, 0.75);
+}
+
+.compact-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.compact-field input {
+  width: 180px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+/* 顶栏控件：圆形玻璃按钮，悬浮在底图上 */
+.topbar .icon-button,
+.topbar .secondary-button {
+  min-height: 40px;
+  border-color: var(--glass-border);
+  border-radius: 999px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--sidebar-text);
+}
+
+.topbar .icon-button {
+  width: 40px;
+}
+
+.topbar .icon-button:hover,
+.topbar .secondary-button:hover {
+  background: var(--sidebar-surface);
+}
+
+/* 入场动效移到子块上（morning-crystal 的交错浮现），容器不再整体动 */
+.page-stack {
+  display: grid;
+  gap: var(--space-5);
+  width: min(1480px, 100%);
+  margin: 0 auto;
+}
+
+/* 单列页面网格的列轨由所有子项共同决定，任一宽内容都会撑破整页；
+   子项 min-width 置 0，让每行各自收敛、内部滚动容器自行处理溢出。 */
+.page-stack > * {
+  min-width: 0;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+
+.page-header p {
+  margin: 7px 0 0;
+  color: var(--muted);
+}
+
+.page-action,
+.page-actions {
+  display: flex;
+  justify-content: flex-end;
+}

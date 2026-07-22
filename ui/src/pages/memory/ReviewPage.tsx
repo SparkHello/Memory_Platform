@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowDown,
@@ -24,7 +24,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
@@ -53,7 +53,7 @@ import type {
   ReviewSeverity,
   ReviewResult
 } from "../../types";
-import { badge } from "../../components/Badge";
+import { Badge, badge } from "../../components/Badge";
 import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { InfoCard, StatCard } from "../../components/StatCard";
@@ -95,11 +95,13 @@ import type { Notify } from "../pageTypes";
 export function ReviewPage({
   api,
   notify,
-  confirm
+  confirm,
+  openMemory
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
+  openMemory: (id: string) => void;
 }) {
   const [state, setState] = useState<
     LoadState<{ review: ReviewResult; health: DatabaseHealthResult; memories: MemoryRecord[]; logs: DecisionLog[] }>
@@ -123,20 +125,22 @@ export function ReviewPage({
   const [sortMode, setSortMode] = useState("severity_desc");
   const [showHealthInfo, setShowHealthInfo] = useState(false);
 
-  const load = useCallback(async (showToast = false) => {
+  const load = useCallback(async (showToast = false, signal?: AbortSignal) => {
     setState({ loading: true, error: null, data: null });
     try {
       const [review, health, memories, logs] = await Promise.all([
-        api.reviewMemories(),
-        api.memoryHealth(),
-        api.listMemories(),
-        api.decisionLogs(40)
+        api.reviewMemories(signal),
+        api.memoryHealth(signal),
+        api.listMemories({}, signal),
+        api.decisionLogs(40, {}, signal)
       ]);
       setState({ loading: false, error: null, data: { review, health, memories, logs } });
       if (showToast) {
         notify(`体检完成，共 ${review.recommendations.length} 条建议`, "success");
       }
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
       if (showToast) {
         notify(errorMessage(error), "error");
@@ -145,7 +149,9 @@ export function ReviewPage({
   }, [api, notify]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(false, controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   const memoryMap = useMemo(() => {
@@ -188,11 +194,11 @@ export function ReviewPage({
   }, [recommendations, dismissedKeys, riskFilter, severityFilter, coreFilter, sortMode, memoryMap]);
 
   const grouped = useMemo(() => {
-    const map = new Map<ReviewAction, ReviewRecommendation[]>(
-      REVIEW_ACTIONS.map((action) => [action, []])
+    const map = new Map<ReviewSeverity, ReviewRecommendation[]>(
+      REVIEW_SEVERITIES.map((severity) => [severity, []])
     );
     for (const recommendation of visibleRecommendations) {
-      map.get(recommendation.action)?.push(recommendation);
+      map.get(recommendation.severity)?.push(recommendation);
     }
     return map;
   }, [visibleRecommendations]);
@@ -551,133 +557,9 @@ export function ReviewPage({
         }
       />
       {state.loading && <LoadingBlock label="正在运行体检" />}
-      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
       {state.data && (
         <>
-          <div className="stats-grid">
-            <StatCard label="扫描记忆" value={state.data.review.total} />
-            <StatCard label="建议数量" value={state.data.review.recommendations.length} />
-            <StatCard label="高优先级" value={highPriority.length} />
-            <StatCard label="核心影响" value={coreRecommendationCount} />
-          </div>
-          <section className="panel governance-overview">
-            <div className="panel-header">
-              <h2>数据库健康</h2>
-              <span className="count-pill">{displayText(state.data.health.status)}</span>
-            </div>
-            <div className="stats-grid compact-stats">
-              <StatCard label="错误" value={state.data.health.summary.errors} />
-              <StatCard label="警告" value={state.data.health.summary.warnings} />
-              <StatCard label="提示" value={state.data.health.summary.info} />
-              <InfoCard label="检查时间" value={dateText(state.data.health.checked_at)} />
-            </div>
-            <div className="button-row">
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => setShowHealthInfo((value) => !value)}
-              >
-                <Database size={16} />
-                {showHealthInfo ? "隐藏提示" : "显示提示"}
-              </button>
-              <span className="muted-line">
-                当前显示 {visibleHealthIssues.length} / {healthIssues.length}
-              </span>
-            </div>
-            {visibleHealthIssues.length === 0 ? (
-              <EmptyBlock
-                label={healthIssues.length === 0 ? "数据库结构暂无风险" : "仅有提示项，当前已隐藏"}
-              />
-            ) : (
-              <div className="recommendation-list">
-                {visibleHealthIssues.map((issue) => (
-                  <article className="recommendation-card" key={healthIssueKey(issue)}>
-                    <div className="recommendation-topline">
-                      {badge(issue.type)}
-                      <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
-                        {displayText(issue.severity)}
-                      </span>
-                      <span className="count-pill">{issue.object_id}</span>
-                    </div>
-                    <p>{issue.message}</p>
-                    <FieldList
-                      compact
-                      entries={[
-                        ["关联 ID", issue.related_id],
-                        ["建议动作", issue.recommended_action]
-                      ]}
-                    />
-                  </article>
-                ))}
-              </div>
-            )}
-          </section>
-          <section className="panel governance-overview">
-            <div className="panel-header">
-              <h2>治理概览</h2>
-              <span className="count-pill">当前显示 {visibleRecommendations.length}</span>
-            </div>
-            <div className="governance-grid">
-              <div className="governance-block">
-                <strong>风险统计</strong>
-                {riskStats.length === 0 ? (
-                  <p className="muted-line">暂无风险标签</p>
-                ) : (
-                  <div className="risk-stat-list">
-                    {riskStats.map((item) => (
-                      <button
-                        className={`risk-stat ${riskFilter === item.risk ? "active" : ""}`}
-                        type="button"
-                        key={item.risk}
-                        onClick={() => setRiskFilter(riskFilter === item.risk ? "all" : item.risk)}
-                      >
-                        <span>{displayText(item.risk)}</span>
-                        <strong>{item.count}</strong>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <div className="governance-block">
-                <strong>高优先级待处理</strong>
-                {highPriority.length === 0 ? (
-                  <p className="muted-line">暂无高优先级建议</p>
-                ) : (
-                  <div className="mini-review-list">
-                    {highPriority.map((recommendation) => (
-                      <button
-                        className="mini-review-item"
-                        type="button"
-                        key={reviewDismissKey(recommendation)}
-                        onClick={() => {
-                          setSeverityFilter("high");
-                          setRiskFilter("all");
-                        }}
-                      >
-                        <span>{displayText(recommendation.risk_tags[0] || recommendation.action)}</span>
-                        <em>{recommendation.reason}</em>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <div className="governance-block">
-                <strong>最近 AI 修改</strong>
-                {recentAiLogs.length === 0 ? (
-                  <p className="muted-line">暂无近期 AI 修改记录</p>
-                ) : (
-                  <div className="mini-review-list">
-                    {recentAiLogs.map((log) => (
-                      <div className="mini-review-item passive" key={log.id}>
-                        <span>{dateText(log.created_at)}</span>
-                        <em>{candidateSummary(log.candidate_json)}</em>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
           {coreImpactSections.length > 0 && (
             <div className="notice warning core-impact-notice">
               <Layers3 size={18} />
@@ -736,25 +618,27 @@ export function ReviewPage({
             <EmptyBlock label="当前筛选下暂无体检建议" />
           )}
           <div className="review-groups">
-            {REVIEW_ACTIONS.map((action) => {
-              const items = grouped.get(action) || [];
+            {[...REVIEW_SEVERITIES].reverse().map((severity) => {
+              const items = grouped.get(severity) || [];
               if (items.length === 0) return null;
               return (
-                <section className="panel" key={action}>
+                <section className={`panel severity-queue severity-queue-${severity}`} key={severity}>
                   <div className="panel-header">
-                    <h2>{reviewActionText(action)}</h2>
+                    <h2>{severityText(severity)}严重度行动队列</h2>
                     <span className="count-pill">{items.length}</span>
                   </div>
                   <div className="recommendation-list">
                     {items.map((recommendation, index) => (
-                      <article className="recommendation-card" key={`${action}-${index}`}>
+                      <article className="recommendation-card" key={`${severity}-${index}`}>
                         <div className="recommendation-topline">
                           {badge(recommendation.action)}
                           {badge(recommendation.relation)}
                           <span className={`severity-pill severity-${recommendation.severity}`}>
                             {severityText(recommendation.severity)}
                           </span>
-                          {recommendation.risk_tags.map((risk) => badge(risk))}
+                          {recommendation.risk_tags.map((risk) => (
+                            <Badge key={risk} value={risk} />
+                          ))}
                           {recommendation.core_memory_sections.length > 0 && (
                             <span className="core-pill">
                               核心：{recommendation.core_memory_sections.map(sectionTitle).join("、")}
@@ -774,10 +658,16 @@ export function ReviewPage({
                           {recommendation.memory_ids.map((id) => {
                             const memory = memoryMap.get(id);
                             return (
-                              <div className="linked-memory" key={id}>
+                              <button
+                                className="linked-memory linked-memory-button"
+                                type="button"
+                                key={id}
+                                onClick={() => openMemory(id)}
+                                title="打开记忆档案"
+                              >
                                 <strong>{shortId(id)}</strong>
                                 <span>{memory?.content || "未在当前活跃记忆中找到"}</span>
-                              </div>
+                              </button>
                             );
                           })}
                         </div>
@@ -868,6 +758,131 @@ export function ReviewPage({
               );
             })}
           </div>
+
+          <div className="stats-grid">
+            <StatCard label="扫描记忆" value={state.data.review.total} />
+            <StatCard label="建议数量" value={state.data.review.recommendations.length} />
+            <StatCard label="高优先级" value={highPriority.length} />
+            <StatCard label="核心影响" value={coreRecommendationCount} />
+          </div>
+          <section className="panel panel--quiet governance-overview">
+            <div className="panel-header">
+              <h2>治理概览</h2>
+              <span className="count-pill">当前显示 {visibleRecommendations.length}</span>
+            </div>
+            <div className="governance-grid">
+              <div className="governance-block">
+                <strong>风险统计</strong>
+                {riskStats.length === 0 ? (
+                  <p className="muted-line">暂无风险标签</p>
+                ) : (
+                  <div className="risk-stat-list">
+                    {riskStats.map((item) => (
+                      <button
+                        className={`risk-stat ${riskFilter === item.risk ? "active" : ""}`}
+                        type="button"
+                        key={item.risk}
+                        onClick={() => setRiskFilter(riskFilter === item.risk ? "all" : item.risk)}
+                      >
+                        <span>{displayText(item.risk)}</span>
+                        <strong>{item.count}</strong>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="governance-block">
+                <strong>高优先级待处理</strong>
+                {highPriority.length === 0 ? (
+                  <p className="muted-line">暂无高优先级建议</p>
+                ) : (
+                  <div className="mini-review-list">
+                    {highPriority.map((recommendation) => (
+                      <button
+                        className="mini-review-item"
+                        type="button"
+                        key={reviewDismissKey(recommendation)}
+                        onClick={() => {
+                          setSeverityFilter("high");
+                          setRiskFilter("all");
+                        }}
+                      >
+                        <span>{displayText(recommendation.risk_tags[0] || recommendation.action)}</span>
+                        <em>{recommendation.reason}</em>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="governance-block">
+                <strong>最近 AI 修改</strong>
+                {recentAiLogs.length === 0 ? (
+                  <p className="muted-line">暂无近期 AI 修改记录</p>
+                ) : (
+                  <div className="mini-review-list">
+                    {recentAiLogs.map((log) => (
+                      <div className="mini-review-item passive" key={log.id}>
+                        <span>{dateText(log.created_at)}</span>
+                        <em>{candidateSummary(log.candidate_json)}</em>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+          <section className="panel panel--quiet governance-overview">
+            <div className="panel-header">
+              <h2>数据库健康</h2>
+              <span className="count-pill">{displayText(state.data.health.status)}</span>
+            </div>
+            <div className="stats-grid compact-stats">
+              <StatCard label="错误" value={state.data.health.summary.errors} />
+              <StatCard label="警告" value={state.data.health.summary.warnings} />
+              <StatCard label="提示" value={state.data.health.summary.info} />
+              <InfoCard label="检查时间" value={dateText(state.data.health.checked_at)} />
+            </div>
+            <div className="button-row">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setShowHealthInfo((value) => !value)}
+              >
+                <Database size={16} />
+                {showHealthInfo ? "隐藏提示" : "显示提示"}
+              </button>
+              <span className="muted-line">
+                当前显示 {visibleHealthIssues.length} / {healthIssues.length}
+              </span>
+            </div>
+            {visibleHealthIssues.length === 0 ? (
+              <EmptyBlock
+                label={healthIssues.length === 0 ? "数据库结构暂无风险" : "仅有提示项，当前已隐藏"}
+              />
+            ) : (
+              <div className="recommendation-list">
+                {visibleHealthIssues.map((issue) => (
+                  <article className="recommendation-card" key={healthIssueKey(issue)}>
+                    <div className="recommendation-topline">
+                      {badge(issue.type)}
+                      <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
+                        {displayText(issue.severity)}
+                      </span>
+                      <span className="count-pill">{issue.object_id}</span>
+                    </div>
+                    <p>{issue.message}</p>
+                    <FieldList
+                      compact
+                      entries={[
+                        ["关联 ID", issue.related_id],
+                        ["建议动作", issue.recommended_action]
+                      ]}
+                    />
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
         </>
       )}
       {mergeDraft && (
@@ -1123,6 +1138,4 @@ function reviewRevisionOperationText(operation: string): string {
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
 }
-
-
 

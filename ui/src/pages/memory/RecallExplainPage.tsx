@@ -1,4 +1,4 @@
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -11,7 +11,7 @@ import {
   Search,
   XCircle
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type {
@@ -50,7 +50,15 @@ const FEEDBACK_OPTIONS: Array<{
   { value: "missing", label: "缺失", icon: CircleHelp }
 ];
 
-export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Notify }) {
+export function RecallExplainPage({
+  api,
+  notify,
+  openMemory
+}: {
+  api: MemoryApi;
+  notify: Notify;
+  openMemory: (id: string) => void;
+}) {
   const [query, setQuery] = useState("");
   const [limit, setLimit] = useState(5);
   const [includeCoreMemory, setIncludeCoreMemory] = useState(true);
@@ -61,8 +69,15 @@ export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Not
     data: null
   });
   const [feedbackPending, setFeedbackPending] = useState<string | null>(null);
+  const explainRequestRef = useRef<AbortController | null>(null);
+
+  // 卸载时取消在途的 explain 请求；重复提交时取消上一次。
+  useEffect(() => () => explainRequestRef.current?.abort(), []);
 
   const runExplain = useCallback(async () => {
+    explainRequestRef.current?.abort();
+    const controller = new AbortController();
+    explainRequestRef.current = controller;
     setState((current) => ({ ...current, loading: true, error: null }));
     try {
       const data = await api.explainContext({
@@ -71,9 +86,10 @@ export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Not
         includeCoreMemory,
         includeRecentContext,
         redactSensitive: true
-      });
+      }, controller.signal);
       setState({ loading: false, error: null, data });
     } catch (error) {
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
     }
   }, [api, includeCoreMemory, includeRecentContext, limit, query]);
@@ -248,6 +264,7 @@ export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Not
                     memory={memory}
                     feedbackPending={feedbackPending}
                     onFeedback={submitFeedback}
+                    onOpen={openMemory}
                   />
                 ))}
               </div>
@@ -259,7 +276,7 @@ export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Not
               <h2>候选池</h2>
               <span className="muted">{data.candidate_pool.length} 条候选</span>
             </div>
-            <CompactHitList items={data.candidate_pool} empty="暂无候选" />
+            <CompactHitList items={data.candidate_pool} empty="暂无候选" onOpen={openMemory} />
           </section>
 
           <section className="panel">
@@ -267,7 +284,7 @@ export function RecallExplainPage({ api, notify }: { api: MemoryApi; notify: Not
               <h2>被排除候选</h2>
               <span className="muted">{data.excluded_candidates.length} 条未进入上下文</span>
             </div>
-            <CompactHitList items={data.excluded_candidates} empty="暂无被排除候选" showReason />
+            <CompactHitList items={data.excluded_candidates} empty="暂无被排除候选" showReason onOpen={openMemory} />
           </section>
         </>
       )}
@@ -324,17 +341,21 @@ function ContextBlock({
 function MemoryHitCard({
   memory,
   feedbackPending,
-  onFeedback
+  onFeedback,
+  onOpen
 }: {
   memory: MemorySearchRecord;
   feedbackPending: string | null;
   onFeedback: (memory: MemorySearchRecord, feedback: SearchFeedbackValue) => void;
+  onOpen: (id: string) => void;
 }) {
   return (
     <article className="recall-hit">
       <div className="recall-hit-main">
         <div className="recall-hit-header">
-          <span>{shortId(memory.id)}</span>
+          <button className="hit-id-button" type="button" onClick={() => onOpen(memory.id)} title="打开记忆档案">
+            {shortId(memory.id)}
+          </button>
           <strong>{displayText(memory.type)}</strong>
           <em>{scoreText(memory.score_breakdown.final_score)}</em>
         </div>
@@ -390,11 +411,13 @@ function ScoreBars({ breakdown }: { breakdown: MemoryScoreBreakdown }) {
 function CompactHitList({
   items,
   empty,
-  showReason = false
+  showReason = false,
+  onOpen
 }: {
   items: MemorySearchRecord[];
   empty: string;
   showReason?: boolean;
+  onOpen: (id: string) => void;
 }) {
   if (items.length === 0) {
     return <EmptyBlock label={empty} compact />;
@@ -402,12 +425,18 @@ function CompactHitList({
   return (
     <div className="compact-hit-list">
       {items.map((memory) => (
-        <div className="compact-hit" key={`${memory.id}-${memory.excluded_reason || "candidate"}`}>
+        <button
+          className="compact-hit compact-hit-button"
+          type="button"
+          key={`${memory.id}-${memory.excluded_reason || "candidate"}`}
+          onClick={() => onOpen(memory.id)}
+          title="打开记忆档案"
+        >
           <span>{shortId(memory.id)}</span>
           <p>{memory.content}</p>
           <strong>{scoreText(memory.score_breakdown.final_score)}</strong>
           {showReason && <em>{displayText(memory.excluded_reason || "rank_below_limit")}</em>}
-        </div>
+        </button>
       ))}
     </div>
   );

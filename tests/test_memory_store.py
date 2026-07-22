@@ -1,4 +1,4 @@
-﻿import json
+import json
 
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -572,6 +572,47 @@ def test_temporal_invalidation_closes_older_fact_and_logs(
     assert payload["source"] == "temporal_invalidation"
     assert payload["new_memory_id"] == new.id
     assert payload["superseded_memory_ids"] == [old.id]
+
+
+def test_list_decision_logs_filters_by_memory_id(memory_store: MemoryStore) -> None:
+    old_job = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company A.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    new_job = memory_store.create_memory(
+        user_id="default",
+        content="User works at Company B.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    job_logs = memory_store.list_decision_logs(user_id="default", memory_id=new_job.id)
+    assert len(job_logs) == 1
+    payload = json.loads(job_logs[0].candidate_json)
+    assert payload["new_memory_id"] == new_job.id
+
+    superseded_logs = memory_store.list_decision_logs(user_id="default", memory_id=old_job.id)
+    assert [log.id for log in superseded_logs] == [log.id for log in job_logs]
+
+    assert memory_store.list_decision_logs(user_id="default", memory_id="missing-id") == []
 
 
 def test_temporal_invalidation_compares_offset_datetimes_by_instant(

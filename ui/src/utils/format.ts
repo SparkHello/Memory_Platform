@@ -109,11 +109,36 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const STATUS_MESSAGES: Record<number, string> = {
+  400: "请求参数有误",
+  401: "访问密钥无效，请在设置中核对 GATEWAY_API_KEY",
+  403: "没有权限执行此操作",
+  404: "请求的内容不存在",
+  409: "操作冲突，请刷新后重试",
+  422: "请求格式有误",
+  429: "请求过于频繁，请稍后再试",
+  500: "服务内部错误，请稍后重试",
+  502: "上游服务暂时不可用，请稍后重试",
+  503: "服务暂时不可用，请稍后重试",
+  504: "上游服务响应超时，请稍后重试"
+};
+
+// 4xx 校验类错误保留服务端细节，帮助定位具体字段
+const DETAIL_STATUSES = new Set([400, 409, 422]);
+
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) {
-    return `${error.status}: ${error.detail}`;
+    const base = STATUS_MESSAGES[error.status];
+    if (!base) return `${error.status}: ${error.detail}`;
+    if (DETAIL_STATUSES.has(error.status) && error.detail) {
+      return `${base}：${error.detail}`;
+    }
+    return base;
   }
   if (error instanceof Error) {
+    if (error.message === "Failed to fetch") {
+      return "无法连接到记忆服务，请确认服务地址与端口";
+    }
     return error.message;
   }
   return "操作失败";

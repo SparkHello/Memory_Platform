@@ -1,4 +1,4 @@
-﻿import io
+import io
 import json
 from pathlib import Path
 import zipfile
@@ -723,6 +723,44 @@ def test_memory_spaces_and_classification_rest_endpoints(
         log for log in logs if json.loads(log.candidate_json).get("source") == "classification_update"
     ]
     assert len(classification_logs) == 2
+
+
+def test_decision_logs_rest_filter_by_memory_id(client, auth_headers, memory_store: MemoryStore):
+    coffee = memory_store.create_memory(
+        user_id="default",
+        content="User likes black coffee.",
+        type="emotional",
+    )
+    tea = memory_store.create_memory(
+        user_id="default",
+        content="User used to prefer tea.",
+        type="emotional",
+    )
+    for memory, feedback in ((coffee, "useful"), (tea, "not_useful")):
+        response = client.post(
+            "/memories/search-feedback",
+            headers=auth_headers,
+            json={"memory_id": memory.id, "query": "drinks", "feedback": feedback},
+        )
+        assert response.status_code == 200
+
+    filtered = client.get(
+        f"/memories/decision-logs?memory_id={coffee.id}",
+        headers=auth_headers,
+    )
+    assert filtered.status_code == 200
+    logs = filtered.json()["data"]
+    assert len(logs) == 1
+    payload = json.loads(logs[0]["candidate_json"])
+    assert payload["memory_id"] == coffee.id
+
+    # 其他用户命名空间下查同一个 memory_id，不应命中当前用户的日志
+    cross_user = client.get(
+        f"/memories/decision-logs?memory_id={tea.id}",
+        headers={**auth_headers, "X-User-Id": "alice"},
+    )
+    assert cross_user.status_code == 200
+    assert cross_user.json()["data"] == []
 
 
 def test_restore_version_one_export_defaults_classification_fields(

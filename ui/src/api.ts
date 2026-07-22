@@ -41,12 +41,16 @@ import type {
 } from "./types";
 import { normalizeBaseUrl } from "./storage";
 
+const DEFAULT_TIMEOUT_MS = 30000;
+
 type RequestOptions = {
   method?: string;
   body?: unknown;
   auth?: boolean;
   text?: boolean;
   blob?: boolean;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 };
 
 type RedactionOptions = {
@@ -69,6 +73,10 @@ export class ApiError extends Error {
   }
 }
 
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 export class MemoryApi {
   private settings: ConnectionSettings;
 
@@ -83,44 +91,49 @@ export class MemoryApi {
     return `${this.settings.apiBaseUrl}${path}`;
   }
 
-  async health(): Promise<{ status: string }> {
-    return this.request("/health", { auth: false });
+  async health(signal?: AbortSignal): Promise<{ status: string }> {
+    return this.request("/health", { auth: false, signal });
   }
 
-  async listMemories(options: MemoryListOptions = {}): Promise<MemoryRecord[]> {
+  async listMemories(options: MemoryListOptions = {}, signal?: AbortSignal): Promise<MemoryRecord[]> {
     const payload = await this.request<{ data: MemoryRecord[] }>(
-      `/memories${memoryListQuery(options)}`
+      `/memories${memoryListQuery(options)}`,
+      { signal }
     );
     return payload.data || [];
   }
 
-  async listDeletedMemories(options: RedactionOptions = {}): Promise<MemoryRecord[]> {
+  async listDeletedMemories(options: RedactionOptions = {}, signal?: AbortSignal): Promise<MemoryRecord[]> {
     const payload = await this.request<{ data: MemoryRecord[] }>(
-      `/memories/deleted?limit=1000${redactionSuffix(options.redactSensitive)}`
+      `/memories/deleted?limit=1000${redactionSuffix(options.redactSensitive)}`,
+      { signal }
     );
     return payload.data || [];
   }
 
-  async listMemorySpaces(): Promise<MemorySpace[]> {
-    const payload = await this.request<{ data: MemorySpace[] }>("/memories/spaces");
+  async listMemorySpaces(signal?: AbortSignal): Promise<MemorySpace[]> {
+    const payload = await this.request<{ data: MemorySpace[] }>("/memories/spaces", { signal });
     return payload.data || [];
   }
 
   async memorySpace(
     spaceId: string,
-    options: RedactionOptions = {}
+    options: RedactionOptions = {},
+    signal?: AbortSignal
   ): Promise<MemorySpaceDetail> {
     return this.request(
       `/memories/spaces/${encodeURIComponent(spaceId)}?limit=1000${redactionSuffix(
         options.redactSensitive
-      )}`
+      )}`,
+      { signal }
     );
   }
 
   async searchMemories(
     query: string,
     limit = 20,
-    options: RedactionOptions = {}
+    options: RedactionOptions = {},
+    signal?: AbortSignal
   ): Promise<MemorySearchRecord[]> {
     const payload = await this.request<{ data: MemorySearchRecord[] }>("/memories/search", {
       method: "POST",
@@ -129,7 +142,8 @@ export class MemoryApi {
         limit,
         include_sensitive: options.includeSensitive ?? false,
         redact_sensitive: options.redactSensitive ?? false
-      }
+      },
+      signal
     });
     return payload.data || [];
   }
@@ -141,7 +155,7 @@ export class MemoryApi {
     includeRecentContext?: boolean;
     conversationId?: string | null;
     redactSensitive?: boolean;
-  }): Promise<MemoryContextExplainResult> {
+  }, signal?: AbortSignal): Promise<MemoryContextExplainResult> {
     return this.request("/memories/context/explain", {
       method: "POST",
       body: {
@@ -151,7 +165,8 @@ export class MemoryApi {
         include_recent_context: options.includeRecentContext ?? true,
         conversation_id: options.conversationId || undefined,
         redact_sensitive: options.redactSensitive ?? false
-      }
+      },
+      signal
     });
   }
 
@@ -160,7 +175,7 @@ export class MemoryApi {
     memoryId?: string | null;
     feedback: SearchFeedbackValue;
     note?: string | null;
-  }): Promise<{ recorded: boolean; log: DecisionLog }> {
+  }, signal?: AbortSignal): Promise<{ recorded: boolean; log: DecisionLog }> {
     return this.request("/memories/search-feedback", {
       method: "POST",
       body: {
@@ -168,14 +183,16 @@ export class MemoryApi {
         memory_id: options.memoryId || undefined,
         feedback: options.feedback,
         note: options.note || undefined
-      }
+      },
+      signal
     });
   }
 
   async surfaceMemories(
     limit = 8,
     mode: SurfaceMode = "balanced",
-    options: RedactionOptions = {}
+    options: RedactionOptions = {},
+    signal?: AbortSignal
   ): Promise<MemorySurfaceRecord[]> {
     const payload = await this.request<{ data: MemorySurfaceRecord[] }>("/memories/surface", {
       method: "POST",
@@ -184,7 +201,8 @@ export class MemoryApi {
         mode,
         include_sensitive: options.includeSensitive ?? false,
         redact_sensitive: options.redactSensitive ?? false
-      }
+      },
+      signal
     });
     return payload.data || [];
   }
@@ -202,7 +220,8 @@ export class MemoryApi {
       arousalMin?: number;
       arousalMax?: number;
       redactSensitive?: boolean;
-    } = {}
+    } = {},
+    signal?: AbortSignal
   ): Promise<MemoryNetwork> {
     return this.request("/memories/network", {
       method: "POST",
@@ -218,7 +237,8 @@ export class MemoryApi {
         arousal_min: options.arousalMin,
         arousal_max: options.arousalMax,
         redact_sensitive: options.redactSensitive ?? false
-      }
+      },
+      signal
     });
   }
 
@@ -231,7 +251,8 @@ export class MemoryApi {
       maxCandidates?: number;
       maxEdges?: number;
       redactSensitive?: boolean;
-    } = {}
+    } = {},
+    signal?: AbortSignal
   ): Promise<TraversalResponse> {
     return this.request("/memories/network/traverse", {
       method: "POST",
@@ -243,89 +264,103 @@ export class MemoryApi {
         max_candidates: options.maxCandidates ?? 500,
         max_edges: options.maxEdges ?? 1500,
         redact_sensitive: options.redactSensitive ?? false
-      }
+      },
+      signal
     });
   }
 
-  async getMemory(memoryId: string, options: RedactionOptions = {}): Promise<MemoryRecord> {
+  async getMemory(memoryId: string, options: RedactionOptions = {}, signal?: AbortSignal): Promise<MemoryRecord> {
     const payload = await this.request<{ memory: MemoryRecord }>(
-      `/memories/${encodeURIComponent(memoryId)}${redactionQuery(options.redactSensitive)}`
+      `/memories/${encodeURIComponent(memoryId)}${redactionQuery(options.redactSensitive)}`,
+      { signal }
     );
     return payload.memory;
   }
 
   async whyRemember(
     memoryId: string,
-    options: RedactionOptions = {}
+    options: RedactionOptions = {},
+    signal?: AbortSignal
   ): Promise<MemorySourceExplanation> {
     return this.request(
-      `/memories/${encodeURIComponent(memoryId)}/why${redactionQuery(options.redactSensitive)}`
+      `/memories/${encodeURIComponent(memoryId)}/why${redactionQuery(options.redactSensitive)}`,
+      { signal }
     );
   }
 
-  async deleteMemory(memoryId: string): Promise<void> {
+  async deleteMemory(memoryId: string, signal?: AbortSignal): Promise<void> {
     await this.request(`/memories/${encodeURIComponent(memoryId)}`, {
-      method: "DELETE"
+      method: "DELETE",
+      signal
     });
   }
 
-  async restoreMemory(memoryId: string): Promise<void> {
+  async restoreMemory(memoryId: string, signal?: AbortSignal): Promise<void> {
     await this.request(`/memories/${encodeURIComponent(memoryId)}/restore`, {
-      method: "POST"
+      method: "POST",
+      signal
     });
   }
 
-  async purgeDeletedMemory(memoryId: string): Promise<MemoryPurgeResult> {
+  async purgeDeletedMemory(memoryId: string, signal?: AbortSignal): Promise<MemoryPurgeResult> {
     return this.request(`/memories/deleted/${encodeURIComponent(memoryId)}/purge`, {
       method: "DELETE",
-      body: { confirm_memory_id: memoryId }
+      body: { confirm_memory_id: memoryId },
+      signal
     });
   }
 
   async updateMemory(
     memoryId: string,
-    payload: MemoryUpdatePayload
+    payload: MemoryUpdatePayload,
+    signal?: AbortSignal
   ): Promise<MemoryUpdateResult> {
     return this.request(`/memories/${encodeURIComponent(memoryId)}`, {
       method: "PATCH",
-      body: payload
+      body: payload,
+      signal
     });
   }
 
   async updateMemorySpaces(
     memoryId: string,
-    payload: MemorySpacesUpdatePayload
+    payload: MemorySpacesUpdatePayload,
+    signal?: AbortSignal
   ): Promise<MemoryUpdateResult> {
     return this.request(`/memories/${encodeURIComponent(memoryId)}/spaces`, {
       method: "PATCH",
-      body: payload
+      body: payload,
+      signal
     });
   }
 
-  async memoryReport(): Promise<MemoryReport> {
-    return this.request("/memories/report?format=json");
+  async memoryReport(signal?: AbortSignal): Promise<MemoryReport> {
+    return this.request("/memories/report?format=json", { signal });
   }
 
-  async memoryReportMarkdown(): Promise<string> {
-    return this.request("/memories/report?format=markdown", { text: true });
+  async memoryReportMarkdown(signal?: AbortSignal): Promise<string> {
+    return this.request("/memories/report?format=markdown", { text: true, signal });
   }
 
-  async exportMemories(format: "json" | "markdown"): Promise<MemoryExport | string> {
+  async exportMemories(format: "json" | "markdown", signal?: AbortSignal): Promise<MemoryExport | string> {
     return this.request(`/memories/export?format=${format}&include_deleted=true`, {
-      text: format === "markdown"
+      text: format === "markdown",
+      signal
     });
   }
 
-  async exportObsidianZip(): Promise<Blob> {
+  async exportObsidianZip(signal?: AbortSignal): Promise<Blob> {
     return this.request("/memories/export?format=obsidian_markdown&include_deleted=true", {
-      blob: true
+      blob: true,
+      signal
     });
   }
 
   async restoreFromExport(
     data: MemoryExport,
     overwrite: boolean,
-    includeDeleted: boolean
+    includeDeleted: boolean,
+    signal?: AbortSignal
   ): Promise<RestoreResult> {
     return this.request("/memories/restore", {
       method: "POST",
@@ -333,68 +368,79 @@ export class MemoryApi {
         data,
         overwrite,
         include_deleted: includeDeleted
-      }
+      },
+      signal
     });
   }
 
-  async decisionLogs(limit = 100): Promise<DecisionLog[]> {
+  async decisionLogs(limit = 100, options: { memoryId?: string } = {}, signal?: AbortSignal): Promise<DecisionLog[]> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (options.memoryId) {
+      params.set("memory_id", options.memoryId);
+    }
     const payload = await this.request<{ data: DecisionLog[] }>(
-      `/memories/decision-logs?limit=${limit}`
+      `/memories/decision-logs?${params.toString()}`,
+      { signal }
     );
     return payload.data || [];
   }
 
-  async recentContext(): Promise<RecentContextSummary[]> {
+  async recentContext(signal?: AbortSignal): Promise<RecentContextSummary[]> {
     const payload = await this.request<{ data: RecentContextSummary[] }>(
-      "/memories/recent-context"
+      "/memories/recent-context",
+      { signal }
     );
     return payload.data || [];
   }
 
-  async coreMemory(): Promise<CoreMemorySection[]> {
-    const payload = await this.request<{ data: CoreMemorySection[] }>("/memories/core");
+  async coreMemory(signal?: AbortSignal): Promise<CoreMemorySection[]> {
+    const payload = await this.request<{ data: CoreMemorySection[] }>("/memories/core", { signal });
     return payload.data || [];
   }
 
-  async coreHistory(): Promise<CoreMemoryHistoryItem[]> {
+  async coreHistory(signal?: AbortSignal): Promise<CoreMemoryHistoryItem[]> {
     const payload = await this.request<{ data: CoreMemoryHistoryItem[] }>(
-      "/memories/core/history?limit=200"
+      "/memories/core/history?limit=200",
+      { signal }
     );
     return payload.data || [];
   }
 
-  async consolidateCoreMemory(): Promise<unknown> {
+  async consolidateCoreMemory(signal?: AbortSignal): Promise<unknown> {
     return this.request("/memories/core/consolidate", {
-      method: "POST"
+      method: "POST",
+      signal
     });
   }
 
-  async reviewMemories(): Promise<ReviewResult> {
+  async reviewMemories(signal?: AbortSignal): Promise<ReviewResult> {
     return this.request("/memories/review", {
-      method: "POST"
+      method: "POST",
+      signal
     });
   }
 
-  async memoryHealth(): Promise<DatabaseHealthResult> {
-    return this.request("/memories/health");
+  async memoryHealth(signal?: AbortSignal): Promise<DatabaseHealthResult> {
+    return this.request("/memories/health", { signal });
   }
 
-  async evaluationDiagnosis(): Promise<MechanismDiagnosisResult> {
-    return this.request("/memories/evaluation/diagnosis");
+  async evaluationDiagnosis(signal?: AbortSignal): Promise<MechanismDiagnosisResult> {
+    return this.request("/memories/evaluation/diagnosis", { signal });
   }
 
-  async initRecallEvaluation(): Promise<Record<string, unknown>> {
+  async initRecallEvaluation(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.request("/memories/evaluation/recall/init", {
-      method: "POST"
+      method: "POST",
+      signal
     });
   }
 
-  async recallEvaluationWorkbench(options: { redactSensitive?: boolean } = {}): Promise<RecallEvalWorkbench> {
+  async recallEvaluationWorkbench(options: { redactSensitive?: boolean } = {}, signal?: AbortSignal): Promise<RecallEvalWorkbench> {
     const suffix = options.redactSensitive === false ? "?redact_sensitive=false" : "?redact_sensitive=true";
-    return this.request(`/memories/evaluation/recall/workbench${suffix}`);
+    return this.request(`/memories/evaluation/recall/workbench${suffix}`, { signal });
   }
 
-  async saveRecallEvaluationLabels(labels: RecallEvalLabel[]): Promise<{
+  async saveRecallEvaluationLabels(labels: RecallEvalLabel[], signal?: AbortSignal): Promise<{
     labels: RecallEvalLabel[];
     summary: RecallEvalWorkbench["summary"];
     validation_issues: RecallEvalWorkbench["validation_issues"];
@@ -409,20 +455,22 @@ export class MemoryApi {
           relevant_ids: label.relevant_ids,
           note: label.note || undefined
         }))
-      }
+      },
+      signal
     });
   }
 
   async runRecallEvaluation(options: {
     mode: "keyword" | "embedding";
     k?: number;
-  }): Promise<RecallEvalRunResult> {
+  }, signal?: AbortSignal): Promise<RecallEvalRunResult> {
     return this.request("/memories/evaluation/recall/run", {
       method: "POST",
       body: {
         mode: options.mode,
         k: options.k ?? 8
-      }
+      },
+      signal
     });
   }
 
@@ -434,7 +482,7 @@ export class MemoryApi {
     suggestedContent?: string | null;
     riskTags?: ReviewRiskTag[];
     severity?: ReviewSeverity | null;
-  }): Promise<ReviewRevisionPreview> {
+  }, signal?: AbortSignal): Promise<ReviewRevisionPreview> {
     return this.request("/memories/review/revise/preview", {
       method: "POST",
       body: {
@@ -445,7 +493,8 @@ export class MemoryApi {
         suggested_content: options.suggestedContent || undefined,
         risk_tags: options.riskTags || [],
         severity: options.severity || undefined
-      }
+      },
+      signal
     });
   }
 
@@ -455,7 +504,7 @@ export class MemoryApi {
     recommendationReason?: string | null;
     suggestedContent?: string | null;
     limit?: number;
-  }): Promise<ReviewRelatedCandidate[]> {
+  }, signal?: AbortSignal): Promise<ReviewRelatedCandidate[]> {
     const payload = await this.request<{ data: ReviewRelatedCandidate[] }>(
       "/memories/review/revise/related",
       {
@@ -466,7 +515,8 @@ export class MemoryApi {
           recommendation_reason: options.recommendationReason || undefined,
           suggested_content: options.suggestedContent || undefined,
           limit: options.limit ?? 8
-        }
+        },
+        signal
       }
     );
     return payload.data || [];
@@ -478,7 +528,7 @@ export class MemoryApi {
     previewToken: string;
     riskTags?: ReviewRiskTag[];
     severity?: ReviewSeverity | null;
-  }): Promise<ReviewRevisionApplyResult> {
+  }, signal?: AbortSignal): Promise<ReviewRevisionApplyResult> {
     return this.request("/memories/review/revise/apply", {
       method: "POST",
       body: {
@@ -487,7 +537,8 @@ export class MemoryApi {
         preview_token: options.previewToken,
         risk_tags: options.riskTags || [],
         severity: options.severity || undefined
-      }
+      },
+      signal
     });
   }
 
@@ -499,7 +550,7 @@ export class MemoryApi {
     severity?: ReviewSeverity | null;
     reviewAfter?: string | null;
     content?: string | null;
-  }): Promise<ReviewActionApplyResult> {
+  }, signal?: AbortSignal): Promise<ReviewActionApplyResult> {
     return this.request("/memories/review/actions", {
       method: "POST",
       body: {
@@ -510,17 +561,19 @@ export class MemoryApi {
         severity: options.severity || undefined,
         review_after: options.reviewAfter || undefined,
         content: options.content || undefined
-      }
+      },
+      signal
     });
   }
 
-  async mergeMemories(memoryIds: string[], content?: string | null): Promise<unknown> {
+  async mergeMemories(memoryIds: string[], content?: string | null, signal?: AbortSignal): Promise<unknown> {
     return this.request("/memories/merge", {
       method: "POST",
       body: {
         memory_ids: memoryIds,
         content: content || undefined
-      }
+      },
+      signal
     });
   }
 
@@ -537,23 +590,48 @@ export class MemoryApi {
       headers.set("X-User-Id", this.settings.userId || "default");
     }
 
-    const response = await fetch(this.base(path), {
-      method: options.method || "GET",
-      headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body)
-    });
+    // 手动 AbortController + setTimeout 实现超时兜底，同时串联调用方传入的 signal。
+    const controller = new AbortController();
+    const externalSignal = options.signal;
+    const abortFromOutside = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener("abort", abortFromOutside, { once: true });
+    }
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
-    if (!response.ok) {
-      throw new ApiError(response.status, await readError(response));
-    }
+    try {
+      const response = await fetch(this.base(path), {
+        method: options.method || "GET",
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: controller.signal
+      });
 
-    if (options.text) {
-      return (await response.text()) as T;
+      if (!response.ok) {
+        throw new ApiError(response.status, await readError(response));
+      }
+
+      if (options.text) {
+        return (await response.text()) as T;
+      }
+      if (options.blob) {
+        return (await response.blob()) as T;
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      if (timedOut && isAbortError(error)) {
+        throw new ApiError(0, "请求超时，请检查服务连接后重试");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", abortFromOutside);
     }
-    if (options.blob) {
-      return (await response.blob()) as T;
-    }
-    return (await response.json()) as T;
   }
 }
 

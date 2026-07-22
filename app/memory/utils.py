@@ -1,6 +1,55 @@
+from collections import OrderedDict
 from datetime import UTC, datetime
 import json
 import re
+
+
+# 进程内有界缓存：(memory_id, updated_at) -> 解析后的 embedding 向量。
+# key 里带 updated_at，记忆更新后旧 key 自然失效；记忆删除后条目最多占一个坑位，
+# 由 LRU 上限挤出，不会读到旧向量。
+_EMBEDDING_VECTOR_CACHE_MAX = 2048
+_embedding_vector_cache: OrderedDict[tuple[str, str], list[float] | None] = OrderedDict()
+
+
+def _parse_embedding_vector(raw_json: str | None) -> list[float] | None:
+    if not raw_json:
+        return None
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    try:
+        return [float(value) for value in data]
+    except (TypeError, ValueError):
+        return None
+
+
+def _cached_embedding_vector(
+    *,
+    memory_id: str,
+    updated_at: str | None,
+    embedding_json: str | None,
+) -> list[float] | None:
+    key = (memory_id, updated_at or "")
+    if key in _embedding_vector_cache:
+        _embedding_vector_cache.move_to_end(key)
+        return _embedding_vector_cache[key]
+    vector = _parse_embedding_vector(embedding_json)
+    if len(_embedding_vector_cache) >= _EMBEDDING_VECTOR_CACHE_MAX:
+        _embedding_vector_cache.popitem(last=False)
+    _embedding_vector_cache[key] = vector
+    return vector
+
+
+def _memory_embedding_vector(memory) -> list[float] | None:
+    """按 (id, updated_at) 缓存解析记忆的 embedding，避免每次查询重复 json.loads。"""
+    return _cached_embedding_vector(
+        memory_id=str(memory.id),
+        updated_at=memory.updated_at,
+        embedding_json=memory.embedding_json,
+    )
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:

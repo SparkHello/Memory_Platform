@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#18262d"/>
+      <stop offset="0.3" stop-color="#33494b"/>
+      <stop offset="0.52" stop-color="#66795e"/>
+      <stop offset="0.63" stop-color="#a9b18e"/>
+      <stop offset="0.7" stop-color="#5d6c48"/>
+      <stop offset="0.84" stop-color="#2a3a20"/>
+      <stop offset="1" stop-color="#131c10"/>
+    </linearGradient>
+    <radialGradient id="lightbreak" cx="0.6" cy="0.62" r="0.55">
+      <stop offset="0" stop-color="#efe9c8" stop-opacity="0.7"/>
+      <stop offset="0.4" stop-color="#d3d6ae" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#d3d6ae" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="0.5" cy="0.42" r="0.85">
+      <stop offset="0.55" stop-color="#0b1214" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0b1214" stop-opacity="0.55"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="52"/>
+    </filter>
+    <filter id="softer" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <filter id="grain">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" stitchTiles="stitch"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.05 0"/>
+      <feComposite operator="over" in2="SourceGraphic"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#sky)"/>
+  <rect width="1600" height="1000" fill="url(#lightbreak)"/>
+
+  <!-- 云层：上半部厚重的风暴云 -->
+  <g filter="url(#soft)">
+    <ellipse cx="240" cy="120" rx="520" ry="190" fill="#141f26" opacity="0.85"/>
+    <ellipse cx="900" cy="40" rx="640" ry="180" fill="#1b2a2e" opacity="0.8"/>
+    <ellipse cx="1460" cy="180" rx="480" ry="200" fill="#20323a" opacity="0.75"/>
+    <ellipse cx="620" cy="300" rx="500" ry="150" fill="#2c4146" opacity="0.6"/>
+    <ellipse cx="1200" cy="330" rx="430" ry="130" fill="#243a3c" opacity="0.55"/>
+  </g>
+  <g filter="url(#softer)">
+    <ellipse cx="1020" cy="470" rx="420" ry="70" fill="#c9cfa6" opacity="0.35"/>
+    <ellipse cx="700" cy="520" rx="360" ry="55" fill="#aeb98f" opacity="0.28"/>
+    <ellipse cx="380" cy="430" rx="300" ry="70" fill="#7e9080" opacity="0.3"/>
+  </g>
+
+  <!-- 原野：横向田垄的层次 -->
+  <g filter="url(#softer)">
+    <rect x="-60" y="690" width="1720" height="90" fill="#31441f" opacity="0.7"/>
+    <rect x="-60" y="770" width="1720" height="80" fill="#243318" opacity="0.8"/>
+    <rect x="-60" y="850" width="1720" height="160" fill="#16220e" opacity="0.9"/>
+    <ellipse cx="800" cy="705" rx="700" ry="40" fill="#54683a" opacity="0.5"/>
+  </g>
+
+  <rect width="1600" height="1000" fill="url(#vignette)"/>
+  <rect width="1600" height="1000" filter="url(#grain)" opacity="0.5" fill="none"/>
+</svg>

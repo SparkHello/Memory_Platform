@@ -1,8 +1,10 @@
 from datetime import UTC, datetime, timedelta
+from functools import partial
 import hashlib
 import json
 from typing import Annotated, Literal
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field, ValidationError
@@ -443,11 +445,13 @@ def list_decision_logs(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     conversation_id: str | None = None,
+    memory_id: str | None = None,
     limit: int = 100,
 ) -> dict[str, list[dict]]:
     logs = store.list_decision_logs(
         user_id=user_id,
         conversation_id=conversation_id,
+        memory_id=memory_id,
         limit=limit,
     )
     return {"data": [log.model_dump() for log in logs]}
@@ -1246,10 +1250,15 @@ async def forget_memories(
         limit=body.limit,
         record_usage=False,
     )
-    deleted: list[dict] = []
-    for memory in matches:
-        if store.archive_memory(memory_id=memory.id, user_id=user_id):
-            deleted.append(memory.model_dump(exclude={"embedding_json"}))
+
+    def _archive_matches() -> list[dict]:
+        archived: list[dict] = []
+        for memory in matches:
+            if store.archive_memory(memory_id=memory.id, user_id=user_id):
+                archived.append(memory.model_dump(exclude={"embedding_json"}))
+        return archived
+
+    deleted = await anyio.to_thread.run_sync(_archive_matches)
     return {
         "deleted_count": len(deleted),
         "deleted": deleted,
@@ -1270,15 +1279,20 @@ async def get_memory_context(
     search_results_raw: list = []
     recent_context: dict = {"found": False, "summary": ""}
 
-    search_query = _derive_context_search_query(
-        query=body.query,
-        user_id=user_id,
-        store=store,
-        conversation_id=body.conversation_id,
+    search_query = await anyio.to_thread.run_sync(
+        partial(
+            _derive_context_search_query,
+            query=body.query,
+            user_id=user_id,
+            store=store,
+            conversation_id=body.conversation_id,
+        )
     )
 
     if search_query and body.include_core_memory is not False:
-        core_sections = _safe_core_sections(store=store, user_id=user_id)
+        core_sections = await anyio.to_thread.run_sync(
+            partial(_safe_core_sections, store=store, user_id=user_id)
+        )
 
     if search_query:
         search_results_raw = await search_service.search(
@@ -1291,12 +1305,17 @@ async def get_memory_context(
             m.model_dump(exclude={"embedding_json"}) for m in search_results_raw
         ]
     elif body.include_core_memory:
-        core_sections = _safe_core_sections(store=store, user_id=user_id)
+        core_sections = await anyio.to_thread.run_sync(
+            partial(_safe_core_sections, store=store, user_id=user_id)
+        )
 
     if body.include_recent_context:
-        recent = store.get_recent_context_summary(
-            user_id=user_id,
-            conversation_id=body.conversation_id,
+        recent = await anyio.to_thread.run_sync(
+            partial(
+                store.get_recent_context_summary,
+                user_id=user_id,
+                conversation_id=body.conversation_id,
+            )
         )
         if recent:
             recent_context = {"found": True, "summary": recent.summary}
@@ -1332,23 +1351,31 @@ async def explain_memory_context(
     search_service: Annotated[MemorySearchService, Depends(get_memory_search_service)],
 ) -> dict:
     """解释上下文构建过程；该调试接口不会增加 usage_count。"""
-    search_query = _derive_context_search_query(
-        query=body.query,
-        user_id=user_id,
-        store=store,
-        conversation_id=body.conversation_id,
+    search_query = await anyio.to_thread.run_sync(
+        partial(
+            _derive_context_search_query,
+            query=body.query,
+            user_id=user_id,
+            store=store,
+            conversation_id=body.conversation_id,
+        )
     )
     core_sections = (
-        _safe_core_sections(store=store, user_id=user_id)
+        await anyio.to_thread.run_sync(
+            partial(_safe_core_sections, store=store, user_id=user_id)
+        )
         if body.include_core_memory
         else []
     )
     core_payload = [section.model_dump() for section in core_sections]
-    recent_context = _recent_context_payload(
-        store=store,
-        user_id=user_id,
-        conversation_id=body.conversation_id,
-        include_recent_context=body.include_recent_context,
+    recent_context = await anyio.to_thread.run_sync(
+        partial(
+            _recent_context_payload,
+            store=store,
+            user_id=user_id,
+            conversation_id=body.conversation_id,
+            include_recent_context=body.include_recent_context,
+        )
     )
 
     search_hits = []

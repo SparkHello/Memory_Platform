@@ -1,17 +1,19 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 import json
 import math
 import time
 
+import anyio
 import httpx
 
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.store import MemoryStore
-from app.memory.utils import _parse_iso_datetime, _terms
+from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
 
 
 # ---------------------------------------------------------------------------
@@ -199,13 +201,17 @@ class MemorySearchService:
 
         l2_key = (user_id, normalized, capped_limit, bool(include_sensitive))
         if self.enable_cache:
-            cached_hits = self._cached_search_hits(l2_key, user_id=user_id, now=now)
-            if cached_hits is not None:
-                return self._record_hit_usage(
-                    cached_hits,
+            cached_hits = await anyio.to_thread.run_sync(
+                partial(
+                    self._cached_hits_with_usage,
+                    l2_key,
                     user_id=user_id,
+                    now=now,
                     record_usage=record_usage,
                 )
+            )
+            if cached_hits is not None:
+                return cached_hits
 
         query_embedding = await self._query_embedding(
             query=query,
@@ -214,6 +220,55 @@ class MemorySearchService:
             now=now,
         )
 
+        hits = await anyio.to_thread.run_sync(
+            partial(
+                self._recall_and_rank,
+                user_id=user_id,
+                query=query,
+                query_embedding=query_embedding,
+                limit=capped_limit,
+                include_sensitive=include_sensitive,
+            )
+        )
+        if not hits:
+            return []
+        return await anyio.to_thread.run_sync(
+            partial(
+                self._finalize_hits,
+                l2_key,
+                hits,
+                user_id=user_id,
+                record_usage=record_usage,
+                now=now,
+            )
+        )
+
+    def _cached_hits_with_usage(
+        self,
+        key: tuple,
+        *,
+        user_id: str,
+        now: float,
+        record_usage: bool,
+    ) -> list[MemorySearchHit] | None:
+        cached_hits = self._cached_search_hits(key, user_id=user_id, now=now)
+        if cached_hits is None:
+            return None
+        return self._record_hit_usage(
+            cached_hits,
+            user_id=user_id,
+            record_usage=record_usage,
+        )
+
+    def _recall_and_rank(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        query_embedding: list[float] | None,
+        limit: int,
+        include_sensitive: bool,
+    ) -> list[MemorySearchHit]:
         memories = self.store.list_memories(user_id=user_id, limit=RECALL_CANDIDATE_POOL)
         memories = [
             memory
@@ -223,16 +278,25 @@ class MemorySearchService:
         ]
         if not memories:
             return []
-
-        hits = self._rank_hits(
+        return self._rank_hits(
             memories=memories,
             query=query,
             query_embedding=query_embedding,
-            limit=capped_limit,
+            limit=limit,
         )
+
+    def _finalize_hits(
+        self,
+        key: tuple,
+        hits: list[MemorySearchHit],
+        *,
+        user_id: str,
+        record_usage: bool,
+        now: float,
+    ) -> list[MemorySearchHit]:
         hits = self._record_hit_usage(hits, user_id=user_id, record_usage=record_usage)
         if self.enable_cache:
-            self._cache_search_hits(l2_key, hits, user_id=user_id, now=now)
+            self._cache_search_hits(key, hits, user_id=user_id, now=now)
         return hits
 
     def surface_memories(
@@ -413,7 +477,7 @@ class MemorySearchService:
     ) -> list[tuple[float, MemoryRecord]]:
         scored: list[tuple[float, MemoryRecord]] = []
         for memory in memories:
-            memory_embedding = _load_vector(memory.embedding_json)
+            memory_embedding = _memory_embedding_vector(memory)
             if memory_embedding is None:
                 continue
             cosine = cosine_similarity(query_embedding, memory_embedding)
@@ -859,21 +923,6 @@ def _memory_is_locally_sensitive(memory: MemoryRecord) -> bool:
         if part
     )
     return detect_text_sensitivity(text) != "normal"
-
-
-def _load_vector(raw_json: str | None) -> list[float] | None:
-    if not raw_json:
-        return None
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, list):
-        return None
-    try:
-        return [float(value) for value in data]
-    except (TypeError, ValueError):
-        return None
 
 
 def _float_payload(value: object) -> float:

@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   Activity,
   ArchiveRestore,
@@ -20,7 +20,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
@@ -53,6 +53,7 @@ import type { LoadState } from "../../hooks/useAsyncData";
 import {
   CONFIG_KEYS,
   CORE_SECTIONS,
+  CORE_SECTION_COLOR_VAR,
   DECISIONS,
   MEMORY_TYPES,
   REVIEW_ACTIONS,
@@ -102,17 +103,19 @@ export function CoreMemoryPage({
   });
   const [consolidating, setConsolidating] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setSections({ loading: true, error: null, data: null });
     setHistory({ loading: true, error: null, data: null });
     try {
       const [coreData, historyData] = await Promise.all([
-        api.coreMemory(),
-        api.coreHistory()
+        api.coreMemory(signal),
+        api.coreHistory(signal)
       ]);
       setSections({ loading: false, error: null, data: coreData });
       setHistory({ loading: false, error: null, data: historyData });
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       const message = errorMessage(error);
       setSections({ loading: false, error: message, data: null });
       setHistory({ loading: false, error: message, data: null });
@@ -120,7 +123,9 @@ export function CoreMemoryPage({
   }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   const bySection = useMemo(() => {
@@ -162,77 +167,83 @@ export function CoreMemoryPage({
         title="核心记忆"
         subtitle="按分区查看核心记忆和历史版本。"
         action={
-          <button
-            className="warning-button"
-            type="button"
-            disabled={consolidating}
-            onClick={consolidate}
-          >
-            <RefreshCcw size={16} />
-            重新整理核心记忆
-          </button>
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => setTab("history")}>
+              历史版本
+            </button>
+            <button
+              className="warning-button"
+              type="button"
+              disabled={consolidating}
+              onClick={consolidate}
+            >
+              <RefreshCcw size={16} />
+              重新整理核心记忆
+            </button>
+          </div>
         }
       />
-      <div className="tabs">
-        <button
-          className={tab === "current" ? "active" : ""}
-          type="button"
-          onClick={() => setTab("current")}
-        >
-          当前版本
-        </button>
-        <button
-          className={tab === "history" ? "active" : ""}
-          type="button"
-          onClick={() => setTab("history")}
-        >
-          历史版本
-        </button>
-      </div>
 
-      {tab === "current" && (
-        <>
-          {sections.loading && <LoadingBlock label="正在加载核心记忆" />}
-          {sections.error && <ErrorBlock message={sections.error} onRetry={load} />}
-          {!sections.loading && !sections.error && (
-            <div className="core-grid">
-              {CORE_SECTIONS.map((section) => {
-                const item = bySection.get(section.key);
-                return (
-                  <article className="core-card" key={section.key}>
-                    <div className="core-card-header">
-                      <h2>{section.title}</h2>
-                      <span className="muted">{section.key}</span>
+      {sections.loading && <LoadingBlock label="正在加载核心记忆" />}
+      {sections.error && <ErrorBlock message={sections.error} onRetry={() => void load()} />}
+      {!sections.loading && !sections.error && bySection.size === 0 && (
+        <EmptyBlock
+          label="核心记忆还没有内容"
+          hint="核心记忆只从已保存的长期记忆中提炼。先在日常对话中积累记忆，再运行一次整理。"
+          action={{ label: "重新整理核心记忆", onClick: () => void consolidate() }}
+        />
+      )}
+      {!sections.loading && !sections.error && bySection.size > 0 && (
+        <div className="core-grid">
+          {CORE_SECTIONS.map((section) => {
+            const item = bySection.get(section.key);
+            return (
+              <article
+                className="core-card"
+                key={section.key}
+                style={{ "--tc": CORE_SECTION_COLOR_VAR[section.key] } as CSSProperties}
+              >
+                <div className="core-card-header">
+                  <h2>{section.title}</h2>
+                  <span className="muted">{section.key}</span>
+                </div>
+                {item ? (
+                  <>
+                    <p>{item.content}</p>
+                    <div className="meta-grid">
+                      <span>置信度</span>
+                      <strong>{percent(item.confidence)}</strong>
+                      <span>版本</span>
+                      <strong>{item.version}</strong>
+                      <span>证据记忆</span>
+                      <strong>{item.evidence_memory_ids.length}</strong>
+                      <span>更新时间</span>
+                      <strong>{dateText(item.updated_at)}</strong>
                     </div>
-                    {item ? (
-                      <>
-                        <p>{item.content}</p>
-                        <div className="meta-grid">
-                          <span>置信度</span>
-                          <strong>{percent(item.confidence)}</strong>
-                          <span>版本</span>
-                          <strong>{item.version}</strong>
-                          <span>证据记忆</span>
-                          <strong>{item.evidence_memory_ids.length}</strong>
-                          <span>更新时间</span>
-                          <strong>{dateText(item.updated_at)}</strong>
-                        </div>
-                      </>
-                    ) : (
-                      <EmptyBlock label="暂无内容" compact />
-                    )}
-                  </article>
-                );
-              })}
-            </div>
-          )}
-        </>
+                  </>
+                ) : (
+                  <EmptyBlock label="暂无内容" compact />
+                )}
+              </article>
+            );
+          })}
+        </div>
       )}
 
       {tab === "history" && (
-        <section className="panel">
-          <div className="panel-header">
-            <h2>历史版本</h2>
+        <button className="drawer-scrim detail-drawer-scrim" type="button" aria-label="关闭历史版本" onClick={() => setTab("current")} />
+      )}
+      {tab === "history" && (
+        <aside className="detail-drawer memory-detail-drawer core-history-drawer" role="dialog" aria-modal="true" aria-label="核心记忆历史版本">
+          <div className="drawer-header">
+            <div>
+              <span className="panel-kicker">版本历史</span>
+              <h2>历史版本</h2>
+            </div>
+            <button className="icon-button" type="button" onClick={() => setTab("current")} aria-label="关闭历史版本"><X size={18} /></button>
+          </div>
+          <label className="field-block core-history-filter">
+            <span>分区</span>
             <select
               value={sectionFilter}
               onChange={(event) => setSectionFilter(event.target.value as "all" | CoreSectionName)}
@@ -244,16 +255,19 @@ export function CoreMemoryPage({
                 </option>
               ))}
             </select>
-          </div>
+          </label>
           {history.loading && <LoadingBlock label="正在加载历史版本" />}
-          {history.error && <ErrorBlock message={history.error} onRetry={load} />}
+          {history.error && <ErrorBlock message={history.error} onRetry={() => void load()} />}
           {!history.loading && !history.error && visibleHistory.length === 0 && (
             <EmptyBlock label="暂无历史版本" />
           )}
           <div className="timeline">
             {visibleHistory.map((item) => (
               <article className="timeline-item" key={item.id}>
-                <div className="timeline-dot" />
+                <div
+                  className="timeline-dot"
+                  style={{ background: CORE_SECTION_COLOR_VAR[item.section] }}
+                />
                 <div>
                   <div className="timeline-title">
                     {sectionTitle(item.section)} · v{item.version}
@@ -266,11 +280,10 @@ export function CoreMemoryPage({
               </article>
             ))}
           </div>
-        </section>
+        </aside>
       )}
     </div>
   );
 }
-
 
 

@@ -26,5 +26,6 @@ export function downloadBlob(filename: string, blob: Blob) {
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-  URL.revokeObjectURL(url);
+  // 延迟 revoke，避免部分浏览器在 click() 后同步回收导致下载被打断。
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

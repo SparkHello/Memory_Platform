@@ -35,6 +35,22 @@ from app.memory.utils import _parse_iso_datetime
 _UNSET = object()
 _TIME_RIPPLE_MAX_CANDIDATES = 100
 _SENSITIVITY_RANK = {"normal": 0, "private": 1, "sensitive": 2}
+# 每用户决策日志保留上限：超出后按创建时间从旧到新裁剪，避免全库无界增长。
+_DECISION_LOG_RETENTION_LIMIT = 5000
+
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """sqlite3 的 context manager 只负责 commit/rollback，不关闭连接。
+
+    本项目的所有访问都写成 `with self._connect() as connection:`，
+    因此在退出 with 块时兜底 close，避免连接句柄依赖 GC 回收。
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def _sensitivity_with_floor(
@@ -2323,6 +2339,20 @@ class MemoryStore:
                 log.created_at,
             ),
         )
+        # 每用户只保留最近 _DECISION_LOG_RETENTION_LIMIT 条，防止日志表无界增长。
+        connection.execute(
+            """
+            DELETE FROM memory_decision_logs
+            WHERE user_id = ?
+              AND id NOT IN (
+                  SELECT id FROM memory_decision_logs
+                  WHERE user_id = ?
+                  ORDER BY created_at DESC, rowid DESC
+                  LIMIT ?
+              )
+            """,
+            (user_id, user_id, _DECISION_LOG_RETENTION_LIMIT),
+        )
         return log
 
     def create_decision_log(
@@ -2349,6 +2379,7 @@ class MemoryStore:
         *,
         user_id: str | None = None,
         conversation_id: str | None = None,
+        memory_id: str | None = None,
         limit: int = 100,
     ) -> list[DecisionLog]:
         query = "SELECT * FROM memory_decision_logs"
@@ -2363,10 +2394,21 @@ class MemoryStore:
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        # 记忆引用保存在 candidate_json 的多种 key 里，无法直接进 WHERE，
+        # 先取最近一批，再在 Python 侧用与 purge  scrub 相同的引用判定过滤
+        scan_limit = max(limit, 500) if memory_id else limit
+        params.append(scan_limit)
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [DecisionLog(**dict(row)) for row in rows]
+        logs = [DecisionLog(**dict(row)) for row in rows]
+        if memory_id:
+            references = {memory_id}
+            logs = [
+                log
+                for log in logs
+                if _decision_log_references_memory_ids(log.candidate_json, references)
+            ][:limit]
+        return logs
 
     def _create_core_memory_section_history(
         self,
@@ -2461,7 +2503,10 @@ class MemoryStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path,
+            factory=_ClosingSQLiteConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=5000")
@@ -2875,14 +2920,28 @@ def _scrub_purged_memory_artifacts(
         *(str(row["source_message"] or "") for row in dependent_rows),
     }
     sensitive_fragments.discard("")
-    log_rows = connection.execute(
-        """
-        SELECT id, conversation_id, candidate_json, reason
-        FROM memory_decision_logs
-        WHERE user_id = ?
-        """,
-        (memory.user_id,),
-    ).fetchall()
+    prefilter = _decision_log_scrub_prefilter(
+        affected_conversation_ids=affected_conversation_ids,
+        fragments=sensitive_fragments,
+    )
+    if prefilter is None:
+        log_rows = connection.execute(
+            """
+            SELECT id, conversation_id, candidate_json, reason
+            FROM memory_decision_logs
+            WHERE user_id = ?
+            """,
+            (memory.user_id,),
+        ).fetchall()
+    else:
+        log_rows = connection.execute(
+            f"""
+            SELECT id, conversation_id, candidate_json, reason
+            FROM memory_decision_logs
+            WHERE user_id = ? AND ({prefilter[0]})
+            """,
+            (memory.user_id, *prefilter[1]),
+        ).fetchall()
     for row in log_rows:
         candidate_json = str(row["candidate_json"] or "")
         reason = str(row["reason"] or "")
@@ -2953,6 +3012,55 @@ _DECISION_LOG_MEMORY_REFERENCE_KEYS = {
     "supersedes",
     "target_memory_id",
 }
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _json_like_safe(value: str) -> bool:
+    # decision log 的 candidate_json 用 ensure_ascii=False 存储，片段中只有
+    # 引号、反斜杠和控制字符会被 JSON 转义，导致 LIKE 无法匹配原文。
+    return '"' not in value and "\\" not in value and all(
+        ord(char) >= 0x20 for char in value
+    )
+
+
+def _decision_log_scrub_prefilter(
+    *,
+    affected_conversation_ids: set[str],
+    fragments: set[str],
+) -> tuple[str, list[object]] | None:
+    """构造 SQL 层超集预过滤，只保留可能命中 Python 侧引用/片段判定的日志行。
+
+    片段同时覆盖 memory id（引用判定要求 id 作为 JSON 叶子出现，raw 文本必含该 id）。
+    返回 None 表示片段含 JSON 转义字符、无法安全下推 LIKE，调用方退化为按用户全量扫描。
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if affected_conversation_ids:
+        placeholders = ", ".join("?" for _ in affected_conversation_ids)
+        clauses.append(f"conversation_id IN ({placeholders})")
+        params.extend(sorted(affected_conversation_ids))
+    for fragment in sorted(fragments):
+        if not _json_like_safe(fragment):
+            return None
+        escaped = _like_escape(fragment)
+        if len(fragment) >= 12:
+            # 长片段命中条件是 substring 匹配，raw JSON / reason 必包含原文。
+            clauses.append("candidate_json LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+            clauses.append("reason LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        else:
+            # 短片段只在 Python 侧做叶子等值匹配，raw JSON 中表现为带引号的完整串。
+            clauses.append("candidate_json LIKE ? ESCAPE '\\'")
+            params.append(f'%"{escaped}"%')
+            clauses.append("reason = ?")
+            params.append(fragment)
+    if not clauses:
+        return None
+    return " OR ".join(f"({clause})" for clause in clauses), params
 
 
 def _decision_log_references_memory_ids(raw_json: str, memory_ids: set[str]) -> bool:

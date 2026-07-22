@@ -4,6 +4,7 @@ from itertools import combinations
 from app.memory.models import MemoryRecord
 from app.memory.network import _memory_similarity
 from app.memory.store import MemoryStore
+from app.memory.utils import _memory_embedding_vector
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ def traverse_memory_network(
         memories=memories,
         threshold=threshold,
         max_edges=capped_edges,
+        vectors={memory.id: _memory_embedding_vector(memory) for memory in memories},
     )
     adjacency = _build_adjacency(edges)
     reachable_paths = _reachable_paths(
@@ -134,10 +136,11 @@ def _build_similarity_edges(
     memories: list[MemoryRecord],
     threshold: float,
     max_edges: int,
+    vectors: dict[str, list[float] | None],
 ) -> list[TraversalEdge]:
     scored_edges: list[TraversalEdge] = []
     for left, right in combinations(memories, 2):
-        score = _memory_similarity(left, right)
+        score = _memory_similarity(left, right, vectors=vectors)
         if score < threshold:
             continue
         scored_edges.append(

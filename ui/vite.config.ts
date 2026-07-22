@@ -5,6 +5,7 @@ export default defineConfig({
   base: "/ui/",
   plugins: [react()],
   server: {
+    port: Number(process.env.PORT) || 5173,
     proxy: {
       "/health": {
         target: "http://localhost:2026",

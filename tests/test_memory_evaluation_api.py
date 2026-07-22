@@ -225,7 +225,7 @@ def test_recall_labels_empty_query_returns_friendly_message(
     assert empty.status_code == 422
     detail = empty.json()["detail"]
     assert isinstance(detail, str)
-    assert "blank" in detail.lower()
+    assert "不能为空" in detail
 
 
 def test_recall_workbench_candidates_match_retriever_pool(

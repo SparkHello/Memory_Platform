@@ -1,0 +1,123 @@
+/* Memory Console · 暮色琥珀光场
+   玻璃后面必须有活的东西：三团极缓慢漂移的暖光 + 呼吸的顶光 + 胶片颗粒。
+   全部只动 transform（合成层动画），玻璃的模糊由面板的 backdrop-filter 完成。 */
+
+.ambient-field {
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  overflow: hidden;
+  background: radial-gradient(140% 100% at 50% 0%, var(--bg) 0%, var(--bg-deep) 100%);
+  pointer-events: none;
+}
+
+.ambient-field i {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  will-change: transform;
+}
+
+/* 琥珀余烬：右上，最亮的一团 */
+.af-a {
+  top: -34vmax;
+  right: -18vmax;
+  width: 85vmax;
+  height: 85vmax;
+  background: radial-gradient(circle at 42% 44%, var(--ambient-a), transparent 62%);
+  animation: af-drift-a 88s var(--ease) infinite alternate;
+}
+
+/* 暮色玫瑰：左下 */
+.af-b {
+  bottom: -30vmax;
+  left: -24vmax;
+  width: 78vmax;
+  height: 78vmax;
+  background: radial-gradient(circle at 55% 45%, var(--ambient-b), transparent 64%);
+  animation: af-drift-b 112s var(--ease) infinite alternate;
+}
+
+/* 远处的暮蓝：中右，给类型色谱一个冷的呼应 */
+.af-c {
+  top: 26%;
+  right: -26vmax;
+  width: 64vmax;
+  height: 64vmax;
+  background: radial-gradient(circle at 46% 50%, var(--ambient-c), transparent 66%);
+  animation: af-drift-c 132s var(--ease) infinite alternate;
+}
+
+/* 顶部呼吸的光：像灯罩里透出来的光晕 */
+.af-glow {
+  top: -18vmax;
+  left: 12%;
+  width: 70vmax;
+  height: 42vmax;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 50% 42%, var(--ambient-glow), transparent 62%);
+  animation: af-breathe 14s ease-in-out infinite;
+}
+
+@keyframes af-drift-a {
+  from { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  to { transform: translate3d(-9vmax, 7vmax, 0) rotate(14deg) scale(1.12); }
+}
+
+@keyframes af-drift-b {
+  from { transform: translate3d(0, 0, 0) rotate(0deg) scale(1.06); }
+  to { transform: translate3d(11vmax, -8vmax, 0) rotate(-16deg) scale(0.96); }
+}
+
+@keyframes af-drift-c {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-13vmax, -9vmax, 0) scale(1.16); }
+}
+
+@keyframes af-breathe {
+  0%, 100% { transform: scale(1); opacity: 0.75; }
+  50% { transform: scale(1.07); opacity: 1; }
+}
+
+/* 胶片颗粒：阻断玻璃与渐变的塑料感，steps 跳动模拟颗粒噪声 */
+.af-grain {
+  position: absolute;
+  inset: -60px;
+  border-radius: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px 160px;
+  opacity: var(--grain-opacity);
+  animation: af-grain 1.6s steps(4) infinite;
+}
+
+@keyframes af-grain {
+  0% { transform: translate3d(0, 0, 0); }
+  25% { transform: translate3d(-22px, 14px, 0); }
+  50% { transform: translate3d(14px, -20px, 0); }
+  75% { transform: translate3d(-10px, -12px, 0); }
+  100% { transform: translate3d(18px, 16px, 0); }
+}
+
+/* 暗角：把视线聚回中央 */
+.ambient-field::after {
+  position: absolute;
+  content: "";
+  inset: 0;
+  background: radial-gradient(130% 96% at 50% 6%, transparent 42%, var(--ambient-vignette) 100%);
+}
+
+/* 内容层浮在光场之上 */
+.workspace {
+  position: relative;
+  z-index: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .af-a,
+  .af-b,
+  .af-c,
+  .af-glow,
+  .af-grain {
+    animation: none;
+  }
+}

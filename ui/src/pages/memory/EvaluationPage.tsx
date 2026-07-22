@@ -12,7 +12,7 @@ import {
   Trash2
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { MemoryApi } from "../../api";
+import { isAbortError, type MemoryApi } from "../../api";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type {
@@ -93,17 +93,17 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
   const [initializing, setInitializing] = useState(false);
   const [runningMode, setRunningMode] = useState<RunMode | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setState((current) => ({ ...current, loading: true, error: null }));
     let diagnosisError: string | null = null;
     try {
       const [diagnosis, workbench] = await Promise.all([
-        api.evaluationDiagnosis().catch((error) => {
+        api.evaluationDiagnosis(signal).catch((error) => {
           // 诊断失败不应连累整页：记下错误，仍渲染召回工作台。
           diagnosisError = errorMessage(error);
           return null;
         }),
-        api.recallEvaluationWorkbench().catch((error) => {
+        api.recallEvaluationWorkbench({}, signal).catch((error) => {
           if (String(errorMessage(error)).startsWith("404:")) return null;
           throw error;
         })
@@ -112,12 +112,16 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
       setLabels(workbench?.labels || []);
       setSelectedLabelId((current) => current || workbench?.labels[0]?.id || null);
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), diagnosis: null, diagnosisError, workbench: null });
     }
   }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   const selectedLabel = useMemo(() => {
@@ -283,7 +287,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
           <span className="count-pill">{progress}%</span>
         </div>
         <div className="evaluation-progress-bar" aria-label="召回标注进度">
-          <span style={{ width: `${progress}%` }} />
+          <span style={{ transform: `scaleX(${progress / 100})` }} />
         </div>
         {(state.workbench?.validation_issues || []).length > 0 && (
           <div className="evaluation-issues">
@@ -439,7 +443,11 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
       ) : (
         !state.loading && (
           <section className="panel">
-            <EmptyBlock label="尚未初始化召回评测快照" />
+            <EmptyBlock
+              label="尚未初始化召回评测快照"
+              hint="初始化会把当前真实库快照到本地评测目录，标注与运行都在隔离快照上进行。"
+              action={{ label: "初始化快照", onClick: () => void initialize() }}
+            />
           </section>
         )
       )}

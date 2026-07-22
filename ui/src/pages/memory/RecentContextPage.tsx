@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArchiveRestore,
@@ -20,7 +20,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
+import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
@@ -86,17 +86,21 @@ export function RecentContextPage({ api }: { api: MemoryApi }) {
     data: null
   });
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setState({ loading: true, error: null, data: null });
     try {
-      setState({ loading: false, error: null, data: await api.recentContext() });
+      setState({ loading: false, error: null, data: await api.recentContext(signal) });
     } catch (error) {
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
     }
   }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   return (
@@ -105,15 +109,17 @@ export function RecentContextPage({ api }: { api: MemoryApi }) {
         title="近期上下文"
         subtitle="近期上下文用于恢复最近对话，不属于长期记忆，也不会进入核心记忆。"
         action={
-          <button className="secondary-button" type="button" onClick={load}>
+          <button className="secondary-button" type="button" onClick={() => void load()}>
             <RefreshCcw size={16} />
             刷新
           </button>
         }
       />
       {state.loading && <LoadingBlock label="正在加载近期上下文" />}
-      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
-      {state.data && state.data.length === 0 && <EmptyBlock label="暂无近期上下文" />}
+      {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
+      {state.data && state.data.length === 0 && (
+        <EmptyBlock label="暂无近期上下文" hint="随对话累积的近期摘要会出现在这里。" />
+      )}
       {state.data && state.data.length > 0 && (
         <div className="context-list">
           {state.data.map((item) => (

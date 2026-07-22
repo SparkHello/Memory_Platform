@@ -1,11 +1,10 @@
-import json
 from itertools import combinations
 
 from app.memory.models import MemoryRecord
 from app.memory.redaction import redact_memory_payload
 from app.memory.search import cosine_similarity
 from app.memory.store import MemoryStore
-from app.memory.utils import _char_overlap, _term_jaccard
+from app.memory.utils import _char_overlap, _memory_embedding_vector, _term_jaccard
 
 
 CORE_SECTION_TITLES = {
@@ -49,6 +48,8 @@ def build_memory_network(
         arousal_max=arousal_max,
     )[:capped_limit]
     memory_by_id = {memory.id: memory for memory in memories}
+    # 两两比较前一次性解析全部候选向量（带缓存），避免 O(n²) 次重复 json.loads。
+    vectors = {memory.id: _memory_embedding_vector(memory) for memory in memories}
     core_sections = store.list_core_memory_sections(user_id=user_id)
 
     nodes = [_core_node(section) for section in core_sections]
@@ -79,7 +80,7 @@ def build_memory_network(
 
     similarity_edges = []
     for left, right in combinations(memories, 2):
-        score = _memory_similarity(left, right)
+        score = _memory_similarity(left, right, vectors=vectors)
         if score < threshold:
             continue
         similarity_edges.append((score, left.id, right.id))
@@ -216,9 +217,18 @@ def _append_edge(edges: list[dict], edge_keys: set[tuple[str, str, str]], edge: 
     edges.append(edge)
 
 
-def _memory_similarity(left: MemoryRecord, right: MemoryRecord) -> float:
-    left_vector = _load_vector(left.embedding_json)
-    right_vector = _load_vector(right.embedding_json)
+def _memory_similarity(
+    left: MemoryRecord,
+    right: MemoryRecord,
+    *,
+    vectors: dict[str, list[float] | None] | None = None,
+) -> float:
+    if vectors is None:
+        left_vector = _memory_embedding_vector(left)
+        right_vector = _memory_embedding_vector(right)
+    else:
+        left_vector = vectors.get(left.id)
+        right_vector = vectors.get(right.id)
     if left_vector is not None and right_vector is not None:
         return max(0.0, cosine_similarity(left_vector, right_vector))
 
@@ -229,18 +239,3 @@ def _memory_similarity(left: MemoryRecord, right: MemoryRecord) -> float:
     if left.type == right.type:
         text_score += 0.06
     return min(1.0, text_score)
-
-
-def _load_vector(raw_json: str | None) -> list[float] | None:
-    if not raw_json:
-        return None
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, list):
-        return None
-    try:
-        return [float(value) for value in data]
-    except (TypeError, ValueError):
-        return None

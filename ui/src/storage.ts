@@ -3,6 +3,21 @@ import type { ConnectionSettings } from "./types";
 const API_BASE_URL_KEY = "memory-console.apiBaseUrl";
 const API_KEY_KEY = "memory-console.gatewayApiKey";
 const USER_ID_KEY = "memory-console.userId";
+const THEME_KEY = "memory-console.theme";
+
+export type ThemeMode = "dark" | "light";
+
+export function loadTheme(): ThemeMode {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored === "light" || stored === "dark") {
+    return stored;
+  }
+  return "dark";
+}
+
+export function saveTheme(theme: ThemeMode) {
+  localStorage.setItem(THEME_KEY, theme);
+}
 
 export function normalizeBaseUrl(value: string): string {
   const trimmed = value.trim();

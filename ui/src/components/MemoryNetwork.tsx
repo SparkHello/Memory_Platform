@@ -16,10 +16,11 @@ import {
   useMemo,
   useRef,
   useState,
-  type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent
+  type PointerEvent as ReactPointerEvent
 } from "react";
 import type { MemoryNetwork as MemoryNetworkData, MemoryNetworkEdge, MemoryNetworkNode } from "../types";
+import { MEMORY_TYPES } from "../utils/constants";
+import { displayText } from "../utils/format";
 
 type SimNode = MemoryNetworkNode &
   SimulationNodeDatum & {
@@ -65,6 +66,8 @@ export function MemoryNetwork({
   const [view, setView] = useState<ViewTransform>(INITIAL_VIEW);
   const [isPanning, setIsPanning] = useState(false);
   const dragRef = useRef<DragState | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setView(INITIAL_VIEW);
@@ -103,14 +106,23 @@ export function MemoryNetwork({
     updateView(INITIAL_VIEW);
   }, [updateView]);
 
-  const handleWheel = useCallback(
-    (event: ReactWheelEvent<SVGSVGElement>) => {
+  // React 的 onWheel 是 passive 监听，preventDefault 无效会连带滚动页面；
+  // 必须用原生非 passive 监听器接管滚轮缩放。挂在外层 frame 上以覆盖缩放
+  // 工具栏区域，并以 graph 为依赖，保证空图→有图重渲染后监听仍在。
+  useEffect(() => {
+    const frame = frameRef.current;
+    const svg = svgRef.current;
+    if (!frame || !svg) return;
+    const handleWheel = (event: WheelEvent) => {
+      if ((event.target as Element | null)?.closest?.(".network-legend")) return;
       event.preventDefault();
-      const point = clientPointToSvg(event.currentTarget, event.clientX, event.clientY);
+      event.stopPropagation();
+      const point = clientPointToSvg(svg, event.clientX, event.clientY);
       zoomAt(point, Math.exp(-event.deltaY * 0.0014));
-    },
-    [zoomAt]
-  );
+    };
+    frame.addEventListener("wheel", handleWheel, { passive: false });
+    return () => frame.removeEventListener("wheel", handleWheel);
+  }, [zoomAt, graph]);
 
   const handlePointerDown = useCallback((event: ReactPointerEvent<SVGSVGElement>) => {
     if (event.button !== 0) return;
@@ -153,7 +165,7 @@ export function MemoryNetwork({
   }
 
   return (
-    <div className="memory-network-frame">
+    <div className="memory-network-frame" ref={frameRef}>
       <div className="network-zoom-toolbar" aria-label="网络视图控制">
         <button
           className="icon-button compact"
@@ -184,11 +196,11 @@ export function MemoryNetwork({
         </button>
       </div>
       <svg
+        ref={svgRef}
         className={`memory-network ${isPanning ? "is-panning" : ""}`}
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         role="img"
         aria-label="记忆网络"
-        onWheel={handleWheel}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={finishPan}
@@ -249,6 +261,18 @@ export function MemoryNetwork({
           </g>
         </g>
       </svg>
+      <div className="network-legend" aria-hidden="true">
+        {MEMORY_TYPES.map((type) => (
+          <span key={type}>
+            <i style={{ background: TYPE_FILL[type] }} />
+            {displayText(type)}
+          </span>
+        ))}
+        <span>
+          <i style={{ background: CORE_FILL, borderRadius: "50%" }} />
+          核心
+        </span>
+      </div>
     </div>
   );
 }
@@ -319,18 +343,25 @@ function nodeRadius(node: MemoryNetworkNode): number {
   return 4.2 + importance * 0.45;
 }
 
+const TYPE_FILL: Record<string, string> = {
+  episodic: "var(--type-episodic)",
+  semantic: "var(--type-semantic)",
+  procedural: "var(--type-procedural)",
+  emotional: "var(--type-emotional)",
+  reflective: "var(--type-reflective)"
+};
+
+const CORE_FILL = "var(--network-core)";
+
 function nodeFill(node: MemoryNetworkNode): string {
-  if (node.kind === "core") return "#315f72";
-  const valence = node.valence ?? 0.5;
-  if (valence < 0.38) return "#b65f62";
-  if (valence > 0.62) return "#4f8b68";
-  return "#b18b55";
+  if (node.kind === "core") return CORE_FILL;
+  return TYPE_FILL[node.type || ""] || "var(--muted)";
 }
 
 function nodeStroke(node: MemoryNetworkNode): string {
-  if (node.kind === "core") return "#e9f2f5";
+  if (node.kind === "core") return "var(--network-core-stroke)";
   const arousal = node.arousal ?? 0.3;
-  return arousal > 0.65 ? "#5b3440" : "#fffaf1";
+  return arousal > 0.65 ? "var(--network-hot-stroke)" : "var(--network-node-stroke)";
 }
 
 function clientPointToSvg(svg: SVGSVGElement, clientX: number, clientY: number): { x: number; y: number } {

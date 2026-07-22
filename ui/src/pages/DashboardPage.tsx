@@ -1,23 +1,23 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
-  Activity,
-  Archive,
+  ArrowRight,
   Brain,
-  Database,
+  CheckCircle2,
+  ChevronDown,
   FileText,
   GitBranch,
   Layers3,
-  ListChecks,
   RefreshCcw,
   ShieldAlert,
+  SlidersHorizontal,
   Sparkles,
   Wrench
 } from "lucide-react";
-import { MemoryApi } from "../api";
+import { MemoryApi, isAbortError } from "../api";
 import { MemoryNetwork } from "../components/MemoryNetwork";
 import { MemoryTraverse } from "../components/MemoryTraverse";
-import { PageHeader } from "../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../components/StateBlocks";
+import { useCountUp } from "../hooks/useCountUp";
 import type {
   ConnectionSettings,
   DecisionLog,
@@ -34,16 +34,26 @@ import type {
   TraversalResponse
 } from "../types";
 import { downloadFile } from "../utils/files";
-import { MEMORY_TYPES, SENSITIVITIES, SURFACE_MODES } from "../utils/constants";
+import {
+  MEMORY_TYPES,
+  MEMORY_TYPE_COLOR_VAR,
+  SENSITIVITIES,
+  SURFACE_MODES
+} from "../utils/constants";
 import {
   dateText,
   displayText,
   errorMessage,
-  joinUrl,
   percent,
   shortId
 } from "../utils/format";
 import type { Notify } from "./pageTypes";
+
+type EvalProgress = {
+  total: number;
+  unlabeled: number;
+  targetMin: number;
+};
 
 type DashboardData = {
   health: string;
@@ -53,6 +63,7 @@ type DashboardData = {
   surfaced: MemorySurfaceRecord[];
   network: MemoryNetworkData;
   spaces: MemorySpace[];
+  evalProgress: EvalProgress | null;
 };
 
 type NetworkFilters = {
@@ -67,6 +78,16 @@ type NetworkFilters = {
 
 type NetworkDensity = "overview" | "standard" | "more";
 
+const DEFAULT_NETWORK_FILTERS: NetworkFilters = {
+  spaceId: "all",
+  type: "all",
+  sensitivity: "all",
+  valenceMin: 0,
+  valenceMax: 1,
+  arousalMin: 0,
+  arousalMax: 1
+};
+
 const NETWORK_DENSITY_OPTIONS: Array<{
   key: NetworkDensity;
   label: string;
@@ -78,64 +99,102 @@ const NETWORK_DENSITY_OPTIONS: Array<{
   { key: "more", label: "更多", limit: 110, maxSimilarityEdges: 120 }
 ];
 
+type EmotionPresetKey = "all" | "positive" | "negative" | "high_arousal" | "calm";
+
+const EMOTION_PRESETS: Array<{
+  key: EmotionPresetKey;
+  label: string;
+  valence: [number, number];
+  arousal: [number, number];
+}> = [
+  { key: "all", label: "全部", valence: [0, 1], arousal: [0, 1] },
+  { key: "positive", label: "偏积极", valence: [0.62, 1], arousal: [0, 1] },
+  { key: "negative", label: "偏低落", valence: [0, 0.38], arousal: [0, 1] },
+  { key: "high_arousal", label: "高唤起", valence: [0, 1], arousal: [0.65, 1] },
+  { key: "calm", label: "平静", valence: [0, 1], arousal: [0, 0.4] }
+];
+
+function emotionPresetFor(filters: NetworkFilters): EmotionPresetKey | "custom" {
+  const match = EMOTION_PRESETS.find(
+    (preset) =>
+      preset.valence[0] === filters.valenceMin &&
+      preset.valence[1] === filters.valenceMax &&
+      preset.arousal[0] === filters.arousalMin &&
+      preset.arousal[1] === filters.arousalMax
+  );
+  return match ? match.key : "custom";
+}
+
 type LoadState = {
   loading: boolean;
   error: string | null;
   data: DashboardData | null;
 };
 
+type StudioAction = {
+  key: string;
+  tone: "warning" | "info" | "muted" | "primary";
+  title: string;
+  value: string;
+  hint: string;
+  page: PageKey;
+};
+
 export function DashboardPage({
   api,
   settings,
   setPage,
+  openMemory,
   notify
 }: {
   api: MemoryApi;
   settings: ConnectionSettings;
   setPage: (page: PageKey) => void;
+  openMemory: (id: string) => void;
   notify: Notify;
 }) {
   const [state, setState] = useState<LoadState>({ loading: true, error: null, data: null });
+  const [surfaceLoading, setSurfaceLoading] = useState(false);
+  const [networkLoading, setNetworkLoading] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("balanced");
   const [networkDensity, setNetworkDensity] = useState<NetworkDensity>("overview");
-  const [networkFilters, setNetworkFilters] = useState<NetworkFilters>({
-    spaceId: "all",
-    type: "all",
-    sensitivity: "all",
-    valenceMin: 0,
-    valenceMax: 1,
-    arousalMin: 0,
-    arousalMax: 1
-  });
+  const [networkFiltersOpen, setNetworkFiltersOpen] = useState(false);
+  const [networkFilters, setNetworkFilters] = useState<NetworkFilters>(DEFAULT_NETWORK_FILTERS);
 
-  const load = useCallback(async () => {
-    setState({ loading: true, error: null, data: null });
+  const load = useCallback(async (
+    nextSurfaceMode: SurfaceMode,
+    nextDensity: NetworkDensity,
+    nextFilters: NetworkFilters,
+    signal?: AbortSignal
+  ) => {
+    setState((current) => ({ ...current, loading: true, error: null }));
     try {
       const density =
-        NETWORK_DENSITY_OPTIONS.find((option) => option.key === networkDensity) ||
+        NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) ||
         NETWORK_DENSITY_OPTIONS[0];
-      const [health, report, review, logs, surfaced, network, spaces] = await Promise.all([
-        api.health(),
-        api.memoryReport(),
-        api.reviewMemories(),
-        api.decisionLogs(10),
-        api.surfaceMemories(6, surfaceMode, { redactSensitive: true }),
+      const [health, report, review, logs, surfaced, network, spaces, workbench] = await Promise.all([
+        api.health(signal),
+        api.memoryReport(signal),
+        api.reviewMemories(signal),
+        api.decisionLogs(10, {}, signal),
+        api.surfaceMemories(6, nextSurfaceMode, { redactSensitive: true }, signal),
         api.memoryNetwork({
           limit: density.limit,
           similarityThreshold: 0.42,
           maxSimilarityEdges: density.maxSimilarityEdges,
-          spaceId: networkFilters.spaceId === "all" ? undefined : networkFilters.spaceId,
-          type: networkFilters.type === "all" ? undefined : networkFilters.type,
+          spaceId: nextFilters.spaceId === "all" ? undefined : nextFilters.spaceId,
+          type: nextFilters.type === "all" ? undefined : nextFilters.type,
           sensitivity:
-            networkFilters.sensitivity === "all" ? undefined : networkFilters.sensitivity,
-          valenceMin: networkFilters.valenceMin,
-          valenceMax: networkFilters.valenceMax,
-          arousalMin: networkFilters.arousalMin,
-          arousalMax: networkFilters.arousalMax,
+            nextFilters.sensitivity === "all" ? undefined : nextFilters.sensitivity,
+          valenceMin: nextFilters.valenceMin,
+          valenceMax: nextFilters.valenceMax,
+          arousalMin: nextFilters.arousalMin,
+          arousalMax: nextFilters.arousalMax,
           redactSensitive: true
-        }),
-        api.listMemorySpaces()
+        }, signal),
+        api.listMemorySpaces(signal),
+        api.recallEvaluationWorkbench({}, signal).catch(() => null)
       ]);
       setState({
         loading: false,
@@ -147,17 +206,97 @@ export function DashboardPage({
           logs,
           surfaced,
           network,
-          spaces
+          spaces,
+          evalProgress: summarizeEvalProgress(workbench)
         }
       });
     } catch (error) {
-      setState({ loading: false, error: errorMessage(error), data: null });
+      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+      if (isAbortError(error)) return;
+      setState((current) => ({ ...current, loading: false, error: errorMessage(error) }));
     }
-  }, [api, surfaceMode, networkDensity, networkFilters]);
+  }, [api]);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load("balanced", "overview", DEFAULT_NETWORK_FILTERS, controller.signal);
+    return () => controller.abort();
   }, [load]);
+
+  const surfaceRequestRef = useRef<AbortController | null>(null);
+  const networkRequestRef = useRef<AbortController | null>(null);
+
+  // 卸载时取消用户触发的局部刷新请求。
+  useEffect(
+    () => () => {
+      surfaceRequestRef.current?.abort();
+      networkRequestRef.current?.abort();
+    },
+    []
+  );
+
+  const refreshSurface = async (nextMode: SurfaceMode) => {
+    setSurfaceMode(nextMode);
+    if (!state.data) return;
+    surfaceRequestRef.current?.abort();
+    const controller = new AbortController();
+    surfaceRequestRef.current = controller;
+    setSurfaceLoading(true);
+    try {
+      const surfaced = await api.surfaceMemories(6, nextMode, { redactSensitive: true }, controller.signal);
+      setState((current) => current.data ? {
+        ...current,
+        data: { ...current.data, surfaced }
+      } : current);
+    } catch (error) {
+      if (!isAbortError(error)) notify(errorMessage(error), "error");
+    } finally {
+      if (surfaceRequestRef.current === controller) setSurfaceLoading(false);
+    }
+  };
+
+  const refreshNetwork = async (nextDensity: NetworkDensity, nextFilters: NetworkFilters) => {
+    if (!state.data) return;
+    const density = NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) || NETWORK_DENSITY_OPTIONS[0];
+    networkRequestRef.current?.abort();
+    const controller = new AbortController();
+    networkRequestRef.current = controller;
+    setNetworkLoading(true);
+    try {
+      const network = await api.memoryNetwork({
+        limit: density.limit,
+        similarityThreshold: 0.42,
+        maxSimilarityEdges: density.maxSimilarityEdges,
+        spaceId: nextFilters.spaceId === "all" ? undefined : nextFilters.spaceId,
+        type: nextFilters.type === "all" ? undefined : nextFilters.type,
+        sensitivity: nextFilters.sensitivity === "all" ? undefined : nextFilters.sensitivity,
+        valenceMin: nextFilters.valenceMin,
+        valenceMax: nextFilters.valenceMax,
+        arousalMin: nextFilters.arousalMin,
+        arousalMax: nextFilters.arousalMax,
+        redactSensitive: true
+      }, controller.signal);
+      setSelectedNodeId((current) => current && network.nodes.some((node) => node.id === current) ? current : null);
+      setState((current) => current.data ? {
+        ...current,
+        data: { ...current.data, network }
+      } : current);
+    } catch (error) {
+      if (!isAbortError(error)) notify(errorMessage(error), "error");
+    } finally {
+      if (networkRequestRef.current === controller) setNetworkLoading(false);
+    }
+  };
+
+  const changeNetworkDensity = (nextDensity: NetworkDensity) => {
+    setNetworkDensity(nextDensity);
+    void refreshNetwork(nextDensity, networkFilters);
+  };
+
+  const changeNetworkFilters = (nextFilters: NetworkFilters) => {
+    setNetworkFilters(nextFilters);
+    void refreshNetwork(networkDensity, nextFilters);
+  };
 
   const data = state.data;
   const selectedNode = useMemo(() => {
@@ -166,56 +305,95 @@ export function DashboardPage({
   }, [data, selectedNodeId]);
   const emotion = useMemo(() => (data ? summarizeEmotion(data.network.nodes) : null), [data]);
 
+  const metrics = data
+    ? [
+        { label: "活跃记忆", value: data.report.counts.active_memories },
+        { label: "回收站", value: data.report.counts.deleted_memories },
+        { label: "核心分区", value: data.report.counts.core_sections },
+        { label: "记忆空间", value: data.spaces.length }
+      ]
+    : [];
+
+  const actions = data ? buildStudioActions(data) : [];
+  const todayText = useMemo(
+    () => new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" }),
+    []
+  );
+
+  const greeting = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour < 6) return "夜深了，记忆在安静地呼吸";
+    if (hour < 11) return "早安，新的一天开始了";
+    if (hour < 14) return "午安，记忆在阳光下沉淀";
+    if (hour < 18) return "下午好，有些记忆正在浮现";
+    if (hour < 22) return "晚上好，是时候回看今天了";
+    return "夜深了，记忆在安静地呼吸";
+  }, []);
+
   return (
     <div className="page-stack studio-page">
-      <PageHeader
-        title="记忆工作室"
-        subtitle="让长期记忆以关系、情绪和浮现顺序被看见。"
-        action={
-          <button className="secondary-button" type="button" onClick={load}>
-            <RefreshCcw size={16} />
-            刷新
-          </button>
-        }
-      />
-
-      <div className="notice">
-        <ShieldAlert size={16} />
-        当前为遮罩视图，私密和敏感正文已隐藏。
-      </div>
-
-      {state.loading && <LoadingBlock label="正在整理记忆工作室" />}
-      {state.error && <ErrorBlock message={state.error} onRetry={load} />}
+      {state.loading && !state.data && <LoadingBlock label="正在整理记忆工作室" />}
+      {state.error && !state.data && <ErrorBlock message={state.error} onRetry={() => void load(surfaceMode, networkDensity, networkFilters)} />}
 
       {data && (
         <>
-          <section className="studio-hero">
-            <div>
-              <span className="studio-kicker">Memory Studio</span>
-              <h2>今天最值得回到脑海里的线索</h2>
-              <p>
-                当前连接到 {settings.userId || "default"} 的本地记忆库，MCP 地址为{" "}
-                <code>{joinUrl(settings.apiBaseUrl, "/mcp")}</code>
-              </p>
+          <header className="studio-head">
+            <div className="studio-head-row">
+              <div className="studio-greeting">
+                <strong className="greeting-text">{greeting}</strong>
+                <span className="greeting-date">{todayText}</span>
+              </div>
+              <div className="studio-head-side">
+                <span className="studio-health">
+                  <span className={`status-dot ${data.health === "ok" ? "ok" : "bad"}`} />
+                  {data.health === "ok" ? "服务在线" : data.health}
+                </span>
+                <button
+                  className={`icon-button studio-refresh ${state.loading ? "is-loading" : ""}`}
+                  type="button"
+                  onClick={() => void load(surfaceMode, networkDensity, networkFilters)}
+                  title="刷新数据"
+                  aria-label="刷新整页数据"
+                  disabled={state.loading}
+                >
+                  <RefreshCcw size={15} />
+                </button>
+              </div>
             </div>
-            <div className="studio-health">
-              <span className={`status-dot ${data.health === "ok" ? "ok" : "bad"}`} />
-              <strong>{data.health === "ok" ? "服务在线" : data.health}</strong>
-            </div>
+            <span className="hero-note">
+              <ShieldAlert size={13} />
+              遮罩视图 · 私密与敏感正文已隐藏
+            </span>
+          </header>
+
+          <section className="action-band" aria-label="今日待办">
+            {actions.length === 0 ? (
+              <div className="action-clear">
+                <CheckCircle2 size={16} />
+                <span>一切就绪，没有待处理事项。记忆会在日常对话中自然积累。</span>
+              </div>
+            ) : (
+              actions.map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  className={`action-card tone-${action.tone}`}
+                  onClick={() => setPage(action.page)}
+                >
+                  <span className="action-title">{action.title}</span>
+                  <strong className="action-value">{action.value}</strong>
+                  <span className="action-hint">{action.hint}</span>
+                  <ArrowRight className="action-arrow" size={15} />
+                </button>
+              ))
+            )}
           </section>
 
-          <div className="studio-metrics">
-            <Metric icon={Database} label="活跃记忆" value={data.report.counts.active_memories} />
-            <Metric icon={Archive} label="回收站" value={data.report.counts.deleted_memories} />
-            <Metric icon={Layers3} label="核心分区" value={data.report.counts.core_sections} />
-            <Metric icon={Layers3} label="记忆空间" value={data.spaces.length} />
-            <Metric icon={ListChecks} label="体检建议" value={data.review.recommendations.length} />
-            <Metric icon={Activity} label="最近决策" value={data.logs.length} />
-          </div>
+          <MetricStrip metrics={metrics} />
 
           <div className="studio-grid">
-            <section className="panel surfaced-panel">
-              <div className="panel-header">
+            <div className="studio-main">
+            <section className="panel surfaced-panel" aria-busy={surfaceLoading}>              <div className="panel-header">
                 <h2>
                   <Sparkles size={18} />
                   浮现记忆
@@ -224,13 +402,15 @@ export function DashboardPage({
                   打开记忆库
                 </button>
               </div>
-              <div className="tabs surface-mode-tabs" aria-label="浮现模式">
+              <div className="tabs surfaced-mode-tabs" aria-label="浮现模式">
                 {SURFACE_MODES.map((mode) => (
                   <button
                     key={mode}
                     type="button"
                     className={surfaceMode === mode ? "active" : ""}
-                    onClick={() => setSurfaceMode(mode)}
+                    onClick={() => void refreshSurface(mode)}
+                    aria-pressed={surfaceMode === mode}
+                    disabled={surfaceLoading}
                   >
                     {displayText(mode)}
                   </button>
@@ -243,29 +423,51 @@ export function DashboardPage({
                   {data.surfaced.map((memory) => (
                     <button
                       key={memory.id}
-                      className={`surfaced-item ${selectedNodeId === memory.id ? "active" : ""}`}
+                      className="surfaced-item"
                       type="button"
-                      onClick={() => setSelectedNodeId(memory.id)}
+                      style={{ "--tc": MEMORY_TYPE_COLOR_VAR[memory.type] } as CSSProperties}
+                      onClick={() => openMemory(memory.id)}
                     >
-                      <span>{memory.surface_reason_text || surfaceReason(memory.surface_reason)}</span>
-                      <strong>{memory.content}</strong>
-                      <small>
-                        重要度 {memory.importance} · 浮现分 {scoreText(memory.surface_score)} · 生命力{" "}
-                        {scoreText(memory.life_score)}
-                      </small>
-                      <small>
-                        最近活跃 {daysSinceText(memory.days_since_last_active)} ·{" "}
+                      <span className="surfaced-tab">{displayText(memory.type)}</span>
+                      <span>
+                        {memory.surface_reason_text || surfaceReason(memory.surface_reason)}
                         {memory.review_signals.length
-                          ? memory.review_signals.map(displayText).join("、")
-                          : "无复核信号"}
-                      </small>
+                          ? ` · ${memory.review_signals.map(displayText).join("、")}`
+                          : ""}
+                      </span>
+                      <strong>{memory.content}</strong>
+                      <span className="surfaced-footer">
+                        <i className="emo-dot" style={{ background: valenceColorVar(memory.valence) }} />
+                        <span className="vita">
+                          <i style={{ width: `${lifeWidth(memory.life_score)}%` }} />
+                        </span>
+                        <small>
+                          重要 {memory.importance} · {daysSinceText(memory.days_since_last_active)}
+                        </small>
+                      </span>
                     </button>
                   ))}
                 </div>
               )}
+              <VitalityTrack memories={data.surfaced} loading={surfaceLoading} />
             </section>
 
-            <section className="panel emotion-panel">
+            <section className="panel panel--quiet spaces-panel">
+              <div className="panel-header">
+                <h2>
+                  <Layers3 size={18} />
+                  空间概览
+                </h2>
+                <button className="ghost-button compact" type="button" onClick={() => setPage("memories")}>
+                  整理
+                </button>
+              </div>
+              <SpaceOverview spaces={data.spaces} onOpenMemories={() => setPage("memories")} />
+            </section>
+            </div>
+
+            <div className="studio-side">
+              <section className="panel panel--quiet emotion-panel">
               <div className="panel-header">
                 <h2>
                   <Brain size={18} />
@@ -274,17 +476,7 @@ export function DashboardPage({
               </div>
               {emotion && (
                 <>
-                  <div
-                    className="emotion-orbit"
-                    style={
-                      {
-                        "--x": `${emotion.valence * 100}%`,
-                        "--y": `${(1 - emotion.arousal) * 100}%`
-                      } as CSSProperties
-                    }
-                  >
-                    <span />
-                  </div>
+                  <EmotionQuadrant valence={emotion.valence} arousal={emotion.arousal} />
                   <div className="emotion-stats">
                     <div>
                       <span>平均正向度</span>
@@ -306,48 +498,49 @@ export function DashboardPage({
                 </>
               )}
             </section>
-
-            <section className="panel spaces-panel">
-              <div className="panel-header">
-                <h2>
-                  <Layers3 size={18} />
-                  空间概览
-                </h2>
-                <button className="ghost-button compact" type="button" onClick={() => setPage("memories")}>
-                  整理
-                </button>
-              </div>
-              <SpaceOverview spaces={data.spaces} onOpenMemories={() => setPage("memories")} />
-            </section>
+            </div>
           </div>
 
-          <section className="panel network-panel">
+          <section className="panel panel--quiet network-panel">
             <div className="panel-header network-panel-header">
               <h2>记忆网络</h2>
               <div className="network-header-actions">
                 <span className="muted">
-                {data.network.nodes.length} 个节点 · {data.network.edges.length} 条关系
-              </span>
+                  {data.network.nodes.length} 个节点 · {data.network.edges.length} 条关系
+                </span>
                 <div className="tabs network-density-tabs" aria-label="网络密度">
                   {NETWORK_DENSITY_OPTIONS.map((option) => (
                     <button
                       key={option.key}
                       type="button"
                       className={networkDensity === option.key ? "active" : ""}
-                      onClick={() => setNetworkDensity(option.key)}
+                      onClick={() => changeNetworkDensity(option.key)}
+                      disabled={networkLoading}
                     >
                       {option.label}
                     </button>
                   ))}
                 </div>
+                <button
+                  className={`secondary-button compact network-filter-toggle ${networkFiltersOpen ? "active" : ""}`}
+                  type="button"
+                  onClick={() => setNetworkFiltersOpen((current) => !current)}
+                  aria-expanded={networkFiltersOpen}
+                >
+                  <SlidersHorizontal size={15} />
+                  过滤器
+                  <ChevronDown size={14} />
+                </button>
               </div>
             </div>
-            <NetworkFiltersView
-              filters={networkFilters}
-              spaces={data.spaces}
-              onChange={setNetworkFilters}
-            />
-            <div className="network-workspace">
+            {networkFiltersOpen && (
+              <NetworkFiltersView
+                filters={networkFilters}
+                spaces={data.spaces}
+                onChange={changeNetworkFilters}
+              />
+            )}
+            <div className="network-workspace" aria-busy={networkLoading}>
               <MemoryNetwork
                 network={data.network}
                 selectedId={selectedNodeId}
@@ -357,7 +550,7 @@ export function DashboardPage({
                 node={selectedNode}
                 spaces={data.spaces}
                 api={api}
-                onOpenMemory={() => setPage("memories")}
+                onOpenMemory={() => selectedNode && openMemory(selectedNode.id)}
                 onExport={async () => {
                   try {
                     const exportData = await api.exportMemories("json");
@@ -381,20 +574,47 @@ export function DashboardPage({
   );
 }
 
-function Metric({
-  icon: Icon,
-  label,
-  value
-}: {
-  icon: typeof Database;
-  label: string;
-  value: number | string;
-}) {
+function MetricStrip({ metrics }: { metrics: Array<{ label: string; value: number | string }> }) {
   return (
-    <div className="studio-metric">
-      <Icon size={18} />
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <div className="metric-strip">
+      {metrics.map((metric) => (
+        <div className="metric-cell" key={metric.label}>
+          {typeof metric.value === "number" ? (
+            <MetricNumber value={metric.value} />
+          ) : (
+            <strong>{metric.value}</strong>
+          )}
+          <span>{metric.label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MetricNumber({ value }: { value: number }) {
+  const animated = useCountUp(value);
+  return <strong>{animated}</strong>;
+}
+
+function VitalityTrack({
+  memories,
+  loading
+}: {
+  memories: MemorySurfaceRecord[];
+  loading: boolean;
+}) {
+  const average = memories.length
+    ? Math.round(memories.reduce((sum, memory) => sum + lifeWidth(memory.life_score), 0) / memories.length)
+    : 0;
+  return (
+    <div className="hero-vitality" aria-label={`浮现记忆平均生命力 ${average}%`}>
+      <span>生命力轨道</span>
+      <div className="vitality-rail" aria-hidden="true">
+        {memories.slice(0, 6).map((memory) => (
+          <i key={memory.id} style={{ width: `${Math.max(5, lifeWidth(memory.life_score))}%` }} />
+        ))}
+      </div>
+      <strong>{loading ? "刷新中" : `${average}%`}</strong>
     </div>
   );
 }
@@ -430,6 +650,8 @@ function NetworkFiltersView({
   spaces: MemorySpace[];
   onChange: (filters: NetworkFilters) => void;
 }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const activePreset = emotionPresetFor(filters);
   return (
     <div className="network-filters">
       <label className="field-block small">
@@ -440,7 +662,7 @@ function NetworkFiltersView({
         >
           <option value="all">全部</option>
           {spaces.map((space) => (
-            <option key={space.id} value={space.id}>
+            <option key={space.id} value={space.name}>
               {space.name}
             </option>
           ))}
@@ -481,58 +703,98 @@ function NetworkFiltersView({
           ))}
         </select>
       </label>
-      <label className="field-block small">
-        <span>正向度下限</span>
-        <input
-          type="number"
-          min={0}
-          max={1}
-          step={0.05}
-          value={filters.valenceMin}
-          onChange={(event) =>
-            onChange({ ...filters, valenceMin: boundedUnit(Number(event.target.value)) })
-          }
-        />
-      </label>
-      <label className="field-block small">
-        <span>正向度上限</span>
-        <input
-          type="number"
-          min={0}
-          max={1}
-          step={0.05}
-          value={filters.valenceMax}
-          onChange={(event) =>
-            onChange({ ...filters, valenceMax: boundedUnit(Number(event.target.value)) })
-          }
-        />
-      </label>
-      <label className="field-block small">
-        <span>唤起度下限</span>
-        <input
-          type="number"
-          min={0}
-          max={1}
-          step={0.05}
-          value={filters.arousalMin}
-          onChange={(event) =>
-            onChange({ ...filters, arousalMin: boundedUnit(Number(event.target.value)) })
-          }
-        />
-      </label>
-      <label className="field-block small">
-        <span>唤起度上限</span>
-        <input
-          type="number"
-          min={0}
-          max={1}
-          step={0.05}
-          value={filters.arousalMax}
-          onChange={(event) =>
-            onChange({ ...filters, arousalMax: boundedUnit(Number(event.target.value)) })
-          }
-        />
-      </label>
+      <div className="field-block small emotion-preset-field">
+        <span>情绪</span>
+        <div className="tabs emotion-preset-tabs" role="group" aria-label="情绪预设">
+          {EMOTION_PRESETS.map((preset) => (
+            <button
+              key={preset.key}
+              type="button"
+              className={activePreset === preset.key ? "active" : ""}
+              onClick={() =>
+                onChange({
+                  ...filters,
+                  valenceMin: preset.valence[0],
+                  valenceMax: preset.valence[1],
+                  arousalMin: preset.arousal[0],
+                  arousalMax: preset.arousal[1]
+                })
+              }
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="field-block small network-advanced-field">
+        <span aria-hidden="true">&nbsp;</span>
+        <button
+          className={`ghost-button compact network-advanced-toggle ${advancedOpen ? "active" : ""}`}
+          type="button"
+          onClick={() => setAdvancedOpen((open) => !open)}
+          aria-expanded={advancedOpen}
+        >
+          <SlidersHorizontal size={14} />
+          高级数值
+          <ChevronDown size={13} />
+        </button>
+      </div>
+      {advancedOpen && (
+        <>
+          <label className="field-block small">
+            <span>正向度下限</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={filters.valenceMin}
+              onChange={(event) =>
+                onChange({ ...filters, valenceMin: boundedUnit(Number(event.target.value)) })
+              }
+            />
+          </label>
+          <label className="field-block small">
+            <span>正向度上限</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={filters.valenceMax}
+              onChange={(event) =>
+                onChange({ ...filters, valenceMax: boundedUnit(Number(event.target.value)) })
+              }
+            />
+          </label>
+          <label className="field-block small">
+            <span>唤起度下限</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={filters.arousalMin}
+              onChange={(event) =>
+                onChange({ ...filters, arousalMin: boundedUnit(Number(event.target.value)) })
+              }
+            />
+          </label>
+          <label className="field-block small">
+            <span>唤起度上限</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={filters.arousalMax}
+              onChange={(event) =>
+                onChange({ ...filters, arousalMax: boundedUnit(Number(event.target.value)) })
+              }
+            />
+          </label>
+        </>
+      )}
     </div>
   );
 }
@@ -657,7 +919,7 @@ function NetworkDetail({
         </blockquote>
       )}
       <button className="primary-button full-width" type="button" onClick={onOpenMemory}>
-        打开记忆库编辑
+        打开记忆档案
       </button>
       <button
         className="secondary-button full-width"
@@ -684,6 +946,121 @@ function NetworkDetail({
       />
     </aside>
   );
+}
+
+function EmotionQuadrant({ valence, arousal }: { valence: number; arousal: number }) {
+  const x = 14 + boundedUnit(valence) * 192;
+  const y = 206 - boundedUnit(arousal) * 192;
+  return (
+    <div className="emotion-quadrant">
+      <svg viewBox="0 0 220 220" role="img" aria-label="情绪象限分布">
+        <defs>
+          <clipPath id="eq-clip">
+            <rect x="14" y="14" width="192" height="192" rx="10" />
+          </clipPath>
+        </defs>
+        <g clipPath="url(#eq-clip)">
+          <rect className="eq-tl" x="14" y="14" width="96" height="96" />
+          <rect className="eq-tr" x="110" y="14" width="96" height="96" />
+          <rect className="eq-bl" x="14" y="110" width="96" height="96" />
+          <rect className="eq-br" x="110" y="110" width="96" height="96" />
+        </g>
+        <line className="eq-axis" x1="110" y1="14" x2="110" y2="206" />
+        <line className="eq-axis" x1="14" y1="110" x2="206" y2="110" />
+        <line className="eq-guide" x1={x} y1="14" x2={x} y2="206" />
+        <line className="eq-guide" x1="14" y1={y} x2="206" y2={y} />
+        <rect className="eq-frame" x="14" y="14" width="192" height="192" rx="10" />
+        <text className="eq-label" x="22" y="30">
+          紧绷 / 低落
+        </text>
+        <text className="eq-label" x="198" y="30" textAnchor="end">
+          明亮 / 兴奋
+        </text>
+        <text className="eq-label" x="22" y="198">
+          低落 / 平静
+        </text>
+        <text className="eq-label" x="198" y="198">
+          明亮 / 平静
+        </text>
+        <circle className="eq-dot" cx={x} cy={y} r="6.5" />
+      </svg>
+    </div>
+  );
+}
+
+function buildStudioActions(data: DashboardData): StudioAction[] {
+  const list: StudioAction[] = [];
+  const reviewCount = data.review.recommendations.length;
+  if (reviewCount > 0) {
+    list.push({
+      key: "review",
+      tone: "warning",
+      title: "记忆体检",
+      value: `${reviewCount} 条`,
+      hint: "有记忆值得回看，去处理体检建议",
+      page: "review"
+    });
+  } else {
+    const signalCount = data.surfaced.filter((memory) => memory.review_signals.length > 0).length;
+    if (signalCount > 0) {
+      list.push({
+        key: "signals",
+        tone: "warning",
+        title: "待复核记忆",
+        value: `${signalCount} 条`,
+        hint: "浮现记忆带有复核信号，去体检页确认",
+        page: "review"
+      });
+    }
+  }
+  if (data.evalProgress && data.evalProgress.unlabeled > 0) {
+    const graded = data.evalProgress.total - data.evalProgress.unlabeled;
+    list.push({
+      key: "evaluation",
+      tone: "info",
+      title: "召回标注",
+      value: `${graded}/${data.evalProgress.targetMin}`,
+      hint: `还有 ${data.evalProgress.unlabeled} 条 query 待标注`,
+      page: "evaluation"
+    });
+  }
+  if (data.report.counts.deleted_memories > 0) {
+    list.push({
+      key: "trash",
+      tone: "muted",
+      title: "回收站",
+      value: `${data.report.counts.deleted_memories} 条`,
+      hint: "待恢复或彻底清理",
+      page: "memories"
+    });
+  }
+  if (data.report.counts.core_sections === 0) {
+    list.push({
+      key: "core",
+      tone: "primary",
+      title: "核心记忆",
+      value: "未整理",
+      hint: "运行一次整理，提炼长期画像",
+      page: "core"
+    });
+  }
+  return list;
+}
+
+function summarizeEvalProgress(
+  workbench: { labels?: Array<{ judgment?: string; relevant_ids: string[] }>; target_label_min?: number } | null
+): EvalProgress | null {
+  const labels = workbench?.labels || [];
+  if (!workbench || !labels.length) return null;
+  const unlabeled = labels.filter((label) => {
+    const judgment = label.judgment || (label.relevant_ids.length > 0 ? "relevant" : "unlabeled");
+    return !(judgment === "no_answer" || (judgment === "relevant" && label.relevant_ids.length > 0));
+  }).length;
+  return {
+    total: labels.length,
+    unlabeled,
+    targetMin: workbench.target_label_min || 20
+  };
 }
 
 function summarizeEmotion(nodes: MemoryNetworkNode[]) {
@@ -733,9 +1110,16 @@ function surfaceReason(reason: string): string {
   }[reason] || reason;
 }
 
-function scoreText(value?: number | null): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return value.toFixed(1);
+function valenceColorVar(value?: number | null): string {
+  const valence = value ?? 0.5;
+  if (valence < 0.38) return "var(--emo-neg)";
+  if (valence > 0.62) return "var(--emo-pos)";
+  return "var(--emo-mid)";
+}
+
+function lifeWidth(value?: number | null): number {
+  if (value === null || value === undefined || Number.isNaN(value)) return 0;
+  return Math.min(100, Math.max(0, value));
 }
 
 function daysSinceText(value?: number | null): string {

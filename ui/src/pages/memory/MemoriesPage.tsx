@@ -1,99 +1,88 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity,
   ArchiveRestore,
-  Clipboard,
+  ChevronLeft,
+  ChevronRight,
+  Columns3,
   Download,
-  Eye,
-  EyeOff,
-  FileText,
-  GitBranch,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  Plus,
   RefreshCcw,
-  Save,
   Search,
   ShieldAlert,
+  SlidersHorizontal,
   Trash2,
-  Upload,
-  Wrench,
   X
 } from "lucide-react";
-import { MemoryApi } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
-import type {
-  ConnectionSettings,
-  CoreMemoryHistoryItem,
-  CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  MemoryAction,
-  MemoryExport,
-  MemoryRecord,
-  MemoryReport,
-  MemorySpace,
-  MemoryStatus,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult,
-  TraversalResponse
-} from "../../types";
+import { MemoryApi, isAbortError } from "../../api";
+import type { MemoryExport, MemoryRecord, MemorySpace } from "../../types";
 import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { FilterSelect, RangeFields } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
-import { MemoryTraverse } from "../../components/MemoryTraverse";
-import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
+import { useConfirm } from "../../hooks/useConfirm";
+import { useDialogA11y } from "../../hooks/useDialogA11y";
+import { downloadFile } from "../../utils/files";
 import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
   MEMORY_TYPES,
   MEMORY_STATUSES,
-  REVIEW_ACTIONS,
   SENSITIVITIES,
   STABILITIES
 } from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, editDraftToSpacesPayload, memoryToEditDraft, normalizeTags } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
+import { dateText, displayText, errorMessage, percent } from "../../utils/format";
+import { normalizeTags } from "../../utils/memory";
+import type { MemoryFilters } from "../../utils/memory";
 import type { Notify } from "../pageTypes";
+
+const DEFAULT_FILTERS: MemoryFilters = {
+  type: "all",
+  status: "all",
+  sensitivity: "all",
+  stability: "all",
+  minImportance: 1,
+  maxImportance: 10,
+  minConfidence: 0,
+  maxConfidence: 1,
+  hasValidUntil: false,
+  hasReviewAfter: false,
+  spaceId: "all",
+  topicQuery: "",
+  entityQuery: ""
+};
+
+type MemoryColumn =
+  | "classification"
+  | "typeStatus"
+  | "importance"
+  | "updated"
+  | "confidence"
+  | "stability"
+  | "sensitivity"
+  | "usage"
+  | "lastUsed";
+
+const MEMORY_COLUMNS: Array<{ key: MemoryColumn; label: string }> = [
+  { key: "classification", label: "分类" },
+  { key: "typeStatus", label: "类型 / 状态" },
+  { key: "importance", label: "重要度" },
+  { key: "updated", label: "更新时间" },
+  { key: "confidence", label: "置信度" },
+  { key: "stability", label: "稳定性" },
+  { key: "sensitivity", label: "敏感级别" },
+  { key: "usage", label: "激活次数" },
+  { key: "lastUsed", label: "最近使用" }
+];
 
 export function MemoriesPage({
   api,
   notify,
-  confirm
+  openMemory,
+  refreshKey
 }: {
   api: MemoryApi;
   notify: Notify;
-  confirm: ConfirmFn;
+  openMemory: (id: string) => void;
+  refreshKey: number;
 }) {
   const [tab, setTab] = useState<"active" | "deleted">("active");
   const [state, setState] = useState<LoadState<MemoryRecord[]>>({
@@ -103,80 +92,75 @@ export function MemoriesPage({
   });
   const [spaces, setSpaces] = useState<MemorySpace[]>([]);
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<MemoryRecord | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [editDraft, setEditDraft] = useState<MemoryEditDraft | null>(null);
-  const [editError, setEditError] = useState<string | null>(null);
-  const [savingEdit, setSavingEdit] = useState(false);
-  const [purgeTarget, setPurgeTarget] = useState<MemoryRecord | null>(null);
-  const [purgeConfirmText, setPurgeConfirmText] = useState("");
-  const [purging, setPurging] = useState(false);
-  const [why, setWhy] = useState<LoadState<MemorySourceExplanation>>({
-    loading: false,
-    error: null,
-    data: null
-  });
-  const [traverse, setTraverse] = useState<LoadState<TraversalResponse>>({
-    loading: false,
-    error: null,
-    data: null
-  });
-  const [filters, setFilters] = useState<MemoryFilters>({
-    type: "all",
-    status: "all",
-    sensitivity: "all",
-    stability: "all",
-    minImportance: 1,
-    maxImportance: 10,
-    minConfidence: 0,
-    maxConfidence: 1,
-    hasValidUntil: false,
-    hasReviewAfter: false,
-    spaceId: "all",
-    topicQuery: "",
-    entityQuery: ""
-  });
+  const [submittedQuery, setSubmittedQuery] = useState("");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const [pageIndex, setPageIndex] = useState(0);
+  const [visibleColumns, setVisibleColumns] = useState<Set<MemoryColumn>>(
+    () => new Set(["classification", "typeStatus", "importance", "updated"])
+  );
+  const [filters, setFilters] = useState<MemoryFilters>({ ...DEFAULT_FILTERS });
+  const filterDrawerRef = useDialogA11y<HTMLElement>(
+    () => setFiltersOpen(false),
+    filtersOpen
+  );
 
   const load = useCallback(
-    async (mode = tab) => {
+    async (mode = tab, signal?: AbortSignal) => {
       setState({ loading: true, error: null, data: null });
-      setWhy({ loading: false, error: null, data: null });
-      setTraverse({ loading: false, error: null, data: null });
       try {
         const memoryPromise =
           mode === "deleted"
-            ? api.listDeletedMemories({ redactSensitive: true })
-            : query.trim()
-              ? api.searchMemories(query.trim(), 20, {
-                  includeSensitive: true,
-                  redactSensitive: true
-                })
-              : api.listMemories({ redactSensitive: true, status: "all" });
+            ? api.listDeletedMemories({ redactSensitive: true }, signal)
+            : submittedQuery
+              ? api.searchMemories(
+                  submittedQuery,
+                  20,
+                  {
+                    includeSensitive: true,
+                    redactSensitive: true
+                  },
+                  signal
+                )
+              : api.listMemories({ redactSensitive: true, status: "all" }, signal);
         const [memories, loadedSpaces] = await Promise.all([
           memoryPromise,
-          api.listMemorySpaces()
+          api.listMemorySpaces(signal)
         ]);
         setSpaces(loadedSpaces);
         setState({ loading: false, error: null, data: memories });
       } catch (error) {
+        // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
+        if (isAbortError(error)) return;
         setState({ loading: false, error: errorMessage(error), data: null });
       }
     },
-    [api, query, tab]
+    [api, submittedQuery, tab]
   );
 
   useEffect(() => {
-    void load(tab);
+    const controller = new AbortController();
+    void load(tab, controller.signal);
+    return () => controller.abort();
   }, [load, tab]);
 
+  // 输入防抖：停顿 300ms 后才真正发搜索请求；Enter / 搜索按钮立即触发。
   useEffect(() => {
-    setWhy({ loading: false, error: null, data: null });
-    setTraverse({ loading: false, error: null, data: null });
-    setEditing(false);
-    setEditDraft(null);
-    setEditError(null);
-    setSavingEdit(false);
-  }, [selected?.id]);
+    const handle = setTimeout(() => setSubmittedQuery(query.trim()), 300);
+    return () => clearTimeout(handle);
+  }, [query]);
+
+  const runSearch = () => {
+    const value = query.trim();
+    if (value === submittedQuery) void load("active");
+    else setSubmittedQuery(value);
+  };
+
+  // 全局记忆档案抽屉改动记忆后，回表刷新。
+  useEffect(() => {
+    if (refreshKey > 0) void load(tab);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   const memories = useMemo(() => {
     return (state.data || []).filter((memory) => {
@@ -195,190 +179,170 @@ export function MemoriesPage({
     });
   }, [filters, state.data]);
 
-  const runWhy = async (memory: MemoryRecord) => {
-    setWhy({ loading: true, error: null, data: null });
+  const pageSize = 25;
+  const pageCount = Math.max(1, Math.ceil(memories.length / pageSize));
+  const pagedMemories = useMemo(
+    () => memories.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize),
+    [memories, pageIndex]
+  );
+
+  useEffect(() => {
+    setPageIndex(0);
+    setSelectedIds(new Set());
+  }, [filters, query, tab]);
+
+  useEffect(() => {
+    if (pageIndex >= pageCount) setPageIndex(pageCount - 1);
+  }, [pageCount, pageIndex]);
+
+  const activeFilters: Array<{ key: string; label: string; clear: () => void }> = [];
+  if (query.trim()) {
+    activeFilters.push({ key: "query", label: `搜索：${query.trim()}`, clear: () => setQuery("") });
+  }
+  if (filters.type !== "all") activeFilters.push({ key: "type", label: `类型：${displayText(filters.type)}`, clear: () => setFilters({ ...filters, type: "all" }) });
+  if (filters.status !== "all") activeFilters.push({ key: "status", label: `状态：${displayText(filters.status)}`, clear: () => setFilters({ ...filters, status: "all" }) });
+  if (filters.sensitivity !== "all") activeFilters.push({ key: "sensitivity", label: `敏感级别：${displayText(filters.sensitivity)}`, clear: () => setFilters({ ...filters, sensitivity: "all" }) });
+  if (filters.stability !== "all") activeFilters.push({ key: "stability", label: `稳定性：${displayText(filters.stability)}`, clear: () => setFilters({ ...filters, stability: "all" }) });
+  if (filters.spaceId !== "all") activeFilters.push({ key: "space", label: `空间：${spaces.find((space) => space.id === filters.spaceId)?.name || "已选"}`, clear: () => setFilters({ ...filters, spaceId: "all" }) });
+  if (filters.topicQuery) activeFilters.push({ key: "topic", label: `主题：${filters.topicQuery}`, clear: () => setFilters({ ...filters, topicQuery: "" }) });
+  if (filters.entityQuery) activeFilters.push({ key: "entity", label: `实体：${filters.entityQuery}`, clear: () => setFilters({ ...filters, entityQuery: "" }) });
+  if (filters.minImportance !== 1 || filters.maxImportance !== 10) activeFilters.push({ key: "importance", label: `重要度：${filters.minImportance}–${filters.maxImportance}`, clear: () => setFilters({ ...filters, minImportance: 1, maxImportance: 10 }) });
+  if (filters.minConfidence !== 0 || filters.maxConfidence !== 1) activeFilters.push({ key: "confidence", label: `置信度：${percent(filters.minConfidence)}–${percent(filters.maxConfidence)}`, clear: () => setFilters({ ...filters, minConfidence: 0, maxConfidence: 1 }) });
+  if (filters.hasValidUntil) activeFilters.push({ key: "validUntil", label: "有有效期", clear: () => setFilters({ ...filters, hasValidUntil: false }) });
+  if (filters.hasReviewAfter) activeFilters.push({ key: "reviewAfter", label: "有复核时间", clear: () => setFilters({ ...filters, hasReviewAfter: false }) });
+
+  const resetFilters = () => {
+    setFilters({ ...DEFAULT_FILTERS });
+    setQuery("");
+  };
+
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const { confirm, confirmState, resolveConfirm } = useConfirm();
+
+  const pageIds = pagedMemories.map((memory) => memory.id);
+  const pageSelectedCount = pageIds.filter((id) => selectedIds.has(id)).length;
+  const allPageSelected = pageIds.length > 0 && pageSelectedCount === pageIds.length;
+
+  const togglePageSelection = () => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allPageSelected) pageIds.forEach((id) => next.delete(id));
+      else pageIds.forEach((id) => next.add(id));
+      return next;
+    });
+  };
+
+  const toggleRowSelection = (id: string) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const runBulk = async (
+    action: (id: string) => Promise<unknown>,
+    successMessage: (done: number) => string
+  ) => {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    setBulkBusy(true);
     try {
-      setWhy({
-        loading: false,
-        error: null,
-        data: await api.whyRemember(memory.id, { redactSensitive: Boolean(memory.redacted) })
-      });
-    } catch (error) {
-      setWhy({ loading: false, error: errorMessage(error), data: null });
+      const results = await Promise.allSettled(ids.map(action));
+      const done = results.filter((result) => result.status === "fulfilled").length;
+      const failed = results.length - done;
+      if (failed === 0) notify(successMessage(done), "success");
+      else notify(`完成 ${done} 条，失败 ${failed} 条`, "error");
+      setSelectedIds(new Set());
+      void load(tab);
+    } finally {
+      setBulkBusy(false);
     }
   };
 
-  const runTraverse = async (memory: MemoryRecord) => {
-    setTraverse({ loading: true, error: null, data: null });
-    try {
-      setTraverse({
-        loading: false,
-        error: null,
-        data: await api.traverseMemoryNetwork(memory.id, {
-          redactSensitive: Boolean(memory.redacted)
-        })
-      });
-    } catch (error) {
-      setTraverse({ loading: false, error: errorMessage(error), data: null });
-    }
+  const bulkDelete = async () => {
+    const ok = await confirm({
+      title: "移入回收站",
+      message: `将把已选的 ${selectedIds.size} 条记忆移入回收站，之后可以随时恢复。`,
+      confirmLabel: "移入回收站",
+      tone: "warning"
+    });
+    if (!ok) return;
+    await runBulk((id) => api.deleteMemory(id), (done) => `已将 ${done} 条记忆移入回收站`);
   };
 
-  const deleteMemory = async (memory: MemoryRecord) => {
-    if (
-      !(await confirm({
-        title: "移入回收站",
-        message: `确认将这条记忆移入回收站？\n\n${memory.content}`,
-        tone: "danger",
-        confirmLabel: "移入回收站"
-      }))
-    ) {
-      return;
-    }
+  const bulkRestore = async () => {
+    await runBulk((id) => api.restoreMemory(id), (done) => `已恢复 ${done} 条记忆`);
+  };
+
+  const bulkPurge = async () => {
+    const ok = await confirm({
+      title: "永久删除所选记忆",
+      message: `将永久删除已选的 ${selectedIds.size} 条记忆。此操作无法撤销，建议先导出备份。`,
+      confirmLabel: "永久删除",
+      tone: "danger"
+    });
+    if (!ok) return;
+    await runBulk((id) => api.purgeDeletedMemory(id), (done) => `已永久删除 ${done} 条记忆`);
+  };
+
+  const bulkExport = async () => {
+    setBulkBusy(true);
     try {
-      await api.deleteMemory(memory.id);
-      notify("已移入回收站，可在回收站恢复。", "success");
-      setSelected(null);
-      await load("active");
+      const exportData = (await api.exportMemories("json")) as MemoryExport;
+      const chosen = new Set(selectedIds);
+      const filtered: MemoryExport = {
+        ...exportData,
+        memories: (exportData.memories || []).filter((memory) => chosen.has(memory.id))
+      };
+      downloadFile(
+        `memory-selected-${new Date().toISOString().slice(0, 10)}.json`,
+        JSON.stringify(filtered, null, 2),
+        "application/json"
+      );
+      notify(`已导出 ${filtered.memories?.length || 0} 条所选记忆`, "success");
     } catch (error) {
       notify(errorMessage(error), "error");
+    } finally {
+      setBulkBusy(false);
     }
   };
 
-  const restoreMemory = async (memory: MemoryRecord) => {
-    try {
-      await api.restoreMemory(memory.id);
-      notify("已恢复记忆", "success");
-      setSelected(null);
-      await load("deleted");
-    } catch (error) {
-      notify(errorMessage(error), "error");
-    }
-  };
-
-  const openPurgeDialog = (memory: MemoryRecord) => {
-    setPurgeTarget(memory);
-    setPurgeConfirmText("");
-  };
-
-  const closePurgeDialog = () => {
-    if (purging) return;
-    setPurgeTarget(null);
-    setPurgeConfirmText("");
-  };
-
-  const purgeDeletedMemory = async () => {
-    if (!purgeTarget) return;
-    const confirmationCode = purgeTarget.id.slice(0, 8);
-    if (purgeConfirmText.trim() !== confirmationCode) return;
-    setPurging(true);
-    try {
-      await api.purgeDeletedMemory(purgeTarget.id);
-      notify("已永久删除记忆。", "success");
-      if (selected?.id === purgeTarget.id) {
-        setSelected(null);
+  // "/" 聚焦搜索；Esc 清除选择（浮层打开时交给浮层自己处理）
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (filtersOpen || columnsOpen || confirmState) return;
+        setSelectedIds((current) => (current.size ? new Set() : current));
+        return;
       }
-      setPurgeTarget(null);
-      setPurgeConfirmText("");
-      await load("deleted");
-    } catch (error) {
-      notify(errorMessage(error), "error");
-    } finally {
-      setPurging(false);
-    }
-  };
-
-  const revealMemory = async (memory: MemoryRecord) => {
-    if (tab !== "active") return;
-    try {
-      const fullMemory = await api.getMemory(memory.id);
-      setSelected(fullMemory);
-      setState((current) =>
-        current.data
-          ? {
-              ...current,
-              data: current.data.map((item) => (item.id === fullMemory.id ? fullMemory : item))
-            }
-          : current
-      );
-      setWhy({ loading: false, error: null, data: null });
-      notify("已显示完整内容", "success");
-    } catch (error) {
-      notify(errorMessage(error), "error");
-    }
-  };
-
-  const startEdit = () => {
-    if (!selected) return;
-    if (selected.redacted) {
-      notify("请先显式查看完整内容，再编辑这条记忆。", "info");
-      return;
-    }
-    setEditDraft(memoryToEditDraft(selected, spaces));
-    setEditError(null);
-    setEditing(true);
-  };
-
-  const cancelEdit = () => {
-    setEditing(false);
-    setEditDraft(null);
-    setEditError(null);
-  };
-
-  const saveEdit = async () => {
-    if (!selected || !editDraft) return;
-    if (!editDraft.content.trim()) {
-      setEditError("content 不能为空");
-      return;
-    }
-    if (
-      !(await confirm({
-        title: "更新记忆",
-        message: "确定要更新这条记忆吗？这会影响后续检索和回答注入。",
-        tone: "warning",
-        confirmLabel: "更新"
-      }))
-    ) {
-      return;
-    }
-    setSavingEdit(true);
-    setEditError(null);
-    try {
-      const result = await api.updateMemory(selected.id, editDraftToPayload(editDraft));
-      const spacesResult = await api.updateMemorySpaces(
-        selected.id,
-        editDraftToSpacesPayload(editDraft)
-      );
-      const updatedMemory = spacesResult.memory || result.memory;
-      setSelected(updatedMemory);
-      setState((current) =>
-        current.data
-          ? {
-              ...current,
-              data: current.data.map((memory) =>
-                memory.id === updatedMemory.id ? updatedMemory : memory
-              )
-            }
-          : current
-      );
-      notify("记忆已更新", "success");
-      setEditing(false);
-      setEditDraft(null);
-      await load("active");
-    } catch (error) {
-      setEditError(errorMessage(error));
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  const purgeConfirmationCode = purgeTarget?.id.slice(0, 8) || "";
-  const purgeConfirmed = purgeConfirmText.trim() === purgeConfirmationCode;
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (tab === "deleted") return;
+      event.preventDefault();
+      searchInputRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tab, filtersOpen, columnsOpen, confirmState]);
 
   return (
     <div className="page-stack">
       <PageHeader
         title="记忆库"
-        subtitle="查看、搜索、筛选、解释、删除和恢复记忆。"
+        subtitle="查看、搜索和筛选记忆；点任意一条打开它的档案。"
         action={
           <div className="button-row">
             <button className="secondary-button" type="button" onClick={() => load(tab)}>
@@ -393,20 +357,14 @@ export function MemoriesPage({
         <button
           className={tab === "active" ? "active" : ""}
           type="button"
-          onClick={() => {
-            setTab("active");
-            setSelected(null);
-          }}
+          onClick={() => setTab("active")}
         >
           活跃记忆
         </button>
         <button
           className={tab === "deleted" ? "active" : ""}
           type="button"
-          onClick={() => {
-            setTab("deleted");
-            setSelected(null);
-          }}
+          onClick={() => setTab("deleted")}
         >
           回收站
         </button>
@@ -414,43 +372,36 @@ export function MemoriesPage({
 
       <div className="notice">
         <ShieldAlert size={16} />
-        当前为遮罩视图，私密和敏感正文只在显式查看后显示。
+        当前为遮罩视图，私密和敏感正文只在档案里显式查看后显示。
       </div>
 
-      <div className={`memory-layout ${selected ? "has-detail" : ""}`}>
-        <aside className="filter-panel">
-          <div className="search-box">
-            <Search size={16} />
-            <input
-              value={query}
-              disabled={tab === "deleted"}
-              placeholder="搜索记忆"
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  void load("active");
-                }
-              }}
-            />
+      <div className="memory-layout">
+        {filtersOpen && (
+          <button
+            className="drawer-scrim filter-drawer-scrim"
+            type="button"
+            aria-label="关闭高级筛选"
+            onClick={() => setFiltersOpen(false)}
+          />
+        )}
+        <aside
+          ref={filterDrawerRef}
+          className={`filter-panel filter-drawer ${filtersOpen ? "open" : ""}`}
+          role="dialog"
+          aria-modal="true"
+          aria-label="高级筛选"
+          aria-hidden={!filtersOpen}
+          tabIndex={-1}
+        >
+          <div className="drawer-header filter-drawer-header">
+            <div>
+              <span className="panel-kicker">筛选</span>
+              <h2>高级筛选</h2>
+            </div>
+            <button className="icon-button" type="button" onClick={() => setFiltersOpen(false)} aria-label="关闭高级筛选">
+              <X size={18} />
+            </button>
           </div>
-          <button
-            className="primary-button full-width"
-            type="button"
-            disabled={tab === "deleted" || !query.trim()}
-            onClick={() => load("active")}
-          >
-            搜索
-          </button>
-          <button
-            className="ghost-button full-width"
-            type="button"
-            onClick={() => {
-              setQuery("");
-              void load(tab);
-            }}
-          >
-            清空搜索
-          </button>
 
           <FilterSelect
             label="类型"
@@ -548,599 +499,216 @@ export function MemoriesPage({
             />
             有复核时间
           </label>
+          <div className="filter-drawer-actions">
+            <button className="ghost-button" type="button" onClick={resetFilters}>重置全部</button>
+            <button className="primary-button" type="button" onClick={() => setFiltersOpen(false)}>查看 {memories.length} 条结果</button>
+          </div>
         </aside>
 
         <section className="panel memory-table-panel">
+          <div className="memory-table-toolbar">
+            <div className="search-box memory-search-box">
+              <Search size={17} />
+              <input
+                ref={searchInputRef}
+                value={query}
+                disabled={tab === "deleted"}
+                placeholder={tab === "deleted" ? "回收站不支持搜索" : "搜索记忆内容（按 / 聚焦）"}
+                aria-label="搜索记忆"
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") runSearch();
+                }}
+              />
+              {query && (
+                <button className="search-clear" type="button" onClick={() => setQuery("")} aria-label="清空搜索">
+                  <X size={15} />
+                </button>
+              )}
+            </div>
+            <button className="secondary-button" type="button" disabled={tab === "deleted" || !query.trim()} onClick={runSearch}>搜索</button>
+            <span className="result-count">{memories.length} 条结果</span>
+            <div className="table-toolbar-spacer" />
+            <button className={`secondary-button ${activeFilters.length ? "active" : ""}`} type="button" onClick={() => setFiltersOpen(true)}>
+              <SlidersHorizontal size={16} />
+              筛选{activeFilters.length ? ` ${activeFilters.length}` : ""}
+            </button>
+            <div className="column-picker-wrap">
+              <button className="secondary-button" type="button" onClick={() => setColumnsOpen((current) => !current)} aria-expanded={columnsOpen}>
+                <Columns3 size={16} />
+                列
+              </button>
+              {columnsOpen && (
+                <div className="column-picker" role="dialog" aria-label="选择表格列">
+                  <strong>显示字段</strong>
+                  {MEMORY_COLUMNS.map((column) => (
+                    <label className="checkbox-row" key={column.key}>
+                      <input
+                        type="checkbox"
+                        checked={visibleColumns.has(column.key)}
+                        onChange={() => setVisibleColumns((current) => {
+                          const next = new Set(current);
+                          if (next.has(column.key)) next.delete(column.key);
+                          else next.add(column.key);
+                          return next;
+                        })}
+                      />
+                      {column.label}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {activeFilters.length > 0 && (
+            <div className="active-filter-row">
+              {activeFilters.map((filter) => (
+                <button key={filter.key} type="button" onClick={filter.clear}>
+                  {filter.label}
+                  <X size={13} />
+                </button>
+              ))}
+              <button className="clear-all-filters" type="button" onClick={resetFilters}>清除全部</button>
+            </div>
+          )}
+
+          {selectedIds.size > 0 && (
+            <div className="bulk-bar" role="region" aria-label="批量操作">
+              <strong>已选 {selectedIds.size} 条</strong>
+              {tab === "active" ? (
+                <>
+                  <button className="secondary-button compact" type="button" disabled={bulkBusy} onClick={() => void bulkExport()}>
+                    <Download size={15} />
+                    导出所选
+                  </button>
+                  <button className="danger-button compact" type="button" disabled={bulkBusy} onClick={() => void bulkDelete()}>
+                    <Trash2 size={15} />
+                    移入回收站
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className="secondary-button compact" type="button" disabled={bulkBusy} onClick={() => void bulkRestore()}>
+                    <ArchiveRestore size={15} />
+                    恢复
+                  </button>
+                  <button className="danger-button compact" type="button" disabled={bulkBusy} onClick={() => void bulkPurge()}>
+                    <Trash2 size={15} />
+                    永久删除
+                  </button>
+                </>
+              )}
+              <button className="ghost-button compact" type="button" onClick={() => setSelectedIds(new Set())}>
+                清除选择
+              </button>
+            </div>
+          )}
+
           {state.loading && <LoadingBlock label="正在加载记忆" />}
           {state.error && <ErrorBlock message={state.error} onRetry={() => load(tab)} />}
           {!state.loading && !state.error && memories.length === 0 && (
-            <EmptyBlock label={tab === "deleted" ? "回收站为空" : "没有匹配的记忆"} />
+            <EmptyBlock
+              label={tab === "deleted" ? "回收站为空" : "没有匹配的记忆"}
+              hint={tab === "deleted" ? "被软删除的记忆会保留在这里，可以恢复或彻底清理。" : "调整搜索词或筛选条件后再试。"}
+            />
           )}
           {memories.length > 0 && (
-            <div className="table-wrap">
+            <>
+            <div className="table-wrap memory-table-desktop">
               <table className="data-table">
                 <thead>
                   <tr>
+                    <th className="row-select-cell">
+                      <input
+                        type="checkbox"
+                        aria-label="选择本页全部记忆"
+                        checked={allPageSelected}
+                        ref={(element) => {
+                          if (element) element.indeterminate = pageSelectedCount > 0 && !allPageSelected;
+                        }}
+                        onChange={togglePageSelection}
+                      />
+                    </th>
                     <th>内容</th>
-                    <th>分类</th>
-                    <th>类型</th>
-                    <th>状态</th>
-                    <th>重要度</th>
-                    <th>置信度</th>
-                    <th>稳定性</th>
-                    <th>敏感级别</th>
-                    <th>使用次数</th>
-                    <th>最近使用</th>
-                    <th>更新时间</th>
-                    <th />
+                    {visibleColumns.has("classification") && <th>分类</th>}
+                    {visibleColumns.has("typeStatus") && <th>类型 / 状态</th>}
+                    {visibleColumns.has("importance") && <th>重要度</th>}
+                    {visibleColumns.has("updated") && <th>更新时间</th>}
+                    {visibleColumns.has("confidence") && <th>置信度</th>}
+                    {visibleColumns.has("stability") && <th>稳定性</th>}
+                    {visibleColumns.has("sensitivity") && <th>敏感级别</th>}
+                    {visibleColumns.has("usage") && <th>激活次数</th>}
+                    {visibleColumns.has("lastUsed") && <th>最近使用</th>}
                   </tr>
                 </thead>
                 <tbody>
-                  {memories.map((memory) => (
+                  {pagedMemories.map((memory) => (
                     <tr
                       key={memory.id}
-                      className={selected?.id === memory.id ? "selected" : ""}
-                      onClick={() => setSelected(memory)}
+                      tabIndex={0}
+                      className={selectedIds.has(memory.id) ? "selected" : ""}
+                      onClick={() => openMemory(memory.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          openMemory(memory.id);
+                        }
+                      }}
                     >
-                      <td className="content-cell">{memory.content}</td>
-                      <td className="classification-cell">{classificationSummary(memory, spaces)}</td>
-                      <td>{badge(memory.type)}</td>
-                      <td>{badge(memory.status || "dynamic")}</td>
-                      <td>{memory.importance}</td>
-                      <td>{percent(memory.confidence)}</td>
-                      <td>{badge(memory.stability)}</td>
-                      <td>{badge(memory.sensitivity)}</td>
-                      <td>{memory.usage_count}</td>
-                      <td>{dateText(memory.last_used_at)}</td>
-                      <td>{dateText(memory.updated_at)}</td>
-                      <td>
-                        {tab === "deleted" ? (
-                          <div className="button-row">
-                            <button
-                              className="secondary-button compact"
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                void restoreMemory(memory);
-                              }}
-                            >
-                              恢复
-                            </button>
-                            <button
-                              className="danger-button compact"
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                openPurgeDialog(memory);
-                              }}
-                            >
-                              永久删除
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            className="danger-button compact"
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void deleteMemory(memory);
-                            }}
-                          >
-                            移入回收站
-                          </button>
-                        )}
+                      <td className="row-select-cell" onClick={(event) => event.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          aria-label={`选择记忆：${memory.content.slice(0, 24)}`}
+                          checked={selectedIds.has(memory.id)}
+                          onChange={() => toggleRowSelection(memory.id)}
+                          onKeyDown={(event) => event.stopPropagation()}
+                        />
                       </td>
+                      <td className="content-cell">{memory.content}</td>
+                      {visibleColumns.has("classification") && <td className="classification-cell">{classificationSummary(memory, spaces)}</td>}
+                      {visibleColumns.has("typeStatus") && <td><div className="table-badge-stack">{badge(memory.type)}{badge(memory.status || "dynamic")}</div></td>}
+                      {visibleColumns.has("importance") && <td>
+                        <span className={`imp ${memory.importance >= 8 ? "high" : ""}`}>
+                          {memory.importance}
+                        </span>
+                      </td>}
+                      {visibleColumns.has("updated") && <td>{dateText(memory.updated_at)}</td>}
+                      {visibleColumns.has("confidence") && <td>
+                        <span className="conf">{percent(memory.confidence)}</span>
+                      </td>}
+                      {visibleColumns.has("stability") && <td>{badge(memory.stability)}</td>}
+                      {visibleColumns.has("sensitivity") && <td>{badge(memory.sensitivity)}</td>}
+                      {visibleColumns.has("usage") && <td>{memory.usage_count}</td>}
+                      {visibleColumns.has("lastUsed") && <td>{dateText(memory.last_used_at)}</td>}
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
+            <div className="memory-card-list">
+              {pagedMemories.map((memory) => (
+                <button key={memory.id} type="button" onClick={() => openMemory(memory.id)}>
+                  <span className="memory-card-kicker">{badge(memory.type)} {badge(memory.status || "dynamic")}</span>
+                  <strong>{memory.content}</strong>
+                  <span className="memory-card-classification">{classificationSummary(memory, spaces)}</span>
+                  <span className="memory-card-meta"><b>重要度 {memory.importance}</b><span>{dateText(memory.updated_at)}</span></span>
+                </button>
+              ))}
+            </div>
+            <div className="table-pagination">
+              <span>第 {pageIndex + 1} / {pageCount} 页</span>
+              <div className="button-row">
+                <button className="icon-button" type="button" disabled={pageIndex === 0} onClick={() => setPageIndex((current) => Math.max(0, current - 1))} aria-label="上一页"><ChevronLeft size={17} /></button>
+                <button className="icon-button" type="button" disabled={pageIndex >= pageCount - 1} onClick={() => setPageIndex((current) => Math.min(pageCount - 1, current + 1))} aria-label="下一页"><ChevronRight size={17} /></button>
+              </div>
+            </div>
+            </>
           )}
         </section>
-
-        {selected && (
-          <aside className="detail-drawer">
-            <div className="drawer-header">
-              <h2>记忆详情</h2>
-              <button className="icon-button" type="button" onClick={() => setSelected(null)} title="关闭">
-                <X size={18} />
-              </button>
-            </div>
-            {selected.redacted && (
-              <div className="notice warning">
-                <ShieldAlert size={16} />
-                这条记忆的正文和来源原文已遮罩，真实数据未被改写。
-              </div>
-            )}
-            {editing && editDraft ? (
-              <div className="edit-form">
-                <label className="field-block">
-                  <span>内容</span>
-                  <textarea
-                    value={editDraft.content}
-                    rows={5}
-                    onChange={(event) =>
-                      setEditDraft({ ...editDraft, content: event.target.value })
-                    }
-                  />
-                </label>
-                {editDraft.content.trim() !== selected.content && (
-                  <div className="notice warning">
-                    修改内容后，旧 embedding 会失效；后续版本可提供重建 embedding。
-                  </div>
-                )}
-                <div className="classification-edit-grid">
-                  <TagEditor
-                    label="主题"
-                    values={editDraft.topics}
-                    placeholder="添加主题"
-                    onChange={(topics) => setEditDraft({ ...editDraft, topics })}
-                  />
-                  <TagEditor
-                    label="实体"
-                    values={editDraft.entities}
-                    placeholder="添加人物、项目或地点"
-                    onChange={(entities) => setEditDraft({ ...editDraft, entities })}
-                  />
-                  <TagEditor
-                    label="空间"
-                    values={editDraft.space_names}
-                    placeholder="添加空间"
-                    onChange={(space_names) => setEditDraft({ ...editDraft, space_names })}
-                  />
-                </div>
-                <div className="edit-grid">
-                  <label className="field-block">
-                    <span>类型</span>
-                    <select
-                      value={editDraft.type}
-                      onChange={(event) =>
-                        setEditDraft({ ...editDraft, type: event.target.value as MemoryType })
-                      }
-                    >
-                      {MEMORY_TYPES.map((type) => (
-                        <option key={type} value={type}>
-                          {displayText(type)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field-block">
-                    <span>重要度</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      step={1}
-                      value={editDraft.importance}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          importance: Math.round(clampNumber(Number(event.target.value), 1, 10))
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="field-block">
-                    <span>置信度</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={editDraft.confidence}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          confidence: clampNumber(Number(event.target.value), 0, 1)
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="field-block range-slider">
-                    <span>情绪正向度 {percent(editDraft.valence)}</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={editDraft.valence}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          valence: clampNumber(Number(event.target.value), 0, 1)
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="field-block range-slider">
-                    <span>唤起度 {percent(editDraft.arousal)}</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={editDraft.arousal}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          arousal: clampNumber(Number(event.target.value), 0, 1)
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="field-block">
-                    <span>稳定性</span>
-                    <select
-                      value={editDraft.stability}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          stability: event.target.value as MemoryStability
-                        })
-                      }
-                    >
-                      {STABILITIES.map((stability) => (
-                        <option key={stability} value={stability}>
-                          {displayText(stability)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field-block">
-                    <span>状态</span>
-                    <select
-                      value={editDraft.status}
-                      onChange={(event) =>
-                        setEditDraft({ ...editDraft, status: event.target.value as MemoryStatus })
-                      }
-                    >
-                      {MEMORY_STATUSES.map((status) => (
-                        <option key={status} value={status}>
-                          {displayText(status)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field-block">
-                    <span>敏感级别</span>
-                    <select
-                      value={editDraft.sensitivity}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          sensitivity: event.target.value as MemorySensitivity
-                        })
-                      }
-                    >
-                      {SENSITIVITIES.map((sensitivity) => (
-                        <option key={sensitivity} value={sensitivity}>
-                          {displayText(sensitivity)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field-block">
-                    <span>有效期</span>
-                    <input
-                      value={editDraft.valid_until}
-                      onChange={(event) =>
-                        setEditDraft({ ...editDraft, valid_until: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label className="field-block">
-                    <span>复核时间</span>
-                    <input
-                      value={editDraft.review_after}
-                      onChange={(event) =>
-                        setEditDraft({ ...editDraft, review_after: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label className="field-block">
-                    <span>来源对话 ID</span>
-                    <input
-                      value={editDraft.source_conversation_id}
-                      onChange={(event) =>
-                        setEditDraft({
-                          ...editDraft,
-                          source_conversation_id: event.target.value
-                        })
-                      }
-                    />
-                  </label>
-                </div>
-                <label className="field-block">
-                  <span>来源原文</span>
-                  <textarea
-                    value={editDraft.source_message}
-                    rows={3}
-                    onChange={(event) =>
-                      setEditDraft({ ...editDraft, source_message: event.target.value })
-                    }
-                  />
-                </label>
-                {editError && (
-                  <div className="notice warning">
-                    <ShieldAlert size={16} />
-                    {editError}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <>
-                <FieldList
-                  entries={[
-                    ["id", selected.id],
-                    ["内容", selected.content],
-                    ["主题", selected.topics],
-                    ["实体", selected.entities],
-                    ["空间", spaceNamesForMemory(selected, spaces)],
-                    ["类型", displayText(selected.type)],
-                    ["重要度", selected.importance],
-                    ["置信度", percent(selected.confidence)],
-                    ["情绪正向度", percent(selected.valence)],
-                    ["唤起度", percent(selected.arousal)],
-                    ["来源原文", selected.source_message],
-                    ["来源对话 ID", selected.source_conversation_id],
-                    ["使用次数", selected.usage_count],
-                    ["状态", displayText(selected.status || "dynamic")],
-                    ["已消化", selected.digested ? "是" : "否"],
-                    ["衰减 λ", selected.decay_lambda ?? "-"],
-                    ["最近使用", selected.last_used_at],
-                    ["最近活跃状态", recentActivityText(selected)],
-                    ["稳定性", displayText(selected.stability)],
-                    ["复核时间", selected.review_after],
-                    ["敏感级别", displayText(selected.sensitivity)],
-                    ["证据记忆 ID", selected.evidence_memory_ids],
-                    ["创建时间", selected.created_at],
-                    ["更新时间", selected.updated_at]
-                  ]}
-                />
-                <TemporalFactPanel memory={selected} />
-                <MemoryTraverse
-                  traverse={traverse.data}
-                  loading={traverse.loading}
-                  error={traverse.error}
-                />
-              </>
-            )}
-            <div className="drawer-actions">
-              {tab === "active" && editing && (
-                <>
-                  <button
-                    className="primary-button"
-                    type="button"
-                    disabled={savingEdit}
-                    onClick={saveEdit}
-                  >
-                    <Save size={16} />
-                    保存
-                  </button>
-                  <button
-                    className="ghost-button"
-                    type="button"
-                    disabled={savingEdit}
-                    onClick={cancelEdit}
-                  >
-                    <X size={16} />
-                    取消
-                  </button>
-                </>
-              )}
-              {tab === "active" && !editing && (
-                <>
-                  {selected.redacted && (
-                    <button
-                      className="primary-button"
-                      type="button"
-                      onClick={() => revealMemory(selected)}
-                    >
-                      <Eye size={16} />
-                      查看完整内容
-                    </button>
-                  )}
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={Boolean(selected.redacted)}
-                    onClick={startEdit}
-                  >
-                    <Pencil size={16} />
-                    编辑
-                  </button>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => runWhy(selected)}
-                  >
-                    为什么记得？
-                  </button>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => runTraverse(selected)}
-                  >
-                    <GitBranch size={16} />
-                    实验图遍历
-                  </button>
-                  <button
-                    className="danger-button"
-                    type="button"
-                    onClick={() => deleteMemory(selected)}
-                  >
-                    <Trash2 size={16} />
-                    移入回收站
-                  </button>
-                </>
-              )}
-              {tab === "deleted" && (
-                <>
-                  <button
-                    className="primary-button"
-                    type="button"
-                    onClick={() => restoreMemory(selected)}
-                  >
-                    <ArchiveRestore size={16} />
-                    恢复
-                  </button>
-                  <button
-                    className="danger-button"
-                    type="button"
-                    onClick={() => openPurgeDialog(selected)}
-                  >
-                    <Trash2 size={16} />
-                    永久删除
-                  </button>
-                </>
-              )}
-            </div>
-            {!editing && why.loading && <LoadingBlock label="正在读取来源" />}
-            {!editing && why.error && <ErrorBlock message={why.error} />}
-            {!editing && why.data && (
-              <section className="subpanel">
-                <h3>为什么记得？</h3>
-                {why.data.redacted && (
-                  <div className="notice warning">
-                    <ShieldAlert size={16} />
-                    来源摘录处于遮罩视图。
-                  </div>
-                )}
-                <FieldList
-                  entries={[
-                    ["来源摘录", why.data.source_excerpt],
-                    ["来源对话 ID", why.data.source_conversation_id],
-                    ["保存时间", why.data.saved_at],
-                    ["更新时间", why.data.updated_at],
-                    ["置信度", percent(why.data.confidence)],
-                    ["是否核心记忆证据", why.data.is_core_memory_evidence ? "是" : "否"],
-                    ["核心记忆分区", why.data.core_memory_sections.map(displayText)],
-                    ["证据记忆 ID", why.data.evidence_memory_ids]
-                  ]}
-                />
-              </section>
-            )}
-          </aside>
-        )}
       </div>
-      {purgeTarget && (
-        <div className="modal-backdrop" role="dialog" aria-modal="true">
-          <div className="modal-card confirm-card confirm-danger">
-            <div className="drawer-header">
-              <h2>永久删除记忆</h2>
-              <button
-                className="icon-button"
-                type="button"
-                disabled={purging}
-                onClick={closePurgeDialog}
-                title="关闭"
-              >
-                <X size={18} />
-              </button>
-            </div>
-            <div className="confirm-body purge-confirm-body">
-              <div className="notice warning">
-                <ShieldAlert size={16} />
-                永久删除后无法从回收站恢复，审计日志只会保留删除摘要。
-              </div>
-              <FieldList
-                entries={[
-                  ["完整 ID", purgeTarget.id],
-                  ["确认码", purgeConfirmationCode],
-                  ["内容预览", purgeTarget.content]
-                ]}
-              />
-              <label className="field-block">
-                <span>输入 8 位确认码</span>
-                <input
-                  autoFocus
-                  value={purgeConfirmText}
-                  disabled={purging}
-                  onChange={(event) => setPurgeConfirmText(event.target.value)}
-                />
-              </label>
-            </div>
-            <div className="drawer-actions end">
-              <button
-                className="ghost-button"
-                type="button"
-                disabled={purging}
-                onClick={closePurgeDialog}
-              >
-                取消
-              </button>
-              <button
-                className="danger-button"
-                type="button"
-                disabled={!purgeConfirmed || purging}
-                onClick={() => void purgeDeletedMemory()}
-              >
-                <Trash2 size={16} />
-                永久删除
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-function TagEditor({
-  label,
-  values,
-  placeholder,
-  onChange
-}: {
-  label: string;
-  values: string[];
-  placeholder: string;
-  onChange: (values: string[]) => void;
-}) {
-  const [draft, setDraft] = useState("");
-  const addTag = () => {
-    const next = normalizeTags([...values, draft]);
-    if (next.length !== values.length || next.some((value, index) => value !== values[index])) {
-      onChange(next);
-    }
-    setDraft("");
-  };
-
-  return (
-    <div className="tag-editor">
-      <span>{label}</span>
-      <div className="tag-list">
-        {values.length === 0 && <small>未设置</small>}
-        {values.map((value) => (
-          <button
-            key={value}
-            className="tag-chip"
-            type="button"
-            onClick={() => onChange(values.filter((item) => item !== value))}
-            title={`移除 ${value}`}
-          >
-            {value}
-            <X size={13} />
-          </button>
-        ))}
-      </div>
-      <div className="tag-input-row">
-        <input
-          value={draft}
-          placeholder={placeholder}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              addTag();
-            }
-          }}
-        />
-        <button className="icon-button" type="button" onClick={addTag} title="添加">
-          <Plus size={15} />
-        </button>
-      </div>
+      <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
     </div>
   );
 }
@@ -1148,44 +716,6 @@ function TagEditor({
 function spaceNamesForMemory(memory: MemoryRecord, spaces: MemorySpace[]): string[] {
   const namesById = new Map(spaces.map((space) => [space.id, space.name]));
   return (memory.space_ids || []).map((spaceId) => namesById.get(spaceId) || spaceId);
-}
-
-function TemporalFactPanel({ memory }: { memory: MemoryRecord }) {
-  const hasTemporalDetails = Boolean(
-    memory.valid_from ||
-      memory.valid_until ||
-      memory.temporal_subject ||
-      memory.temporal_predicate ||
-      memory.supersedes ||
-      memory.superseded_by
-  );
-  const isHistoricalFact = (memory.status || "dynamic") === "resolved" && Boolean(memory.superseded_by);
-
-  if (!hasTemporalDetails && !isHistoricalFact) {
-    return null;
-  }
-
-  return (
-    <section className="subpanel temporal-fact-panel">
-      <h3>时间事实</h3>
-      {isHistoricalFact && (
-        <div className="notice warning temporal-fact-notice">
-          <ListChecks size={16} />
-          历史事实，已被新事实取代。
-        </div>
-      )}
-      <FieldList
-        entries={[
-          ["生效时间", memory.valid_from],
-          ["有效期至", memory.valid_until],
-          ["temporal subject", memory.temporal_subject],
-          ["temporal predicate", memory.temporal_predicate],
-          ["取代的记忆 ID", memory.supersedes],
-          ["被取代为记忆 ID", memory.superseded_by]
-        ]}
-      />
-    </section>
-  );
 }
 
 function classificationSummary(memory: MemoryRecord, spaces: MemorySpace[]): string {
@@ -1209,14 +739,3 @@ function hasMatchingTag(values: string[], query: string): boolean {
   if (!normalizedQuery) return true;
   return values.some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
 }
-
-function recentActivityText(memory: MemoryRecord): string {
-  const anchor = memory.last_used_at || memory.updated_at || memory.created_at;
-  if (!anchor) return "-";
-  const date = new Date(anchor);
-  if (Number.isNaN(date.getTime())) return anchor;
-  const days = Math.max(0, (Date.now() - date.getTime()) / 86400000);
-  if (days < 1) return "今天活跃";
-  return `${Math.round(days)} 天未活跃`;
-}
-

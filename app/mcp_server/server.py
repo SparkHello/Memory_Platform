@@ -1,6 +1,8 @@
 import json
 import logging
+from functools import partial
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -293,12 +295,15 @@ async def surface_memories(
     """
     store, embedding_client = _services()
     service = _search_service(store, embedding_client)
-    hits = service.surface_memories(
-        user_id=current_user_id.get(),
-        limit=max(1, min(limit, 20)),
-        mode=mode,
-        include_archived=include_archived,
-        include_sensitive=include_sensitive,
+    hits = await anyio.to_thread.run_sync(
+        partial(
+            service.surface_memories,
+            user_id=current_user_id.get(),
+            limit=max(1, min(limit, 20)),
+            mode=mode,
+            include_archived=include_archived,
+            include_sensitive=include_sensitive,
+        )
     )
     return _dump([_surface_hit_to_dict(hit) for hit in hits])
 
@@ -344,9 +349,12 @@ async def get_recent_context_summary(conversation_id: str = "") -> str:
     不属于长期记忆，也不会进入核心记忆。
     """
     store, _ = _services()
-    summary = store.get_recent_context_summary(
-        user_id=current_user_id.get(),
-        conversation_id=conversation_id or None,
+    summary = await anyio.to_thread.run_sync(
+        partial(
+            store.get_recent_context_summary,
+            user_id=current_user_id.get(),
+            conversation_id=conversation_id or None,
+        )
     )
     if summary is None:
         return _dump({"found": False, "summary": ""})
@@ -361,10 +369,13 @@ async def update_recent_context_summary(conversation_id: str = "", summary: str 
     if len(summary_text) > 12000:
         return _dump({"updated": False, "error": "summary exceeds 12000 characters"})
     store, _ = _services()
-    saved = store.upsert_recent_context_summary(
-        user_id=current_user_id.get(),
-        conversation_id=(conversation_id or "").strip() or None,
-        summary=summary_text,
+    saved = await anyio.to_thread.run_sync(
+        partial(
+            store.upsert_recent_context_summary,
+            user_id=current_user_id.get(),
+            conversation_id=(conversation_id or "").strip() or None,
+            summary=summary_text,
+        )
     )
     return _dump({"updated": True, **_recent_summary_to_dict(saved)})
 
@@ -377,9 +388,12 @@ async def get_core_memory() -> str:
     使用 search_memory 检索细节；核心记忆不是细节检索工具。
     """
     store, _ = _services()
-    sections = safe_core_memory_sections(
-        store=store,
-        user_id=current_user_id.get(),
+    sections = await anyio.to_thread.run_sync(
+        partial(
+            safe_core_memory_sections,
+            store=store,
+            user_id=current_user_id.get(),
+        )
     )
     return _dump([_core_memory_to_dict(section) for section in sections])
 
@@ -440,10 +454,13 @@ async def digest_memories(
                 "resolved_ids": [],
             })
         try:
-            source_memories = store.get_digest_source_memories(
-                memory_ids=source_ids,
-                user_id=user_id,
-                include_sensitive=allow_sensitive,
+            source_memories = await anyio.to_thread.run_sync(
+                partial(
+                    store.get_digest_source_memories,
+                    memory_ids=source_ids,
+                    user_id=user_id,
+                    include_sensitive=allow_sensitive,
+                )
             )
         except ValueError as exc:
             return _dump({
@@ -463,17 +480,20 @@ async def digest_memories(
             default_arousal=0.4,
         )
         try:
-            created, resolved_count = store.apply_memory_digest(
-                user_id=user_id,
-                source_ids=source_ids,
-                resolved_ids=resolved_ids,
-                reflection=reflection_text,
-                reflection_valence=reflection_valence,
-                reflection_arousal=reflection_arousal,
-                feel=feel_text,
-                feel_valence=feel_valence,
-                feel_arousal=feel_arousal,
-                include_sensitive=allow_sensitive,
+            created, resolved_count = await anyio.to_thread.run_sync(
+                partial(
+                    store.apply_memory_digest,
+                    user_id=user_id,
+                    source_ids=source_ids,
+                    resolved_ids=resolved_ids,
+                    reflection=reflection_text,
+                    reflection_valence=reflection_valence,
+                    reflection_arousal=reflection_arousal,
+                    feel=feel_text,
+                    feel_valence=feel_valence,
+                    feel_arousal=feel_arousal,
+                    include_sensitive=allow_sensitive,
+                )
             )
         except (RuntimeError, ValueError) as exc:
             return _dump({
@@ -489,10 +509,13 @@ async def digest_memories(
             "resolved_count": resolved_count,
         })
 
-    memories = store.list_undigested_memories(
-        user_id=user_id,
-        limit=max(1, min(limit, 20)),
-        include_sensitive=allow_sensitive,
+    memories = await anyio.to_thread.run_sync(
+        partial(
+            store.list_undigested_memories,
+            user_id=user_id,
+            limit=max(1, min(limit, 20)),
+            include_sensitive=allow_sensitive,
+        )
     )
     if not memories:
         return _dump({

@@ -330,9 +330,9 @@ class MemoryHealthChecker:
         for key, value in list(_SEARCH_CACHE.items()):
             if not isinstance(key, tuple) or not key or key[0] != user_id:
                 continue
-            if not isinstance(value, tuple) or len(value) < 3:
+            if not isinstance(value, tuple) or len(value) < 4:
                 continue
-            payloads = value[2]
+            payloads = value[3]
             if not isinstance(payloads, list):
                 continue
             for payload in payloads:
