@@ -21,6 +21,13 @@ EXPECTED_TOOLS = {
     "get_recent_context_summary",
     "get_core_memory",
     "digest_memories",
+    "list_knowledge_documents",
+    "search_knowledge",
+    "read_knowledge",
+    "begin_knowledge_upload",
+    "append_knowledge_upload",
+    "commit_knowledge_upload",
+    "manage_knowledge_document",
 }
 
 def _rpc(method: str, params: dict | None = None, request_id: int = 1) -> dict:
@@ -83,7 +90,8 @@ def test_mcp_initialize(client, auth_headers):
     assert result["serverInfo"]["name"] == "memory-gateway"
     instructions = result.get("instructions", "")
     assert "长期记忆" in instructions
-    assert "你只有 7 个工具" in instructions
+    assert "独立长文本知识" in instructions
+    assert "你只有" not in instructions
 
 def test_mcp_tools_list(client, auth_headers):
     result = _post_mcp(client, auth_headers, "tools/list")
@@ -102,6 +110,19 @@ def test_mcp_tools_list(client, auth_headers):
     assert update_schema["properties"]["summary"]["type"] == "string"
     assert update_schema["properties"]["conversation_id"]["type"] == "string"
     assert "anyOf" not in update_schema["properties"]["conversation_id"]
+
+    for name in (
+        "list_knowledge_documents",
+        "search_knowledge",
+        "read_knowledge",
+        "begin_knowledge_upload",
+        "append_knowledge_upload",
+        "commit_knowledge_upload",
+        "manage_knowledge_document",
+    ):
+        tool = next(tool for tool in result["tools"] if tool["name"] == name)
+        for property_schema in tool["inputSchema"].get("properties", {}).values():
+            assert "anyOf" not in property_schema
 
 def test_submit_memory_text_splits_and_saves(
     client,
@@ -802,4 +823,3 @@ def test_rest_endpoints_still_work(client, auth_headers):
 
     response = client.get("/memories", headers=auth_headers)
     assert response.status_code == 200
-

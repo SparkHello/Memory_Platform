@@ -6,11 +6,13 @@ import {
   FileText,
   Gauge,
   History,
+  LibraryBig,
   Layers3,
   ListChecks,
   Menu,
   Moon,
   Search,
+  ScanSearch,
   Settings as SettingsIcon,
   Sun,
   Wrench,
@@ -25,6 +27,8 @@ import type { ConnectionSettings, PageKey } from "../types";
 const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   dashboard: Gauge,
   memories: Database,
+  knowledge: LibraryBig,
+  knowledgeSearch: ScanSearch,
   core: Layers3,
   recent: History,
   review: ListChecks,
@@ -39,6 +43,7 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
 const SECTION_ICONS: Record<SectionKey, typeof Gauge> = {
   studio: Gauge,
   memory: Database,
+  knowledge: LibraryBig,
   governance: ListChecks,
   data: Archive,
   system: SettingsIcon
@@ -106,7 +111,7 @@ export function AppShell({
             <div className="brand-mark">M</div>
             <div className="brand-copy">
               <strong>Memory Console</strong>
-              <span>记忆工作室</span>
+              <span>记忆与知识</span>
             </div>
           </div>
 
@@ -208,7 +213,7 @@ export function AppShell({
           })}
           <button
             type="button"
-            className={sectionForPage(activePage).key === "system" ? "active" : ""}
+            className={["data", "system"].includes(sectionForPage(activePage).key) ? "active" : ""}
             onClick={() => setMoreOpen(true)}
           >
             <Menu size={19} />
@@ -243,7 +248,7 @@ function MobileMoreSheet({
         <header>
           <div>
             <span>全部页面</span>
-            <strong id={titleId}>记忆管理工具</strong>
+            <strong id={titleId}>记忆与知识工具</strong>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
             <X size={18} />

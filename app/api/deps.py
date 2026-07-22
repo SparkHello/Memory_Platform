@@ -4,6 +4,8 @@ from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import Settings, get_settings
+from app.knowledge.agent import KnowledgeAgentConfig, KnowledgeSearchAgent
+from app.knowledge.store import KnowledgeStore
 from app.llm.client import OpenAICompatibleClient
 from app.memory.search import (
     EmbeddingClient,
@@ -40,6 +42,32 @@ def get_user_id(x_user_id: Annotated[str | None, Header()] = None) -> str:
 def get_memory_store(settings: Annotated[Settings, Depends(get_settings)]) -> MemoryStore:
     # Schema initialization/migration runs once in the application lifespan.
     return MemoryStore(settings.database_path)
+
+
+def get_knowledge_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> KnowledgeStore:
+    # Schema initialization/migration runs once in the application lifespan.
+    return KnowledgeStore(
+        settings.knowledge_database_path,
+        max_document_bytes=settings.knowledge_max_document_bytes,
+    )
+
+
+def get_knowledge_search_agent(
+    store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> KnowledgeSearchAgent:
+    config = KnowledgeAgentConfig(
+        base_url=settings.knowledge_agent_base_url,
+        api_key=settings.knowledge_agent_api_key,
+        flash_model=settings.knowledge_agent_flash_model,
+        pro_model=settings.knowledge_agent_pro_model,
+        egress_policy=settings.knowledge_agent_egress_policy,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
+        timeout_seconds=settings.knowledge_agent_timeout_seconds,
+    )
+    return KnowledgeSearchAgent(store=store, config=config)
 
 
 def get_embedding_client(

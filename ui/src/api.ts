@@ -39,6 +39,19 @@ import type {
   SurfaceMode,
   TraversalResponse
 } from "./types";
+import type {
+  KnowledgeDocument,
+  KnowledgeDocumentDetail,
+  KnowledgeDocumentStatus,
+  KnowledgeExport,
+  KnowledgeReadResponse,
+  KnowledgeRestoreResult,
+  KnowledgeSearchQuality,
+  KnowledgeSearchResponse,
+  KnowledgeStatus,
+  KnowledgeUploadCommitResult,
+  KnowledgeUploadSession
+} from "./types";
 import { normalizeBaseUrl } from "./storage";
 
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -93,6 +106,200 @@ export class MemoryApi {
 
   async health(signal?: AbortSignal): Promise<{ status: string }> {
     return this.request("/health", { auth: false, signal });
+  }
+
+  async knowledgeStatus(signal?: AbortSignal): Promise<KnowledgeStatus> {
+    return this.request("/knowledge/status", { signal });
+  }
+
+  async listKnowledgeDocuments(
+    options: { status?: KnowledgeDocumentStatus; query?: string; limit?: number } = {},
+    signal?: AbortSignal
+  ): Promise<KnowledgeDocument[]> {
+    const params = new URLSearchParams({
+      status: options.status || "active",
+      limit: String(options.limit ?? 500)
+    });
+    if (options.query?.trim()) params.set("query", options.query.trim());
+    const payload = await this.request<{ data: KnowledgeDocument[] }>(
+      `/knowledge/documents?${params.toString()}`,
+      { signal }
+    );
+    return payload.data || [];
+  }
+
+  async knowledgeDocument(reference: string, signal?: AbortSignal): Promise<KnowledgeDocumentDetail> {
+    return this.request(`/knowledge/documents/${encodeURIComponent(reference)}`, { signal });
+  }
+
+  async beginKnowledgeUpload(
+    payload: {
+      title: string;
+      content_type: string;
+      source_name?: string;
+      replace_document_ref?: string;
+      sensitivity?: string;
+    },
+    signal?: AbortSignal
+  ): Promise<KnowledgeUploadSession> {
+    return this.request("/knowledge/uploads", {
+      method: "POST",
+      body: {
+        title: payload.title,
+        content_type: payload.content_type,
+        source_name: payload.source_name || "",
+        replace_document_ref: payload.replace_document_ref || "",
+        sensitivity: payload.sensitivity || "normal"
+      },
+      signal
+    });
+  }
+
+  async appendKnowledgeUpload(
+    uploadId: string,
+    sequence: number,
+    text: string,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    return this.request(
+      `/knowledge/uploads/${encodeURIComponent(uploadId)}/parts/${sequence}`,
+      { method: "PUT", body: { text }, signal }
+    );
+  }
+
+  async commitKnowledgeUpload(
+    uploadId: string,
+    expectedParts: number,
+    expectedSha256 = "",
+    signal?: AbortSignal
+  ): Promise<KnowledgeUploadCommitResult> {
+    return this.request(`/knowledge/uploads/${encodeURIComponent(uploadId)}/commit`, {
+      method: "POST",
+      body: { expected_parts: expectedParts, expected_sha256: expectedSha256 },
+      signal,
+      timeoutMs: 120000
+    });
+  }
+
+  async cancelKnowledgeUpload(uploadId: string, signal?: AbortSignal): Promise<void> {
+    await this.request(`/knowledge/uploads/${encodeURIComponent(uploadId)}`, {
+      method: "DELETE",
+      signal
+    });
+  }
+
+  async updateKnowledgeDocument(
+    reference: string,
+    payload: { title?: string; source_name?: string; sensitivity?: string },
+    signal?: AbortSignal
+  ): Promise<KnowledgeDocument> {
+    const result = await this.request<{ document?: KnowledgeDocument } & KnowledgeDocument>(
+      `/knowledge/documents/${encodeURIComponent(reference)}`,
+      { method: "PATCH", body: payload, signal }
+    );
+    return result.document || result;
+  }
+
+  async deleteKnowledgeDocument(reference: string, signal?: AbortSignal): Promise<void> {
+    await this.request(`/knowledge/documents/${encodeURIComponent(reference)}`, {
+      method: "DELETE",
+      signal
+    });
+  }
+
+  async restoreKnowledgeDocument(reference: string, signal?: AbortSignal): Promise<void> {
+    await this.request(`/knowledge/documents/${encodeURIComponent(reference)}/restore`, {
+      method: "POST",
+      signal
+    });
+  }
+
+  async purgeKnowledgeDocument(reference: string, confirmDocumentId: string, signal?: AbortSignal): Promise<void> {
+    await this.request(`/knowledge/deleted/${encodeURIComponent(reference)}/purge`, {
+      method: "DELETE",
+      body: { confirm_document_id: confirmDocumentId },
+      signal
+    });
+  }
+
+  async restoreKnowledgeVersion(
+    documentReference: string,
+    versionReference: string,
+    signal?: AbortSignal
+  ): Promise<KnowledgeUploadCommitResult> {
+    return this.request(
+      `/knowledge/documents/${encodeURIComponent(documentReference)}/versions/${encodeURIComponent(versionReference)}/restore`,
+      { method: "POST", signal, timeoutMs: 120000 }
+    );
+  }
+
+  async reindexKnowledgeDocument(
+    documentReference: string,
+    versionReference: string,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    return this.request(
+      `/knowledge/documents/${encodeURIComponent(documentReference)}/versions/${encodeURIComponent(versionReference)}/reindex`,
+      { method: "POST", signal, timeoutMs: 120000 }
+    );
+  }
+
+  async searchKnowledge(
+    options: {
+      request: string;
+      limit?: number;
+      documentRefs?: string[];
+      quality?: KnowledgeSearchQuality;
+      includeSensitive?: boolean;
+    },
+    signal?: AbortSignal
+  ): Promise<KnowledgeSearchResponse> {
+    return this.request("/knowledge/search", {
+      method: "POST",
+      body: {
+        request: options.request,
+        limit: options.limit ?? 5,
+        document_refs: options.documentRefs || [],
+        quality: options.quality || "balanced",
+        include_sensitive: options.includeSensitive ?? false
+      },
+      signal,
+      timeoutMs: 35000
+    });
+  }
+
+  async readKnowledge(
+    options: {
+      reference: string;
+      cursor?: string;
+      maxChars?: number;
+      includeSensitive?: boolean;
+    },
+    signal?: AbortSignal
+  ): Promise<KnowledgeReadResponse> {
+    return this.request("/knowledge/read", {
+      method: "POST",
+      body: {
+        reference: options.reference,
+        cursor: options.cursor || "",
+        max_chars: options.maxChars ?? 20000,
+        include_sensitive: options.includeSensitive ?? false
+      },
+      signal
+    });
+  }
+
+  async exportKnowledge(signal?: AbortSignal): Promise<KnowledgeExport> {
+    return this.request("/knowledge/export", { signal, timeoutMs: 120000 });
+  }
+
+  async restoreKnowledge(data: KnowledgeExport, signal?: AbortSignal): Promise<KnowledgeRestoreResult> {
+    return this.request("/knowledge/restore", {
+      method: "POST",
+      body: { data },
+      signal,
+      timeoutMs: 120000
+    });
   }
 
   async listMemories(options: MemoryListOptions = {}, signal?: AbortSignal): Promise<MemoryRecord[]> {
@@ -614,6 +821,10 @@ export class MemoryApi {
 
       if (!response.ok) {
         throw new ApiError(response.status, await readError(response));
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
       }
 
       if (options.text) {

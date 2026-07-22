@@ -1,6 +1,8 @@
 export type PageKey =
   | "dashboard"
   | "memories"
+  | "knowledge"
+  | "knowledgeSearch"
   | "core"
   | "review"
   | "recall"
@@ -613,4 +615,209 @@ export interface TraversalResponse {
   seed: MemoryRecord;
   results: TraversalResultItem[];
   meta: TraversalMeta;
+}
+
+export type KnowledgeDocumentStatus = "active" | "deleted";
+export type KnowledgeIndexStatus = "pending" | "indexing" | "ready" | "indexed" | "failed";
+export type KnowledgeSearchQuality = "fast" | "balanced" | "deep";
+
+export interface KnowledgeVersion {
+  id: string;
+  ref: string;
+  version_ref?: string;
+  document_id?: string;
+  document_ref?: string;
+  version_number: number;
+  content_sha256: string;
+  sha256?: string;
+  byte_size: number;
+  size_bytes?: number;
+  character_count?: number;
+  content?: string;
+  index_status: KnowledgeIndexStatus;
+  index_error?: string | null;
+  created_at: string;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  ref: string;
+  document_ref?: string;
+  user_id?: string;
+  title: string;
+  source_name: string;
+  content_type: string;
+  sensitivity: MemorySensitivity;
+  status: KnowledgeDocumentStatus;
+  current_version_id?: string | null;
+  current_version_ref?: string | null;
+  current_version_number?: number | null;
+  current_version?: KnowledgeVersion | null;
+  byte_size?: number;
+  size_bytes?: number;
+  character_count?: number;
+  index_status?: KnowledgeIndexStatus;
+  index_error?: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at?: string | null;
+}
+
+export interface KnowledgeDocumentDetail {
+  document: KnowledgeDocument;
+  versions: KnowledgeVersion[];
+}
+
+export interface KnowledgeStatus {
+  available?: boolean;
+  status?: string;
+  error?: string | null;
+  active_documents?: number;
+  deleted_documents?: number;
+  failed_indexes?: number;
+  indexing_failed?: number;
+  failed_versions?: number;
+  index_failures?: number;
+  counts?: {
+    active?: number;
+    deleted?: number;
+    failed?: number;
+    failed_indexes?: number;
+    [key: string]: number | undefined;
+  };
+}
+
+export interface KnowledgeUploadSession {
+  id: string;
+  upload_id?: string;
+  expires_at?: string;
+  expected_version_id?: string | null;
+}
+
+export interface KnowledgeUploadCommitResult {
+  document: KnowledgeDocument;
+  version: KnowledgeVersion;
+  created?: boolean;
+  deduplicated?: boolean;
+  duplicate?: boolean;
+}
+
+export interface KnowledgeSearchHit {
+  document_ref: string;
+  version_ref: string;
+  chunk_ref: string;
+  title: string;
+  source_name?: string;
+  heading_path?: string[] | string;
+  title_path?: string[] | string;
+  char_start?: number;
+  char_end?: number;
+  start_char?: number;
+  end_char?: number;
+  line_start?: number;
+  line_end?: number;
+  start_line?: number;
+  end_line?: number;
+  excerpt: string;
+  score?: number;
+  match_signals?: string[];
+  channels?: string[];
+  match_reason?: string;
+  sensitivity?: MemorySensitivity;
+}
+
+export interface KnowledgeAgentStep {
+  model?: string;
+  round?: number;
+  tool?: string;
+  action?: string;
+  status?: string;
+  query?: string;
+  reference_count?: number;
+  result_count?: number;
+  summary?: string;
+  [key: string]: unknown;
+}
+
+export interface KnowledgeSearchResponse {
+  data?: KnowledgeSearchHit[];
+  results?: KnowledgeSearchHit[];
+  local_candidates?: KnowledgeSearchHit[];
+  request?: string;
+  agent_used?: boolean;
+  agent_model?: string | null;
+  model?: string | null;
+  agent_rounds?: number;
+  rounds?: number;
+  upgraded?: boolean;
+  escalated?: boolean;
+  agent_attempted?: boolean;
+  fallback_reason?: string | null;
+  elapsed_ms?: number;
+  baseline_count?: number;
+  query_plan?: string[];
+  steps?: KnowledgeAgentStep[];
+  tool_steps?: KnowledgeAgentStep[];
+  metadata?: {
+    agent_used?: boolean;
+    agent_attempted?: boolean;
+    model?: string;
+    rounds?: number;
+    flash_rounds?: number;
+    pro_rounds?: number;
+    escalated?: boolean;
+    fallback_reason?: string;
+    elapsed_ms?: number;
+    baseline_count?: number;
+    tool_steps?: KnowledgeAgentStep[];
+  };
+  agent?: {
+    agent_used?: boolean;
+    agent_attempted?: boolean;
+    model?: string;
+    rounds?: number;
+    flash_rounds?: number;
+    pro_rounds?: number;
+    escalated?: boolean;
+    fallback_reason?: string;
+    elapsed_ms?: number;
+    baseline_count?: number;
+    tool_steps?: KnowledgeAgentStep[];
+  };
+  [key: string]: unknown;
+}
+
+export interface KnowledgeReadResponse {
+  reference: string;
+  document_ref: string;
+  version_ref: string;
+  chunk_ref?: string | null;
+  title?: string;
+  content?: string;
+  text?: string;
+  char_start?: number;
+  char_end?: number;
+  start_char?: number;
+  end_char?: number;
+  line_start?: number;
+  line_end?: number;
+  complete: boolean;
+  next_cursor: string;
+  [key: string]: unknown;
+}
+
+export interface KnowledgeExport {
+  version?: number;
+  exported_at?: string;
+  user_id?: string;
+  documents?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+export interface KnowledgeRestoreResult {
+  created?: number;
+  updated?: number;
+  skipped?: number;
+  invalid?: number;
+  [key: string]: unknown;
 }

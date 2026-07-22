@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.api import deps
 from app.config import get_settings
+from app.knowledge.store import KnowledgeStore
 from app.main import create_app
 from app.memory.search import NullEmbeddingClient
 from app.memory.store import MemoryStore
@@ -139,14 +140,32 @@ def memory_store(tmp_path) -> MemoryStore:
 
 
 @pytest.fixture
+def knowledge_store(tmp_path) -> KnowledgeStore:
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    store.init_db()
+    return store
+
+
+@pytest.fixture
 def fake_llm() -> FakeLLMClient:
     return FakeLLMClient()
 
 
 @pytest.fixture
-def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> Iterator[TestClient]:
+def client(
+    monkeypatch,
+    memory_store: MemoryStore,
+    knowledge_store: KnowledgeStore,
+    fake_llm: FakeLLMClient,
+) -> Iterator[TestClient]:
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
+    monkeypatch.setenv(
+        "KNOWLEDGE_DATABASE_PATH",
+        knowledge_store.database_path,
+    )
+    monkeypatch.setenv("KNOWLEDGE_AGENT_API_KEY", "")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "none")
     monkeypatch.setenv("EVAL_DIR", str(Path(memory_store.database_path).with_name("eval")))
     monkeypatch.setenv("UPSTREAM_API_KEY", "")
     monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")
@@ -158,6 +177,7 @@ def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> I
     # MCP 的 session manager 不允许重复启动，每个测试都构建全新应用实例
     app = create_app()
     app.dependency_overrides[deps.get_memory_store] = lambda: memory_store
+    app.dependency_overrides[deps.get_knowledge_store] = lambda: knowledge_store
     app.dependency_overrides[deps.get_embedding_client] = lambda: NullEmbeddingClient()
     app.dependency_overrides[deps.get_llm_client] = lambda: fake_llm
 
@@ -171,4 +191,3 @@ def client(monkeypatch, memory_store: MemoryStore, fake_llm: FakeLLMClient) -> I
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-gateway-key"}
-

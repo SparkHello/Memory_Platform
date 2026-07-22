@@ -8,6 +8,7 @@ import "./styles/components.css";
 import "./styles/pages.css";
 import "./styles/morning-crystal.css";
 import "./styles/accessibility.css";
+import "./styles/knowledge.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

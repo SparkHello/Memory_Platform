@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,42 @@ class Settings(BaseSettings):
     )
     embedding_dimensions: int = Field(default=1024, validation_alias="EMBEDDING_DIMENSIONS")
     database_path: str = Field(default="data/memory.db", validation_alias="DATABASE_PATH")
+    knowledge_database_path: str = Field(
+        default="data/knowledge.db",
+        validation_alias="KNOWLEDGE_DATABASE_PATH",
+    )
+    knowledge_max_document_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024,
+        validation_alias="KNOWLEDGE_MAX_DOCUMENT_BYTES",
+    )
+    knowledge_agent_base_url: str = Field(
+        default="https://api.deepseek.com",
+        validation_alias="KNOWLEDGE_AGENT_BASE_URL",
+    )
+    knowledge_agent_api_key: str = Field(
+        default="",
+        validation_alias="KNOWLEDGE_AGENT_API_KEY",
+    )
+    knowledge_agent_flash_model: str = Field(
+        default="deepseek-v4-flash",
+        validation_alias="KNOWLEDGE_AGENT_FLASH_MODEL",
+    )
+    knowledge_agent_pro_model: str = Field(
+        default="deepseek-v4-pro",
+        validation_alias="KNOWLEDGE_AGENT_PRO_MODEL",
+    )
+    knowledge_agent_egress_policy: Literal["none", "normal", "all"] = Field(
+        default="none",
+        validation_alias="KNOWLEDGE_AGENT_EGRESS_POLICY",
+    )
+    knowledge_agent_timeout_seconds: float = Field(
+        default=25.0,
+        ge=1.0,
+        le=120.0,
+        validation_alias="KNOWLEDGE_AGENT_TIMEOUT_SECONDS",
+    )
     eval_dir: str = Field(default="eval", validation_alias="EVAL_DIR")
     request_timeout_seconds: float = Field(
         default=60.0,

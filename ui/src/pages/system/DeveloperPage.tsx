@@ -94,7 +94,12 @@ export function DeveloperPage({
     "POST /memories/search",
     "GET /memories/core",
     "POST /memories/review",
-    "GET /memories/export"
+    "GET /memories/export",
+    "GET /knowledge/documents",
+    "POST /knowledge/uploads",
+    "POST /knowledge/search",
+    "POST /knowledge/read",
+    "GET /knowledge/export"
   ];
 
   const copy = async (text: string) => {
@@ -104,7 +109,7 @@ export function DeveloperPage({
 
   return (
     <div className="page-stack">
-      <PageHeader title="接入信息" subtitle="MCP 和记忆管理 REST 常用接入信息。" />
+      <PageHeader title="接入信息" subtitle="MCP、记忆管理与独立知识库的常用 REST 接入信息。" />
       <section className="panel access-card">
         <div className="panel-header">
           <h2>MCP</h2>
@@ -133,6 +138,5 @@ export function DeveloperPage({
     </div>
   );
 }
-
 
 

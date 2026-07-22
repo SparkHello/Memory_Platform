@@ -8,6 +8,8 @@ import { useToast } from "./hooks/useToast";
 import { AppShell, type NavSignals } from "./layout/AppShell";
 import { hashForRoute, parseHash } from "./navigation";
 import { DashboardPage } from "./pages/DashboardPage";
+import { KnowledgeLibraryPage } from "./pages/knowledge/KnowledgeLibraryPage";
+import { KnowledgeSearchPage } from "./pages/knowledge/KnowledgeSearchPage";
 import { CoreMemoryPage } from "./pages/memory/CoreMemoryPage";
 import { DecisionLogsPage } from "./pages/memory/DecisionLogsPage";
 import { EvaluationPage } from "./pages/memory/EvaluationPage";
@@ -32,7 +34,11 @@ export function App() {
   const [memoryId, setMemoryId] = useState<string | null>(
     () => parseHash(window.location.hash)?.memoryId ?? null
   );
+  const [knowledgeId, setKnowledgeId] = useState<string | null>(
+    () => parseHash(window.location.hash)?.knowledgeId ?? null
+  );
   const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
+  const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
   const [serviceStatus, setServiceStatus] = useState<{
     loading: boolean;
     tone: "ok" | "warning" | "bad";
@@ -54,10 +60,11 @@ export function App() {
     }
     const next: NavSignals = {};
     try {
-      const [report, review, workbench] = await Promise.all([
+      const [report, review, workbench, knowledge] = await Promise.all([
         api.memoryReport(),
         api.reviewMemories(),
-        api.recallEvaluationWorkbench().catch(() => null)
+        api.recallEvaluationWorkbench().catch(() => null),
+        api.knowledgeStatus().catch(() => null)
       ]);
       if (review.recommendations.length > 0) {
         next.review = { text: String(review.recommendations.length), tone: "warning" };
@@ -74,6 +81,18 @@ export function App() {
           next.evaluation = { text: String(unlabeled), tone: "info" };
         }
       }
+      const failedIndexes =
+        knowledge?.failed_indexes ??
+        knowledge?.indexing_failed ??
+        knowledge?.failed_versions ??
+        knowledge?.index_failures ??
+        knowledge?.counts?.index_failed ??
+        knowledge?.counts?.failed_indexes ??
+        knowledge?.counts?.failed ??
+        0;
+      if (failedIndexes > 0) {
+        next.knowledge = { text: String(failedIndexes), tone: "warning" };
+      }
     } catch {
       // 角标只是辅助信号，拉取失败时保持无角标状态
     }
@@ -82,17 +101,21 @@ export function App() {
 
   const lastSignalsRefreshRef = useRef(0);
   const seenRefreshKeyRef = useRef(memoryRefreshKey);
+  const seenKnowledgeRefreshKeyRef = useRef(knowledgeRefreshKey);
 
   useEffect(() => {
     // 角标刷新节流：切页 60s 内不重复拉取（reviewMemories 是服务端全库扫描）；
     // 首次加载和记忆变更（memoryRefreshKey 递增）仍立即刷新。
     const now = Date.now();
-    const forced = memoryRefreshKey !== seenRefreshKeyRef.current;
+    const forced =
+      memoryRefreshKey !== seenRefreshKeyRef.current ||
+      knowledgeRefreshKey !== seenKnowledgeRefreshKeyRef.current;
     seenRefreshKeyRef.current = memoryRefreshKey;
+    seenKnowledgeRefreshKeyRef.current = knowledgeRefreshKey;
     if (!forced && now - lastSignalsRefreshRef.current < 60_000) return;
     lastSignalsRefreshRef.current = now;
     void refreshSignals();
-  }, [refreshSignals, memoryRefreshKey, activePage]);
+  }, [refreshSignals, memoryRefreshKey, knowledgeRefreshKey, activePage]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -102,10 +125,10 @@ export function App() {
   useEffect(() => {
     document.querySelector(".content-area")?.scrollTo(0, 0);
     document.documentElement.dataset.page = activePage;
-  }, [activePage]);
+  }, [activePage, knowledgeId]);
 
-  const syncHash = useCallback((nextPage: PageKey, nextMemoryId: string | null) => {
-    const nextHash = hashForRoute(nextPage, nextMemoryId);
+  const syncHash = useCallback((nextPage: PageKey, nextMemoryId: string | null, nextKnowledgeId: string | null = null) => {
+    const nextHash = hashForRoute(nextPage, nextMemoryId, nextKnowledgeId);
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash.slice(1);
     }
@@ -114,13 +137,14 @@ export function App() {
   const navigateToPage = useCallback((nextPage: PageKey) => {
     setPage(nextPage);
     setMemoryId(null);
-    syncHash(nextPage, null);
+    setKnowledgeId(null);
+    syncHash(nextPage, null, null);
   }, [syncHash]);
 
   const openMemory = useCallback((id: string) => {
     setMemoryId(id);
     setPage((current) => {
-      syncHash(current, id);
+      syncHash(current, id, null);
       return current;
     });
   }, [syncHash]);
@@ -128,25 +152,39 @@ export function App() {
   const closeMemory = useCallback(() => {
     setMemoryId(null);
     setPage((current) => {
-      syncHash(current, null);
+      syncHash(current, null, null);
       return current;
     });
   }, [syncHash]);
 
+  const openKnowledge = useCallback((id: string) => {
+    setPage("knowledge");
+    setMemoryId(null);
+    setKnowledgeId(id);
+    syncHash("knowledge", null, id);
+  }, [syncHash]);
+
+  const closeKnowledge = useCallback(() => {
+    setKnowledgeId(null);
+    setPage("knowledge");
+    syncHash("knowledge", null, null);
+  }, [syncHash]);
+
   useEffect(() => {
     if (!window.location.hash) {
-      window.history.replaceState(null, "", hashForRoute(activePage, memoryId));
+      window.history.replaceState(null, "", hashForRoute(activePage, memoryId, knowledgeId));
     }
     const onHashChange = () => {
       const route = parseHash(window.location.hash);
       if (route) {
         setPage(route.page);
         setMemoryId(route.memoryId);
+        setKnowledgeId(route.knowledgeId);
       }
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, [activePage, memoryId]);
+  }, [activePage, memoryId, knowledgeId]);
 
   const pingService = useCallback(async () => {
     setServiceStatus((current) => ({ ...current, loading: true }));
@@ -206,6 +244,20 @@ export function App() {
         )}
         {activePage === "memories" && (
           <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} />
+        )}
+        {activePage === "knowledge" && (
+          <KnowledgeLibraryPage
+            api={api}
+            documentId={knowledgeId}
+            notify={notify}
+            confirm={confirm}
+            onOpenDocument={openKnowledge}
+            onCloseDocument={closeKnowledge}
+            onChanged={() => setKnowledgeRefreshKey((current) => current + 1)}
+          />
+        )}
+        {activePage === "knowledgeSearch" && (
+          <KnowledgeSearchPage api={api} notify={notify} onOpenDocument={openKnowledge} />
         )}
         {activePage === "core" && (
           <CoreMemoryPage api={api} notify={notify} confirm={confirm} />

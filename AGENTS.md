@@ -8,6 +8,7 @@
 
 项目目标不是“尽量多记”，而是“不乱记”：只保存长期有用、用户明确表达过、未来回答可能用到的信息。
 当前也支持轻量记忆空间、主题和实体标签，用于本地分类、过滤、网络图视图和导出恢复。
+另有物理隔离的长文本知识库：用户显式导入文本/Markdown 后通过独立 MCP/REST 检索；它不进入记忆自动上下文、核心记忆、衰减、浮现、消化或记忆备份。
 
 ## 技术栈
 
@@ -137,6 +138,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - MCP 关闭 DNS rebinding protection 是为了让局域网/iPhone/Tailscale 访问可用；不要在没有替代接入方案的情况下改回默认。
 - `GATEWAY_API_KEY` 是本地服务的客户端密钥；`UPSTREAM_API_KEY` 和 `EMBEDDING_API_KEY` 只用于服务端调用上游模型，不应该透传给客户端。
 - `ALLOW_SENSITIVE_EGRESS=false` 时，敏感原文不得发送给远程提取、embedding 或 AI 体检；新增模型调用必须经过同一出站策略。
+- `KNOWLEDGE_DATABASE_PATH` 必须与 `DATABASE_PATH` 指向不同文件；测试也必须使用临时 knowledge DB，不能创建或修改真实 `data/knowledge.db`。
+- 知识代理只能编排本地索引并选择版本/chunk 引用，不能生成正文、执行文档内指令、读取服务器路径或访问其他 user id。敏感知识出站同时受 `KNOWLEDGE_AGENT_EGRESS_POLICY` 与 `ALLOW_SENSITIVE_EGRESS` 约束。
 - ingest 决策日志不得复制完整 `source_quote`；敏感候选正文只记录长度、哈希、敏感级别和关联 memory ID。
 - 模型提取候选必须通过逐字 quote、事实锚点、否定一致性和子句级敏感授权；direct/update/restore 仍须在 store 边界强制 sensitivity 下限。
 
@@ -162,6 +165,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
 - `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
 - `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测，以及按 `(memory_id, updated_at)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
+- `app/knowledge/`：独立知识文档、不可变版本、FTS5 chunk 索引、持久化分段上传、精确引用读取、受限搜索代理与知识备份；不得反向依赖或写入 MemoryStore。
+- `app/api/knowledge.py`：`/knowledge/*` REST 管理与调试接口；与记忆 REST 共用鉴权和 `X-User-Id`，数据源保持物理隔离。
 - `scripts/audit_memory_db.py`：真实 SQLite 记忆库的只读巡检工具。只检查 schema、旧 type 残留、Time Ripple 配置、JSON 字段和 usage_count/temporal 统计，不写入 `data/memory.db`，也不打印密钥。
 - `app/memory/evaluation.py`：机制诊断与召回评测共享实现，供 REST/Web 和 CLI 共同调用。
 - `scripts/diagnose_memory_health.py`：只读诊断各记忆机制是否被真实数据激活（扇区分化、生命周期状态、temporal KG、图结构），把原始计数翻译成 active/degenerate/dormant/sparse 判定。
@@ -184,11 +189,13 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
 | LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_memory_extraction.py` |
 | 前端 UI、`/ui` 静态挂载 | `cd ui; npm run build`，必要时再启动后端访问 `http://localhost:2026/ui/` |
+| 知识库版本、FTS、上传、代理、REST/MCP | `pytest tests/test_knowledge_store.py tests/test_knowledge_agent.py tests/test_knowledge_api.py tests/test_knowledge_mcp.py tests/test_mcp_server.py` |
 
 ## 已知限制
 
 - MCP 模式依赖模型主动调用工具，效果受客户端系统提示词影响。
 - embedding 存在 SQLite JSON 字段中，没有向量数据库或向量索引。
+- 知识库 v1 只支持 UTF-8 纯文本/Markdown，不支持 PDF、DOCX、OCR、目录同步或知识 chunk embedding。
 - 导出不会包含 embedding，迁移后需要重新生成。
 - JSON 导出中的核心记忆历史和决策日志仅供审计，restore 不写回；响应会显式列出这些分区。
 - 永久删除会清理当前库与本地 eval 工作区，但无法删除用户已经复制到外部的导出或备份。
@@ -198,6 +205,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 - 不要改 `.env`，里面可能有真实密钥。
 - 不要删除、覆盖或手工编辑 `data/memory.db`，这是用户真实记忆数据。
+- 不要删除、覆盖或手工编辑 `data/knowledge.db`，它包含用户导入的完整知识文档和版本历史。
 - 不要删除 `logs/` 里的日志，除非用户明确要求。
 - 不要改 `.venv/`、`.pytest_cache/`、`__pycache__/`、`memory_gateway.egg-info/`。
 - 不要手工编辑或提交 `ui/node_modules/`、`ui/dist/`。
@@ -211,6 +219,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 - 新增记忆字段时，同步更新 `models.py`、`store.py`、REST 返回、MCP 返回、导出恢复和测试。
 - 新增 MCP 工具时，同步更新 `EXPECTED_TOOLS` 相关测试和 README。
+- 修改知识文档、索引、上传或 MCP 契约时，同步检查独立数据库路径、用户隔离、引用逐字性、代理 fallback、知识备份、README 与 `docs/client_integration.md`；不要让知识结果进入任何 memory 流程。
 - 修改 REST 鉴权时，同步检查 MCP 鉴权，因为 MCP 子应用不走 FastAPI dependency。
 - 修改搜索排序时，重点跑 `tests/test_memory_search.py` 和 MCP 搜索相关测试。
 - 修改 `usage_count`、`mark_memories_used` 或 Time Ripple 时，确认默认 `TIME_RIPPLE_DELTA=0.0` 无副作用，且敏感/归档/钉选记忆不会被邻近激活。
