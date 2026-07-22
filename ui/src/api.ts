@@ -251,6 +251,7 @@ export class MemoryApi {
       documentRefs?: string[];
       quality?: KnowledgeSearchQuality;
       includeSensitive?: boolean;
+      timeoutMs?: number;
     },
     signal?: AbortSignal
   ): Promise<KnowledgeSearchResponse> {
@@ -264,7 +265,7 @@ export class MemoryApi {
         include_sensitive: options.includeSensitive ?? false
       },
       signal,
-      timeoutMs: 35000
+      timeoutMs: options.timeoutMs ?? 35000
     });
   }
 

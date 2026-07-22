@@ -98,6 +98,7 @@ def knowledge_status(
             "error": init_error,
             "agent_enabled": False,
             "agent_egress_policy": settings.knowledge_agent_egress_policy,
+            "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
         }
     payload = _store_call(store.status, user_id=user_id)
     return {
@@ -109,6 +110,7 @@ def knowledge_status(
             and settings.knowledge_agent_egress_policy != "none"
         ),
         "agent_egress_policy": settings.knowledge_agent_egress_policy,
+        "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
         "agent_flash_model": settings.knowledge_agent_flash_model,
         "agent_pro_model": settings.knowledge_agent_pro_model,
         "sensitive_egress_enabled": settings.allow_sensitive_egress,

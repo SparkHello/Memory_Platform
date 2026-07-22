@@ -21,7 +21,7 @@ import { ReviewPage } from "./pages/memory/ReviewPage";
 import { DeveloperPage } from "./pages/system/DeveloperPage";
 import { SettingsPage } from "./pages/system/SettingsPage";
 import { loadSettings, loadTheme, saveSettings, saveTheme, type ThemeMode } from "./storage";
-import type { ConnectionSettings, PageKey } from "./types";
+import type { ConnectionSettings, KnowledgeStatus, PageKey } from "./types";
 import { errorMessage } from "./utils/format";
 
 export function App() {
@@ -45,6 +45,7 @@ export function App() {
     message: string;
   }>({ loading: true, tone: "warning", message: "检查中" });
   const [navSignals, setNavSignals] = useState<NavSignals>({});
+  const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeStatus | null>(null);
 
   const api = useMemo(() => new MemoryApi(settings), [settings]);
   const { toast, notify, clearToast } = useToast();
@@ -56,6 +57,7 @@ export function App() {
   const refreshSignals = useCallback(async () => {
     if (!settings.apiKey) {
       setNavSignals({});
+      setKnowledgeStatus(null);
       return;
     }
     const next: NavSignals = {};
@@ -93,6 +95,7 @@ export function App() {
       if (failedIndexes > 0) {
         next.knowledge = { text: String(failedIndexes), tone: "warning" };
       }
+      setKnowledgeStatus(knowledge);
     } catch {
       // 角标只是辅助信号，拉取失败时保持无角标状态
     }
@@ -257,7 +260,7 @@ export function App() {
           />
         )}
         {activePage === "knowledgeSearch" && (
-          <KnowledgeSearchPage api={api} notify={notify} onOpenDocument={openKnowledge} />
+          <KnowledgeSearchPage api={api} notify={notify} onOpenDocument={openKnowledge} status={knowledgeStatus} />
         )}
         {activePage === "core" && (
           <CoreMemoryPage api={api} notify={notify} confirm={confirm} />

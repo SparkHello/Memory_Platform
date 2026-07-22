@@ -273,6 +273,56 @@ def test_version_cursor_pages_reconstruct_text_without_gaps(
         )
 
 
+def test_title_length_limit_is_300_for_upload_and_update(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    upload = knowledge_store.begin_upload("alice", "标" * 300)
+    knowledge_store.append_upload("alice", upload.id, 0, "正文")
+    committed = knowledge_store.commit_upload("alice", upload.id, 1)
+    assert len(committed.document.title) == 300
+
+    with pytest.raises(KnowledgeValidationError):
+        knowledge_store.begin_upload("alice", "标" * 301)
+    with pytest.raises(KnowledgeValidationError):
+        knowledge_store.update_document(
+            "alice",
+            document_ref=committed.document.ref,
+            title="题" * 301,
+        )
+    updated = knowledge_store.update_document(
+        "alice",
+        document_ref=committed.document.ref,
+        title="题" * 300,
+    )
+    assert len(updated.title) == 300
+
+
+def test_sensitive_document_read_is_hidden_without_explicit_opt_in(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    text = "deployment api_key=sk-abcdefghijklmnop must remain local"
+    result = _commit(knowledge_store, text)
+    assert result.document.sensitivity == "sensitive"
+    hits = knowledge_store.search_chunks("alice", "deployment", include_sensitive=True)
+    chunk_ref = hits[0].chunk_ref
+
+    with pytest.raises(KnowledgeNotFoundError):
+        knowledge_store.read_reference(
+            "alice", result.version.ref, signing_key="test-key"
+        )
+    with pytest.raises(KnowledgeNotFoundError):
+        knowledge_store.read_reference("alice", chunk_ref, signing_key="test-key")
+
+    version_page = knowledge_store.read_reference(
+        "alice", result.version.ref, include_sensitive=True, signing_key="test-key"
+    )
+    chunk_page = knowledge_store.read_reference(
+        "alice", chunk_ref, include_sensitive=True, signing_key="test-key"
+    )
+    assert version_page["content"] == text
+    assert chunk_page["content"] == text
+
+
 def test_user_isolation_applies_to_documents_search_chunks_and_uploads(
     knowledge_store: KnowledgeStore,
 ) -> None:

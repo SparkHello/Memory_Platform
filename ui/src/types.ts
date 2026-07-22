@@ -685,6 +685,9 @@ export interface KnowledgeStatus {
     failed_indexes?: number;
     [key: string]: number | undefined;
   };
+  agent_enabled?: boolean;
+  agent_egress_policy?: string;
+  agent_timeout_seconds?: number;
 }
 
 export interface KnowledgeUploadSession {

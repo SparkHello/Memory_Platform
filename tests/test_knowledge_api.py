@@ -50,6 +50,34 @@ def _upload(
     return committed.json()
 
 
+def test_knowledge_rest_requires_valid_bearer_token(client) -> None:
+    bad_headers = {"Authorization": "Bearer wrong-key"}
+    probes = [
+        ("GET", "/knowledge/documents", None),
+        (
+            "POST",
+            "/knowledge/search",
+            {"request": "未授权检索", "limit": 5},
+        ),
+        (
+            "POST",
+            "/knowledge/uploads",
+            {"title": "未授权上传", "content_type": "text/markdown"},
+        ),
+        (
+            "POST",
+            "/knowledge/read",
+            {"reference": "knowledge://version/anything"},
+        ),
+        ("POST", "/knowledge/restore", {"data": {"documents": []}}),
+    ]
+
+    for method, path, payload in probes:
+        for headers in ({}, bad_headers):
+            response = client.request(method, path, headers=headers, json=payload)
+            assert response.status_code == 401, (method, path, headers, response.text)
+
+
 def test_knowledge_rest_upload_search_and_lossless_read(
     client,
     auth_headers,
@@ -257,3 +285,13 @@ def test_knowledge_export_restore_is_separate_and_rebinds_user(client, auth_head
     assert len(bob) == 1
     assert bob[0]["user_id"] == "bob"
     assert bob[0]["document_ref"] != first["document"]["document_ref"]
+
+
+def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers) -> None:
+    status = client.get("/knowledge/status", headers=auth_headers)
+    assert status.status_code == 200, status.text
+    payload = status.json()
+    assert payload["available"] is True
+    assert payload["agent_enabled"] is False
+    assert payload["agent_egress_policy"] == "none"
+    assert payload["agent_timeout_seconds"] == 25.0

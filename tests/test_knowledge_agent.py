@@ -138,6 +138,53 @@ async def test_local_baseline_fallback_when_egress_is_disabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_normal_egress_policy_falls_back_when_sensitive_candidates_requested() -> None:
+    store = FakeStore([_hit(sensitivity="sensitive")])
+    remote = FakeCompletionClient([])
+    agent = KnowledgeSearchAgent(
+        store,
+        _config(egress_policy="normal"),
+        client=remote,
+    )
+
+    result = await agent.search("敏感内容", "alice", include_sensitive=True)
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert result.metadata.agent_used is False
+    assert result.metadata.agent_attempted is False
+    assert result.metadata.fallback_reason == "sensitive_egress_disabled"
+    assert remote.calls == []
+
+
+@pytest.mark.asyncio
+async def test_normal_egress_policy_allows_remote_without_sensitive_excerpts() -> None:
+    sensitive_excerpt = "敏感原文绝不外发"
+    store = FakeStore(
+        [
+            _hit(),
+            _hit(SECOND_CHUNK_REF, excerpt=sensitive_excerpt, sensitivity="sensitive"),
+        ]
+    )
+    remote = FakeCompletionClient(
+        [_tool_response("select_references", {"chunk_refs": [CHUNK_REF], "needs_pro": False})]
+    )
+    agent = KnowledgeSearchAgent(
+        store,
+        _config(egress_policy="normal"),
+        client=remote,
+    )
+
+    result = await agent.search("普通检索", "alice", include_sensitive=False)
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert result.metadata.agent_used is True
+    assert remote.calls
+    outbound = json.dumps(remote.calls, ensure_ascii=False)
+    assert sensitive_excerpt not in outbound
+    assert SECOND_CHUNK_REF not in outbound
+
+
+@pytest.mark.asyncio
 async def test_model_can_only_select_refs_and_never_supplies_final_text() -> None:
     store = FakeStore([_hit(excerpt="逐字原文，不可由模型改写")])
     remote = FakeCompletionClient(

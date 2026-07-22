@@ -23,7 +23,8 @@ import type {
   KnowledgeDocument,
   KnowledgeSearchHit,
   KnowledgeSearchQuality,
-  KnowledgeSearchResponse
+  KnowledgeSearchResponse,
+  KnowledgeStatus
 } from "../../types";
 import { copyText } from "../../utils/files";
 import { errorMessage, numberText } from "../../utils/format";
@@ -33,11 +34,13 @@ import { knowledgeDocumentRef } from "./knowledgeData";
 export function KnowledgeSearchPage({
   api,
   notify,
-  onOpenDocument
+  onOpenDocument,
+  status
 }: {
   api: MemoryApi;
   notify: Notify;
   onOpenDocument: (id: string) => void;
+  status: KnowledgeStatus | null;
 }) {
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [documentsError, setDocumentsError] = useState<string | null>(null);
@@ -66,6 +69,10 @@ export function KnowledgeSearchPage({
     return () => controller.abort();
   }, [loadDocuments]);
 
+  // 前端超时跟随后端 KNOWLEDGE_AGENT_TIMEOUT_SECONDS（留 10s 余量）；status 未加载时回退 35s。
+  const searchTimeoutMs = status?.agent_timeout_seconds ? status.agent_timeout_seconds * 1000 + 10000 : 35000;
+  const egressWarning = Boolean(status?.agent_enabled && status.agent_egress_policy && status.agent_egress_policy !== "none");
+
   const runSearch = async () => {
     const cleanRequest = request.trim();
     if (!cleanRequest) {
@@ -80,7 +87,8 @@ export function KnowledgeSearchPage({
         limit,
         documentRefs: [...selectedRefs],
         quality,
-        includeSensitive
+        includeSensitive,
+        timeoutMs: searchTimeoutMs
       }));
     } catch (searchError) {
       setResult(null);
@@ -206,13 +214,15 @@ export function KnowledgeSearchPage({
         </form>
       </section>
 
-      <div className="notice warning knowledge-egress-notice">
-        <ShieldAlert size={18} />
-        <span>
-          启用 DeepSeek 代理时，检索需求和获准的候选正文可能发送到远程服务。DeepSeek 说明这些内容可能用于技术改进，并在中国处理与存储。
-          <a href="https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html" target="_blank" rel="noreferrer" aria-label="查看 DeepSeek 隐私政策（新窗口）">查看隐私政策 <ExternalLink size={12} /></a>
-        </span>
-      </div>
+      {egressWarning && (
+        <div className="notice warning knowledge-egress-notice">
+          <ShieldAlert size={18} />
+          <span>
+            启用 DeepSeek 代理时，检索需求和获准的候选正文可能发送到远程服务。DeepSeek 说明这些内容可能用于技术改进，并在中国处理与存储。
+            <a href="https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html" target="_blank" rel="noreferrer" aria-label="查看 DeepSeek 隐私政策（新窗口）">查看隐私政策 <ExternalLink size={12} /></a>
+          </span>
+        </div>
+      )}
 
       {loading && <LoadingBlock label="正在运行本地基线与受限搜索代理" />}
       {error && <ErrorBlock message={error} onRetry={() => void runSearch()} />}

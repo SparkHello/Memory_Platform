@@ -296,7 +296,7 @@ class KnowledgeStore:
         sensitivity: KnowledgeSensitivity = "normal",
     ) -> KnowledgeUploadSession:
         user_id = _required_text(user_id, "user_id", 256)
-        title = _required_text(title, "title", 500)
+        title = _required_text(title, "title", 300)
         source_name = _optional_text(source_name, "source_name", 1000)
         content_type = _validate_content_type(content_type)
         sensitivity = _validate_sensitivity(sensitivity)
@@ -865,7 +865,7 @@ class KnowledgeStore:
                 document_id=document_id,
                 include_deleted=False,
             )
-            new_title = row["title"] if title is None else _required_text(title, "title", 500)
+            new_title = row["title"] if title is None else _required_text(title, "title", 300)
             new_source = (
                 row["source_name"]
                 if source_name is None

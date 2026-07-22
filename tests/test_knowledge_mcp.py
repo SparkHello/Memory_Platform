@@ -334,6 +334,56 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
     assert current["content"] == original
 
 
+def test_knowledge_mcp_update_metadata_can_raise_but_not_lower_sensitivity(
+    client,
+    auth_headers,
+) -> None:
+    alice = _user_headers(auth_headers, "alice")
+    committed = _upload(
+        client,
+        alice,
+        title="普通手册",
+        parts=["# 常规内容\n\n不含敏感信息的操作说明。"],
+    )
+    document_ref = committed["document"]["document_ref"]
+    assert committed["document"]["sensitivity"] == "normal"
+
+    upgraded = _call(
+        client,
+        alice,
+        "manage_knowledge_document",
+        {
+            "action": "update_metadata",
+            "document_ref": document_ref,
+            "sensitivity": "sensitive",
+        },
+    )
+    assert upgraded["ok"] is True
+    assert upgraded["document"]["sensitivity"] == "sensitive"
+
+    detected = _upload(
+        client,
+        alice,
+        title="部署笔记",
+        parts=["deployment api_key=sk-abcdefghijklmnop must remain local"],
+    )
+    detected_ref = detected["document"]["document_ref"]
+    assert detected["document"]["sensitivity"] == "sensitive"
+
+    downgraded = _call(
+        client,
+        alice,
+        "manage_knowledge_document",
+        {
+            "action": "update_metadata",
+            "document_ref": detected_ref,
+            "sensitivity": "normal",
+        },
+    )
+    assert downgraded["ok"] is True
+    assert downgraded["document"]["sensitivity"] == "sensitive"
+
+
 def test_knowledge_mcp_enforces_part_limit_user_isolation_and_no_purge(
     client,
     auth_headers,

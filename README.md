@@ -177,7 +177,7 @@ X-User-Id: default
 | `search_knowledge(request, ...)` | 显式检索独立知识库；本地 FTS 为事实来源，可选 DeepSeek 代理只编排查询并选择引用。 |
 | `read_knowledge(reference, ...)` | 按版本/chunk 引用逐字读取，小文档一次返回，大文档用签名 cursor 分页。 |
 | `begin_knowledge_upload` / `append_knowledge_upload` / `commit_knowledge_upload` | 持久化分段上传新文档或新版本。 |
-| `manage_knowledge_document(...)` | 更新元数据、软删除、恢复、恢复版本或重建索引；不提供永久清理。 |
+| `manage_knowledge_document(...)` | 更新元数据（含上调文档敏感度）、软删除、恢复、恢复版本或重建索引；不提供永久清理。 |
 
 推荐给 iOS/Kelivo 等 AI 客户端的系统提示片段：
 
@@ -306,7 +306,7 @@ X-User-Id: default
 | Method | Path | 用途 |
 | --- | --- | --- |
 | `GET` | `/knowledge/status` | 查看知识索引和远程代理是否可用，不返回密钥。 |
-| `GET` | `/knowledge/documents` | 按 active/deleted、标题和数量列出文档。 |
+| `GET` | `/knowledge/documents` | 按 active/deleted、标题和数量列出文档；REST 默认 `include_sensitive=true`（管理台视角），MCP `list_knowledge_documents` 默认 `false`（模型视角），这是有意差异。 |
 | `GET` | `/knowledge/documents/{id}` | 查看文档详情和不可变版本历史。 |
 | `POST/PUT` | `/knowledge/uploads/*` | begin、追加有序文本片段并 commit 为新文档或新版本。 |
 | `POST` | `/knowledge/search` | 运行本地全文检索与可选受限代理编排。 |

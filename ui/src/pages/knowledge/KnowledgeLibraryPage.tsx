@@ -385,6 +385,9 @@ function KnowledgeDetailPage({
   const [sourceName, setSourceName] = useState("");
   const [sensitivity, setSensitivity] = useState<MemorySensitivity>("normal");
   const [purgeOpen, setPurgeOpen] = useState(false);
+  // 正文读取请求序号：每次发起新读取（含切换版本、清空）都会递增，
+  // 在途的旧请求（尤其是“继续加载”的 append）resolve 后据此丢弃，避免串版本追加和 loading 态串扰。
+  const readRequestRef = useRef(0);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -419,22 +422,26 @@ function KnowledgeDetailPage({
 
   const loadRead = useCallback(async (reference: string, cursor = "", append = false, signal?: AbortSignal) => {
     if (!reference) return;
+    const requestId = ++readRequestRef.current;
     setReading(true);
     setReadError(null);
     try {
       const page = await api.readKnowledge({ reference, cursor, maxChars: 20000, includeSensitive: true }, signal);
+      if (requestId !== readRequestRef.current) return;
       setReadPages((current) => append ? [...current, page] : [page]);
     } catch (loadError) {
       if (isAbortError(loadError)) return;
+      if (requestId !== readRequestRef.current) return;
       if (!append) setReadPages([]);
       setReadError(errorMessage(loadError));
     } finally {
-      setReading(false);
+      if (requestId === readRequestRef.current) setReading(false);
     }
   }, [api]);
 
   useEffect(() => {
     if (!selectedVersionRef || detail?.document.status === "deleted") {
+      readRequestRef.current += 1;
       setReadPages([]);
       setReadError(null);
       setReading(false);
