@@ -277,10 +277,17 @@ def test_user_isolation_applies_to_documents_search_chunks_and_uploads(
     knowledge_store: KnowledgeStore,
 ) -> None:
     result = _commit(knowledge_store, "Alice only secret marker")
+    hits = knowledge_store.search_chunks("alice", "secret marker")
+    assert hits
+    chunk_ref = hits[0].chunk_ref
 
     assert knowledge_store.list_documents("bob", include_sensitive=True) == []
     assert knowledge_store.search_chunks("bob", "secret marker") == []
-    assert knowledge_store.get_chunks_by_refs("bob", [result.version.ref.replace("version", "chunk")]) == []
+    assert knowledge_store.get_chunks_by_refs("bob", [chunk_ref]) == []
+    with pytest.raises(KnowledgeNotFoundError):
+        knowledge_store.read_reference(
+            "bob", chunk_ref, include_sensitive=True, signing_key="test-key"
+        )
     with pytest.raises(KnowledgeNotFoundError):
         knowledge_store.get_document_detail("bob", document_ref=result.document.ref)
     with pytest.raises(KnowledgeNotFoundError):
@@ -353,3 +360,235 @@ def test_upload_commit_checks_optional_exact_sha256(
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
     result = knowledge_store.commit_upload("alice", upload.id, 1, digest.upper())
     assert result.version.content_sha256 == digest
+
+
+def test_deduplicated_upload_repairs_failed_index(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    first = _commit(knowledge_store, "相同正文带有修复关键字")
+    with knowledge_store._connect() as connection:
+        connection.execute(
+            """
+            UPDATE knowledge_versions
+            SET index_status = 'failed', index_error = 'simulated', indexed_at = NULL
+            WHERE id = ?
+            """,
+            (first.version.id,),
+        )
+    assert knowledge_store.search_chunks("alice", "修复关键字") == []
+
+    second = _commit(
+        knowledge_store,
+        "相同正文带有修复关键字",
+        replace_document_ref=first.document.ref,
+    )
+
+    assert second.deduplicated is True
+    assert second.version.id == first.version.id
+    assert second.version.index_status == "ready"
+    assert knowledge_store.counts("alice")["versions"] == 1
+    hits = knowledge_store.search_chunks("alice", "修复关键字")
+    assert hits and hits[0].version_ref == first.version.ref
+
+
+def test_reindex_failed_version_keeps_ready_current_version(
+    knowledge_store: KnowledgeStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _commit(knowledge_store, "第一版保持当前")
+    upload = knowledge_store.begin_upload(
+        "alice", "测试文档", replace_document_ref=first.document.ref
+    )
+    knowledge_store.append_upload("alice", upload.id, 0, "第二版索引失败")
+
+    def fail_chunking(_text: str):
+        raise RuntimeError("forced index failure")
+
+    monkeypatch.setattr(store_module, "chunk_knowledge_text", fail_chunking)
+    failed = knowledge_store.commit_upload("alice", upload.id, 1)
+    assert failed.version.index_status == "failed"
+    monkeypatch.undo()
+
+    reindexed = knowledge_store.reindex_version(
+        user_id="alice",
+        document_ref=first.document.ref,
+        version_ref=failed.version.ref,
+    )
+
+    assert reindexed.version.index_status == "ready"
+    assert reindexed.document.current_version_id == first.version.id
+    detail = knowledge_store.get_document_detail(
+        "alice", document_ref=first.document.ref
+    )
+    assert detail["document"].current_version_id == first.version.id
+
+
+def test_reindex_without_any_ready_version_becomes_current(
+    knowledge_store: KnowledgeStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_chunking(_text: str):
+        raise RuntimeError("forced index failure")
+
+    monkeypatch.setattr(store_module, "chunk_knowledge_text", fail_chunking)
+    failed = _commit(knowledge_store, "唯一版本初始失败")
+    assert failed.version.index_status == "failed"
+    assert failed.document.current_version_id is None
+    monkeypatch.undo()
+
+    reindexed = knowledge_store.reindex_version(
+        user_id="alice",
+        version_ref=failed.version.ref,
+    )
+
+    assert reindexed.version.index_status == "ready"
+    assert reindexed.document.current_version_id == failed.version.id
+
+
+def test_restore_export_is_idempotent(
+    knowledge_store: KnowledgeStore,
+    tmp_path: Path,
+) -> None:
+    _commit(knowledge_store, "幂等恢复 marker")
+    exported = knowledge_store.export_user("alice")
+
+    restored_store = KnowledgeStore(str(tmp_path / "restored.db"))
+    restored_store.init_db()
+    first = restored_store.restore_export("bob", exported)
+    assert first["restored_documents"] == 1
+    assert first["skipped_documents"] == 0
+
+    second = restored_store.restore_export("bob", exported)
+    assert set(second) == {
+        "restored_documents",
+        "restored_versions",
+        "failed_versions",
+        "skipped_documents",
+        "document_refs",
+        "chunks_rebuilt",
+        "fts_rebuilt",
+    }
+    assert second["restored_documents"] == 0
+    assert second["restored_versions"] == 0
+    assert second["skipped_documents"] == 1
+    assert second["document_refs"] == []
+    assert len(restored_store.list_documents("bob", include_sensitive=True)) == 1
+
+
+def test_restore_rejects_oversized_total_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = {
+        "format": "memory-gateway-knowledge",
+        "documents": [
+            {
+                "source_document_ref": "knowledge://document/oversize",
+                "title": "过大",
+                "versions": [
+                    {"version_number": 1, "content": "x" * 64},
+                    {"version_number": 2, "content": "y" * 64},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(store_module, "_MAX_RESTORE_TOTAL_BYTES", 100)
+    restored_store = KnowledgeStore(str(tmp_path / "limited.db"))
+    restored_store.init_db()
+
+    with pytest.raises(KnowledgeValidationError):
+        restored_store.restore_export("bob", exported)
+    assert restored_store.list_documents("bob", include_sensitive=True) == []
+
+
+def test_commit_cleans_upload_parts_and_is_idempotent(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    upload = knowledge_store.begin_upload("alice", "清理片段")
+    knowledge_store.append_upload("alice", upload.id, 0, "正文片段")
+    committed = knowledge_store.commit_upload("alice", upload.id, 1)
+
+    with knowledge_store._connect() as connection:
+        parts = connection.execute(
+            "SELECT COUNT(*) AS count FROM knowledge_upload_parts WHERE upload_id = ?",
+            (upload.id,),
+        ).fetchone()["count"]
+        session = connection.execute(
+            "SELECT * FROM knowledge_upload_sessions WHERE id = ?",
+            (upload.id,),
+        ).fetchone()
+    assert parts == 0
+    assert session["status"] == "committed"
+    assert session["committed_document_ref"] == committed.document.ref
+    assert session["committed_version_ref"] == committed.version.ref
+
+    repeated = knowledge_store.commit_upload("alice", upload.id, 1)
+    assert repeated.document.ref == committed.document.ref
+    assert repeated.version.ref == committed.version.ref
+    assert repeated.deduplicated is True
+    counts = knowledge_store.counts("alice")
+    assert counts["documents"] == 1
+    assert counts["versions"] == 1
+
+
+def test_cancel_allows_expired_and_committing_sessions(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    expired = knowledge_store.begin_upload("alice", "过期")
+    with knowledge_store._connect() as connection:
+        connection.execute(
+            "UPDATE knowledge_upload_sessions SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000Z", expired.id),
+        )
+    with pytest.raises(KnowledgeConflictError):
+        knowledge_store.append_upload("alice", expired.id, 0, "正文")
+    assert knowledge_store.cancel_upload("alice", expired.id) is True
+
+    stuck = knowledge_store.begin_upload("alice", "卡住")
+    knowledge_store.append_upload("alice", stuck.id, 0, "残留片段")
+    with knowledge_store._connect() as connection:
+        connection.execute(
+            "UPDATE knowledge_upload_sessions SET status = 'committing' WHERE id = ?",
+            (stuck.id,),
+        )
+    assert knowledge_store.cancel_upload("alice", stuck.id) is True
+    with knowledge_store._connect() as connection:
+        parts = connection.execute(
+            "SELECT COUNT(*) AS count FROM knowledge_upload_parts WHERE upload_id = ?",
+            (stuck.id,),
+        ).fetchone()["count"]
+    assert parts == 0
+
+    committed = _commit(knowledge_store, "已提交不可取消")
+    upload = knowledge_store.begin_upload("alice", "再提交")
+    knowledge_store.append_upload("alice", upload.id, 0, "另一份正文")
+    knowledge_store.commit_upload("alice", upload.id, 1)
+    with pytest.raises(KnowledgeConflictError):
+        knowledge_store.cancel_upload("alice", upload.id)
+    assert committed.document.ref != ""
+
+
+def test_begin_upload_sweeps_stale_sessions(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    stale = knowledge_store.begin_upload("alice", "待清扫")
+    knowledge_store.append_upload("alice", stale.id, 0, "残留片段")
+    with knowledge_store._connect() as connection:
+        connection.execute(
+            "UPDATE knowledge_upload_sessions SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000Z", stale.id),
+        )
+
+    knowledge_store.begin_upload("alice", "触发懒清理")
+
+    with knowledge_store._connect() as connection:
+        sessions = connection.execute(
+            "SELECT COUNT(*) AS count FROM knowledge_upload_sessions WHERE id = ?",
+            (stale.id,),
+        ).fetchone()["count"]
+        parts = connection.execute(
+            "SELECT COUNT(*) AS count FROM knowledge_upload_parts WHERE upload_id = ?",
+            (stale.id,),
+        ).fetchone()["count"]
+    assert sessions == 0
+    assert parts == 0

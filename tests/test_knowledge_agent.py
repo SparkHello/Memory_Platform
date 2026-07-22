@@ -443,3 +443,19 @@ async def test_openai_compatible_client_supports_fake_transport_without_network(
     assert captured["authorization"] == "Bearer test-key"
     assert captured["payload"]["model"] == "deepseek-v4-flash"
     assert captured["payload"]["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_result_carries_baseline_candidates_without_a_second_search() -> None:
+    store = FakeStore([_hit()])
+    agent = KnowledgeSearchAgent(
+        store,
+        _config(egress_policy="none"),
+        client=FakeCompletionClient([]),
+    )
+
+    result = await agent.search("原始需求", "alice")
+
+    assert len(store.search_calls) == 1
+    assert [item["chunk_ref"] for item in result.baseline_candidates] == [CHUNK_REF]
+    assert result.metadata.baseline_refs == [CHUNK_REF]

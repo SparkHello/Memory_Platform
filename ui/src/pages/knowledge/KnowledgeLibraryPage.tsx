@@ -185,7 +185,14 @@ function KnowledgeListPage({
     setRestoring(true);
     try {
       const result = await api.restoreKnowledge(restorePreview);
-      notify(`恢复完成：新增 ${result.created ?? 0}，跳过 ${result.skipped ?? 0}`, "success");
+      const restored = result.restored_documents ?? 0;
+      const skipped = result.skipped_documents ?? 0;
+      const failed = result.failed_versions ?? 0;
+      if (failed > 0) {
+        notify(`恢复完成：新增 ${restored}，跳过 ${skipped}；但有 ${failed} 个版本索引失败，请在文档详情中重建索引`, "error");
+      } else {
+        notify(`恢复完成：新增 ${restored}，跳过 ${skipped}`, "success");
+      }
       setRestorePreview(null);
       if (restoreInputRef.current) restoreInputRef.current.value = "";
       onChanged();

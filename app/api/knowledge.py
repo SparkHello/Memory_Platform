@@ -329,22 +329,12 @@ async def search_knowledge(
                 include_sensitive=body.include_sensitive,
             )
         )
-        baseline = await anyio.to_thread.run_sync(
-            partial(
-                store.search_chunks,
-                user_id=user_id,
-                query=body.request,
-                limit=min(20, max(10, body.limit * 3)),
-                document_refs=body.document_refs,
-                include_sensitive=body.include_sensitive,
-            )
-        )
     except Exception as exc:
         _raise_store_error(exc)
     by_ref = {item.chunk_ref: item for item in selected}
     ordered = [by_ref[ref] for ref in result.selected_refs if ref in by_ref]
     hits = _bounded_search_hit_payloads(ordered)
-    local_candidates = _search_candidate_payloads(list(baseline))
+    local_candidates = _search_candidate_payloads(list(result.baseline_candidates))
     metadata = result.metadata.model_dump()
     return {
         "request": body.request,

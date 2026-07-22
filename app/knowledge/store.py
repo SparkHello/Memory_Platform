@@ -35,6 +35,7 @@ _SENSITIVITIES: Final = {"normal", "private", "sensitive"}
 _SENSITIVITY_RANK: Final = {"normal": 0, "private": 1, "sensitive": 2}
 _UPLOAD_PART_MAX_CHARS: Final = 1_048_576
 _UPLOAD_TTL_HOURS: Final = 24
+_MAX_RESTORE_TOTAL_BYTES: Final = 100 * 1024 * 1024
 _READ_MAX_CHARS: Final = 20_000
 _SEARCH_MAX_RESULTS: Final = 20
 _SEARCH_EXCERPT_CHARS: Final = 800
@@ -259,6 +260,27 @@ class KnowledgeStore:
                 )
                 """
             )
+            self._ensure_documents_source_document_ref(connection)
+
+    @staticmethod
+    def _ensure_documents_source_document_ref(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_documents)"
+            ).fetchall()
+        }
+        if "source_document_ref" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_documents "
+                "ADD COLUMN source_document_ref TEXT NOT NULL DEFAULT ''"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_knowledge_documents_user_source_ref
+            ON knowledge_documents(user_id, source_document_ref)
+            """
+        )
 
     # ------------------------------------------------------------------
     # Upload lifecycle
@@ -284,6 +306,13 @@ class KnowledgeStore:
         expected_version_id: str | None = None
 
         with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM knowledge_upload_sessions
+                WHERE user_id = ? AND status IN ('open', 'expired') AND expires_at < ?
+                """,
+                (user_id, now),
+            )
             if replace_document_ref:
                 replace_id = self._document_id(replace_document_ref)
                 row = self._get_document_row(
@@ -425,6 +454,37 @@ class KnowledgeStore:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM knowledge_upload_sessions
+                WHERE id = ? AND user_id = ?
+                """,
+                (upload_id, user_id),
+            ).fetchone()
+            if existing is None:
+                raise KnowledgeNotFoundError("upload session not found")
+            if existing["status"] == "committed":
+                committed_document_id = self._document_id(
+                    existing["committed_document_ref"]
+                )
+                committed_version_id = self._version_id(
+                    existing["committed_version_ref"]
+                )
+                version_row = connection.execute(
+                    "SELECT * FROM knowledge_versions WHERE id = ? AND user_id = ?",
+                    (committed_version_id, user_id),
+                ).fetchone()
+                if version_row is None:
+                    raise KnowledgeNotFoundError("knowledge version not found")
+                document_model = self._load_document_model(
+                    connection, user_id=user_id, document_id=committed_document_id
+                )
+                return KnowledgeCommitResult(
+                    document=document_model,
+                    version=self._version_from_row(version_row),
+                    created=False,
+                    deduplicated=True,
+                )
             session = self._require_open_upload(
                 connection,
                 user_id=user_id,
@@ -539,6 +599,21 @@ class KnowledgeStore:
                             user_id,
                         ),
                     )
+                    if current["index_status"] != "ready":
+                        # Identical content must not stay unsearchable: rebuild
+                        # the index of the existing version instead of creating
+                        # a duplicate one.
+                        self._index_version_in_connection(
+                            connection,
+                            user_id=user_id,
+                            document_id=document_id,
+                            version_id=current["id"],
+                            make_current=True,
+                        )
+                        current = connection.execute(
+                            "SELECT * FROM knowledge_versions WHERE id = ?",
+                            (current["id"],),
+                        ).fetchone()
                     connection.execute(
                         """
                         UPDATE knowledge_upload_sessions
@@ -552,6 +627,10 @@ class KnowledgeStore:
                             _version_ref(current["id"]),
                             upload_id,
                         ),
+                    )
+                    connection.execute(
+                        "DELETE FROM knowledge_upload_parts WHERE upload_id = ?",
+                        (upload_id,),
                     )
                     document_model = self._load_document_model(
                         connection, user_id=user_id, document_id=document_id
@@ -635,6 +714,10 @@ class KnowledgeStore:
                     upload_id,
                 ),
             )
+            connection.execute(
+                "DELETE FROM knowledge_upload_parts WHERE upload_id = ?",
+                (upload_id,),
+            )
             document_model = self._load_document_model(
                 connection, user_id=user_id, document_id=document_id
             )
@@ -658,7 +741,7 @@ class KnowledgeStore:
             ).fetchone()
             if row is None:
                 raise KnowledgeNotFoundError("upload session not found")
-            if row["status"] in {"committing", "committed"}:
+            if row["status"] == "committed":
                 raise KnowledgeConflictError("a committed upload cannot be cancelled")
             connection.execute(
                 "DELETE FROM knowledge_upload_sessions WHERE id = ? AND user_id = ?",
@@ -1048,10 +1131,19 @@ class KnowledgeStore:
                 document_id=row["document_id"],
                 include_deleted=False,
             )
-            prior_status = row["index_status"]
-            make_current = prior_status in {"pending", "indexing", "failed"}
-            if document["current_version_id"] == version_id:
-                make_current = True
+            make_current = document["current_version_id"] == version_id
+            if not make_current:
+                ready = connection.execute(
+                    """
+                    SELECT 1 FROM knowledge_versions
+                    WHERE document_id = ? AND user_id = ? AND index_status = 'ready'
+                    LIMIT 1
+                    """,
+                    (row["document_id"], user_id),
+                ).fetchone()
+                # Without any ready version the document would otherwise stay
+                # unsearchable; only then does a reindexed version take over.
+                make_current = ready is None
             self._index_version_in_connection(
                 connection,
                 user_id=user_id,
@@ -1390,16 +1482,37 @@ class KnowledgeStore:
         documents_value = payload.get("documents")
         if not isinstance(documents_value, list):
             raise KnowledgeValidationError("knowledge export documents must be a list")
-        if len(documents_value) > 100_000:
+        if len(documents_value) > 10_000:
             raise KnowledgeValidationError("knowledge export contains too many documents")
         prepared = [self._validate_import_document(value) for value in documents_value]
+        total_bytes = sum(
+            len(version["content"].encode("utf-8"))
+            for item in prepared
+            for version in item["versions"]
+        )
+        if total_bytes > _MAX_RESTORE_TOTAL_BYTES:
+            raise KnowledgeValidationError("knowledge export data is too large")
 
         restored_documents: list[KnowledgeDocument] = []
         restored_versions = 0
         failed_versions = 0
+        skipped_documents = 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             for item in prepared:
+                source_ref = item["source_document_ref"]
+                if source_ref:
+                    existing = connection.execute(
+                        """
+                        SELECT id FROM knowledge_documents
+                        WHERE user_id = ? AND source_document_ref = ?
+                          AND status != 'deleted'
+                        """,
+                        (user_id, source_ref),
+                    ).fetchone()
+                    if existing is not None:
+                        skipped_documents += 1
+                        continue
                 document_id = _new_id()
                 now = _utc_now()
                 connection.execute(
@@ -1407,8 +1520,8 @@ class KnowledgeStore:
                     INSERT INTO knowledge_documents (
                         id, user_id, title, source_name, content_type,
                         sensitivity, status, current_version_id,
-                        created_at, updated_at, deleted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
+                        created_at, updated_at, deleted_at, source_document_ref
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL, ?)
                     """,
                     (
                         document_id,
@@ -1419,6 +1532,7 @@ class KnowledgeStore:
                         item["sensitivity"],
                         item["created_at"] or now,
                         now,
+                        source_ref,
                     ),
                 )
                 version_ids: dict[int, str] = {}
@@ -1495,6 +1609,7 @@ class KnowledgeStore:
             "restored_documents": len(restored_documents),
             "restored_versions": restored_versions,
             "failed_versions": failed_versions,
+            "skipped_documents": skipped_documents,
             "document_refs": [item.ref for item in restored_documents],
             "chunks_rebuilt": True,
             "fts_rebuilt": True,
@@ -1505,6 +1620,9 @@ class KnowledgeStore:
             raise KnowledgeValidationError("each exported knowledge document must be an object")
         title = _required_text(value.get("title"), "title", 500)
         source_name = _optional_text(value.get("source_name", ""), "source_name", 1000)
+        source_document_ref = value.get("source_document_ref", "")
+        if not isinstance(source_document_ref, str) or len(source_document_ref) > 300:
+            raise KnowledgeValidationError("exported source_document_ref is invalid")
         content_type = _validate_content_type(value.get("content_type", "text/markdown"))
         declared = _validate_sensitivity(value.get("sensitivity", "normal"))
         status = value.get("status", "active")
@@ -1517,7 +1635,6 @@ class KnowledgeStore:
             raise KnowledgeValidationError("exported document contains too many versions")
         versions: list[dict[str, Any]] = []
         seen_numbers: set[int] = set()
-        total_bytes = 0
         for raw_version in versions_value:
             if not isinstance(raw_version, dict):
                 raise KnowledgeValidationError("each exported knowledge version must be an object")
@@ -1535,7 +1652,6 @@ class KnowledgeStore:
                 raise KnowledgeValidationError(
                     f"document exceeds {self.max_document_bytes} UTF-8 bytes"
                 )
-            total_bytes += len(encoded)
             versions.append(
                 {
                     "version_number": number,
@@ -1543,8 +1659,6 @@ class KnowledgeStore:
                     "created_at": _safe_exported_time(raw_version.get("created_at")),
                 }
             )
-        if total_bytes > self.max_document_bytes * len(versions):
-            raise KnowledgeValidationError("exported version data is too large")
         versions.sort(key=lambda item: item["version_number"])
         current_number = value.get("current_version_number")
         if current_number is None:
@@ -1562,6 +1676,7 @@ class KnowledgeStore:
         return {
             "title": title,
             "source_name": source_name,
+            "source_document_ref": source_document_ref,
             "content_type": content_type,
             "sensitivity": sensitivity,
             "status": status,
@@ -1661,6 +1776,7 @@ class KnowledgeStore:
             factory=_ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection

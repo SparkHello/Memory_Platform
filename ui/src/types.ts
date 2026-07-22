@@ -815,9 +815,12 @@ export interface KnowledgeExport {
 }
 
 export interface KnowledgeRestoreResult {
-  created?: number;
-  updated?: number;
-  skipped?: number;
-  invalid?: number;
+  restored_documents?: number;
+  restored_versions?: number;
+  failed_versions?: number;
+  skipped_documents?: number;
+  document_refs?: string[];
+  chunks_rebuilt?: boolean;
+  fts_rebuilt?: boolean;
   [key: string]: unknown;
 }

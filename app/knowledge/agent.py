@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 import inspect
 import json
 import re
 import time
 from typing import Any, Literal, Protocol
 
+import anyio
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -72,13 +74,17 @@ class KnowledgeAgentMetadata(BaseModel):
 class KnowledgeAgentResult(BaseModel):
     """Reference-only agent output.
 
-    Excerpts and full text are intentionally absent.  The search service must
-    resolve ``selected_refs`` again through KnowledgeStore under the current
-    user id before returning verbatim content to a caller.
+    Excerpts and full text are intentionally absent from ``selected_refs``.  The
+    search service must resolve ``selected_refs`` again through KnowledgeStore
+    under the current user id before returning verbatim content to a caller.
+    ``baseline_candidates`` carries the local baseline hits already produced by
+    the internal baseline search so callers do not run the same query twice.
+    It is excluded from serialization to keep the reference-only contract.
     """
 
     selected_refs: list[str] = Field(default_factory=list)
     metadata: KnowledgeAgentMetadata
+    baseline_candidates: list[Any] = Field(default_factory=list, exclude=True)
 
 
 class KnowledgeCompletionClient(Protocol):
@@ -333,14 +339,14 @@ class KnowledgeSearchAgent:
         )
         if local_only_reason:
             metadata.fallback_reason = local_only_reason
-            return self._finish(baseline_refs, metadata, started)
+            return self._finish(baseline_refs, metadata, started, baseline_values)
 
         # A scoped search that returned no candidates may refer to another
         # user's document.  Do not send that opaque identifier or the request
         # to a remote model to distinguish "empty" from "unauthorized".
         if scoped_documents and not baseline:
             metadata.fallback_reason = "scoped_documents_not_found"
-            return self._finish([], metadata, started)
+            return self._finish([], metadata, started, baseline_values)
 
         metadata.agent_attempted = True
         flash_rounds = 2 if quality == "fast" else self.FLASH_MAX_ROUNDS
@@ -365,19 +371,19 @@ class KnowledgeSearchAgent:
         flash_selected = flash.selected_refs
         if flash_selected and quality != "deep" and not flash.needs_pro:
             metadata.agent_used = True
-            return self._finish(flash_selected, metadata, started)
+            return self._finish(flash_selected, metadata, started, baseline_values)
         if not flash.failure_reason and not flash.needs_pro and quality != "deep":
             # An empty selection is a valid agent decision: FTS candidates can
             # be lexical matches that do not actually answer the request.
             metadata.agent_used = True
-            return self._finish([], metadata, started)
+            return self._finish([], metadata, started, baseline_values)
 
         should_escalate = quality != "fast" and (
             quality == "deep" or flash.needs_pro or flash.may_escalate
         )
         if not should_escalate:
             metadata.fallback_reason = flash.failure_reason or "agent_round_limit"
-            return self._finish(baseline_refs, metadata, started)
+            return self._finish(baseline_refs, metadata, started, baseline_values)
 
         metadata.escalated = True
         pro = await self._run_loop(
@@ -399,10 +405,10 @@ class KnowledgeSearchAgent:
         metadata.model = self.config.pro_model
         if pro.selected_refs or not pro.failure_reason:
             metadata.agent_used = True
-            return self._finish(pro.selected_refs, metadata, started)
+            return self._finish(pro.selected_refs, metadata, started, baseline_values)
 
         metadata.fallback_reason = pro.failure_reason
-        return self._finish(baseline_refs, metadata, started)
+        return self._finish(baseline_refs, metadata, started, baseline_values)
 
     async def select_references(
         self,
@@ -744,12 +750,16 @@ class KnowledgeSearchAgent:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
-        value = method(
-            user_id=user_id,
-            query=query,
-            limit=limit,
-            document_refs=document_refs,
-            include_sensitive=include_sensitive,
+        # The store API is synchronous SQLite; keep it off the event loop.
+        value = await anyio.to_thread.run_sync(
+            partial(
+                method,
+                user_id=user_id,
+                query=query,
+                limit=limit,
+                document_refs=document_refs,
+                include_sensitive=include_sensitive,
+            )
         )
         result = await _await_with_timeout(value, remaining)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
@@ -774,10 +784,14 @@ class KnowledgeSearchAgent:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
-        value = method(
-            user_id=user_id,
-            chunk_refs=chunk_refs,
-            include_sensitive=include_sensitive,
+        # The store API is synchronous SQLite; keep it off the event loop.
+        value = await anyio.to_thread.run_sync(
+            partial(
+                method,
+                user_id=user_id,
+                chunk_refs=chunk_refs,
+                include_sensitive=include_sensitive,
+            )
         )
         result = await _await_with_timeout(value, remaining)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
@@ -830,11 +844,13 @@ class KnowledgeSearchAgent:
         selected_refs: list[str],
         metadata: KnowledgeAgentMetadata,
         started: float,
+        baseline: Sequence[Any] = (),
     ) -> KnowledgeAgentResult:
         metadata.elapsed_ms = max(0, round((self._clock() - started) * 1000))
         return KnowledgeAgentResult(
             selected_refs=list(dict.fromkeys(selected_refs)),
             metadata=metadata,
+            baseline_candidates=list(baseline),
         )
 
     @staticmethod

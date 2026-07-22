@@ -499,23 +499,13 @@ async def search_knowledge(
                 include_sensitive=include_sensitive,
             )
         )
-        baseline = await anyio.to_thread.run_sync(
-            partial(
-                store.search_chunks,
-                user_id=current_user_id.get(),
-                query=request_text,
-                limit=min(20, max(10, capped_limit * 3)),
-                document_refs=list(document_refs or []),
-                include_sensitive=include_sensitive,
-            )
-        )
         excerpts = _knowledge_search_results(
             selected,
             result.selected_refs,
             limit=capped_limit,
         )
         local_candidates = _knowledge_search_results(
-            baseline,
+            result.baseline_candidates,
             result.metadata.baseline_refs,
             limit=20,
         )
