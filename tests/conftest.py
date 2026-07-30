@@ -52,12 +52,23 @@ class FakeLLMClient:
             ensure_ascii=False,
         )
         self.review_revision_messages: list[dict] = []
+        self.review_revision_request = None
+        self.review_revision_thinking: str | None = None
+        self.review_revision_structured_tool: dict | None = None
+        self.review_revision_tool_arguments: str | None = None
         self.review_revision_content = json.dumps(
             {"operations": [{"operation": "no_change", "reason": "测试默认不修改"}]},
             ensure_ascii=False,
         )
 
-    async def create_chat_completion(self, request, messages: list[dict]) -> dict:
+    async def create_chat_completion(
+        self,
+        request,
+        messages: list[dict],
+        *,
+        thinking: str | None = None,
+        structured_tool: dict | None = None,
+    ) -> dict:
         if self._is_extraction_call(messages):
             self.extraction_messages = messages
             return {
@@ -90,6 +101,24 @@ class FakeLLMClient:
             }
         if self._is_review_revision_call(messages):
             self.review_revision_messages = messages
+            self.review_revision_request = request
+            self.review_revision_thinking = thinking
+            self.review_revision_structured_tool = structured_tool
+            message = {"role": "assistant", "content": self.review_revision_content}
+            if self.review_revision_tool_arguments is not None:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "submit_memory_review_revision",
+                                "arguments": self.review_revision_tool_arguments,
+                            },
+                        }
+                    ],
+                }
             return {
                 "id": "chatcmpl-review-revision",
                 "object": "chat.completion",
@@ -98,7 +127,7 @@ class FakeLLMClient:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": self.review_revision_content},
+                        "message": message,
                         "finish_reason": "stop",
                     }
                 ],
@@ -165,6 +194,12 @@ def client(
         knowledge_store.database_path,
     )
     monkeypatch.setenv("KNOWLEDGE_AGENT_API_KEY", "")
+    monkeypatch.setenv("LLM_PROVIDER_PRIORITY", "D")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_MIMO_API_KEY", "")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_KIMI_API_KEY", "")
+    monkeypatch.setenv("LLM_DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("LLM_MIMO_API_KEY", "")
+    monkeypatch.setenv("LLM_KIMI_API_KEY", "")
     monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "none")
     monkeypatch.setenv("EVAL_DIR", str(Path(memory_store.database_path).with_name("eval")))
     monkeypatch.setenv("UPSTREAM_API_KEY", "")

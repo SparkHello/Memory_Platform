@@ -401,6 +401,9 @@ def test_recall_run_keyword_does_not_touch_real_usage(
     payload = run.json()
     assert payload["mode"] == "keyword"
     assert payload["summary"]["queries_graded"] == 1
+    predicted_scores = payload["per_query"][0]["predicted_scores"]
+    assert coffee.id in predicted_scores
+    assert predicted_scores[coffee.id]["score_breakdown"]["keyword_score"] > 0
     refreshed = memory_store.get_memory(memory_id=coffee.id, user_id="default")
     assert refreshed is not None
     assert refreshed.usage_count == 0

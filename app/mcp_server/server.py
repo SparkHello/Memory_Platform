@@ -8,6 +8,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from app.api.deps import (
     get_embedding_client,
+    get_knowledge_embedding_indexer,
+    get_knowledge_retrieval_service,
     get_knowledge_search_agent,
     get_knowledge_store,
     get_llm_client,
@@ -15,10 +17,12 @@ from app.api.deps import (
 )
 from app.config import get_settings
 from app.knowledge.agent import KnowledgeSearchAgent
+from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
 from app.knowledge.store import (
     KnowledgeConflictError,
     KnowledgeError,
     KnowledgeNotFoundError,
+    KnowledgeSensitivityConfirmationRequired,
     KnowledgeStore,
     KnowledgeValidationError,
 )
@@ -44,9 +48,9 @@ SERVER_INSTRUCTIONS = """这是用户的长期记忆与独立长文本知识服�
 
 知识库工具用于用户明确导入的文档、笔记、手册和长文本：
 - **list_knowledge_documents**：按标题浏览可用资料。
-- **search_knowledge**：用完整自然语言描述需要查证的内容；结果是版本绑定的逐字片段。
+- **search_knowledge**：用完整自然语言描述需要查证的内容；本地 FTS/向量混合召回，可用标签和元数据限定范围，结果是版本绑定的逐字片段。
 - **read_knowledge**：按 chunk/version 引用精读；只有用户要求全文或任务确需通读时才分页读取整个版本。
-- **begin_knowledge_upload**、**append_knowledge_upload**、**commit_knowledge_upload**：分段新增文档或新版本。
+- **begin_knowledge_upload**、**append_knowledge_upload**、**commit_knowledge_upload**：分段新增 UTF-8 文本/Markdown 或新版本；PDF、DOCX、EPUB 由 Web/REST 导入。
 - **manage_knowledge_document**：更新元数据、软删除、恢复、恢复历史版本或重建索引；永久清理只能在 Web 管理台完成。
 
 知识库永不进入 search_memory、自动上下文、核心记忆、浮现、消化、衰减或 activation_count；只有显式调用知识工具时才检索。
@@ -85,7 +89,22 @@ def _services() -> tuple[MemoryStore, EmbeddingClient]:
 def _knowledge_services() -> tuple[KnowledgeStore, KnowledgeSearchAgent]:
     settings = get_settings()
     store = get_knowledge_store(settings)
-    return store, get_knowledge_search_agent(store, settings)
+    embedding_client = get_embedding_client(settings)
+    retrieval = get_knowledge_retrieval_service(
+        store,
+        embedding_client,
+        settings,
+    )
+    return store, get_knowledge_search_agent(retrieval, settings)
+
+
+def _knowledge_indexer(store: KnowledgeStore) -> KnowledgeEmbeddingIndexer:
+    settings = get_settings()
+    return get_knowledge_embedding_indexer(
+        store,
+        get_embedding_client(settings),
+        settings,
+    )
 
 
 def _search_service(store: MemoryStore, embedding_client: EmbeddingClient) -> MemorySearchService:
@@ -305,6 +324,13 @@ def _knowledge_error(exc: Exception, *, operation: str) -> str:
         code = "not_found"
         message = "知识文档或引用不存在"
         retryable = False
+    elif isinstance(exc, KnowledgeSensitivityConfirmationRequired):
+        code = "sensitivity_confirmation_required"
+        message = (
+            "本地规则认为该文档比所选敏感级别更高；"
+            "请让用户在 Web 控制台检查并点击确认后再导入"
+        )
+        retryable = False
     elif isinstance(exc, KnowledgeConflictError):
         code = "conflict"
         message = str(exc)
@@ -461,10 +487,13 @@ async def search_knowledge(
     document_refs: list[str] = [],
     quality: str = "balanced",
     include_sensitive: bool = False,
+    tags: list[str] = [],
+    metadata_filter: dict[str, str] = {},
 ) -> str:
     """按完整自然语言需求检索独立知识库，返回版本绑定的逐字片段。
 
-    request 应描述要查找或核对的事实；document_refs 可将检索限制到已知文档。
+    request 应描述要查找或核对的事实；document_refs、tags、metadata_filter 可将
+    检索限制到已知文档或精确元数据范围。
     quality 可选 fast、balanced、deep。limit 取值 1–10，越界会被静默钳制到该范围
     （REST /knowledge/search 对越界 limit 返回 422）。远程搜索代理只能选择本地索引
     已经返回的 chunk 引用，最终 excerpt 始终由本地 KnowledgeStore 按当前用户重新读取，
@@ -484,11 +513,50 @@ async def search_knowledge(
     try:
         store, agent = _knowledge_services()
         capped_limit = max(1, min(limit, 10))
+        scope_requested = bool(document_refs or tags or metadata_filter)
+        scoped_refs = await anyio.to_thread.run_sync(
+            partial(
+                store.resolve_document_refs,
+                user_id=current_user_id.get(),
+                document_refs=list(document_refs or []),
+                tags=list(tags or []),
+                metadata_filter=dict(metadata_filter or {}),
+                include_sensitive=include_sensitive,
+            )
+        )
+        if scope_requested and not scoped_refs:
+            return _dump(
+                {
+                    "ok": True,
+                    "request": request_text,
+                    "results": [],
+                    "local_candidates": [],
+                    "metadata": {
+                        "agent_used": False,
+                        "agent_attempted": False,
+                        "model": "",
+                        "rounds": 0,
+                        "escalated": False,
+                        "fallback_reason": "scope_empty",
+                        "elapsed_ms": 0,
+                        "baseline_count": 0,
+                        "baseline_refs": [],
+                        "tool_steps": [],
+                    },
+                    "agent_used": False,
+                    "agent_model": "",
+                    "agent_rounds": 0,
+                    "upgraded": False,
+                    "fallback_reason": "scope_empty",
+                    "elapsed_ms": 0,
+                    "steps": [],
+                }
+            )
         result = await agent.search(
             request=request_text,
             user_id=current_user_id.get(),
             limit=capped_limit,
-            document_refs=list(document_refs or []),
+            document_refs=scoped_refs if scope_requested else [],
             quality=quality,
             include_sensitive=include_sensitive,
         )
@@ -571,6 +639,8 @@ async def begin_knowledge_upload(
     source_name: str = "",
     replace_document_ref: str = "",
     sensitivity: str = "normal",
+    tags: list[str] = [],
+    metadata: dict[str, str] = {},
 ) -> str:
     """开始一次持久化分段上传，返回 upload_id。
 
@@ -598,6 +668,8 @@ async def begin_knowledge_upload(
                 source_name=source_name,
                 replace_document_ref=replace_document_ref,
                 sensitivity=sensitivity,
+                tags=list(tags or []),
+                metadata=dict(metadata or {}),
             )
         )
         payload = _knowledge_model_dump(session)
@@ -652,7 +724,20 @@ async def commit_knowledge_upload(
                 expected_sha256=expected_sha256,
             )
         )
-        return _dump({"ok": True, **_knowledge_commit_to_dict(result)})
+        embedding = await _knowledge_indexer(store).index_version(
+            user_id=current_user_id.get(),
+            version_ref=result.version.ref,
+        )
+        refreshed = await anyio.to_thread.run_sync(
+            partial(
+                store.get_version,
+                user_id=current_user_id.get(),
+                version_id=result.version.ref,
+            )
+        )
+        payload = _knowledge_commit_to_dict(result)
+        payload["version"] = _knowledge_version_to_dict(refreshed)
+        return _dump({"ok": True, **payload, "embedding": embedding})
     except Exception as exc:
         return _knowledge_error(exc, operation="commit_knowledge_upload")
 
@@ -665,6 +750,8 @@ async def manage_knowledge_document(
     version_ref: str = "",
     confirm_document_ref: str = "",
     sensitivity: str = "",
+    tags: list[str] = [],
+    metadata: dict[str, str] = {},
 ) -> str:
     """管理知识文档，但不提供永久删除。
 
@@ -716,6 +803,8 @@ async def manage_knowledge_document(
                     title=title or None,
                     source_name=source_name or None,
                     sensitivity=sensitivity or None,
+                    tags=list(tags) if tags else None,
+                    metadata=dict(metadata) if metadata else None,
                 )
             )
             return _dump(
@@ -764,7 +853,27 @@ async def manage_knowledge_document(
                     version_ref=version_ref,
                 )
             )
-        return _dump({"ok": True, "action": action, **_knowledge_commit_to_dict(result)})
+        embedding = await _knowledge_indexer(store).index_version(
+            user_id=user_id,
+            version_ref=result.version.ref,
+        )
+        refreshed = await anyio.to_thread.run_sync(
+            partial(
+                store.get_version,
+                user_id=user_id,
+                version_id=result.version.ref,
+            )
+        )
+        payload = _knowledge_commit_to_dict(result)
+        payload["version"] = _knowledge_version_to_dict(refreshed)
+        return _dump(
+            {
+                "ok": True,
+                "action": action,
+                **payload,
+                "embedding": embedding,
+            }
+        )
     except Exception as exc:
         return _knowledge_error(exc, operation="manage_knowledge_document")
 

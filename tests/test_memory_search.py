@@ -11,9 +11,11 @@ class StaticEmbeddingClient:
     def __init__(self, vector: list[float] | None):
         self.vector = vector
         self.call_count = 0
+        self.texts: list[str] = []
 
     async def embed(self, text: str) -> list[float] | None:
         self.call_count += 1
+        self.texts.append(text)
         return self.vector
 
 
@@ -577,6 +579,125 @@ async def test_unrelated_chinese_query_abstains(memory_store: MemoryStore) -> No
     assert results == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "用户的年龄",
+        "用户的旅游经历",
+        "用户喜欢吃什么",
+        "用户喜欢的运动",
+        "用户的拍照设备",
+    ],
+)
+async def test_common_user_query_wrappers_do_not_create_keyword_hits(
+    memory_store: MemoryStore,
+    query: str,
+) -> None:
+    memory_store.create_memory(user_id="default", content="用户喜欢用手机拍猫。")
+    memory_store.create_memory(user_id="default", content="用户常住湖南省常德市。")
+    memory_store.create_memory(user_id="default", content="十一特别爱吃西瓜。")
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    results = await service.search(
+        query=query,
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_keeps_meaningful_terms_after_query_normalization(
+    memory_store: MemoryStore,
+) -> None:
+    kelivo = memory_store.create_memory(
+        user_id="default",
+        content="用户使用 Kelivo 作为 AI 客户端。",
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    results = await service.search(
+        query="用户的 AI 客户端是什么",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [kelivo.id]
+
+
+@pytest.mark.asyncio
+async def test_embedding_uses_normalized_query_and_rejects_weak_cosine(
+    memory_store: MemoryStore,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        embedding_json=json.dumps([0.5, 0.8660254]),
+    )
+    embedding_client = StaticEmbeddingClient([1.0, 0.0])
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=embedding_client,
+    )
+
+    results = await service.search(
+        query="用户的年龄是什么",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert embedding_client.texts == ["年龄"]
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_embedding_can_bridge_synonyms(
+    memory_store: MemoryStore,
+) -> None:
+    cats = memory_store.create_memory(
+        user_id="default",
+        content="用户养了两只猫。",
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([1.0, 0.0]),
+    )
+
+    results = await service.search(
+        query="用户有什么宠物",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [cats.id]
+
+
+@pytest.mark.asyncio
+async def test_user_subject_query_rejects_pet_subject_embedding(
+    memory_store: MemoryStore,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="十一特别爱吃西瓜。",
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([1.0, 0.0]),
+    )
+
+    results = await service.search(
+        query="用户喜欢吃什么",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert results == []
+
+
 def test_surface_memories_excludes_sensitive_and_derived_by_default(
     memory_store: MemoryStore,
 ) -> None:
@@ -619,4 +740,3 @@ def _set_memory_times(
             """,
             (created_at, updated_at, memory_id),
         )
-

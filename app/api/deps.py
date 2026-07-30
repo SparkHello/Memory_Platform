@@ -5,6 +5,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import Settings, get_settings
 from app.knowledge.agent import KnowledgeAgentConfig, KnowledgeSearchAgent
+from app.knowledge.retrieval import (
+    KnowledgeEmbeddingIndexer,
+    KnowledgeRetrievalService,
+)
 from app.knowledge.store import KnowledgeStore
 from app.llm.client import OpenAICompatibleClient
 from app.memory.search import (
@@ -54,22 +58,6 @@ def get_knowledge_store(
     )
 
 
-def get_knowledge_search_agent(
-    store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> KnowledgeSearchAgent:
-    config = KnowledgeAgentConfig(
-        base_url=settings.knowledge_agent_base_url,
-        api_key=settings.knowledge_agent_api_key,
-        flash_model=settings.knowledge_agent_flash_model,
-        pro_model=settings.knowledge_agent_pro_model,
-        egress_policy=settings.knowledge_agent_egress_policy,
-        allow_sensitive_egress=settings.allow_sensitive_egress,
-        timeout_seconds=settings.knowledge_agent_timeout_seconds,
-    )
-    return KnowledgeSearchAgent(store=store, config=config)
-
-
 def get_embedding_client(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> EmbeddingClient:
@@ -83,6 +71,57 @@ def get_embedding_client(
             allow_sensitive_egress=settings.allow_sensitive_egress,
         )
     return NullEmbeddingClient()
+
+
+def get_knowledge_retrieval_service(
+    store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
+    embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> KnowledgeRetrievalService:
+    return KnowledgeRetrievalService(
+        store=store,
+        embedding_client=embedding_client,
+        vector_weight=settings.knowledge_hybrid_vector_weight,
+        min_cosine=settings.knowledge_embedding_min_cosine,
+    )
+
+
+def get_knowledge_embedding_indexer(
+    store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
+    embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> KnowledgeEmbeddingIndexer:
+    return KnowledgeEmbeddingIndexer(
+        store=store,
+        embedding_client=embedding_client,
+        batch_size=settings.knowledge_embedding_batch_size,
+    )
+
+
+def get_knowledge_search_agent(
+    retrieval: Annotated[
+        KnowledgeRetrievalService, Depends(get_knowledge_retrieval_service)
+    ],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> KnowledgeSearchAgent:
+    config = KnowledgeAgentConfig(
+        base_url=settings.llm_deepseek_base_url,
+        api_key=settings.llm_deepseek_api_key,
+        flash_model=settings.llm_deepseek_flash_model,
+        pro_model=settings.llm_deepseek_pro_model,
+        provider_priority=settings.llm_provider_priority,
+        mimo_base_url=settings.llm_mimo_base_url,
+        mimo_api_key=settings.llm_mimo_api_key,
+        mimo_model=settings.llm_mimo_model,
+        kimi_base_url=settings.llm_kimi_base_url,
+        kimi_api_key=settings.llm_kimi_api_key,
+        kimi_model=settings.llm_kimi_model,
+        rate_limit_cooldown_seconds=settings.llm_rate_limit_cooldown_seconds,
+        egress_policy=settings.knowledge_agent_egress_policy,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
+        timeout_seconds=settings.knowledge_agent_timeout_seconds,
+    )
+    return KnowledgeSearchAgent(store=retrieval, config=config)
 
 
 def get_memory_search_service(

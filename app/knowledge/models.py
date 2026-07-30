@@ -6,6 +6,14 @@ from pydantic import BaseModel, Field
 KnowledgeSensitivity = Literal["normal", "private", "sensitive"]
 KnowledgeDocumentStatus = Literal["active", "deleted"]
 KnowledgeIndexStatus = Literal["pending", "indexing", "ready", "failed"]
+KnowledgeEmbeddingStatus = Literal[
+    "pending",
+    "indexing",
+    "ready",
+    "partial",
+    "failed",
+    "disabled",
+]
 KnowledgeUploadStatus = Literal[
     "open",
     "committing",
@@ -23,6 +31,8 @@ class KnowledgeDocument(BaseModel):
     source_name: str = ""
     content_type: str = "text/markdown"
     sensitivity: KnowledgeSensitivity = "normal"
+    detected_sensitivity: KnowledgeSensitivity = "normal"
+    sensitivity_override_confirmed: bool = False
     status: KnowledgeDocumentStatus = "active"
     current_version_id: str | None = None
     current_version_ref: str = ""
@@ -33,6 +43,8 @@ class KnowledgeDocument(BaseModel):
     created_at: str
     updated_at: str
     deleted_at: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
 class KnowledgeVersion(BaseModel):
@@ -49,6 +61,10 @@ class KnowledgeVersion(BaseModel):
     index_error: str | None = None
     created_at: str
     indexed_at: str | None = None
+    embedding_status: KnowledgeEmbeddingStatus = "pending"
+    embedding_model: str = ""
+    embedded_at: str | None = None
+    embedding_error: str | None = None
     content: str | None = None
 
 
@@ -87,6 +103,7 @@ class KnowledgeSearchHit(BaseModel):
     excerpt: str
     score: float
     match_signals: list[str] = Field(default_factory=list)
+    channels: list[str] = Field(default_factory=list)
 
 
 class KnowledgeCommitResult(BaseModel):
@@ -112,6 +129,8 @@ class KnowledgeUploadSession(BaseModel):
     expected_current_version_id: str | None = None
     expected_current_version_ref: str = ""
     status: KnowledgeUploadStatus = "open"
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     expires_at: str

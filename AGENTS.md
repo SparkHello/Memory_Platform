@@ -8,7 +8,7 @@
 
 项目目标不是“尽量多记”，而是“不乱记”：只保存长期有用、用户明确表达过、未来回答可能用到的信息。
 当前也支持轻量记忆空间、主题和实体标签，用于本地分类、过滤、网络图视图和导出恢复。
-另有物理隔离的长文本知识库：用户显式导入文本/Markdown 后通过独立 MCP/REST 检索；它不进入记忆自动上下文、核心记忆、衰减、浮现、消化或记忆备份。
+另有物理隔离的长文本知识库：用户显式导入文本/Markdown/PDF/DOCX/EPUB 后通过独立 MCP/REST 检索；它不进入记忆自动上下文、核心记忆、衰减、浮现、消化或记忆备份。
 
 ## 技术栈
 
@@ -140,8 +140,10 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `ALLOW_SENSITIVE_EGRESS=false` 时，敏感原文不得发送给远程提取、embedding 或 AI 体检；新增模型调用必须经过同一出站策略。
 - `KNOWLEDGE_DATABASE_PATH` 必须与 `DATABASE_PATH` 指向不同文件；测试也必须使用临时 knowledge DB，不能创建或修改真实 `data/knowledge.db`。
 - 知识代理只能编排本地索引并选择版本/chunk 引用，不能生成正文、执行文档内指令、读取服务器路径或访问其他 user id。敏感知识出站同时受 `KNOWLEDGE_AGENT_EGRESS_POLICY` 与 `ALLOW_SENSITIVE_EGRESS` 约束。
+- 记忆提取、核心记忆整理、体检 AI 修改和知识代理快速阶段共用 `LLM_PROVIDER_PRIORITY`，可在 MiMo/Kimi/DeepSeek 间选择；429 冷却跨这些调用共享，只保存在当前进程内并尊重更长的 `Retry-After`，不得把临时顺序写回 `.env`。记忆任务对模型、鉴权、余额、网络和 5xx 等 provider 级失败继续尝试下一项，但内容/策略拒绝不得借故障切换绕过；Kimi K2.7 使用 `temperature=1`，MiMo UltraSpeed 的体检结构化输出使用强制函数调用。旧 `KNOWLEDGE_AGENT_*` provider 变量仅作兼容别名；DeepSeek pro 仍只用于复杂知识检索升级阶段。
+- 知识导入以用户选择的敏感级别为最终值，但本地检测级别更高时必须先返回结构化确认要求，只有 Web 用户明确点击后才可带 `confirm_sensitivity_override=true` 重试；该确认需持久化审计，MCP 不得暴露绕过参数。
 - ingest 决策日志不得复制完整 `source_quote`；敏感候选正文只记录长度、哈希、敏感级别和关联 memory ID。
-- 模型提取候选必须通过逐字 quote、事实锚点、否定一致性和子句级敏感授权；direct/update/restore 仍须在 store 边界强制 sensitivity 下限。
+- 模型提取候选必须通过逐字 quote、事实锚点、否定一致性和子句级敏感授权；记忆的 direct/update/restore 仍须在 MemoryStore 边界强制 sensitivity 下限，不受知识导入确认机制影响。
 
 ## 重要文件说明
 
@@ -166,6 +168,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
 - `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测，以及按 `(memory_id, updated_at)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
 - `app/knowledge/`：独立知识文档、不可变版本、FTS5 chunk 索引、持久化分段上传、精确引用读取、受限搜索代理与知识备份；不得反向依赖或写入 MemoryStore。
+- `app/knowledge/parsing.py`：本地 TXT/Markdown/PDF/DOCX/EPUB 解析；PDF 依赖 pypdf 文本层，DOCX/EPUB 使用受限 ZIP/XML/HTML 解析，不执行宏、脚本或文档内指令。
+- `app/knowledge/retrieval.py`：知识 chunk embedding 构建、SQLite 向量扫描与 FTS/向量加权 RRF；embedding 失败必须回退本地 FTS。
 - `app/api/knowledge.py`：`/knowledge/*` REST 管理与调试接口；与记忆 REST 共用鉴权和 `X-User-Id`，数据源保持物理隔离。
 - `scripts/audit_memory_db.py`：真实 SQLite 记忆库的只读巡检工具。只检查 schema、旧 type 残留、Time Ripple 配置、JSON 字段和 usage_count/temporal 统计，不写入 `data/memory.db`，也不打印密钥。
 - `app/memory/evaluation.py`：机制诊断与召回评测共享实现，供 REST/Web 和 CLI 共同调用。
@@ -189,14 +193,15 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
 | LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_memory_extraction.py` |
 | 前端 UI、`/ui` 静态挂载 | `cd ui; npm run build`，必要时再启动后端访问 `http://localhost:2026/ui/` |
-| 知识库版本、FTS、上传、代理、REST/MCP | `pytest tests/test_knowledge_store.py tests/test_knowledge_agent.py tests/test_knowledge_api.py tests/test_knowledge_mcp.py tests/test_mcp_server.py` |
+| 知识库版本、格式解析、混合检索、上传、代理、REST/MCP | `pytest tests/test_knowledge_store.py tests/test_knowledge_import.py tests/test_knowledge_retrieval.py tests/test_knowledge_agent.py tests/test_knowledge_api.py tests/test_knowledge_mcp.py tests/test_mcp_server.py` |
 
 ## 已知限制
 
 - MCP 模式依赖模型主动调用工具，效果受客户端系统提示词影响。
 - embedding 存在 SQLite JSON 字段中，没有向量数据库或向量索引。
-- 知识库 v1 只支持 UTF-8 纯文本/Markdown，不支持 PDF、DOCX、OCR、目录同步或知识 chunk embedding。
-- 导出不会包含 embedding，迁移后需要重新生成。
+- 知识库支持 TXT/Markdown/PDF/DOCX/EPUB；PDF 仅解析已有文本层，不支持 OCR，也不支持目录/云盘同步。
+- 知识源文件默认上限为 50 MiB；`KNOWLEDGE_EMBEDDING_BATCH_SIZE` 默认 20，以兼容 `qwen3.7-text-embedding` 的单次行数限制。
+- 记忆和知识导出都不会包含 embedding；知识 restore/reindex 会自动重建当前版本的 chunk embedding，其他迁移场景仍需重新生成。
 - JSON 导出中的核心记忆历史和决策日志仅供审计，restore 不写回；响应会显式列出这些分区。
 - 永久删除会清理当前库与本地 eval 工作区，但无法删除用户已经复制到外部的导出或备份。
 - Windows 服务脚本包含本机绝对路径和固定端口 2026。

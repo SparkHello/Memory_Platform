@@ -254,6 +254,7 @@ export function App() {
             documentId={knowledgeId}
             notify={notify}
             confirm={confirm}
+            maxDocumentBytes={knowledgeStatus?.max_document_bytes}
             onOpenDocument={openKnowledge}
             onCloseDocument={closeKnowledge}
             onChanged={() => setKnowledgeRefreshKey((current) => current + 1)}

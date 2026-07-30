@@ -14,6 +14,8 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    response_format: dict[str, Any] | None = None
     stream: bool = False
     user: str | None = None
     conversation_id: str | None = None

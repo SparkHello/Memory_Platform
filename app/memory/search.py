@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 import json
 import math
+import re
 import time
 
 import anyio
@@ -33,8 +34,50 @@ _RECALL_LIMIT = 20
 # SQLite/FTS 候选生成接入前，宁可扫描当前个人库，也不能按重要度提前丢掉
 # 低频但精确匹配的旧记忆。该上限只是异常数据量保护，不参与相关性裁剪。
 RECALL_CANDIDATE_POOL = 10_000
-EMBEDDING_MIN_COSINE = 0.35
+EMBEDDING_MIN_COSINE = 0.55
 KEYWORD_MIN_SCORE = 20.0
+_QUERY_QUESTION_PHRASES = (
+    "有什么",
+    "是什么",
+    "为什么",
+    "有没有",
+    "在哪里",
+    "在哪儿",
+    "哪些",
+    "哪个",
+    "什么",
+    "哪里",
+    "怎么",
+    "如何",
+    "是否",
+)
+_QUERY_SUBJECT_PREFIX_RE = re.compile(
+    r"^(?:请(?:帮我)?(?:查找|搜索|回忆|告诉我)?|关于)?"
+    r"(?:用户本人|用户|我本人|本人|我的|我|他的|他|她的|她)(?:的)?"
+)
+_EXPLICIT_USER_QUERY_RE = re.compile(
+    r"^(?:请(?:帮我)?(?:查找|搜索|回忆|告诉我)?|关于)?"
+    r"(?:用户本人|用户|我本人|本人|我的|我|他的|他|她的|她)"
+)
+_RELATED_ENTITY_QUERY_TERMS = (
+    "宠物",
+    "猫",
+    "狗",
+    "动物",
+    "孩子",
+    "家人",
+    "父母",
+    "伴侣",
+    "朋友",
+    "同事",
+)
+_KEYWORD_LOW_INFORMATION_PHRASES = (
+    "喜欢",
+    "偏好",
+    "相关",
+    "信息",
+    "情况",
+)
 _SURFACE_MODES: set[MemorySurfaceMode] = {
     "balanced",
     "important",
@@ -50,6 +93,28 @@ _LOW_LIFE_THRESHOLD = 30.0
 def _normalize_query(query: str) -> str:
     """规范化 query 用于缓存 key：去空格、小写、截断至前 200 字符。"""
     return " ".join(query.split()).lower()[:200]
+
+
+def _semantic_query_text(query: str) -> str:
+    """把面向助手的自然问句压缩成更接近记忆正文的检索意图。"""
+    original = " ".join(query.split()).strip()
+    text = original
+    for phrase in _QUERY_QUESTION_PHRASES:
+        text = text.replace(phrase, "")
+    text = _QUERY_SUBJECT_PREFIX_RE.sub("", text).strip()
+    text = re.sub(r"[？?。！!，,：:]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or original
+
+
+def _keyword_query_text(query: str) -> str:
+    """移除会让几乎所有用户记忆互相命中的低信息量表达。"""
+    text = _semantic_query_text(query)
+    for phrase in _KEYWORD_LOW_INFORMATION_PHRASES:
+        text = text.replace(phrase, "")
+    text = text.replace("的", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def _now() -> float:
@@ -96,10 +161,16 @@ class EmbeddingClient(ABC):
     async def embed(self, text: str) -> list[float] | None:
         raise NotImplementedError
 
+    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+        return [await self.embed(text) for text in texts]
+
 
 class NullEmbeddingClient(EmbeddingClient):
     async def embed(self, text: str) -> list[float] | None:
         return None
+
+    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+        return [None for _ in texts]
 
 
 class OpenAICompatibleEmbeddingClient(EmbeddingClient):
@@ -123,11 +194,40 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
     async def embed(self, text: str) -> list[float] | None:
         if not self.allow_sensitive_egress and detect_text_sensitivity(text) != "normal":
             return None
+        vectors = await self._request_embeddings(text)
+        return vectors[0] if vectors else None
+
+    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+        if not texts:
+            return []
+        allowed_indices: list[int] = []
+        allowed_texts: list[str] = []
+        results: list[list[float] | None] = [None for _ in texts]
+        for index, text in enumerate(texts):
+            if (
+                self.allow_sensitive_egress
+                or detect_text_sensitivity(text) == "normal"
+            ):
+                allowed_indices.append(index)
+                allowed_texts.append(text)
+        if not allowed_texts:
+            return results
+        vectors = await self._request_embeddings(allowed_texts)
+        for local_index, original_index in enumerate(allowed_indices):
+            if local_index < len(vectors):
+                results[original_index] = vectors[local_index]
+        return results
+
+    async def _request_embeddings(
+        self,
+        input_value: str | list[str],
+    ) -> list[list[float] | None]:
+        expected_count = len(input_value) if isinstance(input_value, list) else 1
         url = f"{self.base_url.rstrip('/')}/embeddings"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {
             "model": self.model,
-            "input": text,
+            "input": input_value,
             "encoding_format": "float",
             "dimensions": self.dimensions,
         }
@@ -137,15 +237,25 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
                 response.raise_for_status()
                 data = response.json()
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
-            return None
+            return []
 
         try:
-            embedding = data.get("data", [{}])[0].get("embedding")
-            if not isinstance(embedding, list):
-                return None
-            return [float(value) for value in embedding]
+            items = data.get("data")
+            if not isinstance(items, list):
+                return []
+            by_index: dict[int, list[float]] = {}
+            for fallback_index, item in enumerate(items):
+                if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                    continue
+                response_index = item.get("index", fallback_index)
+                if isinstance(response_index, bool) or not isinstance(response_index, int):
+                    continue
+                by_index[response_index] = [
+                    float(value) for value in item["embedding"]
+                ]
+            return [by_index.get(index) for index in range(expected_count)]
         except (IndexError, TypeError, ValueError):
-            return None
+            return []
 
 
 class MemorySearchService:
@@ -349,7 +459,7 @@ class MemorySearchService:
                 return l1_vector
             del _EMBEDDING_CACHE[l1_key]
 
-        query_embedding = await self.embedding_client.embed(query)
+        query_embedding = await self.embedding_client.embed(_semantic_query_text(query))
         if query_embedding and self.enable_cache:
             self._cache_embedding(l1_key, query_embedding, now)
         return query_embedding
@@ -364,6 +474,11 @@ class MemorySearchService:
     ) -> list[MemorySearchHit]:
         now = datetime.now(UTC)
         combined: dict[str, MemorySearchHit] = {}
+        memories = [
+            memory
+            for memory in memories
+            if not _query_memory_subject_conflict(query, memory)
+        ]
 
         if query_embedding:
             for topic_score, memory in self._score_by_embedding(memories, query_embedding)[:_RECALL_LIMIT]:
@@ -492,17 +607,36 @@ class MemorySearchService:
         memories: list[MemoryRecord],
         query: str,
     ) -> list[tuple[float, MemoryRecord]]:
-        query_terms = _terms(query)
+        keyword_query = _keyword_query_text(query)
+        query_terms = _terms(keyword_query)
+        if not query_terms:
+            return []
         scored: list[tuple[float, MemoryRecord]] = []
-        query_lower = query.lower()
+        query_lower = keyword_query.lower()
+        compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_lower)
+        allow_substring_match = len(compact_query) >= 2
 
         for memory in memories:
             content_lower = memory.content.lower()
             content_terms = _terms(memory.content)
-            term_score = len(query_terms & content_terms) * 15.0
-            substring_score = 40.0 if query_lower and query_lower in content_lower else 0.0
-            char_score = _char_overlap_score(query_lower, content_lower) * 60.0
-            score = min(100.0, term_score + substring_score + char_score)
+            shared_terms = query_terms & content_terms
+            substring_match = (
+                allow_substring_match
+                and bool(compact_query)
+                and compact_query in re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", content_lower)
+            )
+            # 字符重叠只能参与精排，不能独自生成候选；否则所有以“用户”开头的
+            # 记忆都会被“用户的年龄”之类的无答案 query 误召回。
+            if not shared_terms and not substring_match:
+                continue
+            term_score = min(45.0, len(shared_terms) * 18.0)
+            coverage_score = len(shared_terms) / len(query_terms) * 25.0
+            substring_score = 35.0 if substring_match else 0.0
+            char_score = _char_overlap_score(query_lower, content_lower) * 15.0
+            score = min(
+                100.0,
+                term_score + coverage_score + substring_score + char_score,
+            )
             if score >= KEYWORD_MIN_SCORE:
                 scored.append((score, memory))
 
@@ -555,6 +689,19 @@ def _char_overlap_score(query: str, content: str) -> float:
     if not query_chars or not content_chars:
         return 0.0
     return len(query_chars & content_chars) / len(query_chars)
+
+
+def _query_memory_subject_conflict(query: str, memory: MemoryRecord) -> bool:
+    """用户本人问题不应被宠物等其他主语的高相似文本截胡。"""
+    compact_query = re.sub(r"\s+", "", query)
+    if not _EXPLICIT_USER_QUERY_RE.match(compact_query):
+        return False
+    if any(term in compact_query for term in _RELATED_ENTITY_QUERY_TERMS):
+        return False
+    if memory.temporal_subject and memory.temporal_subject.lower() in {"用户", "user", "我"}:
+        return False
+    content = memory.content.lstrip()
+    return not content.startswith(("用户", "我", "本人"))
 
 
 def _upsert_hit(

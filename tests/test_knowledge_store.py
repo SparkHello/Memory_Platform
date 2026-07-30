@@ -10,6 +10,7 @@ import app.knowledge.store as store_module
 from app.knowledge.store import (
     KnowledgeConflictError,
     KnowledgeNotFoundError,
+    KnowledgeSensitivityConfirmationRequired,
     KnowledgeStore,
     KnowledgeValidationError,
 )
@@ -30,6 +31,7 @@ def _commit(
     title: str = "测试文档",
     replace_document_ref: str = "",
     sensitivity: str = "normal",
+    confirm_sensitivity_override: bool = False,
 ):
     session = store.begin_upload(
         user_id,
@@ -38,7 +40,12 @@ def _commit(
         sensitivity=sensitivity,
     )
     store.append_upload(user_id, session.id, 0, text)
-    return store.commit_upload(user_id, session.id, 1)
+    return store.commit_upload(
+        user_id,
+        session.id,
+        1,
+        confirm_sensitivity_override=confirm_sensitivity_override,
+    )
 
 
 def test_chunks_preserve_source_offsets_and_use_trigram_fts(
@@ -301,7 +308,7 @@ def test_sensitive_document_read_is_hidden_without_explicit_opt_in(
     knowledge_store: KnowledgeStore,
 ) -> None:
     text = "deployment api_key=sk-abcdefghijklmnop must remain local"
-    result = _commit(knowledge_store, text)
+    result = _commit(knowledge_store, text, sensitivity="sensitive")
     assert result.document.sensitivity == "sensitive"
     hits = knowledge_store.search_chunks("alice", "deployment", include_sensitive=True)
     chunk_ref = hits[0].chunk_ref
@@ -350,20 +357,44 @@ def test_user_isolation_applies_to_documents_search_chunks_and_uploads(
         knowledge_store.append_upload("bob", upload.id, 0, "stolen")
 
 
-def test_sensitive_floor_and_default_hiding(knowledge_store: KnowledgeStore) -> None:
-    result = _commit(
-        knowledge_store,
-        "deployment api_key=sk-abcdefghijklmnop must remain local",
+def test_detected_sensitive_document_requires_confirmation_then_uses_user_choice(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    text = "deployment api_key=sk-abcdefghijklmnop must remain local"
+    upload = knowledge_store.begin_upload(
+        "alice",
+        "测试文档",
         sensitivity="normal",
     )
+    knowledge_store.append_upload("alice", upload.id, 0, text)
 
-    assert result.document.sensitivity == "sensitive"
-    assert knowledge_store.list_documents("alice") == []
-    assert knowledge_store.search_chunks("alice", "deployment") == []
-    visible = knowledge_store.list_documents("alice", include_sensitive=True)
-    hits = knowledge_store.search_chunks("alice", "deployment", include_sensitive=True)
-    assert visible[0].ref == result.document.ref
-    assert hits[0].sensitivity == "sensitive"
+    with pytest.raises(KnowledgeSensitivityConfirmationRequired) as error:
+        knowledge_store.commit_upload("alice", upload.id, 1)
+
+    assert error.value.declared_sensitivity == "normal"
+    assert error.value.detected_sensitivity == "sensitive"
+    assert knowledge_store.list_documents("alice", include_sensitive=True) == []
+
+    result = knowledge_store.commit_upload(
+        "alice",
+        upload.id,
+        1,
+        confirm_sensitivity_override=True,
+    )
+
+    assert result.document.sensitivity == "normal"
+    assert result.document.detected_sensitivity == "sensitive"
+    assert result.document.sensitivity_override_confirmed is True
+    assert knowledge_store.list_documents("alice")[0].ref == result.document.ref
+    assert knowledge_store.search_chunks("alice", "deployment")
+
+    updated = knowledge_store.update_document(
+        "alice",
+        document_ref=result.document.ref,
+        title="确认后的新标题",
+    )
+    assert updated.sensitivity == "normal"
+    assert updated.sensitivity_override_confirmed is True
 
 
 def test_export_omits_derived_index_and_restore_rebinds_user(

@@ -55,15 +55,20 @@ import type {
 import { normalizeBaseUrl } from "./storage";
 
 const DEFAULT_TIMEOUT_MS = 30000;
+const REVIEW_RELATED_TIMEOUT_MS = 90000;
+const REVIEW_PREVIEW_TIMEOUT_MS = 120000;
 
 type RequestOptions = {
   method?: string;
   body?: unknown;
+  rawBody?: BodyInit;
+  contentType?: string;
   auth?: boolean;
   text?: boolean;
   blob?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
+  timeoutMessage?: string;
 };
 
 type RedactionOptions = {
@@ -78,11 +83,20 @@ type MemoryListOptions = RedactionOptions & {
 export class ApiError extends Error {
   status: number;
   detail: string;
+  code?: string;
+  data?: Record<string, unknown>;
 
-  constructor(status: number, detail: string) {
+  constructor(
+    status: number,
+    detail: string,
+    code?: string,
+    data?: Record<string, unknown>
+  ) {
     super(detail);
     this.status = status;
     this.detail = detail;
+    this.code = code;
+    this.data = data;
   }
 }
 
@@ -139,6 +153,8 @@ export class MemoryApi {
       source_name?: string;
       replace_document_ref?: string;
       sensitivity?: string;
+      tags?: string[];
+      metadata?: Record<string, string | number | boolean>;
     },
     signal?: AbortSignal
   ): Promise<KnowledgeUploadSession> {
@@ -149,7 +165,9 @@ export class MemoryApi {
         content_type: payload.content_type,
         source_name: payload.source_name || "",
         replace_document_ref: payload.replace_document_ref || "",
-        sensitivity: payload.sensitivity || "normal"
+        sensitivity: payload.sensitivity || "normal",
+        tags: payload.tags,
+        metadata: payload.metadata
       },
       signal
     });
@@ -171,11 +189,16 @@ export class MemoryApi {
     uploadId: string,
     expectedParts: number,
     expectedSha256 = "",
+    confirmSensitivityOverride = false,
     signal?: AbortSignal
   ): Promise<KnowledgeUploadCommitResult> {
     return this.request(`/knowledge/uploads/${encodeURIComponent(uploadId)}/commit`, {
       method: "POST",
-      body: { expected_parts: expectedParts, expected_sha256: expectedSha256 },
+      body: {
+        expected_parts: expectedParts,
+        expected_sha256: expectedSha256,
+        confirm_sensitivity_override: confirmSensitivityOverride
+      },
       signal,
       timeoutMs: 120000
     });
@@ -188,9 +211,51 @@ export class MemoryApi {
     });
   }
 
+  async importKnowledgeFile(
+    file: File,
+    payload: {
+      title?: string;
+      source_name?: string;
+      replace_document_ref?: string;
+      sensitivity?: string;
+      confirm_sensitivity_override?: boolean;
+      tags?: string[];
+      metadata?: Record<string, string | number | boolean>;
+    },
+    signal?: AbortSignal
+  ): Promise<KnowledgeUploadCommitResult> {
+    const params = new URLSearchParams({
+      filename: file.name,
+      title: payload.title || "",
+      source_name: payload.source_name || file.name,
+      replace_document_ref: payload.replace_document_ref || "",
+      sensitivity: payload.sensitivity || "normal"
+    });
+    if (payload.tags?.length) params.set("tags", payload.tags.join(","));
+    if (payload.confirm_sensitivity_override) {
+      params.set("confirm_sensitivity_override", "true");
+    }
+    if (payload.metadata && Object.keys(payload.metadata).length) {
+      params.set("metadata_json", JSON.stringify(payload.metadata));
+    }
+    return this.request(`/knowledge/import?${params.toString()}`, {
+      method: "POST",
+      rawBody: file,
+      contentType: file.type || "application/octet-stream",
+      signal,
+      timeoutMs: 120000
+    });
+  }
+
   async updateKnowledgeDocument(
     reference: string,
-    payload: { title?: string; source_name?: string; sensitivity?: string },
+    payload: {
+      title?: string;
+      source_name?: string;
+      sensitivity?: string;
+      tags?: string[];
+      metadata?: Record<string, string | number | boolean>;
+    },
     signal?: AbortSignal
   ): Promise<KnowledgeDocument> {
     const result = await this.request<{ document?: KnowledgeDocument } & KnowledgeDocument>(
@@ -249,6 +314,8 @@ export class MemoryApi {
       request: string;
       limit?: number;
       documentRefs?: string[];
+      tags?: string[];
+      metadataFilter?: Record<string, string | number | boolean>;
       quality?: KnowledgeSearchQuality;
       includeSensitive?: boolean;
       timeoutMs?: number;
@@ -261,6 +328,8 @@ export class MemoryApi {
         request: options.request,
         limit: options.limit ?? 5,
         document_refs: options.documentRefs || [],
+        tags: options.tags || [],
+        metadata_filter: options.metadataFilter || {},
         quality: options.quality || "balanced",
         include_sensitive: options.includeSensitive ?? false
       },
@@ -702,7 +771,9 @@ export class MemoryApi {
         risk_tags: options.riskTags || [],
         severity: options.severity || undefined
       },
-      signal
+      signal,
+      timeoutMs: REVIEW_PREVIEW_TIMEOUT_MS,
+      timeoutMessage: "AI 修改预览生成超时，上游模型可能正忙，请稍后重试"
     });
   }
 
@@ -724,7 +795,9 @@ export class MemoryApi {
           suggested_content: options.suggestedContent || undefined,
           limit: options.limit ?? 8
         },
-        signal
+        signal,
+        timeoutMs: REVIEW_RELATED_TIMEOUT_MS,
+        timeoutMessage: "相关记忆检索超时，向量服务可能正忙，请稍后重试"
       }
     );
     return payload.data || [];
@@ -788,7 +861,9 @@ export class MemoryApi {
   private async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
     const headers = new Headers();
     const auth = options.auth !== false;
-    if (options.body !== undefined) {
+    if (options.rawBody !== undefined) {
+      headers.set("Content-Type", options.contentType || "application/octet-stream");
+    } else if (options.body !== undefined) {
       headers.set("Content-Type", "application/json; charset=utf-8");
     }
     if (auth && this.settings.apiKey) {
@@ -816,12 +891,17 @@ export class MemoryApi {
       const response = await fetch(this.base(path), {
         method: options.method || "GET",
         headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        body: options.rawBody !== undefined
+          ? options.rawBody
+          : options.body === undefined
+            ? undefined
+            : JSON.stringify(options.body),
         signal: controller.signal
       });
 
       if (!response.ok) {
-        throw new ApiError(response.status, await readError(response));
+        const error = await readError(response);
+        throw new ApiError(response.status, error.message, error.code, error.data);
       }
 
       if (response.status === 204) {
@@ -837,7 +917,10 @@ export class MemoryApi {
       return (await response.json()) as T;
     } catch (error) {
       if (timedOut && isAbortError(error)) {
-        throw new ApiError(0, "请求超时，请检查服务连接后重试");
+        throw new ApiError(
+          0,
+          options.timeoutMessage || "请求超时，请检查服务连接后重试"
+        );
       }
       throw error;
     } finally {
@@ -867,14 +950,28 @@ function redactionSuffix(redactSensitive?: boolean): string {
   return redactSensitive ? "&redact_sensitive=true" : "";
 }
 
-async function readError(response: Response): Promise<string> {
+async function readError(response: Response): Promise<{
+  message: string;
+  code?: string;
+  data?: Record<string, unknown>;
+}> {
   try {
-    const payload = await response.json();
+    const payload = await response.json() as Record<string, unknown>;
     if (typeof payload.detail === "string") {
-      return payload.detail;
+      return { message: payload.detail };
     }
-    return JSON.stringify(payload);
+    if (payload.detail && typeof payload.detail === "object") {
+      const detail = payload.detail as Record<string, unknown>;
+      return {
+        message: typeof detail.message === "string"
+          ? detail.message
+          : JSON.stringify(detail),
+        code: typeof detail.code === "string" ? detail.code : undefined,
+        data: detail
+      };
+    }
+    return { message: JSON.stringify(payload) };
   } catch {
-    return response.statusText || `HTTP ${response.status}`;
+    return { message: response.statusText || `HTTP ${response.status}` };
   }
 }

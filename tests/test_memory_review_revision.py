@@ -82,6 +82,84 @@ def test_legacy_mislabeled_sensitive_memory_is_blocked_before_remote_llm(
     assert fake_llm.review_revision_messages == []
 
 
+def test_review_preview_uses_thinking_structured_generation(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢深烘咖啡。",
+    )
+    fake_llm.review_revision_content = json.dumps(
+        {
+            "operations": [
+                {
+                    "operation": "no_change",
+                    "memory_ids": [memory.id],
+                    "reason": "当前记忆准确",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "确认这条记忆准确"},
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.review_revision_thinking == "enabled"
+    assert fake_llm.review_revision_request.max_tokens == 2048
+    assert fake_llm.review_revision_request.response_format == {"type": "json_object"}
+    assert fake_llm.review_revision_structured_tool["name"] == (
+        "submit_memory_review_revision"
+    )
+    assert (
+        fake_llm.review_revision_structured_tool["parameters"]["required"]
+        == ["operations"]
+    )
+
+
+def test_review_preview_accepts_structured_tool_arguments(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢深烘咖啡。",
+    )
+    fake_llm.review_revision_tool_arguments = json.dumps(
+        {
+            "operations": [
+                {
+                    "operation": "no_change",
+                    "memory_ids": [memory.id],
+                    "reason": "当前记忆准确",
+                }
+            ],
+            "reason": "无需修改",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "确认这条记忆准确"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["operations"][0]["operation"] == "no_change"
+    assert response.json()["operations"][0]["memory_ids"] == [memory.id]
+    assert response.json()["reason"] == "无需修改"
+
+
 def test_review_preview_rejects_stale_memory_version(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -1021,4 +1099,3 @@ def test_birth_year_age_statement_is_not_rewritten(
     [memory] = memory_store.list_memories(user_id="default")
     assert memory.content == "用户出生于 2008 年。"
     assert memory.review_after is None
-

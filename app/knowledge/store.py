@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import re
 import sqlite3
 from typing import Any, Final
@@ -101,6 +102,23 @@ class KnowledgeConflictError(KnowledgeError):
     """The requested mutation conflicts with persistent state."""
 
 
+class KnowledgeSensitivityConfirmationRequired(KnowledgeConflictError):
+    """Local detection conflicts with the user's declared sensitivity."""
+
+    def __init__(
+        self,
+        *,
+        declared_sensitivity: KnowledgeSensitivity,
+        detected_sensitivity: KnowledgeSensitivity,
+    ) -> None:
+        self.declared_sensitivity = declared_sensitivity
+        self.detected_sensitivity = detected_sensitivity
+        super().__init__(
+            "local detection classified this document above the selected "
+            "sensitivity; explicit user confirmation is required"
+        )
+
+
 class _ClosingSQLiteConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -119,7 +137,7 @@ class KnowledgeStore:
     def __init__(
         self,
         database_path: str,
-        max_document_bytes: int = 10 * 1024 * 1024,
+        max_document_bytes: int = 50 * 1024 * 1024,
     ) -> None:
         if not database_path or not str(database_path).strip():
             raise KnowledgeValidationError("database_path must not be blank")
@@ -142,6 +160,10 @@ class KnowledgeStore:
                     source_name TEXT NOT NULL DEFAULT '',
                     content_type TEXT NOT NULL DEFAULT 'text/markdown',
                     sensitivity TEXT NOT NULL DEFAULT 'normal',
+                    detected_sensitivity TEXT NOT NULL DEFAULT 'normal',
+                    sensitivity_override_confirmed INTEGER NOT NULL DEFAULT 0,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'active',
                     current_version_id TEXT,
                     created_at TEXT NOT NULL,
@@ -149,6 +171,8 @@ class KnowledgeStore:
                     deleted_at TEXT,
                     CHECK (content_type IN ('text/plain', 'text/markdown')),
                     CHECK (sensitivity IN ('normal', 'private', 'sensitive')),
+                    CHECK (detected_sensitivity IN ('normal', 'private', 'sensitive')),
+                    CHECK (sensitivity_override_confirmed IN (0, 1)),
                     CHECK (status IN ('active', 'deleted'))
                 );
 
@@ -168,12 +192,19 @@ class KnowledgeStore:
                     index_error TEXT,
                     created_at TEXT NOT NULL,
                     indexed_at TEXT,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding_model TEXT NOT NULL DEFAULT '',
+                    embedded_at TEXT,
+                    embedding_error TEXT,
                     FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
                     UNIQUE(document_id, version_number),
                     CHECK (version_number >= 1),
                     CHECK (byte_size >= 0),
                     CHECK (character_count >= 0),
-                    CHECK (index_status IN ('pending', 'indexing', 'ready', 'failed'))
+                    CHECK (index_status IN ('pending', 'indexing', 'ready', 'failed')),
+                    CHECK (embedding_status IN (
+                        'pending', 'indexing', 'ready', 'partial', 'failed', 'disabled'
+                    ))
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_knowledge_versions_user_document
@@ -214,6 +245,8 @@ class KnowledgeStore:
                     content_type TEXT NOT NULL,
                     source_name TEXT NOT NULL DEFAULT '',
                     sensitivity TEXT NOT NULL DEFAULT 'normal',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     replace_document_id TEXT,
                     expected_current_version_id TEXT,
                     status TEXT NOT NULL DEFAULT 'open',
@@ -225,6 +258,27 @@ class KnowledgeStore:
                     FOREIGN KEY(replace_document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
                     CHECK (status IN ('open', 'committing', 'committed', 'failed', 'expired'))
                 );
+
+                CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    vector_json TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(chunk_id) REFERENCES knowledge_chunks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+                    FOREIGN KEY(version_id) REFERENCES knowledge_versions(id) ON DELETE CASCADE,
+                    CHECK (dimensions > 0)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_embeddings_user_version
+                    ON knowledge_chunk_embeddings(user_id, version_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_embeddings_user_document
+                    ON knowledge_chunk_embeddings(user_id, document_id, version_id);
 
                 CREATE INDEX IF NOT EXISTS idx_knowledge_upload_sessions_user_status
                     ON knowledge_upload_sessions(user_id, status, expires_at);
@@ -261,6 +315,10 @@ class KnowledgeStore:
                 """
             )
             self._ensure_documents_source_document_ref(connection)
+            self._ensure_document_metadata_columns(connection)
+            self._ensure_document_sensitivity_columns(connection)
+            self._ensure_version_embedding_columns(connection)
+            self._ensure_upload_metadata_columns(connection)
 
     @staticmethod
     def _ensure_documents_source_document_ref(connection: sqlite3.Connection) -> None:
@@ -282,6 +340,83 @@ class KnowledgeStore:
             """
         )
 
+    @staticmethod
+    def _ensure_document_metadata_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_documents)"
+            ).fetchall()
+        }
+        if "tags_json" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_documents "
+                "ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "metadata_json" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_documents "
+                "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    @staticmethod
+    def _ensure_document_sensitivity_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_documents)"
+            ).fetchall()
+        }
+        if "detected_sensitivity" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_documents "
+                "ADD COLUMN detected_sensitivity TEXT NOT NULL DEFAULT 'normal'"
+            )
+        if "sensitivity_override_confirmed" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_documents "
+                "ADD COLUMN sensitivity_override_confirmed INTEGER NOT NULL DEFAULT 0"
+            )
+
+    @staticmethod
+    def _ensure_version_embedding_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_versions)"
+            ).fetchall()
+        }
+        additions = {
+            "embedding_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "embedding_model": "TEXT NOT NULL DEFAULT ''",
+            "embedded_at": "TEXT",
+            "embedding_error": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE knowledge_versions ADD COLUMN {name} {sql_type}"
+                )
+
+    @staticmethod
+    def _ensure_upload_metadata_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_upload_sessions)"
+            ).fetchall()
+        }
+        if "tags_json" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_upload_sessions "
+                "ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "metadata_json" not in columns:
+            connection.execute(
+                "ALTER TABLE knowledge_upload_sessions "
+                "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
     # ------------------------------------------------------------------
     # Upload lifecycle
 
@@ -294,12 +429,16 @@ class KnowledgeStore:
         source_name: str = "",
         replace_document_ref: str = "",
         sensitivity: KnowledgeSensitivity = "normal",
+        tags: Sequence[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> KnowledgeUploadSession:
         user_id = _required_text(user_id, "user_id", 256)
         title = _required_text(title, "title", 300)
         source_name = _optional_text(source_name, "source_name", 1000)
         content_type = _validate_content_type(content_type)
         sensitivity = _validate_sensitivity(sensitivity)
+        validated_tags = _validate_tags(tags) if tags is not None else None
+        validated_metadata = _validate_metadata(metadata) if metadata is not None else None
         now = _utc_now()
         expires_at = _utc_after(hours=_UPLOAD_TTL_HOURS)
         replace_id: str | None = None
@@ -322,14 +461,23 @@ class KnowledgeStore:
                     include_deleted=False,
                 )
                 expected_version_id = row["current_version_id"]
+                if validated_tags is None:
+                    validated_tags = _json_string_list(row["tags_json"])
+                if validated_metadata is None:
+                    validated_metadata = _json_metadata(row["metadata_json"])
+            if validated_tags is None:
+                validated_tags = []
+            if validated_metadata is None:
+                validated_metadata = {}
             upload_id = _new_id()
             connection.execute(
                 """
                 INSERT INTO knowledge_upload_sessions (
                     id, user_id, title, content_type, source_name, sensitivity,
+                    tags_json, metadata_json,
                     replace_document_id, expected_current_version_id, status,
                     created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
                 """,
                 (
                     upload_id,
@@ -338,6 +486,8 @@ class KnowledgeStore:
                     content_type,
                     source_name,
                     sensitivity,
+                    _json_dump(validated_tags),
+                    _json_dump(validated_metadata),
                     replace_id,
                     expected_version_id,
                     now,
@@ -437,6 +587,7 @@ class KnowledgeStore:
         upload_id: str,
         expected_parts: int,
         expected_sha256: str = "",
+        confirm_sensitivity_override: bool = False,
     ) -> KnowledgeCommitResult:
         user_id = _required_text(user_id, "user_id", 256)
         upload_id = self._plain_id(upload_id, "upload")
@@ -516,6 +667,23 @@ class KnowledgeStore:
             ):
                 raise KnowledgeConflictError("uploaded content SHA-256 does not match")
 
+            declared_sensitivity = _validate_sensitivity(session["sensitivity"])
+            detected_sensitivity = _detected_sensitivity(
+                session["title"],
+                session["source_name"],
+                content,
+            )
+            sensitivity_override_confirmed = (
+                _SENSITIVITY_RANK[detected_sensitivity]
+                > _SENSITIVITY_RANK[declared_sensitivity]
+            )
+            if sensitivity_override_confirmed and not confirm_sensitivity_override:
+                raise KnowledgeSensitivityConfirmationRequired(
+                    declared_sensitivity=declared_sensitivity,
+                    detected_sensitivity=detected_sensitivity,
+                )
+            sensitivity = declared_sensitivity
+
             now = _utc_now()
             connection.execute(
                 """
@@ -524,13 +692,6 @@ class KnowledgeStore:
                 WHERE id = ?
                 """,
                 (now, upload_id),
-            )
-            declared_sensitivity = _validate_sensitivity(session["sensitivity"])
-            sensitivity = _sensitivity_floor(
-                declared_sensitivity,
-                session["title"],
-                session["source_name"],
-                content,
             )
 
             replace_id = session["replace_document_id"]
@@ -541,9 +702,11 @@ class KnowledgeStore:
                     """
                     INSERT INTO knowledge_documents (
                         id, user_id, title, source_name, content_type,
-                        sensitivity, status, current_version_id,
+                        sensitivity, detected_sensitivity,
+                        sensitivity_override_confirmed, tags_json, metadata_json,
+                        status, current_version_id,
                         created_at, updated_at, deleted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
                     """,
                     (
                         document_id,
@@ -552,6 +715,10 @@ class KnowledgeStore:
                         session["source_name"],
                         session["content_type"],
                         sensitivity,
+                        detected_sensitivity,
+                        int(sensitivity_override_confirmed),
+                        session["tags_json"],
+                        session["metadata_json"],
                         now,
                         now,
                     ),
@@ -571,7 +738,6 @@ class KnowledgeStore:
                     raise KnowledgeConflictError(
                         "document changed after the upload began; start a new upload"
                     )
-                sensitivity = _higher_sensitivity(document["sensitivity"], sensitivity)
                 current = None
                 if current_version_id:
                     current = connection.execute(
@@ -586,7 +752,9 @@ class KnowledgeStore:
                         """
                         UPDATE knowledge_documents
                         SET title = ?, source_name = ?, content_type = ?,
-                            sensitivity = ?, updated_at = ?
+                            sensitivity = ?, detected_sensitivity = ?,
+                            sensitivity_override_confirmed = ?,
+                            tags_json = ?, metadata_json = ?, updated_at = ?
                         WHERE id = ? AND user_id = ?
                         """,
                         (
@@ -594,6 +762,10 @@ class KnowledgeStore:
                             session["source_name"],
                             session["content_type"],
                             sensitivity,
+                            detected_sensitivity,
+                            int(sensitivity_override_confirmed),
+                            session["tags_json"],
+                            session["metadata_json"],
                             now,
                             document_id,
                             user_id,
@@ -654,7 +826,9 @@ class KnowledgeStore:
                     """
                     UPDATE knowledge_documents
                     SET title = ?, source_name = ?, content_type = ?,
-                        sensitivity = ?, updated_at = ?
+                        sensitivity = ?, detected_sensitivity = ?,
+                        sensitivity_override_confirmed = ?,
+                        tags_json = ?, metadata_json = ?, updated_at = ?
                     WHERE id = ? AND user_id = ?
                     """,
                     (
@@ -662,6 +836,10 @@ class KnowledgeStore:
                         session["source_name"],
                         session["content_type"],
                         sensitivity,
+                        detected_sensitivity,
+                        int(sensitivity_override_confirmed),
+                        session["tags_json"],
+                        session["metadata_json"],
                         now,
                         document_id,
                         user_id,
@@ -791,6 +969,54 @@ class KnowledgeStore:
             ).fetchall()
         return [self._document_from_row(row) for row in rows]
 
+    def resolve_document_refs(
+        self,
+        user_id: str,
+        *,
+        document_refs: Sequence[str] | None = None,
+        tags: Sequence[str] | None = None,
+        metadata_filter: dict[str, Any] | None = None,
+        include_sensitive: bool = False,
+        limit: int = 50,
+    ) -> list[str]:
+        """Resolve an authorized document scope using exact local metadata filters."""
+        user_id = _required_text(user_id, "user_id", 256)
+        supplied_ids = self._document_ids(document_refs or [])
+        wanted_tags = _validate_tags(tags or [])
+        wanted_metadata = _validate_metadata(metadata_filter or {})
+        limit = _bounded_int(limit, "limit", minimum=1, maximum=1000)
+        conditions = ["user_id = ?", "status = 'active'"]
+        params: list[Any] = [user_id]
+        if not include_sensitive:
+            conditions.append("sensitivity = 'normal'")
+        if supplied_ids:
+            placeholders = ",".join("?" for _ in supplied_ids)
+            conditions.append(f"id IN ({placeholders})")
+            params.extend(supplied_ids)
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, tags_json, metadata_json
+                FROM knowledge_documents
+                WHERE {' AND '.join(conditions)}
+                ORDER BY updated_at DESC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        result: list[str] = []
+        wanted_tag_set = set(wanted_tags)
+        for row in rows:
+            row_tags = set(_json_string_list(row["tags_json"]))
+            row_metadata = _json_metadata(row["metadata_json"])
+            if wanted_tag_set and not wanted_tag_set.issubset(row_tags):
+                continue
+            if any(row_metadata.get(key) != value for key, value in wanted_metadata.items()):
+                continue
+            result.append(_document_ref(row["id"]))
+        return result
+
     def get_document_detail(
         self,
         user_id: str,
@@ -850,12 +1076,20 @@ class KnowledgeStore:
         title: str | None = None,
         source_name: str | None = None,
         sensitivity: KnowledgeSensitivity | None = None,
+        tags: Sequence[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> KnowledgeDocument:
         user_id = _required_text(user_id, "user_id", 256)
         document_id = self._document_id(
             _one_reference(document_id, document_ref, "document")
         )
-        if title is None and source_name is None and sensitivity is None:
+        if (
+            title is None
+            and source_name is None
+            and sensitivity is None
+            and tags is None
+            and metadata is None
+        ):
             raise KnowledgeValidationError("at least one document field must be supplied")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -872,6 +1106,16 @@ class KnowledgeStore:
                 else _optional_text(source_name, "source_name", 1000)
             )
             declared = row["sensitivity"] if sensitivity is None else _validate_sensitivity(sensitivity)
+            new_tags = (
+                _json_string_list(row["tags_json"])
+                if tags is None
+                else _validate_tags(tags)
+            )
+            new_metadata = (
+                _json_metadata(row["metadata_json"])
+                if metadata is None
+                else _validate_metadata(metadata)
+            )
             content_rows = connection.execute(
                 """
                 SELECT content FROM knowledge_versions
@@ -879,19 +1123,46 @@ class KnowledgeStore:
                 """,
                 (user_id, document_id),
             ).fetchall()
-            new_sensitivity = _sensitivity_floor(
-                declared,
+            detected_sensitivity = _detected_sensitivity(
                 new_title,
                 new_source,
                 *(item["content"] for item in content_rows),
             )
+            preserve_confirmed_override = bool(
+                row["sensitivity_override_confirmed"]
+            ) and (sensitivity is None or declared == row["sensitivity"])
+            if preserve_confirmed_override:
+                new_sensitivity = _validate_sensitivity(row["sensitivity"])
+                sensitivity_override_confirmed = (
+                    _SENSITIVITY_RANK[detected_sensitivity]
+                    > _SENSITIVITY_RANK[new_sensitivity]
+                )
+            else:
+                new_sensitivity = _higher_sensitivity(
+                    declared, detected_sensitivity
+                )
+                sensitivity_override_confirmed = False
             connection.execute(
                 """
                 UPDATE knowledge_documents
-                SET title = ?, source_name = ?, sensitivity = ?, updated_at = ?
+                SET title = ?, source_name = ?, sensitivity = ?,
+                    detected_sensitivity = ?,
+                    sensitivity_override_confirmed = ?,
+                    tags_json = ?, metadata_json = ?, updated_at = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (new_title, new_source, new_sensitivity, _utc_now(), document_id, user_id),
+                (
+                    new_title,
+                    new_source,
+                    new_sensitivity,
+                    detected_sensitivity,
+                    int(sensitivity_override_confirmed),
+                    _json_dump(new_tags),
+                    _json_dump(new_metadata),
+                    _utc_now(),
+                    document_id,
+                    user_id,
+                ),
             )
             model = self._load_document_model(
                 connection, user_id=user_id, document_id=document_id
@@ -1050,9 +1321,20 @@ class KnowledgeStore:
             new_version_id = _new_id()
             now = _utc_now()
             content = source["content"]
-            sensitivity = _sensitivity_floor(
-                document["sensitivity"], document["title"], document["source_name"], content
+            detected_sensitivity = _detected_sensitivity(
+                document["title"], document["source_name"], content
             )
+            sensitivity = _validate_sensitivity(document["sensitivity"])
+            sensitivity_override_confirmed = bool(
+                document["sensitivity_override_confirmed"]
+            ) and (
+                _SENSITIVITY_RANK[detected_sensitivity]
+                > _SENSITIVITY_RANK[sensitivity]
+            )
+            if not sensitivity_override_confirmed:
+                sensitivity = _higher_sensitivity(
+                    sensitivity, detected_sensitivity
+                )
             connection.execute(
                 """
                 INSERT INTO knowledge_versions (
@@ -1076,9 +1358,18 @@ class KnowledgeStore:
             connection.execute(
                 """
                 UPDATE knowledge_documents
-                SET sensitivity = ?, updated_at = ? WHERE id = ? AND user_id = ?
+                SET sensitivity = ?, detected_sensitivity = ?,
+                    sensitivity_override_confirmed = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (sensitivity, now, document_id, user_id),
+                (
+                    sensitivity,
+                    detected_sensitivity,
+                    int(sensitivity_override_confirmed),
+                    now,
+                    document_id,
+                    user_id,
+                ),
             )
             self._index_version_in_connection(
                 connection,
@@ -1219,6 +1510,242 @@ class KnowledgeStore:
 
     # Agent compatibility name.
     search_index = search_chunks
+
+    def list_chunks_for_embedding(
+        self,
+        user_id: str,
+        version_ref: str,
+        *,
+        include_sensitive: bool = False,
+    ) -> list[KnowledgeChunk]:
+        user_id = _required_text(user_id, "user_id", 256)
+        version_id = self._version_id(version_ref)
+        sensitive_sql = "" if include_sensitive else "AND d.sensitivity = 'normal'"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT c.*
+                FROM knowledge_chunks c
+                JOIN knowledge_documents d
+                    ON d.id = c.document_id AND d.user_id = c.user_id
+                JOIN knowledge_versions v
+                    ON v.id = c.version_id AND v.user_id = c.user_id
+                WHERE c.user_id = ? AND c.version_id = ?
+                  AND d.status = 'active'
+                  AND v.index_status = 'ready'
+                  {sensitive_sql}
+                ORDER BY c.ordinal ASC
+                """,
+                (user_id, version_id),
+            ).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def set_version_embedding_status(
+        self,
+        user_id: str,
+        version_ref: str,
+        *,
+        status: str,
+        model: str = "",
+        error: str = "",
+    ) -> None:
+        if status not in {
+            "pending",
+            "indexing",
+            "ready",
+            "partial",
+            "failed",
+            "disabled",
+        }:
+            raise KnowledgeValidationError("invalid knowledge embedding status")
+        user_id = _required_text(user_id, "user_id", 256)
+        version_id = self._version_id(version_ref)
+        model = _optional_text(model, "embedding model", 300)
+        error = _optional_text(error, "embedding error", 1000)
+        embedded_at = _utc_now() if status in {"ready", "partial"} else None
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE knowledge_versions
+                SET embedding_status = ?, embedding_model = ?,
+                    embedded_at = ?, embedding_error = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (status, model, embedded_at, error or None, version_id, user_id),
+            )
+            if result.rowcount != 1:
+                raise KnowledgeNotFoundError("knowledge version not found")
+
+    def replace_chunk_embeddings(
+        self,
+        user_id: str,
+        version_ref: str,
+        *,
+        model: str,
+        vectors: dict[str, list[float]],
+        total_chunks: int,
+    ) -> dict[str, int | str]:
+        user_id = _required_text(user_id, "user_id", 256)
+        version_id = self._version_id(version_ref)
+        model = _required_text(model, "embedding model", 300)
+        total_chunks = _bounded_int(
+            total_chunks, "total_chunks", minimum=1, maximum=100_000
+        )
+        prepared: list[tuple[str, list[float]]] = []
+        dimensions: int | None = None
+        for reference, raw_vector in vectors.items():
+            chunk_id = self._chunk_id(reference)
+            vector = _validated_vector(raw_vector)
+            if dimensions is None:
+                dimensions = len(vector)
+            if len(vector) != dimensions:
+                raise KnowledgeValidationError("embedding dimensions must be consistent")
+            prepared.append((chunk_id, vector))
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            version = self._get_version_row(
+                connection,
+                user_id=user_id,
+                version_id=version_id,
+                active_document=True,
+                include_sensitive=True,
+            )
+            connection.execute(
+                "DELETE FROM knowledge_chunk_embeddings "
+                "WHERE user_id = ? AND version_id = ?",
+                (user_id, version_id),
+            )
+            stored = 0
+            for chunk_id, vector in prepared:
+                chunk = connection.execute(
+                    """
+                    SELECT id, document_id, content
+                    FROM knowledge_chunks
+                    WHERE id = ? AND user_id = ? AND version_id = ?
+                    """,
+                    (chunk_id, user_id, version_id),
+                ).fetchone()
+                if chunk is None:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_chunk_embeddings (
+                        chunk_id, document_id, version_id, user_id, model,
+                        dimensions, vector_json, content_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk_id,
+                        chunk["document_id"],
+                        version_id,
+                        user_id,
+                        model,
+                        len(vector),
+                        _json_dump(vector),
+                        hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest(),
+                        now,
+                    ),
+                )
+                stored += 1
+            if stored == total_chunks:
+                status = "ready"
+                error = None
+            elif stored:
+                status = "partial"
+                error = f"embedded {stored} of {total_chunks} chunks"
+            else:
+                status = "failed"
+                error = "embedding provider returned no vectors"
+            connection.execute(
+                """
+                UPDATE knowledge_versions
+                SET embedding_status = ?, embedding_model = ?,
+                    embedded_at = ?, embedding_error = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    status,
+                    model,
+                    now if stored else None,
+                    error,
+                    version["id"],
+                    user_id,
+                ),
+            )
+        return {"status": status, "stored": stored, "total": total_chunks}
+
+    def search_chunks_by_embedding(
+        self,
+        user_id: str,
+        query_vector: Sequence[float],
+        *,
+        model: str,
+        query: str = "",
+        limit: int = 20,
+        document_refs: Sequence[str] | None = None,
+        include_sensitive: bool = False,
+        min_cosine: float = 0.25,
+    ) -> list[KnowledgeSearchHit]:
+        user_id = _required_text(user_id, "user_id", 256)
+        vector = _validated_vector(query_vector)
+        model = _required_text(model, "embedding model", 300)
+        query = _optional_text(query, "query", 8000)
+        limit = _bounded_int(limit, "limit", minimum=1, maximum=_SEARCH_MAX_RESULTS)
+        document_ids = self._document_ids(document_refs or [])
+        if len(document_ids) > 50:
+            raise KnowledgeValidationError("document_refs must not contain more than 50 items")
+        conditions = [
+            "e.user_id = ?",
+            "e.model = ?",
+            "e.dimensions = ?",
+            "d.status = 'active'",
+            "d.current_version_id = c.version_id",
+            "v.index_status = 'ready'",
+            "v.embedding_status IN ('ready', 'partial')",
+        ]
+        params: list[Any] = [user_id, model, len(vector)]
+        if not include_sensitive:
+            conditions.append("d.sensitivity = 'normal'")
+        if document_ids:
+            placeholders = ",".join("?" for _ in document_ids)
+            conditions.append(f"c.document_id IN ({placeholders})")
+            params.extend(document_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    c.*, d.title, d.source_name, d.content_type, d.sensitivity,
+                    v.version_number, e.vector_json, 0.0 AS rank
+                FROM knowledge_chunk_embeddings e
+                JOIN knowledge_chunks c
+                    ON c.id = e.chunk_id AND c.user_id = e.user_id
+                JOIN knowledge_documents d
+                    ON d.id = c.document_id AND d.user_id = c.user_id
+                JOIN knowledge_versions v
+                    ON v.id = c.version_id AND v.user_id = c.user_id
+                WHERE {' AND '.join(conditions)}
+                LIMIT 10000
+                """,
+                params,
+            ).fetchall()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                candidate = _validated_vector(json.loads(row["vector_json"]))
+            except (TypeError, json.JSONDecodeError, KnowledgeValidationError):
+                continue
+            cosine = _cosine_similarity(vector, candidate)
+            if cosine < min_cosine:
+                continue
+            payload = dict(row)
+            payload["rank"] = cosine
+            scored.append((cosine, payload))
+        scored.sort(key=lambda item: (-item[0], item[1]["ordinal"]))
+        return [
+            self._search_hit_from_row(row, query=query, signal="embedding")
+            for _, row in scored[:limit]
+        ]
 
     def get_chunks_by_refs(
         self,
@@ -1442,6 +1969,12 @@ class KnowledgeStore:
                         "source_name": row["source_name"],
                         "content_type": row["content_type"],
                         "sensitivity": row["sensitivity"],
+                        "detected_sensitivity": row["detected_sensitivity"],
+                        "sensitivity_override_confirmed": bool(
+                            row["sensitivity_override_confirmed"]
+                        ),
+                        "tags": _json_string_list(row["tags_json"]),
+                        "metadata": _json_metadata(row["metadata_json"]),
                         "status": row["status"],
                         "current_version_number": current_number,
                         "created_at": row["created_at"],
@@ -1466,7 +1999,7 @@ class KnowledgeStore:
                 )
         return {
             "format": "memory-gateway-knowledge",
-            "schema_version": 1,
+            "schema_version": 3,
             "exported_at": _utc_now(),
             "documents": documents,
         }
@@ -1519,9 +2052,11 @@ class KnowledgeStore:
                     """
                     INSERT INTO knowledge_documents (
                         id, user_id, title, source_name, content_type,
-                        sensitivity, status, current_version_id,
+                        sensitivity, detected_sensitivity,
+                        sensitivity_override_confirmed, tags_json, metadata_json,
+                        status, current_version_id,
                         created_at, updated_at, deleted_at, source_document_ref
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL, ?)
                     """,
                     (
                         document_id,
@@ -1530,6 +2065,10 @@ class KnowledgeStore:
                         item["source_name"],
                         item["content_type"],
                         item["sensitivity"],
+                        item["detected_sensitivity"],
+                        int(item["sensitivity_override_confirmed"]),
+                        _json_dump(item["tags"]),
+                        _json_dump(item["metadata"]),
                         item["created_at"] or now,
                         now,
                         source_ref,
@@ -1625,6 +2164,8 @@ class KnowledgeStore:
             raise KnowledgeValidationError("exported source_document_ref is invalid")
         content_type = _validate_content_type(value.get("content_type", "text/markdown"))
         declared = _validate_sensitivity(value.get("sensitivity", "normal"))
+        tags = _validate_tags(value.get("tags", []))
+        metadata = _validate_metadata(value.get("metadata", {}))
         status = value.get("status", "active")
         if status not in {"active", "deleted"}:
             raise KnowledgeValidationError("exported document status is invalid")
@@ -1667,11 +2208,24 @@ class KnowledgeStore:
             raise KnowledgeValidationError("current_version_number must be an integer")
         if current_number not in seen_numbers:
             raise KnowledgeValidationError("current_version_number is not present in versions")
-        sensitivity = _sensitivity_floor(
-            declared,
+        detected_sensitivity = _detected_sensitivity(
             title,
             source_name,
             *(item["content"] for item in versions),
+        )
+        raw_override = value.get("sensitivity_override_confirmed", False)
+        if not isinstance(raw_override, bool):
+            raise KnowledgeValidationError(
+                "sensitivity_override_confirmed must be a boolean"
+            )
+        sensitivity_override_confirmed = raw_override and (
+            _SENSITIVITY_RANK[detected_sensitivity]
+            > _SENSITIVITY_RANK[declared]
+        )
+        sensitivity = (
+            declared
+            if sensitivity_override_confirmed
+            else _higher_sensitivity(declared, detected_sensitivity)
         )
         return {
             "title": title,
@@ -1679,6 +2233,10 @@ class KnowledgeStore:
             "source_document_ref": source_document_ref,
             "content_type": content_type,
             "sensitivity": sensitivity,
+            "detected_sensitivity": detected_sensitivity,
+            "sensitivity_override_confirmed": sensitivity_override_confirmed,
+            "tags": tags,
+            "metadata": metadata,
             "status": status,
             "current_version_number": current_number,
             "created_at": _safe_exported_time(value.get("created_at")),
@@ -1706,9 +2264,26 @@ class KnowledgeStore:
                 """,
                 (user_id,),
             ).fetchall()
+            embedding_rows = connection.execute(
+                """
+                SELECT embedding_status, COUNT(*) AS count
+                FROM knowledge_versions
+                WHERE user_id = ? GROUP BY embedding_status
+                """,
+                (user_id,),
+            ).fetchall()
             chunk_count = int(
                 connection.execute(
                     "SELECT COUNT(*) AS count FROM knowledge_chunks WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()["count"]
+            )
+            embedded_chunk_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM knowledge_chunk_embeddings WHERE user_id = ?
+                    """,
                     (user_id,),
                 ).fetchone()["count"]
             )
@@ -1727,11 +2302,18 @@ class KnowledgeStore:
             "deleted_documents": 0,
             "versions": 0,
             "chunks": chunk_count,
+            "embedded_chunks": embedded_chunk_count,
             "index_pending": 0,
             "index_indexing": 0,
             "index_ready": 0,
             "index_failed": 0,
             "open_uploads": open_uploads,
+            "embedding_pending": 0,
+            "embedding_indexing": 0,
+            "embedding_ready": 0,
+            "embedding_partial": 0,
+            "embedding_failed": 0,
+            "embedding_disabled": 0,
         }
         for row in document_rows:
             count = int(row["count"])
@@ -1741,6 +2323,8 @@ class KnowledgeStore:
             count = int(row["count"])
             result["versions"] += count
             result[f"index_{row['index_status']}"] = count
+        for row in embedding_rows:
+            result[f"embedding_{row['embedding_status']}"] = int(row["count"])
         return result
 
     get_counts = counts
@@ -1831,10 +2415,16 @@ class KnowledgeStore:
         connection.execute(
             """
             UPDATE knowledge_versions
-            SET index_status = 'indexing', index_error = NULL, indexed_at = NULL
+            SET index_status = 'indexing', index_error = NULL, indexed_at = NULL,
+                embedding_status = 'pending', embedding_model = '',
+                embedded_at = NULL, embedding_error = NULL
             WHERE id = ? AND user_id = ?
             """,
             (version_id, user_id),
+        )
+        connection.execute(
+            "DELETE FROM knowledge_chunk_embeddings WHERE user_id = ? AND version_id = ?",
+            (user_id, version_id),
         )
         connection.execute(
             "DELETE FROM knowledge_chunks_fts WHERE user_id = ? AND version_id = ?",
@@ -2189,6 +2779,10 @@ class KnowledgeStore:
             source_name=row["source_name"],
             content_type=row["content_type"],
             sensitivity=row["sensitivity"],
+            detected_sensitivity=row["detected_sensitivity"],
+            sensitivity_override_confirmed=bool(
+                row["sensitivity_override_confirmed"]
+            ),
             status=row["status"],
             current_version_id=version_id,
             current_version_ref=_version_ref(version_id) if version_id else "",
@@ -2199,6 +2793,8 @@ class KnowledgeStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             deleted_at=row["deleted_at"],
+            tags=_json_string_list(row["tags_json"]),
+            metadata=_json_metadata(row["metadata_json"]),
         )
 
     def _version_from_row(
@@ -2221,6 +2817,10 @@ class KnowledgeStore:
             index_error=row["index_error"],
             created_at=row["created_at"],
             indexed_at=row["indexed_at"],
+            embedding_status=row["embedding_status"],
+            embedding_model=row["embedding_model"],
+            embedded_at=row["embedded_at"],
+            embedding_error=row["embedding_error"],
             content=row["content"] if include_content else None,
         )
 
@@ -2270,6 +2870,9 @@ class KnowledgeStore:
             signals.append("heading")
         if signal == "reference":
             score = 1.0
+        elif signal == "embedding":
+            score = max(-1.0, min(1.0, rank))
+            signals.append("cosine")
         elif signal == "fts":
             # FTS5 bm25 is ordered ascending and normally returns negative
             # values; negate it so a stronger match also has a larger score.
@@ -2293,6 +2896,7 @@ class KnowledgeStore:
             excerpt=excerpt,
             score=score,
             match_signals=signals,
+            channels=[signal],
         )
 
     def _upload_session_from_row(self, row: sqlite3.Row) -> KnowledgeUploadSession:
@@ -2305,6 +2909,8 @@ class KnowledgeStore:
             content_type=row["content_type"],
             source_name=row["source_name"],
             sensitivity=row["sensitivity"],
+            tags=_json_string_list(row["tags_json"]),
+            metadata=_json_metadata(row["metadata_json"]),
             replace_document_id=replace_id,
             replace_document_ref=_document_ref(replace_id) if replace_id else "",
             expected_current_version_id=expected_id,
@@ -2472,6 +3078,94 @@ def _validate_sensitivity(value: str) -> KnowledgeSensitivity:
     return value  # type: ignore[return-value]
 
 
+def _validate_tags(values: Sequence[str] | Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        raise KnowledgeValidationError("tags must be a list of strings")
+    if len(values) > 32:
+        raise KnowledgeValidationError("tags must not contain more than 32 items")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = _required_text(value, "tag", 80)
+        normalized = tag.casefold()
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(tag)
+    return result
+
+
+def _validate_metadata(value: Any) -> dict[str, str | int | float | bool]:
+    if not isinstance(value, dict):
+        raise KnowledgeValidationError("metadata must be an object")
+    if len(value) > 50:
+        raise KnowledgeValidationError("metadata must not contain more than 50 fields")
+    result: dict[str, str | int | float | bool] = {}
+    for raw_key, raw_value in value.items():
+        key = _required_text(raw_key, "metadata key", 80)
+        if key.startswith("_"):
+            raise KnowledgeValidationError("metadata keys must not start with underscore")
+        if isinstance(raw_value, bool):
+            result[key] = raw_value
+        elif isinstance(raw_value, str):
+            result[key] = _optional_text(raw_value, f"metadata.{key}", 500)
+        elif isinstance(raw_value, int):
+            result[key] = raw_value
+        elif isinstance(raw_value, float) and math.isfinite(raw_value):
+            result[key] = raw_value
+        else:
+            raise KnowledgeValidationError(
+                "metadata values must be strings, numbers, or booleans"
+            )
+    return result
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _json_metadata(value: str) -> dict[str, str | int | float | bool]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    try:
+        return _validate_metadata(parsed)
+    except KnowledgeValidationError:
+        return {}
+
+
+def _validated_vector(values: Sequence[float] | Any) -> list[float]:
+    if not isinstance(values, (list, tuple)) or not values:
+        raise KnowledgeValidationError("embedding vector must be a non-empty list")
+    if len(values) > 16_384:
+        raise KnowledgeValidationError("embedding vector is too large")
+    result: list[float] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise KnowledgeValidationError("embedding values must be finite numbers")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise KnowledgeValidationError(
+                "embedding values must be finite numbers"
+            ) from exc
+        if not math.isfinite(number):
+            raise KnowledgeValidationError("embedding values must be finite numbers")
+        result.append(number)
+    return result
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right) or not left:
+        return -1.0
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm <= 0.0 or right_norm <= 0.0:
+        return -1.0
+    return max(-1.0, min(1.0, dot / (left_norm * right_norm)))
+
+
 def _detect_sensitivity(text: str) -> KnowledgeSensitivity:
     if any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS):
         return "sensitive"
@@ -2488,12 +3182,8 @@ def detect_knowledge_text_sensitivity(text: str) -> KnowledgeSensitivity:
     return _detect_sensitivity(text)
 
 
-def _sensitivity_floor(
-    declared: KnowledgeSensitivity,
-    *texts: str | None,
-) -> KnowledgeSensitivity:
-    detected = _detect_sensitivity("\n".join(value for value in texts if value))
-    return _higher_sensitivity(declared, detected)
+def _detected_sensitivity(*texts: str | None) -> KnowledgeSensitivity:
+    return _detect_sensitivity("\n".join(value for value in texts if value))
 
 
 def _higher_sensitivity(left: str, right: str) -> KnowledgeSensitivity:

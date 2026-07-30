@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import partial
 import inspect
 import json
+import logging
 import re
 import time
 from typing import Any, Literal, Protocol
@@ -15,6 +16,14 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.knowledge.store import detect_knowledge_text_sensitivity
+from app.llm.routing import (
+    GLOBAL_PROVIDER_COOLDOWNS as _GLOBAL_PROVIDER_COOLDOWNS,
+    LLMProvider as _KnowledgeProvider,
+    ProviderCooldowns as KnowledgeProviderCooldowns,
+    ProviderCoolingDown as KnowledgeProviderCoolingDown,
+    effective_provider_priority as _effective_provider_priority,
+    retry_after_seconds as _retry_after_seconds,
+)
 
 
 KnowledgeAgentQuality = Literal["fast", "balanced", "deep"]
@@ -25,6 +34,7 @@ _VERSION_REF_RE = re.compile(r"^knowledge://version/[A-Za-z0-9][A-Za-z0-9_-]{0,1
 _CHUNK_REF_RE = re.compile(r"^knowledge://chunk/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_TOOL_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,200}$")
 _SENSITIVE_LEVELS = {"private", "sensitive"}
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeAgentConfig(BaseModel):
@@ -40,11 +50,31 @@ class KnowledgeAgentConfig(BaseModel):
     api_key: str = ""
     flash_model: str = "deepseek-v4-flash"
     pro_model: str = "deepseek-v4-pro"
+    provider_priority: str = "D"
+    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
+    mimo_api_key: str = ""
+    mimo_model: str = "mimo-v2.5-pro-ultraspeed"
+    kimi_base_url: str = "https://api.moonshot.cn/v1"
+    kimi_api_key: str = ""
+    kimi_model: str = "kimi-k2.7-code"
+    rate_limit_cooldown_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
     egress_policy: KnowledgeAgentEgressPolicy = "none"
     allow_sensitive_egress: bool = False
     timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("provider_priority")
+    @classmethod
+    def _valid_provider_priority(cls, value: str) -> str:
+        normalized = "".join(value.upper().split())
+        if not normalized:
+            return "D"
+        if set(normalized) - {"M", "K", "D"}:
+            raise ValueError("provider_priority only accepts M, K, and D")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("provider_priority cannot contain duplicates")
+        return normalized
 
 
 class KnowledgeAgentToolStep(BaseModel):
@@ -106,9 +136,13 @@ class OpenAICompatibleKnowledgeAgentClient:
         config: KnowledgeAgentConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        cooldowns: KnowledgeProviderCooldowns | None = None,
+        wall_clock: Any = time.time,
     ) -> None:
         self.config = config
         self.transport = transport
+        self.cooldowns = cooldowns or _GLOBAL_PROVIDER_COOLDOWNS
+        self._wall_clock = wall_clock
 
     async def create_chat_completion(
         self,
@@ -118,22 +152,100 @@ class OpenAICompatibleKnowledgeAgentClient:
         tools: list[dict[str, Any]],
         timeout_seconds: float,
     ) -> dict[str, Any]:
-        if not self.config.api_key:
-            raise RuntimeError("KNOWLEDGE_AGENT_API_KEY is not configured")
+        if model == self.config.flash_model:
+            return await self._create_flash_completion(
+                messages=messages,
+                tools=tools,
+                timeout_seconds=timeout_seconds,
+            )
 
-        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        provider = self._provider("D", model=model)
+        if not provider.configured:
+            raise RuntimeError("LLM_DEEPSEEK_API_KEY is not configured")
+        remaining = self.cooldowns.remaining(provider)
+        if remaining > 0:
+            raise KnowledgeProviderCoolingDown(
+                f"DeepSeek provider is cooling down for {remaining:.1f} seconds"
+            )
+        try:
+            return await self._post(
+                provider=provider,
+                messages=messages,
+                tools=tools,
+                timeout_seconds=timeout_seconds,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                self._defer_after_429(provider, exc.response)
+            raise
+
+    async def _create_flash_completion(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        providers = [
+            self._provider(code)
+            for code in _effective_provider_priority(self.config.provider_priority)
+        ]
+        providers = [provider for provider in providers if provider.configured]
+        if not providers:
+            raise RuntimeError("no configured knowledge-agent provider is available")
+
+        eligible = [
+            provider for provider in providers if self.cooldowns.remaining(provider) <= 0
+        ]
+        if not eligible:
+            raise KnowledgeProviderCoolingDown(
+                "all configured knowledge-agent providers are cooling down"
+            )
+
+        last_rate_limit: httpx.HTTPStatusError | None = None
+        for provider in eligible:
+            try:
+                return await self._post(
+                    provider=provider,
+                    messages=messages,
+                    tools=tools,
+                    timeout_seconds=timeout_seconds,
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 429:
+                    raise
+                last_rate_limit = exc
+                self._defer_after_429(provider, exc.response)
+
+        if last_rate_limit is not None:
+            raise last_rate_limit
+        raise KnowledgeProviderCoolingDown(
+            "all configured knowledge-agent providers are cooling down"
+        )
+
+    async def _post(
+        self,
+        *,
+        provider: _KnowledgeProvider,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        url = f"{provider.base_url.rstrip('/')}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json; charset=utf-8",
         }
         payload = {
-            "model": model,
+            "model": provider.model,
             "messages": messages,
             "tools": tools,
-            "tool_choice": "auto",
-            "temperature": 0,
+            "temperature": _knowledge_temperature(provider),
             "stream": False,
         }
+        payload.update(_knowledge_thinking_payload(provider))
+        if provider.code != "D":
+            payload["tool_choice"] = "auto"
         timeout = min(timeout_seconds, self.config.timeout_seconds)
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -144,7 +256,61 @@ class OpenAICompatibleKnowledgeAgentClient:
             data = response.json()
         if not isinstance(data, dict):
             raise ValueError("knowledge agent response must be a JSON object")
+        data.setdefault("model", provider.model)
         return data
+
+    def _provider(
+        self,
+        code: Literal["M", "K", "D"],
+        *,
+        model: str | None = None,
+    ) -> _KnowledgeProvider:
+        if code == "M":
+            return _KnowledgeProvider(
+                code="M",
+                base_url=self.config.mimo_base_url,
+                api_key=self.config.mimo_api_key,
+                model=self.config.mimo_model,
+            )
+        if code == "K":
+            return _KnowledgeProvider(
+                code="K",
+                base_url=self.config.kimi_base_url,
+                api_key=self.config.kimi_api_key,
+                model=self.config.kimi_model,
+            )
+        return _KnowledgeProvider(
+            code="D",
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            model=model or self.config.flash_model,
+        )
+
+    def _defer_after_429(
+        self,
+        provider: _KnowledgeProvider,
+        response: httpx.Response,
+    ) -> None:
+        retry_after = _retry_after_seconds(
+            response.headers.get("Retry-After", ""),
+            wall_time=self._wall_clock(),
+        )
+        seconds = max(self.config.rate_limit_cooldown_seconds, retry_after)
+        self.cooldowns.defer(provider, seconds)
+        logger.warning(
+            "知识代理触发 429，临时后移 provider=%s cooldown_seconds=%.1f",
+            provider.code,
+            seconds,
+        )
+
+
+def _knowledge_temperature(provider: _KnowledgeProvider) -> int:
+    if provider.code != "K":
+        return 0
+    model = provider.model.lower()
+    if model.startswith("kimi-k2.7") or model.startswith("kimi-for-coding"):
+        return 1
+    return 0
 
 
 class _SearchIndexArgs(BaseModel):
@@ -241,6 +407,7 @@ class _ToolCall:
 class _LoopOutcome:
     selected_refs: list[str]
     rounds: int
+    model: str = ""
     needs_pro: bool = False
     may_escalate: bool = False
     failure_reason: str = ""
@@ -366,7 +533,7 @@ class KnowledgeSearchAgent:
         )
         metadata.flash_rounds = flash.rounds
         metadata.rounds += flash.rounds
-        metadata.model = self.config.flash_model
+        metadata.model = flash.model or self.config.flash_model
 
         flash_selected = flash.selected_refs
         if flash_selected and quality != "deep" and not flash.needs_pro:
@@ -402,7 +569,7 @@ class KnowledgeSearchAgent:
         )
         metadata.pro_rounds = pro.rounds
         metadata.rounds += pro.rounds
-        metadata.model = self.config.pro_model
+        metadata.model = pro.model or self.config.pro_model
         if pro.selected_refs or not pro.failure_reason:
             metadata.agent_used = True
             return self._finish(pro.selected_refs, metadata, started, baseline_values)
@@ -456,6 +623,7 @@ class KnowledgeSearchAgent:
         )
         invalid_streak = 0
         last_failure = ""
+        used_model = model
 
         for round_number in range(1, max_rounds + 1):
             try:
@@ -464,35 +632,39 @@ class KnowledgeSearchAgent:
                     messages=messages,
                     deadline=deadline,
                 )
+                used_model = _response_model(raw, fallback=model)
                 calls = _extract_tool_calls(raw)
             except Exception as exc:
                 return _LoopOutcome(
                     selected_refs=[],
                     rounds=round_number,
+                    model=used_model,
                     failure_reason=_agent_failure_reason(exc),
                 )
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": (
-                                    call.arguments
-                                    if isinstance(call.arguments, str)
-                                    else json.dumps(call.arguments, ensure_ascii=False)
-                                ),
-                            },
-                        }
-                        for call in calls
-                    ],
-                }
-            )
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": _response_message_text(raw, "content"),
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": (
+                                call.arguments
+                                if isinstance(call.arguments, str)
+                                else json.dumps(call.arguments, ensure_ascii=False)
+                            ),
+                        },
+                    }
+                    for call in calls
+                ],
+            }
+            reasoning_content = _response_message_text(raw, "reasoning_content")
+            if reasoning_content:
+                assistant_message["reasoning_content"] = reasoning_content
+            messages.append(assistant_message)
 
             round_invalid = False
             round_valid = False
@@ -500,7 +672,7 @@ class KnowledgeSearchAgent:
                 try:
                     tool_payload, selection, needs_pro = await self._execute_tool(
                         call=call,
-                        model=model,
+                        model=used_model,
                         round_number=round_number,
                         user_id=user_id,
                         result_limit=result_limit,
@@ -514,6 +686,7 @@ class KnowledgeSearchAgent:
                     return _LoopOutcome(
                         selected_refs=[],
                         rounds=round_number,
+                        model=used_model,
                         failure_reason="agent_timeout",
                     )
                 except _ToolRejected as exc:
@@ -521,7 +694,7 @@ class KnowledgeSearchAgent:
                     last_failure = exc.reason
                     metadata.tool_steps.append(
                         KnowledgeAgentToolStep(
-                            model=model,
+                            model=used_model,
                             round=round_number,
                             tool=(
                                 call.name
@@ -539,7 +712,7 @@ class KnowledgeSearchAgent:
                     last_failure = "local_tool_failed"
                     metadata.tool_steps.append(
                         KnowledgeAgentToolStep(
-                            model=model,
+                            model=used_model,
                             round=round_number,
                             tool=(
                                 call.name
@@ -564,6 +737,7 @@ class KnowledgeSearchAgent:
                     return _LoopOutcome(
                         selected_refs=selection,
                         rounds=round_number,
+                        model=used_model,
                         needs_pro=needs_pro,
                         may_escalate=needs_pro,
                     )
@@ -582,6 +756,7 @@ class KnowledgeSearchAgent:
                 return _LoopOutcome(
                     selected_refs=[],
                     rounds=round_number,
+                    model=used_model,
                     may_escalate=True,
                     failure_reason=last_failure or "invalid_tool_arguments",
                 )
@@ -589,6 +764,7 @@ class KnowledgeSearchAgent:
         return _LoopOutcome(
             selected_refs=[],
             rounds=max_rounds,
+            model=used_model,
             may_escalate=True,
             failure_reason=last_failure or "agent_round_limit",
         )
@@ -822,7 +998,7 @@ class KnowledgeSearchAgent:
     def _local_only_reason(self, *, request: str, include_sensitive: bool) -> str:
         if self.config.egress_policy == "none":
             return "egress_disabled"
-        if not self.config.api_key:
+        if not _configured_provider_codes(self.config):
             return "agent_not_configured"
         # The request itself is outbound data too.  A caller may ask a
         # sensitive question while leaving include_sensitive=false; that must
@@ -1044,9 +1220,48 @@ async def _await_with_timeout(value: Any, timeout: float) -> Any:
     return value
 
 
+def _configured_provider_codes(config: KnowledgeAgentConfig) -> list[str]:
+    configured = {
+        "M": bool(config.mimo_base_url and config.mimo_api_key and config.mimo_model),
+        "K": bool(config.kimi_base_url and config.kimi_api_key and config.kimi_model),
+        "D": bool(config.base_url and config.api_key and config.flash_model),
+    }
+    return [
+        code
+        for code in _effective_provider_priority(config.provider_priority)
+        if configured[code]
+    ]
+
+
+def _response_model(response: Mapping[str, Any], *, fallback: str) -> str:
+    value = response.get("model")
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:200]
+    return fallback
+
+
+def _knowledge_thinking_payload(provider: _KnowledgeProvider) -> dict[str, Any]:
+    model = provider.model.lower()
+    if provider.code == "K":
+        if model.startswith("kimi-k3"):
+            return {"reasoning_effort": "max"}
+        return {"thinking": {"type": "enabled", "keep": "all"}}
+    return {"thinking": {"type": "enabled"}}
+
+
+def _response_message_text(response: Mapping[str, Any], field: str) -> str:
+    try:
+        value = response["choices"][0]["message"].get(field)
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def _agent_failure_reason(exc: Exception) -> str:
     if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
         return "agent_timeout"
+    if isinstance(exc, KnowledgeProviderCoolingDown):
+        return "agent_rate_limited"
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         if status_code == 429:

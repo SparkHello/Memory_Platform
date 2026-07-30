@@ -4,7 +4,6 @@ import {
   ChevronDown,
   Clipboard,
   Clock3,
-  ExternalLink,
   Filter,
   ListTree,
   RefreshCcw,
@@ -48,6 +47,8 @@ export function KnowledgeSearchPage({
   const [quality, setQuality] = useState<KnowledgeSearchQuality>("balanced");
   const [limit, setLimit] = useState(5);
   const [includeSensitive, setIncludeSensitive] = useState(false);
+  const [tagsText, setTagsText] = useState("");
+  const [metadataText, setMetadataText] = useState("");
   const [selectedRefs, setSelectedRefs] = useState<Set<string>>(() => new Set());
   const [result, setResult] = useState<KnowledgeSearchResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +73,9 @@ export function KnowledgeSearchPage({
   // 前端超时跟随后端 KNOWLEDGE_AGENT_TIMEOUT_SECONDS（留 10s 余量）；status 未加载时回退 35s。
   const searchTimeoutMs = status?.agent_timeout_seconds ? status.agent_timeout_seconds * 1000 + 10000 : 35000;
   const egressWarning = Boolean(status?.agent_enabled && status.agent_egress_policy && status.agent_egress_policy !== "none");
+  const providerSummary = (status?.agent_configured_providers || [])
+    .map((provider) => PROVIDER_LABELS[provider] || provider)
+    .join(" → ");
 
   const runSearch = async () => {
     const cleanRequest = request.trim();
@@ -86,6 +90,8 @@ export function KnowledgeSearchPage({
         request: cleanRequest,
         limit,
         documentRefs: [...selectedRefs],
+        tags: parseTags(tagsText),
+        metadataFilter: parseMetadataFilter(metadataText),
         quality,
         includeSensitive,
         timeoutMs: searchTimeoutMs
@@ -193,6 +199,16 @@ export function KnowledgeSearchPage({
               <span className="muted">不选择时搜索当前用户的全部有效文档。</span>
               {selectedRefs.size > 0 && <button className="ghost-button compact" type="button" onClick={() => setSelectedRefs(new Set())}><X size={13} />清除范围</button>}
             </div>
+            <div className="knowledge-filter-grid">
+              <label className="field-block">
+                <span>标签（全部匹配）</span>
+                <input value={tagsText} onChange={(event) => setTagsText(event.target.value)} placeholder="产品, 架构" />
+              </label>
+              <label className="field-block">
+                <span>元数据精确过滤（JSON）</span>
+                <input value={metadataText} onChange={(event) => setMetadataText(event.target.value)} placeholder={'{"department":"研发"}'} />
+              </label>
+            </div>
             {documentsError && <ErrorBlock message={documentsError} onRetry={() => void loadDocuments()} />}
             {!documentsError && documents.length === 0 && <EmptyBlock compact label="知识库暂无有效文档" />}
             {!documentsError && documents.length > 0 && (
@@ -218,8 +234,11 @@ export function KnowledgeSearchPage({
         <div className="notice warning knowledge-egress-notice">
           <ShieldAlert size={18} />
           <span>
-            启用 DeepSeek 代理时，检索需求和获准的候选正文可能发送到远程服务。DeepSeek 说明这些内容可能用于技术改进，并在中国处理与存储。
-            <a href="https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html" target="_blank" rel="noreferrer" aria-label="查看 DeepSeek 隐私政策（新窗口）">查看隐私政策 <ExternalLink size={12} /></a>
+            远程知识代理已启用{providerSummary ? `（${providerSummary}）` : ""}。检索需求和获准的候选正文可能按优先级发送给相应服务商。
+            {status?.agent_rate_limit_cooldown_seconds
+              ? ` 某个服务商返回 429 后，当前进程会暂时跳过它至少 ${numberText(status.agent_rate_limit_cooldown_seconds)} 秒。`
+              : ""}
+            请根据实际启用的服务商确认数据处理条款。
           </span>
         </div>
       )}
@@ -358,6 +377,25 @@ export function KnowledgeSearchPage({
       )}
     </div>
   );
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  M: "MiMo",
+  K: "Kimi",
+  D: "DeepSeek"
+};
+
+function parseTags(value: string): string[] {
+  return [...new Set(value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))];
+}
+
+function parseMetadataFilter(value: string): Record<string, string | number | boolean> {
+  if (!value.trim()) return {};
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("元数据过滤必须是 JSON 对象");
+  }
+  return parsed as Record<string, string | number | boolean>;
 }
 
 function AgentStepView({ step, index }: { step: KnowledgeAgentStep; index: number }) {

@@ -3,44 +3,81 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 
 
 def test_knowledge_agent_is_local_only_by_default(monkeypatch) -> None:
     for key in (
-        "KNOWLEDGE_AGENT_API_KEY",
-        "KNOWLEDGE_AGENT_EGRESS_POLICY",
         "KNOWLEDGE_AGENT_FLASH_MODEL",
         "KNOWLEDGE_AGENT_PRO_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("KNOWLEDGE_AGENT_API_KEY", "")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_MIMO_API_KEY", "")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_KIMI_API_KEY", "")
+    monkeypatch.setenv("LLM_DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("LLM_MIMO_API_KEY", "")
+    monkeypatch.setenv("LLM_KIMI_API_KEY", "")
+    monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "none")
+    monkeypatch.setenv("LLM_PROVIDER_PRIORITY", "")
     get_settings.cache_clear()
 
     settings = get_settings()
 
-    assert settings.knowledge_agent_api_key == ""
+    assert settings.llm_deepseek_api_key == ""
     assert settings.knowledge_agent_egress_policy == "none"
-    assert settings.knowledge_agent_flash_model == "deepseek-v4-flash"
-    assert settings.knowledge_agent_pro_model == "deepseek-v4-pro"
+    assert settings.llm_deepseek_flash_model == "deepseek-v4-flash"
+    assert settings.llm_deepseek_pro_model == "deepseek-v4-pro"
+    assert settings.llm_provider_priority == "D"
     get_settings.cache_clear()
 
 
-def test_knowledge_agent_configuration_is_independent(monkeypatch) -> None:
-    monkeypatch.setenv("UPSTREAM_API_KEY", "memory-key")
-    monkeypatch.setenv("UPSTREAM_MODEL", "memory-model")
-    monkeypatch.setenv("KNOWLEDGE_AGENT_API_KEY", "knowledge-key")
-    monkeypatch.setenv("KNOWLEDGE_AGENT_FLASH_MODEL", "deepseek-v4-flash")
-    monkeypatch.setenv("KNOWLEDGE_AGENT_PRO_MODEL", "deepseek-v4-pro")
-    monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "all")
-    get_settings.cache_clear()
+def test_llm_provider_priority_is_normalized_and_validated() -> None:
+    settings = Settings(
+        _env_file=None,
+        LLM_PROVIDER_PRIORITY=" m k d ",
+    )
+    assert settings.llm_provider_priority == "MKD"
 
-    settings = get_settings()
+    with pytest.raises(ValueError, match="同一模型代号"):
+        Settings(_env_file=None, LLM_PROVIDER_PRIORITY="MMD")
+    with pytest.raises(ValueError, match="M、K、D"):
+        Settings(_env_file=None, LLM_PROVIDER_PRIORITY="MX")
+
+
+def test_legacy_knowledge_agent_priority_alias_still_works() -> None:
+    settings = Settings(
+        _env_file=None,
+        KNOWLEDGE_AGENT_PROVIDER_PRIORITY="KD",
+    )
+
+    assert settings.llm_provider_priority == "KD"
+
+
+def test_knowledge_defaults_support_large_books_and_qwen_batch_limit() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.knowledge_max_document_bytes == 50 * 1024 * 1024
+    assert settings.knowledge_embedding_batch_size == 20
+    assert settings.llm_kimi_base_url == "https://api.moonshot.cn/v1"
+
+
+def test_shared_llm_provider_configuration_keeps_legacy_upstream_fallback(
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        UPSTREAM_API_KEY="memory-key",
+        UPSTREAM_MODEL="memory-model",
+        KNOWLEDGE_AGENT_API_KEY="knowledge-key",
+        KNOWLEDGE_AGENT_FLASH_MODEL="deepseek-v4-flash",
+        KNOWLEDGE_AGENT_PRO_MODEL="deepseek-v4-pro",
+        KNOWLEDGE_AGENT_EGRESS_POLICY="all",
+    )
 
     assert settings.upstream_api_key == "memory-key"
-    assert settings.knowledge_agent_api_key == "knowledge-key"
-    assert settings.knowledge_agent_api_key != settings.upstream_api_key
+    assert settings.llm_deepseek_api_key == "knowledge-key"
+    assert settings.llm_deepseek_api_key != settings.upstream_api_key
     assert settings.knowledge_agent_egress_policy == "all"
-    get_settings.cache_clear()
 
 
 def test_memory_and_knowledge_database_paths_must_be_distinct(monkeypatch, tmp_path) -> None:

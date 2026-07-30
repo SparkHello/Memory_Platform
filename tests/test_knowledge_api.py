@@ -78,6 +78,55 @@ def test_knowledge_rest_requires_valid_bearer_token(client) -> None:
             assert response.status_code == 401, (method, path, headers, response.text)
 
 
+def test_segmented_upload_requires_then_accepts_sensitivity_confirmation(
+    client,
+    auth_headers,
+) -> None:
+    headers = _headers(auth_headers, "alice")
+    text = "示例配置：api_key=sk-abcdefghijklmnop，仅供教材演示。"
+    begun = client.post(
+        "/knowledge/uploads",
+        headers=headers,
+        json={
+            "title": "教材示例",
+            "content_type": "text/plain",
+            "source_name": "examples.txt",
+            "sensitivity": "normal",
+        },
+    )
+    upload_id = begun.json()["upload_id"]
+    appended = client.put(
+        f"/knowledge/uploads/{upload_id}/parts/0",
+        headers=headers,
+        json={"text": text},
+    )
+    assert appended.status_code == 200
+    commit_body = {
+        "expected_parts": 1,
+        "expected_sha256": hashlib.sha256(text.encode()).hexdigest(),
+    }
+
+    warning = client.post(
+        f"/knowledge/uploads/{upload_id}/commit",
+        headers=headers,
+        json=commit_body,
+    )
+    assert warning.status_code == 409
+    assert (
+        warning.json()["detail"]["code"]
+        == "sensitivity_confirmation_required"
+    )
+
+    confirmed = client.post(
+        f"/knowledge/uploads/{upload_id}/commit",
+        headers=headers,
+        json={**commit_body, "confirm_sensitivity_override": True},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["document"]["sensitivity"] == "normal"
+    assert confirmed.json()["document"]["sensitivity_override_confirmed"] is True
+
+
 def test_knowledge_rest_upload_search_and_lossless_read(
     client,
     auth_headers,
@@ -295,3 +344,11 @@ def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers)
     assert payload["agent_enabled"] is False
     assert payload["agent_egress_policy"] == "none"
     assert payload["agent_timeout_seconds"] == 25.0
+    assert payload["agent_provider_priority"] == "D"
+    assert payload["agent_configured_providers"] == []
+    assert payload["agent_rate_limit_cooldown_seconds"] == 300.0
+    assert payload["llm_provider_priority"] == "D"
+    assert payload["llm_configured_providers"] == []
+    assert payload["llm_rate_limit_cooldown_seconds"] == 300.0
+    assert payload["max_document_bytes"] == 50 * 1024 * 1024
+    assert payload["embedding_batch_size"] == 20

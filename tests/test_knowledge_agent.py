@@ -6,6 +6,7 @@ import pytest
 
 from app.knowledge.agent import (
     KnowledgeAgentConfig,
+    KnowledgeProviderCooldowns,
     KnowledgeSearchAgent,
     OpenAICompatibleKnowledgeAgentClient,
 )
@@ -41,24 +42,33 @@ def _hit(
     }
 
 
-def _tool_response(name: str, arguments: dict, *, call_id: str = "call_1") -> dict:
+def _tool_response(
+    name: str,
+    arguments: dict,
+    *,
+    call_id: str = "call_1",
+    reasoning_content: str = "",
+) -> dict:
+    message = {
+        "role": "assistant",
+        "content": "这段内容不得成为最终正文",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        ],
+    }
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     return {
         "choices": [
             {
-                "message": {
-                    "role": "assistant",
-                    "content": "这段内容不得成为最终正文",
-                    "tool_calls": [
-                        {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments, ensure_ascii=False),
-                            },
-                        }
-                    ],
-                }
+                "message": message
             }
         ]
     }
@@ -490,6 +500,86 @@ async def test_openai_compatible_client_supports_fake_transport_without_network(
     assert captured["authorization"] == "Bearer test-key"
     assert captured["payload"]["model"] == "deepseek-v4-flash"
     assert captured["payload"]["stream"] is False
+    assert captured["payload"]["thinking"] == {"type": "enabled"}
+    assert "tool_choice" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_overrides", "expected_thinking"),
+    [
+        (
+            {
+                "provider_priority": "M",
+                "mimo_api_key": "mimo-key",
+                "api_key": "",
+            },
+            {"type": "enabled"},
+        ),
+        (
+            {
+                "provider_priority": "K",
+                "kimi_api_key": "kimi-key",
+                "api_key": "",
+            },
+            {"type": "enabled", "keep": "all"},
+        ),
+    ],
+)
+async def test_alternate_knowledge_providers_enable_thinking(
+    config_overrides: dict,
+    expected_thinking: dict,
+) -> None:
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [], "model": captured["model"]})
+
+    config = _config(**config_overrides)
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+    )
+    await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+
+    assert captured["thinking"] == expected_thinking
+    assert captured["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_agent_replays_reasoning_content_across_tool_rounds() -> None:
+    store = FakeStore([_hit()])
+    remote = FakeCompletionClient(
+        [
+            _tool_response(
+                "search_index",
+                {"query": "补充检索", "limit": 5, "document_refs": []},
+                reasoning_content="需要先补充检索。",
+            ),
+            _tool_response(
+                "select_references",
+                {"chunk_refs": [CHUNK_REF], "needs_pro": False},
+                reasoning_content="已有充分证据。",
+            ),
+        ]
+    )
+    agent = KnowledgeSearchAgent(store, _config(), client=remote)
+
+    result = await agent.search("查找资料", "alice")
+
+    assert result.selected_refs == [CHUNK_REF]
+    assistant_messages = [
+        message
+        for message in remote.calls[1]["messages"]
+        if message["role"] == "assistant"
+    ]
+    assert assistant_messages[0]["reasoning_content"] == "需要先补充检索。"
 
 
 @pytest.mark.asyncio
@@ -506,3 +596,189 @@ async def test_result_carries_baseline_candidates_without_a_second_search() -> N
     assert len(store.search_calls) == 1
     assert [item["chunk_ref"] for item in result.baseline_candidates] == [CHUNK_REF]
     assert result.metadata.baseline_refs == [CHUNK_REF]
+
+
+@pytest.mark.asyncio
+async def test_flash_provider_429_fails_over_and_is_skipped_during_cooldown() -> None:
+    now = {"value": 100.0}
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        model = payload["model"]
+        calls.append(model)
+        if model == "mimo-v2.5-pro-ultraspeed":
+            return httpx.Response(429, headers={"Retry-After": "60"})
+        return httpx.Response(
+            200,
+            json=_tool_response(
+                "select_references",
+                {"chunk_refs": [CHUNK_REF], "needs_pro": False},
+            ),
+        )
+
+    config = _config(
+        provider_priority="MKD",
+        mimo_api_key="mimo-key",
+        kimi_api_key="kimi-key",
+        rate_limit_cooldown_seconds=300,
+    )
+    cooldowns = KnowledgeProviderCooldowns(clock=lambda: now["value"])
+    transport = httpx.MockTransport(handler)
+
+    first_client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=transport,
+        cooldowns=cooldowns,
+    )
+    first = await first_client.create_chat_completion(
+        model=config.flash_model,
+        messages=[{"role": "user", "content": "test"}],
+        tools=[],
+        timeout_seconds=25,
+    )
+
+    second_client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=transport,
+        cooldowns=cooldowns,
+    )
+    second = await second_client.create_chat_completion(
+        model=config.flash_model,
+        messages=[{"role": "user", "content": "test again"}],
+        tools=[],
+        timeout_seconds=25,
+    )
+
+    assert calls == [
+        "mimo-v2.5-pro-ultraspeed",
+        "kimi-k2.7-code",
+        "kimi-k2.7-code",
+    ]
+    assert first["model"] == "kimi-k2.7-code"
+    assert second["model"] == "kimi-k2.7-code"
+
+    now["value"] += 300
+    await second_client.create_chat_completion(
+        model=config.flash_model,
+        messages=[{"role": "user", "content": "after cooldown"}],
+        tools=[],
+        timeout_seconds=25,
+    )
+    assert calls[-2:] == ["mimo-v2.5-pro-ultraspeed", "kimi-k2.7-code"]
+
+
+@pytest.mark.asyncio
+async def test_kimi_k27_knowledge_agent_uses_temperature_one() -> None:
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [], "model": "kimi-k2.7-code"})
+
+    config = _config(
+        provider_priority="K",
+        kimi_api_key="kimi-key",
+        kimi_model="kimi-k2.7-code",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+        cooldowns=KnowledgeProviderCooldowns(),
+    )
+
+    await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+
+    assert calls[0]["temperature"] == 1
+    assert calls[0]["thinking"] == {"type": "enabled", "keep": "all"}
+
+
+@pytest.mark.asyncio
+async def test_retry_after_longer_than_default_cooldown_is_respected() -> None:
+    monotonic_now = {"value": 10.0}
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content.decode("utf-8"))["model"]
+        calls.append(model)
+        if model == "mimo-v2.5-pro-ultraspeed":
+            return httpx.Response(429, headers={"Retry-After": "600"})
+        return httpx.Response(200, json={"choices": [], "model": model})
+
+    config = _config(
+        provider_priority="MK",
+        mimo_api_key="mimo-key",
+        kimi_api_key="kimi-key",
+        rate_limit_cooldown_seconds=300,
+    )
+    cooldowns = KnowledgeProviderCooldowns(clock=lambda: monotonic_now["value"])
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+        cooldowns=cooldowns,
+    )
+
+    await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+    monotonic_now["value"] += 301
+    await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+    assert calls == [
+        "mimo-v2.5-pro-ultraspeed",
+        "kimi-k2.7-code",
+        "kimi-k2.7-code",
+    ]
+
+    monotonic_now["value"] += 299
+    await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+    assert calls[-2:] == ["mimo-v2.5-pro-ultraspeed", "kimi-k2.7-code"]
+
+
+@pytest.mark.asyncio
+async def test_m_only_priority_uses_deepseek_as_implicit_429_fallback() -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content.decode("utf-8"))["model"]
+        calls.append(model)
+        if model == "mimo-v2.5-pro-ultraspeed":
+            return httpx.Response(429)
+        return httpx.Response(200, json={"choices": [], "model": model})
+
+    config = _config(
+        provider_priority="M",
+        mimo_api_key="mimo-key",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+        cooldowns=KnowledgeProviderCooldowns(),
+    )
+
+    response = await client.create_chat_completion(
+        model=config.flash_model,
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+    )
+
+    assert calls == ["mimo-v2.5-pro-ultraspeed", "deepseek-v4-flash"]
+    assert response["model"] == "deepseek-v4-flash"

@@ -334,7 +334,7 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
     assert current["content"] == original
 
 
-def test_knowledge_mcp_update_metadata_can_raise_but_not_lower_sensitivity(
+def test_knowledge_mcp_can_raise_sensitivity_but_cannot_bypass_user_confirmation(
     client,
     auth_headers,
 ) -> None:
@@ -361,27 +361,44 @@ def test_knowledge_mcp_update_metadata_can_raise_but_not_lower_sensitivity(
     assert upgraded["ok"] is True
     assert upgraded["document"]["sensitivity"] == "sensitive"
 
-    detected = _upload(
+    begun = _call(
         client,
         alice,
-        title="部署笔记",
-        parts=["deployment api_key=sk-abcdefghijklmnop must remain local"],
-    )
-    detected_ref = detected["document"]["document_ref"]
-    assert detected["document"]["sensitivity"] == "sensitive"
-
-    downgraded = _call(
-        client,
-        alice,
-        "manage_knowledge_document",
+        "begin_knowledge_upload",
         {
-            "action": "update_metadata",
-            "document_ref": detected_ref,
+            "title": "部署笔记",
+            "content_type": "text/markdown",
+            "source_name": "mcp-test.md",
+            "replace_document_ref": "",
             "sensitivity": "normal",
         },
     )
-    assert downgraded["ok"] is True
-    assert downgraded["document"]["sensitivity"] == "sensitive"
+    text = "deployment api_key=sk-abcdefghijklmnop must remain local"
+    appended = _call(
+        client,
+        alice,
+        "append_knowledge_upload",
+        {
+            "upload_id": begun["upload_id"],
+            "sequence": 0,
+            "text": text,
+        },
+    )
+    assert appended["ok"] is True
+
+    detected = _call(
+        client,
+        alice,
+        "commit_knowledge_upload",
+        {
+            "upload_id": begun["upload_id"],
+            "expected_parts": 1,
+            "expected_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        },
+    )
+    assert detected["ok"] is False
+    assert detected["error"]["code"] == "sensitivity_confirmation_required"
+    assert "Web 控制台" in detected["error"]["message"]
 
 
 def test_knowledge_mcp_enforces_part_limit_user_isolation_and_no_purge(

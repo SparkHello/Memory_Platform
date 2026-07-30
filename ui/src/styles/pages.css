@@ -912,6 +912,12 @@
   padding-right: 2px;
 }
 
+.evaluation-candidate-list {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
 .evaluation-label-item {
   display: grid;
   gap: 4px;
@@ -1003,6 +1009,7 @@
 
 .evaluation-candidate {
   display: grid;
+  flex: none;
   grid-template-columns: 18px minmax(0, 1fr) 18px;
   gap: 10px;
   align-items: start;
@@ -1565,4 +1572,3 @@
 .traverse-meta {
   margin-top: 8px;
 }
-

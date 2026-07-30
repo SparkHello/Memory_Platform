@@ -1,8 +1,10 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.llm.routing import normalize_provider_priority
 
 
 class Settings(BaseSettings):
@@ -29,26 +31,114 @@ class Settings(BaseSettings):
         validation_alias="KNOWLEDGE_DATABASE_PATH",
     )
     knowledge_max_document_bytes: int = Field(
-        default=10 * 1024 * 1024,
+        default=50 * 1024 * 1024,
         ge=1024,
         le=100 * 1024 * 1024,
         validation_alias="KNOWLEDGE_MAX_DOCUMENT_BYTES",
     )
-    knowledge_agent_base_url: str = Field(
+    knowledge_embedding_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=128,
+        validation_alias="KNOWLEDGE_EMBEDDING_BATCH_SIZE",
+    )
+    knowledge_embedding_min_cosine: float = Field(
+        default=0.25,
+        ge=-1.0,
+        le=1.0,
+        validation_alias="KNOWLEDGE_EMBEDDING_MIN_COSINE",
+    )
+    knowledge_hybrid_vector_weight: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        validation_alias="KNOWLEDGE_HYBRID_VECTOR_WEIGHT",
+    )
+    llm_deepseek_base_url: str = Field(
         default="https://api.deepseek.com",
-        validation_alias="KNOWLEDGE_AGENT_BASE_URL",
+        validation_alias=AliasChoices(
+            "LLM_DEEPSEEK_BASE_URL",
+            "KNOWLEDGE_AGENT_BASE_URL",
+        ),
     )
-    knowledge_agent_api_key: str = Field(
+    llm_deepseek_api_key: str = Field(
         default="",
-        validation_alias="KNOWLEDGE_AGENT_API_KEY",
+        validation_alias=AliasChoices(
+            "LLM_DEEPSEEK_API_KEY",
+            "KNOWLEDGE_AGENT_API_KEY",
+        ),
     )
-    knowledge_agent_flash_model: str = Field(
+    llm_deepseek_flash_model: str = Field(
         default="deepseek-v4-flash",
-        validation_alias="KNOWLEDGE_AGENT_FLASH_MODEL",
+        validation_alias=AliasChoices(
+            "LLM_DEEPSEEK_FLASH_MODEL",
+            "KNOWLEDGE_AGENT_FLASH_MODEL",
+        ),
     )
-    knowledge_agent_pro_model: str = Field(
+    llm_deepseek_pro_model: str = Field(
         default="deepseek-v4-pro",
-        validation_alias="KNOWLEDGE_AGENT_PRO_MODEL",
+        validation_alias=AliasChoices(
+            "LLM_DEEPSEEK_PRO_MODEL",
+            "KNOWLEDGE_AGENT_PRO_MODEL",
+        ),
+    )
+    llm_provider_priority: str = Field(
+        default="D",
+        validation_alias=AliasChoices(
+            "LLM_PROVIDER_PRIORITY",
+            "KNOWLEDGE_AGENT_PROVIDER_PRIORITY",
+        ),
+    )
+    llm_mimo_base_url: str = Field(
+        default="https://api.xiaomimimo.com/v1",
+        validation_alias=AliasChoices(
+            "LLM_MIMO_BASE_URL",
+            "KNOWLEDGE_AGENT_MIMO_BASE_URL",
+        ),
+    )
+    llm_mimo_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "LLM_MIMO_API_KEY",
+            "KNOWLEDGE_AGENT_MIMO_API_KEY",
+        ),
+    )
+    llm_mimo_model: str = Field(
+        default="mimo-v2.5-pro-ultraspeed",
+        validation_alias=AliasChoices(
+            "LLM_MIMO_MODEL",
+            "KNOWLEDGE_AGENT_MIMO_MODEL",
+        ),
+    )
+    llm_kimi_base_url: str = Field(
+        default="https://api.moonshot.cn/v1",
+        validation_alias=AliasChoices(
+            "LLM_KIMI_BASE_URL",
+            "KNOWLEDGE_AGENT_KIMI_BASE_URL",
+        ),
+    )
+    llm_kimi_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "LLM_KIMI_API_KEY",
+            "KNOWLEDGE_AGENT_KIMI_API_KEY",
+        ),
+    )
+    llm_kimi_model: str = Field(
+        default="kimi-k2.7-code",
+        validation_alias=AliasChoices(
+            "LLM_KIMI_MODEL",
+            "KNOWLEDGE_AGENT_KIMI_MODEL",
+        ),
+    )
+    llm_rate_limit_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=1.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "LLM_RATE_LIMIT_COOLDOWN_SECONDS",
+            "KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS",
+        ),
     )
     knowledge_agent_egress_policy: Literal["none", "normal", "all"] = Field(
         default="none",
@@ -69,6 +159,11 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="ALLOW_SENSITIVE_EGRESS",
     )
+
+    @field_validator("llm_provider_priority")
+    @classmethod
+    def _validate_llm_provider_priority(cls, value: str) -> str:
+        return normalize_provider_priority(value)
 
     # 衰减引擎 (Ebbinghaus)
     decay_lambda_default: float = Field(default=0.02, validation_alias="DECAY_LAMBDA_DEFAULT")

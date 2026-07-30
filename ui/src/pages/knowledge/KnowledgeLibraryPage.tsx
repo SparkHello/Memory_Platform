@@ -35,7 +35,7 @@ import type {
   MemorySensitivity
 } from "../../types";
 import { copyText, downloadFile } from "../../utils/files";
-import { dateText, errorMessage, shortId } from "../../utils/format";
+import { dateText, displayText, errorMessage, shortId } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 import {
   knowledgeDocumentBytes,
@@ -51,6 +51,7 @@ export function KnowledgeLibraryPage({
   documentId,
   notify,
   confirm,
+  maxDocumentBytes,
   onOpenDocument,
   onCloseDocument,
   onChanged
@@ -59,6 +60,7 @@ export function KnowledgeLibraryPage({
   documentId: string | null;
   notify: Notify;
   confirm: ConfirmFn;
+  maxDocumentBytes?: number;
   onOpenDocument: (id: string) => void;
   onCloseDocument: () => void;
   onChanged: () => void;
@@ -70,6 +72,7 @@ export function KnowledgeLibraryPage({
         documentId={documentId}
         notify={notify}
         confirm={confirm}
+        maxDocumentBytes={maxDocumentBytes}
         onBack={onCloseDocument}
         onChanged={onChanged}
       />
@@ -80,6 +83,7 @@ export function KnowledgeLibraryPage({
       api={api}
       notify={notify}
       confirm={confirm}
+      maxDocumentBytes={maxDocumentBytes}
       onOpenDocument={onOpenDocument}
       onChanged={onChanged}
     />
@@ -90,12 +94,14 @@ function KnowledgeListPage({
   api,
   notify,
   confirm,
+  maxDocumentBytes,
   onOpenDocument,
   onChanged
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
+  maxDocumentBytes?: number;
   onOpenDocument: (id: string) => void;
   onChanged: () => void;
 }) {
@@ -232,12 +238,13 @@ function KnowledgeListPage({
           <div className="panel-header">
             <div>
               <h2>添加长文本</h2>
-              <p className="muted">粘贴正文或选择本机 UTF-8 文本文件。</p>
+              <p className="muted">粘贴正文，或选择本机 TXT、Markdown、PDF、DOCX、EPUB 文件。</p>
             </div>
           </div>
           <KnowledgeUploadForm
             api={api}
             notify={notify}
+            maxDocumentBytes={maxDocumentBytes}
             onCancel={() => setShowUpload(false)}
             onComplete={(result) => {
               setShowUpload(false);
@@ -293,7 +300,7 @@ function KnowledgeListPage({
                       <span>{document.source_name || shortId(knowledgeDocumentRef(document))}</span>
                     </button>
                   </td>
-                  <td>{contentTypeLabel(document.content_type)}</td>
+                  <td>{documentFormatLabel(document)}</td>
                   <td>{formatBytes(knowledgeDocumentBytes(document))}</td>
                   <td>{documentVersionNumber(document) ? `v${documentVersionNumber(document)}` : "—"}</td>
                   <td><IndexBadge status={documentIndexStatus(document)} /></td>
@@ -361,6 +368,7 @@ function KnowledgeDetailPage({
   documentId,
   notify,
   confirm,
+  maxDocumentBytes,
   onBack,
   onChanged
 }: {
@@ -368,6 +376,7 @@ function KnowledgeDetailPage({
   documentId: string;
   notify: Notify;
   confirm: ConfirmFn;
+  maxDocumentBytes?: number;
   onBack: () => void;
   onChanged: () => void;
 }) {
@@ -384,6 +393,8 @@ function KnowledgeDetailPage({
   const [title, setTitle] = useState("");
   const [sourceName, setSourceName] = useState("");
   const [sensitivity, setSensitivity] = useState<MemorySensitivity>("normal");
+  const [tagsText, setTagsText] = useState("");
+  const [metadataText, setMetadataText] = useState("");
   const [purgeOpen, setPurgeOpen] = useState(false);
   // 正文读取请求序号：每次发起新读取（含切换版本、清空）都会递增，
   // 在途的旧请求（尤其是“继续加载”的 append）resolve 后据此丢弃，避免串版本追加和 loading 态串扰。
@@ -398,6 +409,12 @@ function KnowledgeDetailPage({
       setTitle(next.document.title);
       setSourceName(next.document.source_name || "");
       setSensitivity(next.document.sensitivity || "normal");
+      setTagsText((next.document.tags || []).join(", "));
+      setMetadataText(
+        next.document.metadata && Object.keys(next.document.metadata).length
+          ? JSON.stringify(next.document.metadata, null, 2)
+          : ""
+      );
       const current = currentVersion(next);
       const latest = latestVersion(next.versions);
       setSelectedVersionRef((existing) =>
@@ -460,7 +477,9 @@ function KnowledgeDetailPage({
       await api.updateKnowledgeDocument(detail.document.id, {
         title: title.trim(),
         source_name: sourceName.trim(),
-        sensitivity
+        sensitivity,
+        tags: parseKnowledgeTags(tagsText),
+        metadata: parseKnowledgeMetadata(metadataText)
       });
       notify("文档信息已更新", "success");
       setEditing(false);
@@ -574,12 +593,22 @@ function KnowledgeDetailPage({
       />
 
       <section className="knowledge-meta-strip" aria-label="文档信息">
-        <div><span>格式</span><strong>{contentTypeLabel(document.content_type)}</strong></div>
+        <div><span>格式</span><strong>{documentFormatLabel(document)}</strong></div>
         <div><span>大小</span><strong>{formatBytes(knowledgeDocumentBytes(document))}</strong></div>
         <div><span>当前版本</span><strong>{documentVersionNumber(document) ? `v${documentVersionNumber(document)}` : "—"}</strong></div>
         <div><span>敏感级别</span><Badge value={document.sensitivity || "normal"} /></div>
         <div><span>索引状态</span><IndexBadge status={documentIndexStatus(document)} /></div>
       </section>
+
+      {document.sensitivity_override_confirmed && (
+        <div className="notice warning knowledge-sensitivity-audit">
+          <ShieldAlert size={17} />
+          <span>
+            本地规则曾检测为“{displayText(document.detected_sensitivity || "sensitive")}”，
+            用户已明确确认按“{displayText(document.sensitivity)}”处理。
+          </span>
+        </div>
+      )}
 
       {editing && (
         <section className="panel knowledge-metadata-editor">
@@ -588,6 +617,8 @@ function KnowledgeDetailPage({
             <label className="field-block knowledge-title-field"><span>标题</span><input value={title} maxLength={240} onChange={(event) => setTitle(event.target.value)} /></label>
             <label className="field-block knowledge-source-field"><span>来源名称</span><input value={sourceName} maxLength={500} onChange={(event) => setSourceName(event.target.value)} /></label>
             <label className="field-block"><span>敏感级别</span><select value={sensitivity} onChange={(event) => setSensitivity(event.target.value as MemorySensitivity)}><option value="normal">普通</option><option value="private">私密</option><option value="sensitive">敏感</option></select></label>
+            <label className="field-block knowledge-source-field"><span>标签</span><input value={tagsText} maxLength={2000} onChange={(event) => setTagsText(event.target.value)} placeholder="用逗号分隔" /></label>
+            <label className="field-block knowledge-source-field"><span>结构化元数据（JSON）</span><textarea rows={4} value={metadataText} onChange={(event) => setMetadataText(event.target.value)} placeholder={'{"department":"研发","year":2026}'} /></label>
           </div>
           <div className="button-row end"><button className="ghost-button" type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button><button className="primary-button" type="button" disabled={saving || !title.trim()} onClick={() => void saveMetadata()}><Save size={16} />{saving ? "正在保存" : "保存"}</button></div>
         </section>
@@ -599,11 +630,14 @@ function KnowledgeDetailPage({
           <KnowledgeUploadForm
             api={api}
             notify={notify}
+            maxDocumentBytes={maxDocumentBytes}
             replaceDocumentRef={knowledgeDocumentRef(document)}
             initialTitle={document.title}
             initialSourceName={document.source_name}
             initialSensitivity={document.sensitivity}
             initialContentType={document.content_type}
+            initialTags={document.tags}
+            initialMetadata={document.metadata}
             onCancel={() => setShowNewVersion(false)}
             onComplete={(result) => {
               setShowNewVersion(false);
@@ -655,6 +689,9 @@ function KnowledgeDetailPage({
                   </button>
                   <div className="knowledge-version-actions">
                     <IndexBadge status={version.index_status} />
+                    {version.embedding_status && version.embedding_status !== "disabled" && (
+                      <IndexBadge status={`向量:${version.embedding_status}`} />
+                    )}
                     {version.index_status === "failed" && <button className="ghost-button compact" type="button" onClick={() => void reindex(version)}><RefreshCcw size={13} />重建索引</button>}
                     {!isCurrent && document.status === "active" && <button className="ghost-button compact" type="button" onClick={() => void restoreVersion(version)}><FileClock size={13} />恢复为新版本</button>}
                   </div>
@@ -714,8 +751,12 @@ function PurgeKnowledgeDialog({
 }
 
 function IndexBadge({ status }: { status: string }) {
-  const label = status === "ready" || status === "indexed" ? "已索引" : status === "indexing" ? "索引中" : status === "failed" ? "失败" : "等待中";
-  return <span className={`knowledge-index-badge knowledge-index-${status}`}>{label}</span>;
+  const isEmbedding = status.startsWith("向量:");
+  const value = isEmbedding ? status.slice(3) : status;
+  const label = isEmbedding
+    ? value === "ready" ? "向量就绪" : value === "partial" ? "部分向量" : value === "failed" ? "向量失败" : "向量构建中"
+    : value === "ready" || value === "indexed" ? "已索引" : value === "indexing" ? "索引中" : value === "failed" ? "失败" : "等待中";
+  return <span className={`knowledge-index-badge knowledge-index-${value}`}>{label}</span>;
 }
 
 function currentVersion(detail: KnowledgeDocumentDetail): KnowledgeVersion | undefined {
@@ -745,7 +786,36 @@ function documentIndexStatus(document: KnowledgeDocument): string {
 function contentTypeLabel(value: string): string {
   if (value === "text/markdown") return "Markdown";
   if (value === "text/plain") return "纯文本";
+  if (value === "application/pdf") return "PDF";
+  if (value === "application/epub+zip") return "EPUB";
+  if (value.includes("wordprocessingml")) return "Word";
   return value || "文本";
+}
+
+function documentFormatLabel(document: KnowledgeDocument): string {
+  const sourceFormat = document.metadata?.source_format;
+  if (sourceFormat === "pdf") return "PDF";
+  if (sourceFormat === "docx") return "Word";
+  if (sourceFormat === "epub") return "EPUB";
+  return contentTypeLabel(document.content_type);
+}
+
+function parseKnowledgeTags(value: string): string[] {
+  return [...new Set(value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))];
+}
+
+function parseKnowledgeMetadata(value: string): Record<string, string | number | boolean> {
+  if (!value.trim()) return {};
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("结构化元数据必须是 JSON 对象");
+  }
+  for (const entry of Object.values(parsed as Record<string, unknown>)) {
+    if (!["string", "number", "boolean"].includes(typeof entry)) {
+      throw new Error("元数据值仅支持字符串、数字或布尔值");
+    }
+  }
+  return parsed as Record<string, string | number | boolean>;
 }
 
 function readPageText(page: KnowledgeReadResponse): string {

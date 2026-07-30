@@ -491,6 +491,15 @@ async def _search_all(
             hit.memory.id: list(hit.channels)
             for hit in hits
         }
+        predicted_scores = {
+            hit.memory.id: {
+                "relevance": hit.relevance,
+                "topic_score": hit.topic_score,
+                "total_score": hit.total_score,
+                "score_breakdown": dict(hit.score_breakdown),
+            }
+            for hit in hits
+        }
         retrieval_mode, fallback_reason = _actual_retrieval_mode(
             requested_mode=requested_mode,
             embedding_available=embedding_tracker.available,
@@ -511,6 +520,7 @@ async def _search_all(
                 "fallback_reason": fallback_reason,
                 "embedding_available": embedding_tracker.available if requested_mode == "embedding" else None,
                 "predicted_channels": predicted_channels,
+                "predicted_scores": predicted_scores,
             }
         )
         rows.append(row)

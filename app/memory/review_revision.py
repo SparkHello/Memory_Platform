@@ -7,6 +7,7 @@ import hmac
 import json
 from typing import Any
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.llm.client import OpenAICompatibleClient
@@ -37,6 +38,9 @@ class ReviewRevisionError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+_REVIEW_REVISION_TOOL_NAME = "submit_memory_review_revision"
 
 
 async def find_related_review_revision_memories(
@@ -154,11 +158,23 @@ async def preview_review_revision(
         model="memory-review-editor",
         messages=messages,
         temperature=0.0,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
         stream=False,
     )
     try:
-        response = await llm_client.create_chat_completion(request=request, messages=messages)
-        raw_output = response["choices"][0]["message"]["content"]
+        response = await llm_client.create_chat_completion(
+            request=request,
+            messages=messages,
+            thinking="enabled",
+            structured_tool=_review_revision_structured_tool(),
+        )
+        raw_output = _review_revision_raw_output(response["choices"][0]["message"])
+    except HTTPException as exc:
+        raise ReviewRevisionError(
+            exc.status_code,
+            f"调用修改模型失败：{exc.detail}",
+        ) from exc
     except Exception as exc:
         raise ReviewRevisionError(502, f"调用修改模型失败：{exc}") from exc
 
@@ -205,6 +221,78 @@ async def preview_review_revision(
         reason=reason,
     )
     return preview
+
+
+def _review_revision_structured_tool() -> dict[str, Any]:
+    operation_properties: dict[str, Any] = {
+        "operation": {
+            "type": "string",
+            "enum": ["update", "merge", "archive", "no_change"],
+        },
+        "reason": {"type": "string"},
+        "memory_ids": {"type": "array", "items": {"type": "string"}},
+        "target_memory_id": {"type": ["string", "null"]},
+        "content": {"type": ["string", "null"]},
+        "type": {
+            "type": ["string", "null"],
+            "enum": [
+                "episodic",
+                "semantic",
+                "procedural",
+                "emotional",
+                "reflective",
+                None,
+            ],
+        },
+        "importance": {"type": ["integer", "null"], "minimum": 1, "maximum": 10},
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "valence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "arousal": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "stability": {
+            "type": ["string", "null"],
+            "enum": ["temporary", "medium", "stable", None],
+        },
+        "valid_until": {"type": ["string", "null"]},
+        "sensitivity": {
+            "type": ["string", "null"],
+            "enum": ["normal", "private", "sensitive", None],
+        },
+    }
+    return {
+        "name": _REVIEW_REVISION_TOOL_NAME,
+        "description": "返回记忆体检修改预览；只使用传入的 memory id。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": operation_properties,
+                        "required": ["operation", "memory_ids", "reason"],
+                    },
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["operations"],
+        },
+    }
+
+
+def _review_revision_raw_output(message: dict[str, Any]) -> str:
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        if function.get("name") != _REVIEW_REVISION_TOOL_NAME:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            return arguments
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
 
 
 def apply_review_revision(

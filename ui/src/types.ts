@@ -619,6 +619,7 @@ export interface TraversalResponse {
 
 export type KnowledgeDocumentStatus = "active" | "deleted";
 export type KnowledgeIndexStatus = "pending" | "indexing" | "ready" | "indexed" | "failed";
+export type KnowledgeEmbeddingStatus = "pending" | "indexing" | "ready" | "partial" | "failed" | "disabled";
 export type KnowledgeSearchQuality = "fast" | "balanced" | "deep";
 
 export interface KnowledgeVersion {
@@ -636,6 +637,10 @@ export interface KnowledgeVersion {
   content?: string;
   index_status: KnowledgeIndexStatus;
   index_error?: string | null;
+  embedding_status?: KnowledgeEmbeddingStatus;
+  embedding_model?: string;
+  embedded_at?: string | null;
+  embedding_error?: string | null;
   created_at: string;
 }
 
@@ -648,6 +653,10 @@ export interface KnowledgeDocument {
   source_name: string;
   content_type: string;
   sensitivity: MemorySensitivity;
+  detected_sensitivity?: MemorySensitivity;
+  sensitivity_override_confirmed?: boolean;
+  tags?: string[];
+  metadata?: Record<string, string | number | boolean>;
   status: KnowledgeDocumentStatus;
   current_version_id?: string | null;
   current_version_ref?: string | null;
@@ -688,6 +697,23 @@ export interface KnowledgeStatus {
   agent_enabled?: boolean;
   agent_egress_policy?: string;
   agent_timeout_seconds?: number;
+  agent_provider_priority?: string;
+  agent_configured_providers?: string[];
+  agent_rate_limit_cooldown_seconds?: number;
+  llm_provider_priority?: string;
+  llm_configured_providers?: string[];
+  llm_rate_limit_cooldown_seconds?: number;
+  agent_mimo_model?: string;
+  agent_kimi_model?: string;
+  agent_flash_model?: string;
+  agent_pro_model?: string;
+  sensitive_egress_enabled?: boolean;
+  embedding_enabled?: boolean;
+  embedding_model?: string;
+  max_document_bytes?: number;
+  embedding_batch_size?: number;
+  hybrid_vector_weight?: number;
+  embedding_min_cosine?: number;
 }
 
 export interface KnowledgeUploadSession {
@@ -703,6 +729,16 @@ export interface KnowledgeUploadCommitResult {
   created?: boolean;
   deduplicated?: boolean;
   duplicate?: boolean;
+  embedding?: {
+    status?: KnowledgeEmbeddingStatus;
+    stored?: number;
+    total?: number;
+  };
+  import?: {
+    source_format?: string;
+    page_count?: number | null;
+    warnings?: string[];
+  };
 }
 
 export interface KnowledgeSearchHit {
