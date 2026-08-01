@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import base64
@@ -314,11 +314,17 @@ class KnowledgeStore:
                 )
                 """
             )
-            self._ensure_documents_source_document_ref(connection)
-            self._ensure_document_metadata_columns(connection)
-            self._ensure_document_sensitivity_columns(connection)
-            self._ensure_version_embedding_columns(connection)
-            self._ensure_upload_metadata_columns(connection)
+            self._run_migrations(connection)
+
+    @staticmethod
+    def _run_migrations(connection: sqlite3.Connection) -> None:
+        """按 PRAGMA user_version 顺序执行一次性的 schema/数据迁移。"""
+        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        for version, step in _KNOWLEDGE_SCHEMA_MIGRATIONS:
+            if current >= version:
+                continue
+            step(connection)
+            connection.execute(f"PRAGMA user_version = {version}")
 
     @staticmethod
     def _ensure_documents_source_document_ref(connection: sqlite3.Connection) -> None:
@@ -3299,3 +3305,23 @@ def _last_touched_line(text: str, start: int, end: int) -> int:
     if end <= start:
         return _line_at(text, start)
     return text.count("\n", 0, end - 1) + 1
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations (PRAGMA user_version)
+#
+# v1 汇总历史遗留的一次性列补齐（老库升级路径）；新库建表已含全部列，
+# v1 对空表运行无副作用。新增 schema 变更时在此追加 (2, _knowledge_migration_v2)。
+
+
+def _knowledge_migration_v1(connection: sqlite3.Connection) -> None:
+    KnowledgeStore._ensure_documents_source_document_ref(connection)
+    KnowledgeStore._ensure_document_metadata_columns(connection)
+    KnowledgeStore._ensure_document_sensitivity_columns(connection)
+    KnowledgeStore._ensure_version_embedding_columns(connection)
+    KnowledgeStore._ensure_upload_metadata_columns(connection)
+
+
+_KNOWLEDGE_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
+    (1, _knowledge_migration_v1),
+]
