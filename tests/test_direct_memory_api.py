@@ -867,6 +867,30 @@ class TestReEmbedEndpoint:
         )
         assert response.status_code == 400
 
+    def test_re_embed_scan_with_fake_embedding(self, client, auth_headers):
+        """scan 模式走通缺失向量扫描路径（回归：_embedding_vector 曾漏改导致 NameError）。"""
+        import app.api.deps as deps
+
+        class FakeEmbeddingClient:
+            def __init__(self) -> None:
+                self.dimensions = 4
+
+            async def embed(self, text: str) -> list[float]:
+                return [0.1, 0.2, 0.3, 0.4]
+
+        client.app.dependency_overrides[deps.get_embedding_client] = (
+            lambda: FakeEmbeddingClient()
+        )
+        response = client.post(
+            "/memories/re-embed",
+            json={"scan": True},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["re_embedded"] == 0
+        assert payload["memory_ids"] == []
+
 
 class TestArchiveExpiredEndpoint:
     """POST /memories/archive-expired"""

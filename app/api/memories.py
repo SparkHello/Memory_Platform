@@ -2086,7 +2086,7 @@ def _find_memories_needing_embedding(
         if not raw:
             memory_ids.append(row["id"])
             continue
-        vector = _embedding_vector(raw)
+        vector = parse_embedding_vector(raw)
         if vector is None:
             memory_ids.append(row["id"])
             continue
