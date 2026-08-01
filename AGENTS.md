@@ -26,36 +26,43 @@
 
 安装开发依赖：
 
-```powershell
-cd C:\Users\spari\Documents\Memory\memory-gateway
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+```bash
+cd /Users/spark/My_Memory
+python3 -m venv .venv
+source .venv/bin/activate
+.venv/bin/pip install -e ".[dev]"
 ```
 
 启动开发服务：
 
-```powershell
-.\.venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
+```bash
+.venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2026
+```
+
+也可以用 `scripts/dev.sh` 一键启动（macOS/Linux）：
+
+```bash
+scripts/dev.sh        # dev：后端热重载 + Vite 开发服务器
+scripts/dev.sh prod   # prod：只启动后端，由 /ui 提供 ui/dist 构建产物
 ```
 
 健康检查：
 
-```powershell
+```bash
 curl http://localhost:2026/health
 ```
 
 运行测试：
 
-```powershell
-pytest
-# 如果 pytest 不在 PATH 中，使用项目虚拟环境：
-.\.venv\Scripts\python -m pytest
+```bash
+.venv/bin/python -m pytest
+# 或先激活虚拟环境，再直接使用 pytest：
+source .venv/bin/activate && pytest
 ```
 
 常用定向测试：
 
-```powershell
+```bash
 pytest tests/test_mcp_server.py
 pytest tests/test_memory_extraction.py
 pytest tests/test_memory_store.py
@@ -65,43 +72,56 @@ pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test
 
 真实库只读巡检：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --env-file .env
-.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --json
+```bash
+.venv/bin/python scripts/audit_memory_db.py --database data/memory.db --env-file .env
+.venv/bin/python scripts/audit_memory_db.py --database data/memory.db --json
 ```
 
 记忆机制健康度诊断（只读，判定扇区分化、生命周期、temporal KG、图结构是否被真实数据激活）：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db
+```bash
+.venv/bin/python scripts/diagnose_memory_health.py --database data/memory.db
 ```
 
 微型召回评测（只读快照真实库到 eval/，再用人工标注 query 给 search_memory 打分，record_usage=False 不污染数据）：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\eval_recall.py --init --database data\memory.db
-# 编辑 eval\labels.jsonl 为每个 query 填 relevant_ids
-.\.venv\Scripts\python.exe scripts\eval_recall.py --run
+```bash
+.venv/bin/python scripts/eval_recall.py --init --database data/memory.db
+# 编辑 eval/labels.jsonl 为每个 query 填 relevant_ids
+.venv/bin/python scripts/eval_recall.py --run
 ```
 
 同一套诊断/评测能力也暴露在 Web Console 的“评测闭环”页。该页只把真实库快照到 `EVAL_DIR`（默认 `eval/`，已 gitignore），标注和结果都留在本地工作区。
 
 查看 LAN / Tailscale 地址：
 
+以下 PowerShell 脚本仅适用于 Windows（一次性打印 LAN / Tailscale 的访问地址）：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1
 powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
 ```
 
+macOS/Linux 可手动查看：
+
+```bash
+# 本机局域网 IPv4（en0 通常是 Wi-Fi；有线网卡可能是 en1 等）
+ipconfig getifaddr en0
+# Tailscale IPv4（已安装并登录时）
+tailscale ip -4
+```
+
 前端 UI 构建：
 
-```powershell
+```bash
 cd ui
 npm install
 npm run build
 ```
 
 Windows 服务脚本：
+
+仅适用于 Windows（NSSM 安装/卸载系统服务）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
@@ -110,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 ## 开发工作流
 
-- 项目根目录是 `C:\Users\spari\Documents\Memory\memory-gateway`，外层 `Memory` 目录不是仓库根。
+- 项目根目录是 `/Users/spark/My_Memory`，不要误把外层目录当作仓库根。
 - 修改前先跑 `git status --short`。如果只看到 Git 读取用户级 ignore 的权限警告，但没有文件列表，通常表示工作区干净。
 - 搜索优先用 `rg` / `rg --files`，再按任务读取相关模块；不要只凭 README 推断实现。
 - 文档改动通常不需要跑完整测试；代码、接口、schema 或保存规则变更需要跑相关定向测试，风险较大时再跑完整 `pytest`。
@@ -190,7 +210,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `docs/client_integration.md`：Kelivo/iOS 接入说明。维护 MCP 原文提交原则、temporal key 填写边界，以及对外把 `usage_count` 解释为 `activation_count` 的文案。
 - `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`；“对话上下文”页同时展示 `/v1` 自动分支树和按 conversation ID 保存的近期摘要；“用量与费用”页展示实际模型、Token、可计费金额、完整度和价格来源。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
-- `scripts/`：Windows PowerShell 辅助脚本。
+- `scripts/`：Python 辅助工具、macOS/Linux 一键启动脚本 `dev.sh`，以及仅适用于 Windows 的 PowerShell 服务脚本。
 
 ## 测试选择指南
 
@@ -202,7 +222,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
 | SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_schema_migrations.py tests/test_memory_store.py` |
 | 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
-| 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts\audit_memory_db.py --database data\memory.db --env-file .env` |
+| 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts/audit_memory_db.py --database data/memory.db --env-file .env` |
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
 | LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_memory_extraction.py` |
 | 模型用量、官方价格映射、实际 provider 归账 | `pytest tests/test_model_usage.py tests/test_llm_client.py tests/test_chat_gateway.py tests/test_chat_streaming.py` |
@@ -221,7 +241,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 记忆和知识导出都不会包含 embedding；知识 restore/reindex 会自动重建当前版本的 chunk embedding，其他迁移场景仍需重新生成。
 - JSON 导出中的核心记忆历史和决策日志仅供审计，restore 不写回；响应会显式列出这些分区。
 - 永久删除会清理当前库与本地 eval 工作区，但无法删除用户已经复制到外部的导出或备份。
-- Windows 服务脚本包含本机绝对路径和固定端口 2026。
+- Windows 服务脚本（仅适用于 Windows）包含本机绝对路径和固定端口 2026。
 
 ## 不要随便修改的地方
 

@@ -68,14 +68,14 @@ docs/               客户端接入和产品路线文档
 
 ## 快速启动
 
-```powershell
-cd C:\path\to\memory-gateway
+```bash
+cd /Users/spark/My_Memory
 
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-Copy-Item .env.example .env
+cp .env.example .env
 ```
 
 编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及 `/v1` 对话代理和记忆提取共用的上游模型：
@@ -118,13 +118,25 @@ LLM_RATE_LIMIT_COOLDOWN_SECONDS=300
 
 启动后端：
 
-```powershell
-uvicorn app.main:app --host 0.0.0.0 --port 2026
+```bash
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 2026
 ```
+
+也可以用仓库自带的 `scripts/dev.sh` 一键启动（macOS/Linux，要求已有 `.venv` 与 `.env`）：
+
+```bash
+# dev 模式：后端热重载 + Vite 开发服务器，前端改动即时生效
+scripts/dev.sh
+
+# prod 模式：只启动后端，由 /ui 提供 ui/dist 的构建产物
+scripts/dev.sh prod
+```
+
+端口默认 `2026`，可用环境变量 `PORT` 覆盖（如 `PORT=3000 scripts/dev.sh`）。
 
 构建 Web 控制台：
 
-```powershell
+```bash
 cd ui
 npm install
 npm run build
@@ -132,7 +144,7 @@ npm run build
 
 构建产物在 `ui/dist`，FastAPI 会挂载到 `/ui`。开发前端时也可以使用：
 
-```powershell
+```bash
 cd ui
 npm run dev
 ```
@@ -146,13 +158,24 @@ npm run dev
 | MCP | `http://localhost:2026/mcp` |
 | OpenAI-compatible base URL | `http://localhost:2026/v1` |
 
-`localhost` 只适用于与网关运行在同一台机器上的客户端。Android/iOS 上的 `localhost` 指向手机自身；手机上的 FLIT 应使用运行网关电脑的局域网或 Tailscale 地址：
+`localhost` 只适用于与网关运行在同一台机器上的客户端。Android/iOS 上的 `localhost` 指向手机自身；手机上的 FLIT 应使用运行网关电脑的局域网或 Tailscale 地址。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
+macOS/Linux 上查看本机地址：
+
+```bash
+# 本机局域网 IPv4（en0 通常是 Wi-Fi；有线网卡可能是 en1 等）
+ipconfig getifaddr en0
+# Tailscale IPv4（已安装并登录时）
+tailscale ip -4
 ```
 
-服务需要以 `--host 0.0.0.0` 启动，并允许 Windows 防火墙在可信私有网络中访问端口 `2026`。不要把该端口无鉴权暴露到公网；远程请求仍必须携带 `GATEWAY_API_KEY`。
+> 仅适用于 Windows：`scripts\show-access-urls.ps1` 会一次性打印 LAN / Tailscale 的 MCP、Web 控制台和健康检查地址。
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
+> ```
+
+服务需要以 `--host 0.0.0.0` 启动。Windows 上需允许 Windows 防火墙在可信私有网络中访问端口 `2026`（仅 Windows）；macOS 若开启应用防火墙，首次启动时允许 Python/uvicorn 接受传入连接即可。不要把该端口无鉴权暴露到公网；远程请求仍必须携带 `GATEWAY_API_KEY`。
 
 除 `/health` 外，受保护接口都需要 Bearer token。`X-User-Id` 可选，省略时使用 `default`：
 
@@ -163,11 +186,11 @@ X-User-Id: default
 
 启动后可先做两步只读验证：
 
-```powershell
-curl.exe http://localhost:2026/health
-curl.exe `
-  -H "Authorization: Bearer <GATEWAY_API_KEY>" `
-  -H "X-User-Id: default" `
+```bash
+curl http://localhost:2026/health
+curl \
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" \
+  -H "X-User-Id: default" \
   http://localhost:2026/v1/models
 ```
 
@@ -331,10 +354,10 @@ L2 命中时仍会校验当前用户的记忆更新时间和活跃数量，并�
 
 查看当前用户、当前服务进程启动以来的累计命中率：
 
-```powershell
-curl.exe `
-  -H "Authorization: Bearer <GATEWAY_API_KEY>" `
-  -H "X-User-Id: default" `
+```bash
+curl \
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" \
+  -H "X-User-Id: default" \
   http://localhost:2026/memories/cache-stats
 ```
 
@@ -580,56 +603,58 @@ curl.exe `
 
 后端测试：
 
-```powershell
-pytest
+```bash
+.venv/bin/python -m pytest
 ```
 
 前端构建：
 
-```powershell
+```bash
 cd ui
 npm run build
 ```
 
 只读真实数据库审计：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --env-file .env
-.\.venv\Scripts\python.exe scripts\audit_memory_db.py --database data\memory.db --json
+```bash
+.venv/bin/python scripts/audit_memory_db.py --database data/memory.db --env-file .env
+.venv/bin/python scripts/audit_memory_db.py --database data/memory.db --json
 ```
 
 机制健康诊断：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db
-.\.venv\Scripts\python.exe scripts\diagnose_memory_health.py --database data\memory.db --json
+```bash
+.venv/bin/python scripts/diagnose_memory_health.py --database data/memory.db
+.venv/bin/python scripts/diagnose_memory_health.py --database data/memory.db --json
 ```
 
 历史记忆分类回填：
 
-```powershell
+```bash
 # 先预览统计，不写库
-.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db --dry-run
+.venv/bin/python scripts/backfill_memory_classification.py --database data/memory.db --dry-run
 
-# 确认后执行；脚本会先生成 data\memory.backup.<timestamp>.db
-.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db
+# 确认后执行；脚本会先生成 data/memory.backup.<timestamp>.db
+.venv/bin/python scripts/backfill_memory_classification.py --database data/memory.db
 
 # 可选：指定用户或限制本次处理数量
-.\.venv\Scripts\python.exe scripts\backfill_memory_classification.py --database data\memory.db --user-id default --limit 50
+.venv/bin/python scripts/backfill_memory_classification.py --database data/memory.db --user-id default --limit 50
 ```
 
 回填会在事务内为缺少分类的 active + archived 记忆补 `topics`、`entities`、`space_ids`，并为每条更新写入 `memory_decision_logs`，`source=classification_backfill`。日志只记录 before/after 摘要、正文长度和 SHA-256，不写完整正文。
 
 微型召回评估：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\eval_recall.py --init --database data\memory.db
-# 编辑 eval\labels.jsonl，为每个 query 填 relevant_ids
-.\.venv\Scripts\python.exe scripts\eval_recall.py --run
-.\.venv\Scripts\python.exe scripts\eval_recall.py --run --use-embedding --json
+```bash
+.venv/bin/python scripts/eval_recall.py --init --database data/memory.db
+# 编辑 eval/labels.jsonl，为每个 query 填 relevant_ids
+.venv/bin/python scripts/eval_recall.py --run
+.venv/bin/python scripts/eval_recall.py --run --use-embedding --json
 ```
 
 Windows 服务辅助脚本：
+
+仅适用于 Windows：
 
 ```powershell
 .\scripts\install-service.ps1
