@@ -1,22 +1,34 @@
 # memory-gateway
 
-`memory-gateway` 是一个本地优先的长期记忆与长文本知识服务，可接入支持远程 Streamable HTTP MCP 和 Bearer 鉴权的 AI 客户端，并提供 REST 管理接口和 Web 控制台；它不依赖 Kelivo，Kelivo 只是可用客户端之一。长期记忆与知识文档分别保存在物理隔离的 SQLite 数据库中：记忆支持提取、浮现和衰减，知识库只在显式调用时做可引用的全文检索。
+`memory-gateway` 是一个本地优先的长期记忆与长文本知识服务，可接入支持远程 Streamable HTTP MCP 或 OpenAI Chat Completions 的 AI 客户端，并提供 REST 管理接口和 Web 控制台；它不依赖某个特定客户端。长期记忆与知识文档分别保存在物理隔离的 SQLite 数据库中：记忆支持提取、浮现和衰减，知识库只在显式调用时做可引用的全文检索。
 
-OpenAI 兼容的外部 `/v1` 聊天网关已经废弃。`/v1/models` 和 `/v1/chat/completions` 目前会返回 `410 Gone`。AI 客户端接入请使用 `/mcp`，管理和调试请使用 `/memories/*`、`/knowledge/*` 与 `/ui`。
+OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat Plus）这类 Chat Completions 客户端。代理会在服务端完成安全记忆召回和上下文注入，并在完整最终回答后提取、去重和嵌入新记忆；支持 SSE 流式、工具调用、多模态消息和推理字段透明转发。MCP 入口仍保留，适合希望由模型显式控制记忆工具的客户端。
+
+## 选择接入方式
+
+| 目标 | 推荐入口 | 记忆由谁触发 |
+| --- | --- | --- |
+| FLIT 等 OpenAI-compatible 聊天客户端，希望无需模型调用工具就自动召回和保存 | `/v1` | 网关在服务端自动处理 |
+| 支持远程 Streamable HTTP MCP，希望由模型决定何时检索、保存或整理 | `/mcp` | 模型显式调用 MCP 工具 |
+| 查看、治理、备份、评测或手动修改数据 | `/ui` 或 REST | 用户/管理程序显式操作 |
+
+`/v1` 与 MCP 可以同时启用，但同一个客户端通常只需选择一种主要记忆路径。知识库始终需要显式 MCP/REST 操作，不会因为使用 `/v1` 而自动进入聊天上下文。
 
 ## 主要能力
 
 - MCP Streamable HTTP 入口 `/mcp`，同时提供长期记忆的检索、浮现、保存与消化，以及独立知识库的浏览、检索、精读、上传和文档管理工具。
+- OpenAI-compatible `/v1/chat/completions` 透明记忆代理：服务端自动混合检索、注入安全核心/长期记忆、流式转发，并只在最终文本回答后执行幂等激活与记忆提取。
 - REST 管理接口 `/memories/*`，覆盖记忆列表、搜索、保存、编辑、软删除、恢复、永久删除、合并、报告、导出、恢复导入、网络图、时间线、体检和评估。
-- Web 控制台 `/ui`，用于日常查看、治理、评估、备份和接入配置。
+- Web 控制台 `/ui`，用于日常查看、治理、评估、备份、接入配置，以及按实际 provider/model 汇总 Token 与公开 API 原价。
 - SQLite 本地存储，按 `X-User-Id` 做用户隔离，默认用户为 `default`。
 - 五类记忆扇区：`episodic`、`semantic`、`procedural`、`emotional`、`reflective`。
 - 生命周期状态：`dynamic`、`resolved`、`archived`、`pinned`，并带有遗忘曲线、消化标记和活跃度统计。
 - 记忆自动组织层：新 ingest 的记忆会自动获得 `topics`、`entities`，并保守绑定到少量 `memory_spaces`。
 - 记忆空间、主题、实体和网络图，用于轻量分类、过滤、可视化和导出。
-- 核心记忆、近期上下文、决策日志和来源解释，便于解释为什么记住、为什么召回。
+- 核心记忆、近期上下文、自动对话分支、决策日志和来源解释，便于解释为什么记住、为什么召回。
 - 敏感内容响应期遮罩：`redact_sensitive=true` 只影响响应，不改写 SQLite 原文。
 - 决策日志不会复制完整 `source_quote`；敏感候选正文只保留长度、SHA-256、敏感级别和关联 memory ID。
+- 提取模型返回空候选时，自由文本理由仍只保留长度和 SHA-256，但会额外保存受控 `model_reason_code`，用于区分临时事项、假设、非用户陈述、敏感授权不足或无长期价值。
 - 保存门槛会先验证逐字 `source_quote`，再检查候选与引用的事实锚点、否定一致性、敏感级别下限和子句级“记住”授权。
 - 敏感内容默认不进入远程提取、embedding、AI 体检、普通搜索或自然浮现；远程处理需显式配置。
 - 回收站永久删除：仅允许删除已经软删除的记忆，要求完整 ID 确认，并清理派生记忆、核心证据、旧日志和本地评测工作区。
@@ -40,12 +52,13 @@ OpenAI 兼容的外部 `/v1` 聊天网关已经废弃。`/v1/models` 和 `/v1/ch
 
 ```text
 app/
-  api/              FastAPI 路由：健康检查、废弃 /v1、/memories 与 /knowledge 管理接口
+  api/              FastAPI 路由：健康检查、/v1 记忆代理、/memories 与 /knowledge 管理接口
   knowledge/        独立知识文档、版本、FTS5 索引、受限搜索代理与备份
   llm/              上游 OpenAI 兼容模型调用和提示词
   mcp_server/       MCP 服务、工具注册和 MCP 鉴权中间件
   memory/           记忆模型、存储、检索、治理、评估、报告、网络、健康检查
-  openai_compat/    OpenAI 兼容 schema，保留给内部上游调用
+  openai_compat/    OpenAI 兼容 schema、透明上游代理和 SSE 旁路解析
+  usage/            模型用量上下文、官方价格映射、事件记录与汇总
 ui/
   src/              React Web 控制台
 tests/              后端和接口测试
@@ -65,7 +78,7 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及记忆提取使用的上游模型：
+编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及 `/v1` 对话代理和记忆提取共用的上游模型：
 
 ```env
 GATEWAY_API_KEY=change-me
@@ -76,6 +89,9 @@ UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 UPSTREAM_API_KEY=your-upstream-api-key
 UPSTREAM_MODEL=glm-5.1
 ALLOW_SENSITIVE_EGRESS=false
+
+CHAT_GATEWAY_ENABLED=true
+CHAT_GATEWAY_DEFAULT_MEMORY_MODE=read-write
 ```
 
 需要语义检索时再配置 embedding；key 为空会自动使用本地关键词/FTS：
@@ -128,6 +144,15 @@ npm run dev
 | 健康检查 | `http://localhost:2026/health` |
 | Web 控制台 | `http://localhost:2026/ui` |
 | MCP | `http://localhost:2026/mcp` |
+| OpenAI-compatible base URL | `http://localhost:2026/v1` |
+
+`localhost` 只适用于与网关运行在同一台机器上的客户端。Android/iOS 上的 `localhost` 指向手机自身；手机上的 FLIT 应使用运行网关电脑的局域网或 Tailscale 地址：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
+```
+
+服务需要以 `--host 0.0.0.0` 启动，并允许 Windows 防火墙在可信私有网络中访问端口 `2026`。不要把该端口无鉴权暴露到公网；远程请求仍必须携带 `GATEWAY_API_KEY`。
 
 除 `/health` 外，受保护接口都需要 Bearer token。`X-User-Id` 可选，省略时使用 `default`：
 
@@ -136,14 +161,39 @@ Authorization: Bearer <GATEWAY_API_KEY>
 X-User-Id: default
 ```
 
+启动后可先做两步只读验证：
+
+```powershell
+curl.exe http://localhost:2026/health
+curl.exe `
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" `
+  -H "X-User-Id: default" `
+  http://localhost:2026/v1/models
+```
+
+升级已有安装后需要重启服务；`MemoryStore.init_db()` 会以兼容方式补建滚动上下文字段和 `conversation_branch_nodes`，不要手工修改 `data/memory.db`。
+
 ## 配置项
 
 当前后端读取的配置集中在 `app/config.py`。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GATEWAY_API_KEY` | 空 | MCP、REST 和 Web 控制台共用访问令牌。未配置时受保护接口返回 500。 |
-| `UPSTREAM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 旧版单 provider 上游 base URL；所选 `D` 未配置 `LLM_DEEPSEEK_API_KEY` 时，记忆任务仍可回退使用它。 |
+| `GATEWAY_API_KEY` | 空 | `/v1`、MCP、REST 和 Web 控制台共用访问令牌。未配置时受保护接口返回 500。 |
+| `CHAT_GATEWAY_ENABLED` | `true` | 是否启用 `/v1/models` 和 `/v1/chat/completions`。 |
+| `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | `read-write` | 默认记忆模式：`off` 仅透明代理，`read` 只召回/注入，`read-write` 还会在完整最终回答后自动提取新记忆。可由请求头 `X-Memory-Mode` 覆盖。 |
+| `CHAT_GATEWAY_SEARCH_LIMIT` | `8` | 每轮自动召回的长期记忆上限，范围 1–20。 |
+| `CHAT_GATEWAY_CONTEXT_MAX_CHARS` | `12000` | 自动注入记忆上下文的字符预算。 |
+| `CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS` | `4` | 混合召回的首 token 前预算；超时后回退本地关键词检索，不阻断聊天。 |
+| `CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS` | `600` | 流式聊天等待相邻上游数据块的超时；独立于后台 LLM 任务的普通超时，兼容慢首 token 和长推理。 |
+| `CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS` | `120` | 流式聊天向上游上传请求体的超时；兼容 FLIT 的大图片/音频请求。 |
+| `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环、网络重试的进程内副作用幂等与工具推理回放窗口。召回复用现有会校验数据库变化的搜索缓存。 |
+| `CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS` | `2` | 自动记忆提取时附带的最近完整用户/助手轮数，用于解释“18”“那个”等省略回答；事实值仍必须来自本轮用户原文。 |
+| `CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS` | `8000` | 发送给记忆提取模型的“滚动摘要 + 最近原文”总字符上限。 |
+| `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS` | `8` | 未压缩轮次达到该数量时，在聊天结束后的后台任务中压缩较早普通上下文。 |
+| `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS` | `6000` | 较早普通上下文与已有摘要达到该字符数时触发后台压缩。 |
+| `CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS` | `4000` | 滚动压缩摘要的最大字符数。 |
+| `UPSTREAM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 单 provider 兼容兜底 base URL；所选 `D` 未配置 `LLM_DEEPSEEK_API_KEY` 时，记忆任务和聊天代理仍可回退使用它。 |
 | `UPSTREAM_API_KEY` | 空 | 旧版单 provider 上游 key；保留用于兼容原有 DeepSeek、GLM 等配置。 |
 | `UPSTREAM_MODEL` | `glm-5.1` | 旧版单 provider 模型名；仅在使用 `UPSTREAM_*` 兼容兜底时生效。 |
 | `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 private/sensitive 的文本发送给远程提取、embedding、AI 体检或知识代理服务。仅在所有相关 provider 均获准处理敏感数据时开启。 |
@@ -157,7 +207,7 @@ X-User-Id: default
 | `KNOWLEDGE_EMBEDDING_BATCH_SIZE` | `20` | 知识 chunk 批量生成 embedding 时的批大小；兼容 `qwen3.7-text-embedding` 单次最多 20 行。 |
 | `KNOWLEDGE_EMBEDDING_MIN_COSINE` | `0.25` | 知识向量候选的最低余弦相似度。 |
 | `KNOWLEDGE_HYBRID_VECTOR_WEIGHT` | `0.65` | 混合检索中向量通道的 RRF 权重，范围 0–1。 |
-| `LLM_PROVIDER_PRIORITY` | `D` | 所有快速 LLM 任务的共享优先级：`M`=MiMo、`K`=Kimi、`D`=DeepSeek，例如 `MKD`、`KD`、`D`；空值按 `D` 处理。只填 `M` 时会隐式追加 `D` 作为紧急兜底。 |
+| `LLM_PROVIDER_PRIORITY` | `D` | 聊天代理 `memory-auto` 与所有快速 LLM 任务的共享优先级：`M`=MiMo、`K`=Kimi、`D`=DeepSeek，例如 `MKD`、`KD`、`D`；空值按 `D` 处理。只填 `M` 时会隐式追加 `D` 作为紧急兜底。 |
 | `LLM_MIMO_BASE_URL` | `https://api.xiaomimimo.com/v1` | MiMo OpenAI-compatible base URL。 |
 | `LLM_MIMO_API_KEY` | 空 | MiMo API key；为空时跳过 `M`。 |
 | `LLM_MIMO_MODEL` | `mimo-v2.5-pro-ultraspeed` | `M` 对应的快速模型。 |
@@ -179,7 +229,7 @@ X-User-Id: default
 
 ### 共享模型优先级与故障切换
 
-`LLM_PROVIDER_PRIORITY` 同时控制记忆提取、核心记忆整理、体检 AI 修改和知识代理快速阶段。优先级是静态配置，运行时只临时跳过正在冷却或未填写 key 的 provider：
+`LLM_PROVIDER_PRIORITY` 同时控制 `memory-auto` 聊天代理、记忆提取、会话上下文压缩、核心记忆整理、体检 AI 修改和知识代理快速阶段。优先级是静态配置，运行时只临时跳过正在冷却或未填写 key 的 provider：
 
 | 配置值 | 正常尝试顺序 | `M` 返回 429 后的冷却期 |
 | --- | --- | --- |
@@ -194,6 +244,100 @@ X-User-Id: default
 - 记忆任务遇到 provider 的模型不存在/不支持、鉴权失效、余额不足、请求超时、网络错误或 5xx 时，会继续尝试下一个已配置 provider；其他 400/403/422 等内容或契约错误仍直接返回，避免绕过安全拒绝。知识代理失败时安全回退本地检索结果。复杂知识检索的 Pro 升级阶段仍固定使用 DeepSeek Pro。
 - MiMo、Kimi、DeepSeek 的知识代理调用显式开启思考；多轮工具调用会保留并回传 `reasoning_content`。Kimi K2.7 使用 `keep=all` 和 `temperature=1`。MiMo UltraSpeed 的体检修改预览使用强制函数调用返回结构化参数；其他支持 JSON mode 的模型继续使用 `response_format=json_object`。DeepSeek 思考模式不发送不兼容的 `tool_choice`。
 - 旧的 `KNOWLEDGE_AGENT_PROVIDER_PRIORITY`、`KNOWLEDGE_AGENT_MIMO_*`、`KNOWLEDGE_AGENT_KIMI_*`、`KNOWLEDGE_AGENT_BASE_URL/API_KEY/FLASH_MODEL/PRO_MODEL` 和 `KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS` 仍作为兼容别名读取；新配置应使用 `LLM_*`。
+
+## FLIT / OpenAI Chat Completions 接入
+
+FLIT（原 LastChat Plus）使用下面的 Provider 配置：
+
+| FLIT 设置 | 值 |
+| --- | --- |
+| Base URL | `http://<memory-gateway 主机>:2026/v1` |
+| API 路径 | `/chat/completions` |
+| API Key | `.env` 中的 `GATEWAY_API_KEY` |
+| Model | 推荐 `memory-auto`，也可从 `/v1/models` 选择具体上游模型 |
+| Responses API | 关闭 |
+| 流式输出（助手的模型设置） | 开启（FLIT 默认） |
+
+FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当前 OpenAI-compatible Provider → 编辑 `memory-auto` 模型”，把输入模态设为“文本 + 图片”、输出模态设为“文本”，并开启“工具”和“推理”两项能力。`/v1/models` 的标准响应不能声明这些 FLIT 私有能力；不手动开启时 FLIT 不会发送 tools/reasoning，图片也可能先被客户端 OCR 改写。
+
+在 FLIT 的自定义 Header 中可设置 `X-User-Id: default`。不要额外设置 `Authorization`，FLIT 会用 API Key 自动生成 Bearer Header。FLIT 当前不能把每个聊天的动态会话 ID 发给网关，因此不要给所有聊天配置同一个静态 `X-Conversation-Id`。缺省时网关会对客户端回传的可见用户/助手历史计算指纹，并在本地保存每个完整回答后的分支节点：正常续聊命中父节点，修改旧消息或重新生成回答会形成独立分支，不会把两条路线的滚动摘要混合。
+
+### 记忆模式与写入时机
+
+默认 `X-Memory-Mode` 为 `read-write`，可在单次请求 Header 中覆盖：
+
+| 模式 | 自动召回/注入 | 更新激活度 | 保存分支上下文 | 自动提取长期记忆 |
+| --- | --- | --- | --- | --- |
+| `read-write` | 是 | 是 | 是 | 是 |
+| `read` | 是 | 否 | 否 | 否 |
+| `off` | 否 | 否 | 否 | 否，作为透明代理 |
+
+分支上下文、激活记录和长期记忆 ingest 只在收到无 tool call 的完整最终文本后执行，并作为响应后的后台任务运行。工具中间响应、上游错误、断流、缺少 `[DONE]`、`length` 截断和内容过滤都不会写入；因此客户端刚看到最终文字时，管理台中的新记忆可能还需要短暂等待才出现。
+
+### 自动召回与保存边界
+
+- 最后一条用户消息的纯文本部分是检索词，也是新事实的唯一权威来源；图片 URL、音频 base64 不进入记忆 embedding。
+- 自动提取最多附带最近两轮可见用户/助手文本用于消歧，不包含 system、工具内容、tool call 或 reasoning。依赖上下文的候选必须同时通过本轮逐字 `source_quote` 和较早逐字 `context_quote` 校验，所以“前文询问年龄，本轮回答 18”可以保存，孤立的“18”会忽略。
+- 去重会直接忽略完全相同、被旧文本逐字包含的候选；对于措辞不同的笼统改写，只有在同类型有效旧记忆同时满足向量相似、实体全覆盖、主题重合、无新增结构化值且没有冲突/时序变化时，才视为“已有更完整的语义等价记忆”。同主题的新细节仍会创建并交给体检确认。
+- 自动注入只包含本地复核为普通级别的长期记忆、安全核心记忆和已匹配的普通级别分支摘要。物理隔离的知识库永不自动注入。
+- 动态记忆块插在客户端已有的稳定 system/developer 前缀之后，以尽量保留上游 prompt-prefix cache；记忆内容仍按每轮检索结果重新生成。
+- 原始多模态消息、`tools`、`tool_calls`、工具结果、上游 `reasoning_content`、usage chunk 和未知厂商字段继续透明转发。BigModel/Mistral 不兼容时才移除 `stream_options`。
+- `memory-auto` 会在实际 provider 确定后处理推理配置。工具中间调用和最终回答的推理状态按用户、轮次和 tool-call 在当前进程短期缓存；跨 provider 故障切换或无法证明来源时会删除不可信的旧推理原文。
+- `ALLOW_SENSITIVE_EGRESS=false` 会阻止敏感旧上下文进入远程提取、压缩、embedding、体检和知识代理，但不会拦截用户主动通过 `/v1` 发给聊天上游的当前消息。使用 `/v1` 即表示该聊天上游获准处理当前对话。
+
+### 对话分支、编辑与重新生成
+
+网关只用客户端可稳定回传的可见 user/assistant 文本计算历史指纹；system、工具调用、工具结果和 reasoning 不参与分支匹配。每个完整回答会保存一个本地分支节点，节点包含不可逆历史指纹、滚动压缩摘要和最近原始轮次，不保存一份额外的完整逐字聊天副本。
+
+- 正常续聊：请求历史命中上一个完整回答，接续该节点。
+- 重新生成回答：同一个父节点产生多个兄弟分支；之后继续哪份回答，就接续哪条路线。
+- 修改旧消息：修改后的可见历史不再命中旧节点，从当前位置建立新分支，不混用旧摘要。
+- 动态 `X-Conversation-Id`/`conversation_id`：供只发送增量消息的客户端后备匹配；不要给所有 FLIT 对话配置同一个静态值。
+- 历史被截断：客户端既不发送动态 ID、又没有带回足够历史时，网关不会猜测其他对话，而是从本次请求自带上下文重新开始。
+
+较早普通轮次达到 8 轮或 6000 字符后在后台压缩，默认保留最近两轮逐字内容。压缩摘要只能辅助理解，不能作为 `context_quote` 或独立授权保存事实。每用户最多保留最近 5000 个分支节点，超出后从最旧节点开始裁剪。分支写入属于最终响应后的后台任务；如果客户端在前一响应刚结束时立即并发发送下一轮，极短时间内可能尚未命中刚生成的节点。
+
+成功响应中的 `X-Memory-Branch-State` 用于诊断本轮输入：
+
+| 值 | 含义 |
+| --- | --- |
+| `root` | 没有可见父历史，从根节点开始。 |
+| `matched` | 精确命中已保存的父分支。 |
+| `fork` | 请求带有父历史，但没有匹配节点；常见于编辑历史、历史被截断或后台节点尚未写完。 |
+| `conversation-fallback` | 没有可见父历史，使用真实动态 conversation ID 的近期摘要。 |
+| `off` | 本轮关闭记忆处理。 |
+
+### 缓存与诊断
+
+本地召回缓存和上游模型的 prompt cache 是两套不同机制：
+
+| 缓存 | Key 要点 | TTL | 容量 | 典型命中场景 |
+| --- | --- | --- | --- | --- |
+| 召回结果 L2 | 用户、规范化后的完整查询、limit、敏感选项 | 120 秒 | 256 | FLIT 同一轮 tools 多次请求相同用户消息 |
+| Query embedding L1 | 用户、规范化后的完整查询 | 300 秒 | 512 | 相同问题以大小写/多余空白差异重复请求 |
+
+L2 命中时仍会校验当前用户的记忆更新时间和活跃数量，并从 SQLite 重新读取记录；删除、归档或敏感度变化不会通过旧正文缓存泄露。空召回结果不写入 L2，因此重复的无结果查询仍显示 L2 miss，但 query embedding 可能命中。普通连续聊天的措辞通常不同，命中率自然会低于同一工具轮次。
+
+响应 Header 可观察单次请求：
+
+| Header | 含义 |
+| --- | --- |
+| `X-Memory-Mode` | 实际记忆模式。 |
+| `X-Memory-Hit-Count` | 在字符预算内实际注入的长期记忆数量，不包含核心记忆或分支摘要。 |
+| `X-Memory-Recall-Cache` | `hit`、`miss`、`bypass` 或 `fallback`。 |
+| `X-Memory-Embedding-Cache` | `hit`、`miss`、`disabled`、`not-needed`、`bypass` 或 `fallback`。 |
+| `X-Memory-Branch-State` | 本轮分支匹配状态，见上表。 |
+
+查看当前用户、当前服务进程启动以来的累计命中率：
+
+```powershell
+curl.exe `
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" `
+  -H "X-User-Id: default" `
+  http://localhost:2026/memories/cache-stats
+```
+
+统计包含当前用户在该进程中的所有启用缓存的记忆搜索，不只 `/v1` 请求；进程重启后清零，多 worker 部署时每个 worker 独立计数。该接口不统计上游 provider 的 prompt-cache 命中率，上游是否缓存及 `cached_tokens` 的返回格式由具体 provider 决定。
 
 ## MCP 工具
 
@@ -275,24 +419,37 @@ X-User-Id: default
 | 记忆体检 | 生成治理建议、风险标签、严重程度、手动动作和 AI 修订预览。 |
 | 召回解释 | 查看一次上下文组装中的核心记忆、搜索命中、候选池、排除原因和分数拆解。 |
 | 评测闭环 | 机制诊断、召回快照、人工标注、关键词/embedding 指标。 |
-| 近期上下文 | 查看最近会话摘要。 |
+| 对话上下文 | 查看 `/v1` 自动分支树、滚动摘要、最近原文和结构状态；可搜索、控制加载数量、软删除整棵后续分支，并在“已清理”视图恢复。另保留按动态 conversation ID 保存的近期摘要视图。 |
+| 用量与费用 | 汇总 `/v1` 聊天、记忆提取/整理/体检、会话压缩、知识代理和 embedding 调用；按故障切换后实际命中的 provider/model、上游 usage 与事件价格快照计算公开 API 原价。 |
 | 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
-| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
+| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录；空候选会显示受控的模型原因码，同时继续隐藏自由文本理由。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
 | 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
+
+### 模型用量与费用
+
+服务会为升级后的每个成功模型响应保存一条独立计量事件，覆盖 `/v1` 的普通回复与工具轮次、全部后台 LLM 任务、记忆/知识搜索 embedding 和知识索引 embedding。`LLM_PROVIDER_PRIORITY` 只决定尝试顺序；账单使用故障切换后真正成功的 provider 与模型，不会默认按优先级第一项估算。
+
+- Token 只采用上游响应的 `usage`，兼容 OpenAI 的 cached token 明细和 DeepSeek 的 cache hit/miss 字段；上游未返回 `usage` 时保留调用记录并显示“缺少 usage”，不猜 Token。
+- 金额按事件发生时保存的人民币价格快照计算；当前映射及官方来源在 Web 控制台“用量与费用 → 当前价格表”中展示。套餐、赠金、限时折扣和账户级优惠不参与估算。
+- 自定义模型或尚未找到明确公开单价的模型仍统计调用和 Token，但金额显示“待定价”，不会用相似模型价格替代，也不会显示成 0 元。
+- 计量从本版本启用后的新调用开始，不读取 provider 账单，也不对旧日志反向估算。
+- 事件只保存 user id、用途、provider/model、Token、价格快照、请求 ID 和时间，不保存提示词、回复或知识正文；查询继续按 `X-User-Id` 隔离。
 
 ## REST 接口概览
 
-所有 `/memories/*` 接口都需要 Bearer token；`X-User-Id` 可选，省略时使用 `default`。
+除 `/health` 外，下面的管理接口都需要 Bearer token；`X-User-Id` 可选，省略时使用 `default`。
 
 ### 基础与查询
 
 | Method | Path | 用途 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查，不需要鉴权。 |
+| `GET` | `/usage/summary?range=7\|30\|90\|all` | 按当前用户汇总模型调用、Token、可计费金额、模型/用途/日期拆分、最近事件和当前价格表。 |
 | `GET` | `/memories` | 列出活跃记忆，支持 `status=dynamic\|resolved\|archived\|pinned\|all` 和 `redact_sensitive=true`。 |
 | `GET` | `/memories/deleted` | 列出软删除记忆，支持 `redact_sensitive=true`。 |
 | `GET` | `/memories/{memory_id}` | 读取单条活跃记忆。 |
 | `POST` | `/memories/search` | 搜索记忆，默认排除敏感内容；显式传 `include_sensitive=true` 才纳入。 |
+| `GET` | `/memories/cache-stats` | 查看当前进程中当前用户的召回/查询 embedding 缓存命中率与 TTL。 |
 | `POST` | `/memories/surface` | 自然浮现记忆，默认排除敏感和 agent-derived 内容，支持多种 `mode`。 |
 | `POST` | `/memories/context` | 一站式返回核心记忆、检索结果和近期上下文，可输出 JSON 或 Markdown。 |
 | `POST` | `/memories/context/explain` | 调试一次上下文组装，不记录使用次数。 |
@@ -335,6 +492,9 @@ X-User-Id: default
 | `POST` | `/memories/core/consolidate` | 从长期记忆重新整理核心记忆。 |
 | `GET` | `/memories/recent-context` | 列出近期上下文摘要。 |
 | `POST` | `/memories/recent-context` | 提交或替换近期上下文摘要，body 为 `conversation_id` 和 `summary`。 |
+| `GET` | `/memories/conversation-branches?limit=500&status=active` | 按更新时间列出当前用户的自动分支节点；`status` 可为 `active` 或 `archived`，响应返回总数和是否截断。 |
+| `DELETE` | `/memories/conversation-branches/{node_id}` | 软删除指定分支节点及全部活跃后代，使其停止参与自动上下文匹配；不删除长期记忆或客户端聊天。 |
+| `POST` | `/memories/conversation-branches/{node_id}/restore` | 恢复已清理的分支节点及其全部已清理后代。 |
 | `GET` | `/memories/decision-logs` | 列出决策和审计日志，支持 `conversation_id`、`memory_id` 和 `limit` 过滤。 |
 | `POST` | `/memories/review` | 生成治理体检建议。 |
 | `POST` | `/memories/review/actions` | 应用手动治理动作，如确认、延后、降权、移入回收站、合并。 |
@@ -349,7 +509,7 @@ X-User-Id: default
 | `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 评估，`k` 为 1–20，包含无答案误召、拒答及实际 fallback 信息。 |
 | `GET` | `/memories/report?format=json\|markdown` | 生成记忆报告。 |
 | `GET` | `/memories/export?format=json\|markdown\|obsidian_markdown` | 导出备份或 Obsidian zip 单向镜像。 |
-| `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆和近期摘要；核心历史与决策日志仅供审计，不写回，响应会显式列出。 |
+| `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆、近期摘要和对话分支节点；核心历史与决策日志仅供审计，不写回，响应会显式列出。 |
 
 ### 独立知识库
 
@@ -369,12 +529,14 @@ X-User-Id: default
 | `DELETE` | `/knowledge/deleted/{id}/purge` | Web 管理专用永久清理，要求完整 ID 匹配。 |
 | `GET/POST` | `/knowledge/export`, `/knowledge/restore` | 独立导出/恢复原文、元数据和版本；派生索引在恢复时重建。 |
 
-### 已废弃接口
+### OpenAI-compatible 记忆代理
 
-| Method | Path | 状态 |
+| Method | Path | 用途 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | 返回 `410 Gone`。 |
-| `POST` | `/v1/chat/completions` | 返回 `410 Gone`。 |
+| `GET` | `/v1/models` | 列出 `memory-auto` 和当前已配置的上游模型。 |
+| `POST` | `/v1/chat/completions` | 透明转发 Chat Completions；支持非流式、SSE、tools、多模态和未知扩展字段。 |
+
+`memory-auto` 按 `LLM_PROVIDER_PRIORITY` 故障切换；请求某个 `/v1/models` 返回的具体模型名时只使用对应 provider。成功响应附带 `X-Memory-Mode`、`X-Memory-Hit-Count`、两层缓存状态和分支状态 Header，不会把“记忆命中”文字插进助手正文。
 
 ## 数据模型要点
 
@@ -383,11 +545,13 @@ X-User-Id: default
 - `origin=user_asserted|agent_derived` 区分用户事实和模型派生内容；agent-derived 默认不进入普通召回和核心整理。
 - `valid_from`、`temporal_subject`、`temporal_predicate` 用于可替换的当前状态事实，例如当前城市、当前雇主、首选称呼。普通 MCP 客户端不要自行填写这些字段。
 - `topics`、`entities`、`space_ids` 是轻量组织结构，不代表系统自动判断事实真伪。
+- `conversation_branch_nodes` 是 `/v1` 的本地运行上下文：保存不可逆历史指纹、滚动摘要和最近原始轮次，按用户隔离并限制为最近 5000 个节点；它不是长期记忆，也不进入核心记忆或衰减。
 - `surface_score`、`life_score`、`review_signals` 是运行时解释信号，默认不持久化为权威事实。
 - 知识文档有标题、版本、来源、敏感度、标签、结构化元数据和索引状态，但没有 memory type、importance、usage、生命周期或衰减字段。
 - 知识导入优先采用用户选择的敏感级别；若本地规则判断更高，首次请求不会写入，并要求用户在 Web 控制台明确点击确认。确认结果会随文档保存并可审计；MCP 不能代替用户绕过确认。
 - 知识引用绑定具体版本与字符范围；代理只能选择引用，响应正文始终来自本地版本原文。
 - PDF、DOCX 和 EPUB 会在本机解析成规范化文本后建立不可变版本；原文件内容不会进入记忆数据库。知识 chunk embedding 是可重建派生数据，备份恢复和重建索引会重新生成。
+- 记忆 JSON 导出当前为 version 3；会包含可恢复的空间、活跃/回收站记忆、近期摘要和对话分支节点，但不包含可重建 embedding。核心记忆当前快照、核心历史和决策日志随导出保留用于审计，restore 不写回这些分区。
 
 ## 自动分类与空间
 
@@ -475,11 +639,12 @@ Windows 服务辅助脚本：
 ## 安全边界
 
 - 不要提交 `.env`、`data/*.db`、`eval/`、`logs/` 或真实 provider key。
-- `data/memory.db`、JSON/Markdown/Obsidian 导出都可能包含完整长期记忆，应按敏感数据处理。
+- `data/memory.db` 除长期记忆外还包含近期摘要、分支节点中的最近原始轮次和压缩摘要；JSON/Markdown/Obsidian 导出也可能含私人内容，都应按敏感数据处理。
 - `redact_sensitive=true` 只是响应期遮罩，不会改写数据库，也不会让备份变成脱敏备份。
 - 永久删除不可恢复，只作用于回收站记忆，并会清理依赖它的 agent-derived 记忆、脱敏相关核心历史和旧决策日志、删除该用户评测工作区。
+- 永久删除一条长期记忆不会删除客户端自身的聊天记录，也不会自动搜索并改写近期摘要或 `conversation_branch_nodes` 中可能重复出现的原始对话。Web Console 的“对话上下文”页可按分支节点软删除该节点及其后代，并从“已清理”状态恢复；当前仍没有按长期 memory ID 自动定位并清理重复对话原文的能力。需要彻底清除时，还应处理客户端聊天、相关摘要和导出副本。
 - 永久删除无法控制已经复制到工作区外的 JSON/Markdown/Obsidian 导出或第三方备份；这些副本必须按各自保留策略删除。
-- `ALLOW_SENSITIVE_EGRESS=false` 是默认安全边界；响应遮罩不能替代出站策略。
+- `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、体检和知识代理的默认安全边界；它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。
 - 知识文档的“按用户选择导入”确认只决定该文档保存后的敏感标签，不会修改全局 `ALLOW_SENSITIVE_EGRESS`；保存为 private/sensitive 时，默认仍禁止远程 embedding/代理出站。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
 - `GATEWAY_API_KEY` 是本地共享令牌；`X-User-Id` 适合可信本地或私有网络部署，不等同完整多租户权限系统。
@@ -488,5 +653,10 @@ Windows 服务辅助脚本：
 ## 当前边界与后续方向
 
 - 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
+- OpenAI-compatible 入口只实现 `/v1/models` 与 `/v1/chat/completions`；不提供 Responses API、文件、音频或图片生成等其他 OpenAI API。
+- `/v1` 工具循环的副作用幂等、工具推理回放和缓存统计是单进程短 TTL 状态；服务重启或多 worker 部署不会共享。对话分支节点本身持久化在 SQLite，但当前个人部署仍建议使用单 worker。
+- FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点并持久化滚动摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。
+- 分支节点和长期记忆提取在完整最终回答后的后台任务中完成，属于最终一致；极快的并发下一轮可能暂时看不到刚结束的一轮。
+- 没有动态 conversation ID 时，短 TTL 内“完全相同的消息历史 + 完全相同的最终回答”无法与 HTTP 重试区分，会按重试去重；不同最终回答仍可独立 ingest。
 - 图遍历和 Time Ripple 保留为实验/兼容能力，不是默认产品路径。
-- 后续更适合优先做人工视觉验收、移动端微调、空间管理增强、近期对话批量导入、更丰富的版本历史、SDK 和外部连接器。
+- 后续更适合优先做空间管理增强、近期对话批量导入、更丰富的版本历史、SDK 和外部连接器。

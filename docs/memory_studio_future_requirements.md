@@ -196,7 +196,7 @@
 - 主题、实体和空间名会 trim、折叠连续空白、去重并保持顺序。
 - REST 支持空间列表、空间详情、记忆空间绑定、主题实体更新、网络图过滤。
 - 分类变化写入 `memory_decision_logs`。
-- JSON export version 2 包含 `memory_spaces`、`topics`、`entities`、`space_ids`，restore 兼容 version 1。
+- JSON export version 3 在 version 2 的 `memory_spaces`、`topics`、`entities`、`space_ids` 基础上加入 `conversation_branch_nodes`；restore 继续兼容旧版本。
 - Web UI 展示并编辑主题、实体、空间，支持按分类过滤和网络图筛选。
 
 边界：

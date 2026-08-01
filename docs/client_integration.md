@@ -1,11 +1,109 @@
-# MCP Client Integration
+# Client Integration
 
-This guide is for AI clients that connect to memory-gateway through MCP or REST.
-The service is not tied to Kelivo: Kelivo is one compatible client among any clients
-that support remote Streamable HTTP MCP and can set a Bearer authorization header.
-Let the model call the memory tools for personal context and the separate knowledge
-tools for explicitly imported long documents. Clients that only support local `stdio`,
-or cannot set the required Bearer header, need a compatible MCP bridge.
+This guide covers the transparent OpenAI Chat Completions gateway, MCP, and REST.
+Use the `/v1` gateway when the client should receive memory automatically without
+asking the model to call MCP tools. Use `/mcp` when the model should explicitly decide
+when to search, save, digest, or read the isolated knowledge library.
+
+## FLIT / OpenAI-Compatible Gateway
+
+FLIT (formerly LastChat Plus) should use:
+
+```text
+Base URL: http://<memory-gateway-host>:2026/v1
+API path: /chat/completions
+API key: <GATEWAY_API_KEY>
+Model: memory-auto
+Responses API: disabled
+Assistant model setting "Streaming output": enabled (FLIT default)
+```
+
+After FLIT discovers `memory-auto`, edit that model under the current
+OpenAI-compatible provider. Set input modalities to `Text + Image`, output modality
+to `Text`, and enable both `Tools` and `Reasoning`. These are FLIT-side switches that
+the standard `/v1/models` response cannot advertise. Without them FLIT omits tool and
+reasoning fields, and may OCR an image instead of forwarding the original image part.
+
+FLIT creates the `Authorization: Bearer ...` header from its API-key field. Do not add
+a second custom Authorization header. A static custom header is suitable for:
+
+```http
+X-User-Id: default
+```
+
+FLIT does not currently forward its per-chat conversation ID. Do not configure one
+static `X-Conversation-Id` for every chat. The gateway instead fingerprints the visible
+user/assistant history that FLIT sends back and persists one rolling-context snapshot
+per completed history node. A normal continuation selects its exact parent; editing an
+older message or regenerating an answer creates a sibling branch rather than mutating
+the other path. Clients that can send a genuinely dynamic conversation ID may still
+use either `X-Conversation-Id` or the local `conversation_id` request-body extension,
+especially when they send only incremental messages.
+
+The default memory behavior is `read-write`. It can be overridden per request:
+
+```http
+X-Memory-Mode: off | read | read-write
+```
+
+- `off` is a plain transparent proxy with no memory reads or writes.
+- `read` injects safe recalled context without persistent activation, summaries, or ingest.
+- `read-write` additionally runs the existing validated ingest pipeline, including
+  extraction, quote/grounding checks, deduplication, classification, and memory
+  embedding.
+
+For each tool-call leg, the gateway finds the last user message and re-injects recall
+reused through the DB-validated search cache. Deleted or newly-sensitive memories are
+rechecked rather than retained as cached raw text. It preserves multimodal parts, tools,
+tool calls, tool results, reasoning fields, usage-only SSE events, and vendor extensions.
+The gateway removes `stream_options` only for selected BigModel/Mistral upstreams that
+reject it. For `memory-auto`, FLIT's AUTO reasoning is resolved after provider routing;
+Kimi K2.7 receives `thinking.keep=all`. Reasoning from both intermediate tool calls and
+the final assistant message in a tool turn is held only in bounded, process-local TTL
+caches keyed by user, conversation/turn, and tool-call ID as applicable, so history
+omitted by FLIT can be replayed to the same provider. If that provider fails over, its
+reasoning text is not sent to the replacement provider; alias history without cached
+provenance is conservatively stripped. Only text parts are used as the search/ingest
+source; image URLs and audio base64 never enter embedding.
+
+Activation and ingest happen only after a complete final text answer. Tool-call
+intermediate responses, upstream errors, disconnected/incomplete streams, missing
+`[DONE]`, `length` truncation, and content filtering do not write memory. Successful
+responses expose `X-Memory-Mode`, `X-Memory-Hit-Count`,
+`X-Memory-Recall-Cache`, `X-Memory-Embedding-Cache`, and
+`X-Memory-Branch-State`; recalled text is never inserted into the visible assistant
+answer. `GET /memories/cache-stats` reports user-isolated hit/miss counters for the
+current process. Recall-result entries live for 120 seconds and query embeddings for
+300 seconds; exact normalized query reuse (especially FLIT tool legs) is likely to hit,
+while differently worded ordinary turns are expected to miss.
+
+The latest user text remains the only authoritative source for new memory. The
+extractor also receives up to two recent visible user/assistant turns for resolving
+short answers and pronouns. It never receives system messages, tool payloads, tool
+results, or reasoning fields. A context-dependent candidate must quote both the latest
+user source and the exact disambiguating context; a bare value such as `18` is rejected
+unless the earlier context clearly asks for the user's age.
+
+After every complete final answer in `read-write` mode, the gateway stores a local
+branch node containing the rolling compressed summary and newest two verbatim turns.
+Later requests match the exact visible parent history, so FLIT can continue the right
+branch without a dynamic ID. A regenerated answer is another child of the same parent;
+an edited history that does not match becomes a fresh fork. A real dynamic conversation
+ID remains a fallback for clients that omit prior messages. If a client supplies
+neither a dynamic ID nor enough history to match a saved node, the gateway starts from
+the request's visible context rather than guessing another chat. A compressed summary
+is non-authoritative: it may help interpretation, but only a retained verbatim turn can
+supply `context_quote`.
+
+Automatic context is limited to locally verified normal-sensitivity user memories,
+safe core memory, and a normal-sensitivity branch/recent summary when one is matched.
+The physically separate knowledge library is never auto-injected.
+`ALLOW_SENSITIVE_EGRESS` protects remote memory extraction, context compression,
+embedding, review, and knowledge-agent calls. Sensitive prior turns remain local and
+are omitted from separate extraction/compaction prompts; it does not stop the current chat message from reaching the
+chat upstream selected by the user. When the assistant's final text is locally detected
+as sensitive, it is omitted from the separate extraction-provider prompt while the
+normal user source can still be evaluated.
 
 ## MCP Client Rules
 
