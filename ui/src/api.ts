@@ -1,9 +1,13 @@
 import type {
   ConnectionSettings,
+  ConversationBranchArchiveResult,
+  ConversationBranchList,
+  ConversationBranchRestoreResult,
   CoreMemoryHistoryItem,
   CoreMemorySection,
   DecisionLog,
   MemoryExport,
+  ModelUsageSummary,
   DatabaseHealthResult,
   MechanismDiagnosisResult,
   MemoryContextExplainResult,
@@ -120,6 +124,13 @@ export class MemoryApi {
 
   async health(signal?: AbortSignal): Promise<{ status: string }> {
     return this.request("/health", { auth: false, signal });
+  }
+
+  async modelUsage(
+    range: "7" | "30" | "90" | "all" = "30",
+    signal?: AbortSignal
+  ): Promise<ModelUsageSummary> {
+    return this.request(`/usage/summary?range=${range}`, { signal });
   }
 
   async knowledgeStatus(signal?: AbortSignal): Promise<KnowledgeStatus> {
@@ -668,6 +679,38 @@ export class MemoryApi {
       { signal }
     );
     return payload.data || [];
+  }
+
+  async conversationBranches(
+    limit = 500,
+    status: "active" | "archived" = "active",
+    signal?: AbortSignal
+  ): Promise<ConversationBranchList> {
+    const params = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(limit, 1000))),
+      status
+    });
+    return this.request(`/memories/conversation-branches?${params.toString()}`, { signal });
+  }
+
+  async archiveConversationBranch(
+    nodeId: string,
+    signal?: AbortSignal
+  ): Promise<ConversationBranchArchiveResult> {
+    return this.request(
+      `/memories/conversation-branches/${encodeURIComponent(nodeId)}`,
+      { method: "DELETE", signal }
+    );
+  }
+
+  async restoreConversationBranch(
+    nodeId: string,
+    signal?: AbortSignal
+  ): Promise<ConversationBranchRestoreResult> {
+    return this.request(
+      `/memories/conversation-branches/${encodeURIComponent(nodeId)}/restore`,
+      { method: "POST", signal }
+    );
   }
 
   async coreMemory(signal?: AbortSignal): Promise<CoreMemorySection[]> {

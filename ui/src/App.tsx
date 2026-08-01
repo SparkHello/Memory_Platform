@@ -20,6 +20,7 @@ import { ReportsPage } from "./pages/memory/ReportsPage";
 import { ReviewPage } from "./pages/memory/ReviewPage";
 import { DeveloperPage } from "./pages/system/DeveloperPage";
 import { SettingsPage } from "./pages/system/SettingsPage";
+import { UsagePage } from "./pages/system/UsagePage";
 import { loadSettings, loadTheme, saveSettings, saveTheme, type ThemeMode } from "./storage";
 import type { ConnectionSettings, KnowledgeStatus, PageKey } from "./types";
 import { errorMessage } from "./utils/format";
@@ -271,11 +272,14 @@ export function App() {
         )}
         {activePage === "recall" && <RecallExplainPage api={api} notify={notify} openMemory={openMemory} />}
         {activePage === "evaluation" && <EvaluationPage api={api} notify={notify} />}
-        {activePage === "recent" && <RecentContextPage api={api} />}
+        {activePage === "recent" && (
+          <RecentContextPage api={api} notify={notify} confirm={confirm} />
+        )}
         {activePage === "reports" && (
           <ReportsPage api={api} settings={settings} notify={notify} confirm={confirm} />
         )}
         {activePage === "logs" && <DecisionLogsPage api={api} />}
+        {activePage === "usage" && <UsagePage api={api} />}
         {activePage === "settings" && (
           <SettingsPage settings={settings} onSave={applySettings} notify={notify} />
         )}

@@ -12,12 +12,13 @@ export const PAGE_META: Record<PageKey, PageMeta> = {
   knowledge: { label: "知识库", shortLabel: "知识库", hash: "#/knowledge" },
   knowledgeSearch: { label: "检索调试", shortLabel: "检索", hash: "#/knowledge-search" },
   core: { label: "核心记忆", shortLabel: "核心", hash: "#/core" },
-  recent: { label: "近期上下文", shortLabel: "近期", hash: "#/recent" },
+  recent: { label: "对话上下文", shortLabel: "上下文", hash: "#/recent" },
   review: { label: "记忆体检", shortLabel: "体检", hash: "#/review" },
   recall: { label: "召回解释", shortLabel: "召回", hash: "#/recall" },
   evaluation: { label: "评测闭环", shortLabel: "评测", hash: "#/evaluation" },
   reports: { label: "报告与备份", shortLabel: "备份", hash: "#/reports" },
   logs: { label: "决策日志", shortLabel: "日志", hash: "#/logs" },
+  usage: { label: "用量与费用", shortLabel: "用量", hash: "#/usage" },
   settings: { label: "连接设置", shortLabel: "设置", hash: "#/settings" },
   developer: { label: "接入信息", shortLabel: "接入", hash: "#/integration" }
 };
@@ -39,7 +40,7 @@ export const NAV_SECTIONS: NavSection[] = [
   { key: "memory", label: "记忆", items: ["memories", "core", "recent"] },
   { key: "knowledge", label: "知识", items: ["knowledge", "knowledgeSearch"] },
   { key: "governance", label: "治理", items: ["review", "evaluation", "recall"] },
-  { key: "data", label: "数据", items: ["reports", "logs"] },
+  { key: "data", label: "数据", items: ["usage", "reports", "logs"] },
   { key: "system", label: "系统", items: ["settings", "developer"] }
 ];
 

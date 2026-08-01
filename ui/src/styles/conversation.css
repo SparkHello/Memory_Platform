@@ -1,0 +1,441 @@
+.conversation-context-page {
+  max-width: 1180px;
+}
+
+.context-page-toolbar,
+.branch-toolbar,
+.branch-node-footer,
+.branch-section-heading,
+.context-record-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.context-page-toolbar {
+  flex-wrap: wrap;
+}
+
+.context-selectors {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.context-limit-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.context-limit-field select {
+  min-height: 36px;
+  padding: 6px 30px 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--field-bg);
+  color: var(--text);
+}
+
+.context-limit-field select:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.context-overview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  padding: 2px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.context-overview > div {
+  display: grid;
+  min-width: 130px;
+  gap: 2px;
+  padding: 12px 24px 12px 0;
+}
+
+.context-overview > div + div {
+  padding-left: 24px;
+  border-left: 1px solid var(--border);
+}
+
+.context-overview span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.context-overview strong {
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.branch-workspace {
+  display: grid;
+  gap: 14px;
+}
+
+.branch-search {
+  max-width: 460px;
+}
+
+.branch-legend {
+  max-width: 76ch;
+}
+
+.branch-tree {
+  display: grid;
+  gap: 8px;
+}
+
+.branch-node {
+  min-width: 0;
+}
+
+.branch-node > summary {
+  display: grid;
+  grid-template-columns: 24px 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 62px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  transition:
+    border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.branch-node > summary::-webkit-details-marker {
+  display: none;
+}
+
+.branch-node > summary:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-strong);
+}
+
+.branch-node > summary:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.branch-node[open] > summary {
+  border-color: color-mix(in srgb, var(--primary) 42%, var(--border));
+  border-radius: var(--radius-md) var(--radius-md) var(--radius-sm) var(--radius-sm);
+  background: var(--primary-soft);
+}
+
+.branch-toggle {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  transition: transform var(--t-fast) var(--ease-out);
+}
+
+.branch-node[open] > summary .branch-toggle {
+  transform: rotate(180deg);
+}
+
+.branch-node-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.branch-node-heading {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.branch-node-heading strong {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-node-heading > span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-statuses {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.context-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.context-chip.fork {
+  border-color: color-mix(in srgb, var(--info) 38%, transparent);
+  background: color-mix(in srgb, var(--info) 10%, transparent);
+  color: var(--info);
+}
+
+.context-chip.leaf {
+  border-color: color-mix(in srgb, var(--success) 35%, transparent);
+  background: color-mix(in srgb, var(--success) 9%, transparent);
+  color: var(--success);
+}
+
+.context-chip.warning {
+  border-color: color-mix(in srgb, var(--warning) 38%, transparent);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  color: var(--warning);
+}
+
+.branch-node-body {
+  display: grid;
+  gap: 18px;
+  padding: 18px 16px 16px 66px;
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+}
+
+.branch-context-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px;
+}
+
+.branch-context-grid section {
+  min-width: 0;
+}
+
+.branch-context-grid h3,
+.branch-turn-section h3 {
+  margin: 0 0 6px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.branch-summary {
+  max-width: 72ch;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.branch-section-heading {
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+.branch-section-heading h3 {
+  margin: 0;
+}
+
+.branch-section-heading span,
+.context-record-meta,
+.branch-identifiers {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.branch-turns {
+  display: grid;
+  gap: 10px;
+}
+
+.branch-turn {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.branch-turn > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+
+.branch-turn span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.branch-turn p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.branch-node-footer {
+  align-items: flex-end;
+  padding-top: 2px;
+}
+
+.branch-identifiers {
+  display: flex;
+  min-width: 0;
+  gap: 4px 14px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.branch-children {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0 28px;
+  padding-left: 18px;
+  border-left: 1px solid var(--border-strong);
+}
+
+.summary-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.summary-workspace .panel-header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.summary-workspace .panel-header p {
+  max-width: 70ch;
+  margin: 0;
+}
+
+.context-summary-record {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.context-summary-record:last-child {
+  border-bottom: 0;
+}
+
+.context-summary-record > p {
+  max-width: 75ch;
+  margin: 10px 0;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.context-record-meta {
+  justify-content: flex-start;
+}
+
+@media (max-width: 760px) {
+  .context-page-toolbar,
+  .branch-toolbar,
+  .branch-node-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .context-page-toolbar .tabs,
+  .context-page-toolbar .tabs button,
+  .context-selectors,
+  .context-limit-field,
+  .context-limit-field select,
+  .branch-search {
+    width: 100%;
+  }
+
+  .context-page-toolbar .tabs {
+    display: flex;
+  }
+
+  .context-page-toolbar .tabs button {
+    flex: 1;
+  }
+
+  .context-limit-field select {
+    flex: 1;
+  }
+
+  .context-overview > div {
+    flex: 1 1 46%;
+    min-width: 0;
+    padding: 10px 12px;
+  }
+
+  .context-overview > div + div {
+    padding-left: 12px;
+  }
+
+  .branch-node > summary {
+    grid-template-columns: 22px 30px minmax(0, 1fr);
+  }
+
+  .branch-statuses {
+    grid-column: 2 / -1;
+    justify-content: flex-start;
+  }
+
+  .branch-node-body {
+    padding: 15px 12px;
+  }
+
+  .branch-context-grid,
+  .branch-turn {
+    grid-template-columns: 1fr;
+  }
+
+  .branch-children {
+    margin-left: 10px;
+    padding-left: 10px;
+  }
+
+  .branch-node-footer .danger-button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .branch-toggle,
+  .branch-node > summary {
+    transition: none;
+  }
+}

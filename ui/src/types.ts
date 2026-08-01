@@ -10,6 +10,7 @@ export type PageKey =
   | "recent"
   | "reports"
   | "logs"
+  | "usage"
   | "settings"
   | "developer";
 
@@ -91,6 +92,93 @@ export interface ConnectionSettings {
   apiBaseUrl: string;
   apiKey: string;
   userId: string;
+}
+
+export interface UsageTotals {
+  calls: number;
+  measured_calls: number;
+  priced_calls: number;
+  unmeasured_calls: number;
+  unpriced_calls: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_cny: number;
+  cache_hit_rate?: number | null;
+}
+
+export interface UsageModelBreakdown extends UsageTotals {
+  provider: string;
+  provider_label: string;
+  model: string;
+  kind: "chat" | "embedding";
+}
+
+export interface UsageOperationBreakdown extends UsageTotals {
+  operation: string;
+}
+
+export interface UsageDailyBreakdown extends UsageTotals {
+  date: string;
+}
+
+export interface UsageEvent {
+  id: string;
+  operation: string;
+  provider: string;
+  provider_label: string;
+  provider_code: string;
+  model: string;
+  kind: "chat" | "embedding";
+  input_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  usage_available: boolean;
+  price_available: boolean;
+  cost_cny?: number | null;
+  currency: string;
+  price_key: string;
+  pricing_as_of: string;
+  pricing_source_url: string;
+  created_at: string;
+}
+
+export interface UsagePrice {
+  key: string;
+  provider: string;
+  provider_label: string;
+  model: string;
+  kind: "chat" | "embedding";
+  currency: string;
+  input_cache_hit_per_million: string;
+  input_cache_miss_per_million: string;
+  output_per_million: string;
+  source_url: string;
+  input_token_min: number;
+  input_token_max?: number | null;
+  input_range_label: string;
+  as_of: string;
+}
+
+export interface ModelUsageSummary {
+  range: {
+    days?: number | null;
+    start?: string | null;
+    end: string;
+  };
+  totals: UsageTotals;
+  by_model: UsageModelBreakdown[];
+  by_operation: UsageOperationBreakdown[];
+  daily: UsageDailyBreakdown[];
+  recent: UsageEvent[];
+  pricing: {
+    as_of: string;
+    currency: string;
+    models: UsagePrice[];
+    note: string;
+  };
 }
 
 export interface MemoryRecord {
@@ -431,12 +519,52 @@ export interface ReviewActionApplyResult {
   affected_core_sections: CoreMemorySection[];
 }
 
+export interface RecentContextTurn {
+  user: string;
+  assistant: string;
+  sensitivity: MemorySensitivity;
+}
+
 export interface RecentContextSummary {
   id: string;
+  user_id?: string;
   conversation_id?: string | null;
   summary: string;
+  compressed_summary: string;
+  recent_turns: RecentContextTurn[];
+  turn_count: number;
   created_at: string;
   updated_at: string;
+  archived?: number;
+}
+
+export interface ConversationBranchNode extends RecentContextSummary {
+  history_fingerprint: string;
+  parent_history_fingerprint: string;
+  turn_fingerprint: string;
+  assistant_digest: string;
+}
+
+export interface ConversationBranchList {
+  data: ConversationBranchNode[];
+  meta: {
+    status: "active" | "archived";
+    total: number;
+    returned: number;
+    truncated: boolean;
+  };
+}
+
+export interface ConversationBranchArchiveResult {
+  id: string;
+  archived: boolean;
+  archived_count: number;
+}
+
+export interface ConversationBranchRestoreResult {
+  id: string;
+  restored: boolean;
+  restored_count: number;
 }
 
 export interface RecentContextPayload {

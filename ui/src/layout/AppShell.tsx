@@ -11,6 +11,7 @@ import {
   ListChecks,
   Menu,
   Moon,
+  ReceiptText,
   Search,
   ScanSearch,
   Settings as SettingsIcon,
@@ -36,6 +37,7 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   evaluation: ClipboardCheck,
   reports: FileText,
   logs: Activity,
+  usage: ReceiptText,
   settings: SettingsIcon,
   developer: Wrench
 };
