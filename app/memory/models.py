@@ -258,14 +258,32 @@ class CoreMemorySectionHistory(BaseModel):
     replaced_at: str
 
 
+class RecentContextTurn(BaseModel):
+    user: str
+    assistant: str
+    sensitivity: MemorySensitivity = "normal"
+
+
 class RecentContextSummary(BaseModel):
     id: str
     user_id: str
     conversation_id: str | None = None
     summary: str
+    compressed_summary: str = ""
+    recent_turns: list[RecentContextTurn] = Field(default_factory=list)
+    turn_count: int = Field(default=0, ge=0)
     created_at: str
     updated_at: str
     archived: int = 0
+
+
+class ConversationBranchNode(RecentContextSummary):
+    """A branch-local rolling-context snapshot for one completed chat history."""
+
+    history_fingerprint: str
+    parent_history_fingerprint: str = ""
+    turn_fingerprint: str
+    assistant_digest: str
 
 
 class CandidateMemory(BaseModel):
@@ -289,6 +307,7 @@ class CandidateMemory(BaseModel):
     entities: list[str] = Field(default_factory=list)
     reason: str = ""
     source_quote: str = ""
+    context_quote: str = ""
 
     @field_validator("type", mode="before")
     @classmethod

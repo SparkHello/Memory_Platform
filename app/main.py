@@ -8,15 +8,17 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Scope
 
-from app.api.deprecated_v1 import router as deprecated_v1_router
+from app.api.chat_gateway import router as chat_gateway_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memories import router as memories_router
+from app.api.usage import router as usage_router
 from app.config import get_settings
 from app.knowledge.store import KnowledgeStore
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
+from app.usage.store import UsageStore
 
 
 UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
@@ -50,6 +52,7 @@ def create_app() -> FastAPI:
         settings = get_settings()
         _validate_database_paths(settings.database_path, settings.knowledge_database_path)
         MemoryStore(settings.database_path).init_db()
+        UsageStore(settings.database_path).init_db()
         app.state.knowledge_init_error = ""
         try:
             KnowledgeStore(
@@ -70,9 +73,10 @@ def create_app() -> FastAPI:
         default_response_class=UTF8JSONResponse,
     )
     app.include_router(health_router)
-    app.include_router(deprecated_v1_router)
+    app.include_router(chat_gateway_router)
     app.include_router(memories_router)
     app.include_router(knowledge_router)
+    app.include_router(usage_router)
 
     @app.get("/", include_in_schema=False)
     @app.get("/dashboard", include_in_schema=False)

@@ -24,6 +24,8 @@ from app.llm.routing import (
     effective_provider_priority as _effective_provider_priority,
     retry_after_seconds as _retry_after_seconds,
 )
+from app.usage.context import model_usage_scope
+from app.usage.recorder import UsageRecorder
 
 
 KnowledgeAgentQuality = Literal["fast", "balanced", "deep"]
@@ -138,11 +140,13 @@ class OpenAICompatibleKnowledgeAgentClient:
         transport: httpx.AsyncBaseTransport | None = None,
         cooldowns: KnowledgeProviderCooldowns | None = None,
         wall_clock: Any = time.time,
+        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.config = config
         self.transport = transport
         self.cooldowns = cooldowns or _GLOBAL_PROVIDER_COOLDOWNS
         self._wall_clock = wall_clock
+        self.usage_recorder = usage_recorder
 
     async def create_chat_completion(
         self,
@@ -257,6 +261,14 @@ class OpenAICompatibleKnowledgeAgentClient:
         if not isinstance(data, dict):
             raise ValueError("knowledge agent response must be a JSON object")
         data.setdefault("model", provider.model)
+        if self.usage_recorder is not None:
+            self.usage_recorder.record_response(
+                payload=data,
+                model=provider.model,
+                kind="chat",
+                provider_code=provider.code,
+                base_url=provider.base_url,
+            )
         return data
 
     def _provider(
@@ -438,10 +450,14 @@ class KnowledgeSearchAgent:
         *,
         client: KnowledgeCompletionClient | None = None,
         clock: Any = time.monotonic,
+        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.store = store
         self.config = config
-        self.client = client or OpenAICompatibleKnowledgeAgentClient(config)
+        self.client = client or OpenAICompatibleKnowledgeAgentClient(
+            config,
+            usage_recorder=usage_recorder,
+        )
         self._clock = clock
 
     async def search(
@@ -631,6 +647,8 @@ class KnowledgeSearchAgent:
                     model=model,
                     messages=messages,
                     deadline=deadline,
+                    user_id=user_id,
+                    operation=f"knowledge_agent_{phase}",
                 )
                 used_model = _response_model(raw, fallback=model)
                 calls = _extract_tool_calls(raw)
@@ -891,17 +909,20 @@ class KnowledgeSearchAgent:
         model: str,
         messages: list[dict[str, Any]],
         deadline: float,
+        user_id: str,
+        operation: str,
     ) -> dict[str, Any]:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
-        value = self.client.create_chat_completion(
-            model=model,
-            messages=messages,
-            tools=_AGENT_TOOLS,
-            timeout_seconds=remaining,
-        )
-        result = await _await_with_timeout(value, remaining)
+        with model_usage_scope(user_id=user_id, operation=operation):
+            value = self.client.create_chat_completion(
+                model=model,
+                messages=messages,
+                tools=_AGENT_TOOLS,
+                timeout_seconds=remaining,
+            )
+            result = await _await_with_timeout(value, remaining)
         if not isinstance(result, dict):
             raise ValueError("knowledge agent response must be an object")
         return result

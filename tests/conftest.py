@@ -6,11 +6,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import deps
+from app.api.chat_gateway import clear_chat_gateway_state
 from app.config import get_settings
 from app.knowledge.store import KnowledgeStore
+from app.llm.routing import LLMProvider
 from app.main import create_app
 from app.memory.search import NullEmbeddingClient
 from app.memory.store import MemoryStore
+from app.openai_compat.gateway_client import GatewayHTTPResult
+from app.openai_compat.gateway_client import GatewayUpstreamHTTPError
 
 
 class FakeLLMClient:
@@ -19,7 +23,14 @@ class FakeLLMClient:
     def __init__(self) -> None:
         self.messages: list[dict] = []
         self.extraction_messages: list[dict] = []
+        self.extraction_calls = 0
         self.core_messages: list[dict] = []
+        self.context_compaction_messages: list[dict] = []
+        self.context_compaction_calls = 0
+        self.context_compaction_content = json.dumps(
+            {"summary": "较早对话的测试压缩摘要。"},
+            ensure_ascii=False,
+        )
         self.response = {
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -69,7 +80,27 @@ class FakeLLMClient:
         thinking: str | None = None,
         structured_tool: dict | None = None,
     ) -> dict:
+        if self._is_context_compaction_call(messages):
+            self.context_compaction_calls += 1
+            self.context_compaction_messages = messages
+            return {
+                "id": "chatcmpl-context-compaction",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": self.context_compaction_content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
         if self._is_extraction_call(messages):
+            self.extraction_calls += 1
             self.extraction_messages = messages
             return {
                 "id": "chatcmpl-extraction",
@@ -143,6 +174,16 @@ class FakeLLMClient:
         return first.get("role") == "system" and "记忆提取器" in first.get("content", "")
 
     @staticmethod
+    def _is_context_compaction_call(messages: list[dict]) -> bool:
+        if not messages:
+            return False
+        first = messages[0]
+        return (
+            first.get("role") == "system"
+            and "会话上下文压缩器" in first.get("content", "")
+        )
+
+    @staticmethod
     def _is_core_consolidation_call(messages: list[dict]) -> bool:
         if not messages:
             return False
@@ -157,14 +198,109 @@ class FakeLLMClient:
         return first.get("role") == "system" and "记忆体检编辑器" in first.get("content", "")
 
 
+class FakeGatewayStream:
+    def __init__(self, chunks: list[bytes], *, provider: LLMProvider) -> None:
+        self.chunks = chunks
+        self.headers = {"content-type": "text/event-stream"}
+        self.closed = False
+        self.provider = provider
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeChatGatewayClient:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+        self.stream_payloads: list[dict] = []
+        self.preferred_provider_codes: list[str | None] = []
+        self.stream_preferred_provider_codes: list[str | None] = []
+        self.response = {
+            "id": "chatcmpl-gateway-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-upstream",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "好的，我会参考这些信息。",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+        self.stream_chunks = [
+            'data: {"id":"chatcmpl-stream","choices":[{"index":0,"delta":{"role":"assistant","content":"你好"},"finish_reason":null}]}\n\n'.encode(),
+            b'data: {"id":"chatcmpl-stream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        self.last_stream: FakeGatewayStream | None = None
+        self.error: GatewayUpstreamHTTPError | None = None
+        self.provider = LLMProvider(
+            code="D",
+            base_url="https://upstream.invalid/v1",
+            api_key="test",
+            model="test-upstream",
+        )
+
+    def list_models(self) -> list[str]:
+        return ["memory-auto", self.provider.model]
+
+    async def complete(
+        self,
+        payload: dict,
+        *,
+        preferred_provider_code: str | None = None,
+    ) -> GatewayHTTPResult:
+        self.payloads.append(payload)
+        self.preferred_provider_codes.append(preferred_provider_code)
+        if self.error is not None:
+            raise self.error
+        return GatewayHTTPResult(
+            content=json.dumps(self.response, ensure_ascii=False).encode("utf-8"),
+            status_code=200,
+            headers={"content-type": "application/json; charset=utf-8"},
+            provider=self.provider,
+        )
+
+    async def open_stream(
+        self,
+        payload: dict,
+        *,
+        preferred_provider_code: str | None = None,
+    ) -> FakeGatewayStream:
+        self.stream_payloads.append(payload)
+        self.stream_preferred_provider_codes.append(preferred_provider_code)
+        if self.error is not None:
+            raise self.error
+        self.last_stream = FakeGatewayStream(
+            list(self.stream_chunks),
+            provider=self.provider,
+        )
+        return self.last_stream
+
+
 @pytest.fixture
 def memory_store(tmp_path) -> MemoryStore:
     store = MemoryStore(str(tmp_path / "memory.db"))
     store.init_db()
     # 清除模块级搜索缓存，避免测试间残留
-    from app.memory.search import _EMBEDDING_CACHE, _SEARCH_CACHE
+    from app.memory.search import _CACHE_METRICS, _EMBEDDING_CACHE, _SEARCH_CACHE
     _EMBEDDING_CACHE.clear()
     _SEARCH_CACHE.clear()
+    _CACHE_METRICS.clear()
     return store
 
 
@@ -181,11 +317,17 @@ def fake_llm() -> FakeLLMClient:
 
 
 @pytest.fixture
+def fake_gateway() -> FakeChatGatewayClient:
+    return FakeChatGatewayClient()
+
+
+@pytest.fixture
 def client(
     monkeypatch,
     memory_store: MemoryStore,
     knowledge_store: KnowledgeStore,
     fake_llm: FakeLLMClient,
+    fake_gateway: FakeChatGatewayClient,
 ) -> Iterator[TestClient]:
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
@@ -208,6 +350,7 @@ def client(
     monkeypatch.setenv("TIME_RIPPLE_DELTA", "0.0")
     monkeypatch.setenv("TIME_RIPPLE_WINDOW_HOURS", "48")
     get_settings.cache_clear()
+    clear_chat_gateway_state()
 
     # MCP 的 session manager 不允许重复启动，每个测试都构建全新应用实例
     app = create_app()
@@ -215,6 +358,7 @@ def client(
     app.dependency_overrides[deps.get_knowledge_store] = lambda: knowledge_store
     app.dependency_overrides[deps.get_embedding_client] = lambda: NullEmbeddingClient()
     app.dependency_overrides[deps.get_llm_client] = lambda: fake_llm
+    app.dependency_overrides[deps.get_chat_gateway_client] = lambda: fake_gateway
 
     with TestClient(app) as test_client:
         yield test_client

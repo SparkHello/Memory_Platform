@@ -4,7 +4,10 @@ from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import Settings, get_settings
-from app.knowledge.agent import KnowledgeAgentConfig, KnowledgeSearchAgent
+from app.knowledge.agent import (
+    KnowledgeAgentConfig,
+    KnowledgeSearchAgent,
+)
 from app.knowledge.retrieval import (
     KnowledgeEmbeddingIndexer,
     KnowledgeRetrievalService,
@@ -18,6 +21,8 @@ from app.memory.search import (
     OpenAICompatibleEmbeddingClient,
 )
 from app.memory.store import MemoryStore
+from app.openai_compat.gateway_client import OpenAIChatGatewayClient
+from app.usage.recorder import UsageRecorder
 
 security = HTTPBearer(auto_error=False)
 
@@ -69,6 +74,7 @@ def get_embedding_client(
             dimensions=settings.embedding_dimensions,
             timeout_seconds=settings.request_timeout_seconds,
             allow_sensitive_egress=settings.allow_sensitive_egress,
+            usage_recorder=UsageRecorder(settings.database_path),
         )
     return NullEmbeddingClient()
 
@@ -121,7 +127,11 @@ def get_knowledge_search_agent(
         allow_sensitive_egress=settings.allow_sensitive_egress,
         timeout_seconds=settings.knowledge_agent_timeout_seconds,
     )
-    return KnowledgeSearchAgent(store=retrieval, config=config)
+    return KnowledgeSearchAgent(
+        store=retrieval,
+        config=config,
+        usage_recorder=UsageRecorder(settings.database_path),
+    )
 
 
 def get_memory_search_service(
@@ -140,4 +150,19 @@ def get_memory_search_service(
 def get_llm_client(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> OpenAICompatibleClient:
-    return OpenAICompatibleClient(settings=settings)
+    return OpenAICompatibleClient(
+        settings=settings,
+        usage_recorder=UsageRecorder(settings.database_path),
+    )
+
+
+def get_chat_gateway_client(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> OpenAIChatGatewayClient:
+    return OpenAIChatGatewayClient(settings=settings)
+
+
+def get_usage_recorder(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> UsageRecorder:
+    return UsageRecorder(settings.database_path)

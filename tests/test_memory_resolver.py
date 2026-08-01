@@ -64,6 +64,145 @@ async def test_resolver_ignores_when_existing_is_more_complete(
 
 
 @pytest.mark.asyncio
+async def test_resolver_ignores_broader_paraphrase_covered_by_old_memory(
+    memory_store: MemoryStore,
+) -> None:
+    existing = memory_store.create_memory(
+        user_id="default",
+        content="用户使用的笔记本是华硕枪神9 Plus，配备 RTX 5060 显卡和 32GB 内存。",
+        type="semantic",
+        importance=6,
+        confidence=0.9,
+        topics=["硬件配置", "设备", "工具"],
+        entities=["华硕枪神9 Plus", "RTX 5060", "枪神9plus"],
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    resolver = MemoryResolver(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([0.71, 0.7042]),
+    )
+
+    result = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate(
+            "用户拥有一台枪神（ROG 枪神）笔记本电脑",
+            type="semantic",
+            importance=6,
+            topics=["设备", "笔记本电脑", "游戏本"],
+            entities=["枪神"],
+        ),
+    )
+
+    assert result.action == "ignore"
+    assert result.relation == "same"
+    assert result.memory == existing
+    assert "语义等价" in result.reason
+    assert len(memory_store.list_memories(user_id="default")) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_hide_new_plan_with_same_device_entity(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户使用的笔记本是华硕枪神9 Plus，配备 RTX 5060 显卡和 32GB 内存。",
+        type="semantic",
+        importance=6,
+        topics=["硬件配置", "设备"],
+        entities=["华硕枪神9 Plus", "枪神9plus"],
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    resolver = MemoryResolver(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([0.71, 0.7042]),
+    )
+
+    result = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate(
+            "用户计划购买一台新的枪神笔记本电脑。",
+            type="semantic",
+            topics=["购买计划", "设备"],
+            entities=["枪神"],
+        ),
+    )
+
+    assert result.action == "create"
+    assert result.memory is not None
+    assert result.memory.id != old.id
+    assert len(memory_store.list_memories(user_id="default")) == 2
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_hide_candidate_with_uncovered_entity(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户使用的笔记本是华硕枪神9 Plus，配备 RTX 5060 显卡和 32GB 内存。",
+        type="semantic",
+        importance=6,
+        topics=["硬件配置", "设备"],
+        entities=["华硕枪神9 Plus", "枪神9plus"],
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    resolver = MemoryResolver(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([0.71, 0.7042]),
+    )
+
+    result = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate(
+            "用户拥有枪神笔记本电脑和 iPhone 手机。",
+            type="semantic",
+            topics=["设备"],
+            entities=["枪神", "iPhone"],
+        ),
+    )
+
+    assert result.action == "create"
+    assert result.memory is not None
+    assert result.memory.id != old.id
+    assert len(memory_store.list_memories(user_id="default")) == 2
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_hide_new_structured_device_detail(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户拥有一台枪神笔记本电脑，并经常用它玩游戏。",
+        type="semantic",
+        importance=6,
+        topics=["设备", "游戏"],
+        entities=["枪神"],
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    resolver = MemoryResolver(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient([0.71, 0.7042]),
+    )
+
+    result = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate(
+            "用户的枪神笔记本配备 RTX 5090 显卡。",
+            type="semantic",
+            topics=["设备", "硬件配置"],
+            entities=["枪神", "RTX 5090"],
+        ),
+    )
+
+    assert result.action == "create"
+    assert result.memory is not None
+    assert result.memory.id != old.id
+    assert len(memory_store.list_memories(user_id="default")) == 2
+
+
+@pytest.mark.asyncio
 async def test_resolver_creates_related_memory_without_overwriting_old_timeline(
     memory_store: MemoryStore,
 ) -> None:
@@ -173,4 +312,3 @@ def _candidate(content: str, *, type: str = "fact", **overrides) -> CandidateMem
     }
     payload.update(overrides)
     return CandidateMemory(**payload)
-

@@ -13,6 +13,21 @@ from app.memory.search import EmbeddingClient
 from app.memory.store import MemoryStore
 
 
+_MODEL_REASON_CODE_LABELS = {
+    "has_candidates": "已提取候选",
+    "no_long_term_value": "没有未来长期价值",
+    "temporary_or_one_off": "临时状态或一次性事项",
+    "hypothetical_or_uncertain": "假设或不确定表述",
+    "not_user_asserted": "不是用户亲口陈述",
+    "sensitive_without_explicit_request": "敏感信息未获明确记忆授权",
+    "insufficient_context": "上下文不足",
+    "other": "其他原因",
+    "unclassified": "模型未提供有效原因码",
+    "invalid_model_output": "模型输出格式无效",
+    "upstream_unavailable": "提取模型不可用",
+}
+
+
 class MemoryIngestService:
     """Turn raw user text into validated, deduplicated long-term memories."""
 
@@ -36,6 +51,8 @@ class MemoryIngestService:
         text: str,
         conversation_id: str | None = None,
         assistant_message: str | None = None,
+        conversation_context: str | None = None,
+        context_quote_source: str | None = None,
         source: str = "ingest",
     ) -> MemoryIngestResult:
         source_text = text.strip()
@@ -71,10 +88,43 @@ class MemoryIngestService:
                 status="rejected",
             )
 
-        extractor = LLMMemoryExtractor(llm_client=self.llm_client)
+        extraction_assistant_message = assistant_message
+        extraction_conversation_context = conversation_context
+        extraction_context_quote_source = context_quote_source
+        if (
+            not self.allow_sensitive_egress
+            and assistant_message
+            and detect_text_sensitivity(assistant_message) != "normal"
+        ):
+            # The user's source can still be safely extracted without copying a
+            # sensitive model/tool result to a separate extraction provider.
+            extraction_assistant_message = None
+        if (
+            not self.allow_sensitive_egress
+            and conversation_context
+            and detect_text_sensitivity(conversation_context) != "normal"
+        ):
+            # Callers should already filter context block-by-block. This
+            # defense-in-depth check prevents mixed sensitive history from
+            # reaching a separate extraction provider.
+            extraction_conversation_context = None
+            extraction_context_quote_source = None
+        if (
+            not self.allow_sensitive_egress
+            and context_quote_source
+            and detect_text_sensitivity(context_quote_source) != "normal"
+        ):
+            extraction_context_quote_source = None
+
+        extractor = LLMMemoryExtractor(
+            llm_client=self.llm_client,
+            user_id=user_id,
+        )
         batch = await extractor.extract_many(
             source_text=source_text,
-            assistant_message=assistant_message,
+            assistant_message=extraction_assistant_message,
+            conversation_context=extraction_conversation_context,
+            context_quote_source=extraction_context_quote_source,
         )
         if batch.retryable_error:
             self.store.create_decision_log(
@@ -98,6 +148,8 @@ class MemoryIngestService:
             )
         if not batch.outcomes:
             item = MemoryIngestItemResult(action="ignore", reason=batch.reason)
+            model_reason_code = batch.reason_code
+            model_reason_label = _MODEL_REASON_CODE_LABELS[model_reason_code]
             self.store.create_decision_log(
                 user_id=user_id,
                 conversation_id=conversation_id,
@@ -105,12 +157,17 @@ class MemoryIngestService:
                     source=source,
                     payload={
                         "action": "ignore",
+                        "model_reason_code": model_reason_code,
                         **_text_audit_fields("model_reason", batch.reason),
                         "model_reason_redacted": True,
                     },
                 ),
                 decision="ignore",
-                reason="提取模型未返回候选记忆；模型理由已脱敏",
+                reason=(
+                    "提取模型未返回候选记忆；"
+                    f"原因码={model_reason_code}（{model_reason_label}）；"
+                    "模型理由已脱敏"
+                ),
             )
             return MemoryIngestResult(
                 ignored=1,
@@ -214,6 +271,10 @@ def _candidate_audit_payload(outcome: ExtractionOutcome) -> dict:
     if isinstance(quote, str) and quote:
         payload.update(_text_audit_fields("source_quote", quote))
         payload["source_quote_redacted"] = True
+    context_quote = payload.pop("context_quote", None)
+    if isinstance(context_quote, str) and context_quote:
+        payload.update(_text_audit_fields("context_quote", context_quote))
+        payload["context_quote_redacted"] = True
 
     if candidate is None:
         raw_output = payload.pop("raw", None)

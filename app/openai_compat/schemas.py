@@ -4,8 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | None
+    role: str = Field(min_length=1)
+    # External OpenAI-compatible clients may send a plain string, null, or
+    # multimodal parts such as text/image_url/input_audio. Keep this open so
+    # the transparent chat gateway does not destroy client-specific payloads.
+    content: Any = None
 
     model_config = ConfigDict(extra="allow")
 

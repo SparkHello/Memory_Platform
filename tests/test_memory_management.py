@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import zipfile
 
+from app.memory.models import RecentContextTurn
 from app.memory.store import MemoryStore
 
 
@@ -559,7 +560,7 @@ def test_restore_export_imports_memories_for_current_user(
         reason="test audit",
     )
     export = client.get("/memories/export", headers=auth_headers).json()
-    assert export["version"] == 2
+    assert export["version"] == 3
     assert export["memory_spaces"][0]["name"] == "Coffee"
     assert export["memories"][0]["topics"] == ["coffee"]
     assert export["memories"][0]["valid_from"] == "2025-01-01"
@@ -610,13 +611,21 @@ def test_restore_export_imports_recent_context_with_overwrite_policy(
     auth_headers,
     memory_store: MemoryStore,
 ):
-    memory_store.upsert_recent_context_summary(
+    memory_store.upsert_recent_context_state(
         user_id="default",
         conversation_id="ctx-export",
-        summary="用户：源摘要",
+        summary="较早摘要\n\n用户：最近问题",
+        compressed_summary="较早摘要",
+        recent_turns=[
+            RecentContextTurn(user="最近问题", assistant="最近回答"),
+        ],
+        turn_count=9,
     )
     export = client.get("/memories/export", headers=auth_headers).json()
-    assert export["recent_context_summaries"][0]["summary"] == "用户：源摘要"
+    exported_context = export["recent_context_summaries"][0]
+    assert exported_context["compressed_summary"] == "较早摘要"
+    assert exported_context["recent_turns"][0]["user"] == "最近问题"
+    assert exported_context["turn_count"] == 9
 
     target_headers = {**auth_headers, "X-User-Id": "recent-restore-target"}
     memory_store.upsert_recent_context_summary(
@@ -651,7 +660,174 @@ def test_restore_export_imports_recent_context_with_overwrite_policy(
         conversation_id="ctx-export",
     )
     assert restored is not None
-    assert restored.summary == "用户：源摘要"
+    assert restored.compressed_summary == "较早摘要"
+    assert restored.recent_turns[0].assistant == "最近回答"
+    assert restored.turn_count == 9
+
+
+def test_export_restore_includes_conversation_branch_nodes(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="1" * 64,
+        parent_history_fingerprint="",
+        turn_fingerprint="2" * 64,
+        assistant_digest="3" * 64,
+        summary="用户：问题\n助手：回答",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="问题", assistant="回答")],
+        turn_count=1,
+    )
+    export = client.get("/memories/export", headers=auth_headers).json()
+
+    assert export["version"] == 3
+    assert export["conversation_branch_nodes"][0]["history_fingerprint"] == "1" * 64
+
+    target_headers = {**auth_headers, "X-User-Id": "branch-restore-target"}
+    restored = client.post(
+        "/memories/restore",
+        headers=target_headers,
+        json={"data": export},
+    )
+
+    assert restored.status_code == 200
+    assert restored.json()["branch_nodes_created"] == 1
+    node = memory_store.get_conversation_branch_node(
+        user_id="branch-restore-target",
+        history_fingerprint="1" * 64,
+    )
+    assert node is not None
+    assert node.recent_turns[0].assistant == "回答"
+
+
+def test_conversation_branch_rest_list_and_archive_subtree(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    root = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="a" * 64,
+        parent_history_fingerprint="",
+        turn_fingerprint="b" * 64,
+        assistant_digest="c" * 64,
+        summary="根节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="根问题", assistant="根回答")],
+        turn_count=1,
+    )
+    child = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="d" * 64,
+        parent_history_fingerprint=root.history_fingerprint,
+        turn_fingerprint="e" * 64,
+        assistant_digest="f" * 64,
+        summary="子节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="子问题", assistant="子回答")],
+        turn_count=2,
+    )
+    grandchild = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="1" * 64,
+        parent_history_fingerprint=child.history_fingerprint,
+        turn_fingerprint="2" * 64,
+        assistant_digest="3" * 64,
+        summary="孙节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="孙问题", assistant="孙回答")],
+        turn_count=3,
+    )
+    other = memory_store.upsert_conversation_branch_node(
+        user_id="other",
+        conversation_id=None,
+        history_fingerprint="4" * 64,
+        parent_history_fingerprint="",
+        turn_fingerprint="5" * 64,
+        assistant_digest="6" * 64,
+        summary="其他用户",
+        compressed_summary="",
+        recent_turns=[],
+        turn_count=1,
+    )
+
+    listed = client.get(
+        "/memories/conversation-branches?limit=2",
+        headers=auth_headers,
+    )
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert payload["meta"] == {
+        "status": "active",
+        "total": 3,
+        "returned": 2,
+        "truncated": True,
+    }
+    assert all(node["user_id"] == "default" for node in payload["data"])
+
+    wrong_user = client.delete(
+        f"/memories/conversation-branches/{other.id}",
+        headers=auth_headers,
+    )
+    assert wrong_user.status_code == 404
+
+    archived = client.delete(
+        f"/memories/conversation-branches/{child.id}",
+        headers=auth_headers,
+    )
+    assert archived.status_code == 200
+    assert archived.json()["archived_count"] == 2
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=child.history_fingerprint,
+    ) is None
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=grandchild.history_fingerprint,
+    ) is None
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=root.history_fingerprint,
+    ) is not None
+
+    archived_list = client.get(
+        "/memories/conversation-branches?status=archived",
+        headers=auth_headers,
+    )
+    assert archived_list.status_code == 200
+    archived_payload = archived_list.json()
+    assert archived_payload["meta"]["status"] == "archived"
+    assert archived_payload["meta"]["total"] == 2
+    assert {node["id"] for node in archived_payload["data"]} == {
+        child.id,
+        grandchild.id,
+    }
+
+    repeated = client.delete(
+        f"/memories/conversation-branches/{child.id}",
+        headers=auth_headers,
+    )
+    assert repeated.status_code == 404
+
+    restored = client.post(
+        f"/memories/conversation-branches/{child.id}/restore",
+        headers=auth_headers,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["restored_count"] == 2
+
+    repeated_restore = client.post(
+        f"/memories/conversation-branches/{child.id}/restore",
+        headers=auth_headers,
+    )
+    assert repeated_restore.status_code == 404
 
 
 def test_memory_spaces_and_classification_rest_endpoints(
@@ -1027,4 +1203,3 @@ def test_patch_memory_requires_authorization(client, memory_store: MemoryStore):
     )
 
     assert response.status_code == 401
-

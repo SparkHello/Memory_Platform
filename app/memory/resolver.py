@@ -1,4 +1,5 @@
 import json
+import re
 from functools import partial
 
 import anyio
@@ -14,11 +15,41 @@ from app.memory.utils import (
     _normalize,
     _term_jaccard,
 )
+from app.usage.context import model_usage_scope
 
 # embedding 余弦相似度达到该值即视为同主题旧记忆
 EMBEDDING_SIMILARITY_THRESHOLD = 0.80
+# 旧记忆在实体、主题和事实细节上覆盖新候选时，可用稍低的向量门槛
+# 识别“更完整旧事实的笼统改写”。该门槛不能单独触发忽略。
+SEMANTIC_COVERAGE_SIMILARITY_THRESHOLD = 0.70
 # 无向量可用时退化为词重叠（Jaccard）判断
 TERM_SIMILARITY_THRESHOLD = 0.5
+
+_GENERIC_ENTITIES = {
+    "个人",
+    "本人",
+    "用户",
+    "设备",
+    "电脑",
+    "笔记本",
+    "笔记本电脑",
+}
+_INTENT_MARKERS = (
+    "准备买",
+    "准备购买",
+    "打算买",
+    "打算购买",
+    "计划买",
+    "计划购买",
+    "考虑买",
+    "考虑购买",
+    "可能会买",
+    "可能购买",
+    "想买",
+    "想购买",
+    "希望买",
+    "希望购买",
+)
 
 
 class MemoryResolver:
@@ -64,8 +95,20 @@ class MemoryResolver:
                     reason="已有更完整的同主题记忆",
                 )
 
-        vector = await self.embedding_client.embed(candidate.memory)
+        with model_usage_scope(user_id=user_id, operation="memory_write"):
+            vector = await self.embedding_client.embed(candidate.memory)
         embedding_json = json.dumps(vector, ensure_ascii=False) if vector else None
+
+        covered_by = await anyio.to_thread.run_sync(
+            partial(_find_semantically_covering_memory, candidate, existing, vector)
+        )
+        if covered_by is not None:
+            return ResolveResult(
+                action="ignore",
+                memory=covered_by,
+                relation="same",
+                reason="已有更完整的语义等价记忆",
+            )
 
         target, related_reason, relation = await anyio.to_thread.run_sync(
             partial(_find_related_memory, candidate, existing, vector, normalized_new)
@@ -145,6 +188,119 @@ class MemoryResolver:
             ),
             "space_ids": [],
         }
+
+
+def _find_semantically_covering_memory(
+    candidate: CandidateMemory,
+    existing: list[MemoryRecord],
+    vector: list[float] | None,
+) -> MemoryRecord | None:
+    """Find an active old fact that conservatively entails a broader paraphrase."""
+    if not vector or candidate.temporal_subject or candidate.temporal_predicate:
+        return None
+
+    best: MemoryRecord | None = None
+    best_score = 0.0
+    for memory in existing:
+        if not _old_memory_covers_candidate(candidate, memory):
+            continue
+        old_vector = _memory_embedding_vector(memory)
+        if old_vector is None:
+            continue
+        score = cosine_similarity(vector, old_vector)
+        if score >= SEMANTIC_COVERAGE_SIMILARITY_THRESHOLD and score > best_score:
+            best = memory
+            best_score = score
+    return best
+
+
+def _old_memory_covers_candidate(
+    candidate: CandidateMemory,
+    memory: MemoryRecord,
+) -> bool:
+    if (
+        memory.type != candidate.type
+        or memory.origin != "user_asserted"
+        or memory.status not in {"dynamic", "pinned"}
+        or memory.sensitivity != candidate.sensitivity
+        or memory.temporal_subject
+        or memory.temporal_predicate
+    ):
+        return False
+
+    new_content = candidate.memory
+    old_content = memory.content
+    if (
+        _looks_conflicting(new_content, old_content)
+        or _looks_superseding(new_content)
+        or _has_intent_marker(new_content) != _has_intent_marker(old_content)
+    ):
+        return False
+
+    if len(_semantic_text(old_content)) < len(_semantic_text(new_content)):
+        return False
+    if not _structured_tokens(new_content).issubset(_structured_tokens(old_content)):
+        return False
+    if not _candidate_entities_are_covered(candidate.entities, memory):
+        return False
+    return _labels_overlap(candidate.topics, memory.topics)
+
+
+def _candidate_entities_are_covered(
+    candidate_entities: list[str],
+    memory: MemoryRecord,
+) -> bool:
+    normalized_candidates = [
+        normalized
+        for value in candidate_entities
+        if (normalized := _semantic_text(value))
+        and normalized not in _GENERIC_ENTITIES
+    ]
+    if not normalized_candidates:
+        return False
+
+    old_labels = [
+        normalized
+        for value in [memory.content, *memory.entities]
+        if (normalized := _semantic_text(value))
+    ]
+    return all(
+        any(
+            candidate_entity == old_label
+            or candidate_entity in old_label
+            or old_label in candidate_entity
+            for old_label in old_labels
+        )
+        for candidate_entity in normalized_candidates
+    )
+
+
+def _labels_overlap(left: list[str], right: list[str]) -> bool:
+    left_labels = {_semantic_text(value) for value in left} - {""}
+    right_labels = {_semantic_text(value) for value in right} - {""}
+    return any(
+        left_label == right_label
+        or (
+            min(len(left_label), len(right_label)) >= 2
+            and (left_label in right_label or right_label in left_label)
+        )
+        for left_label in left_labels
+        for right_label in right_labels
+    )
+
+
+def _semantic_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text.lower())
+
+
+def _structured_tokens(text: str) -> set[str]:
+    compact = re.sub(r"\s+", "", text.lower())
+    return set(re.findall(r"[a-z]*\d+(?:[._-]\d+)*(?:[a-z]+)?", compact))
+
+
+def _has_intent_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _INTENT_MARKERS)
 
 
 def _find_related_memory(

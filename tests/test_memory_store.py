@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
+from app.memory.models import RecentContextTurn
 from app.memory.store import MemoryStore
 
 
@@ -1111,6 +1112,255 @@ def test_recent_context_summary_upsert(memory_store: MemoryStore) -> None:
     assert len(summaries) == 1
     assert summary is not None
     assert summary.summary == "用户：聊咖啡\n助手：推荐早餐"
+    assert summary.compressed_summary == summary.summary
+    assert summary.recent_turns == []
+
+
+def test_recent_context_state_round_trip(memory_store: MemoryStore) -> None:
+    saved = memory_store.upsert_recent_context_state(
+        user_id="default",
+        conversation_id="rolling",
+        summary="较早摘要\n\n最近两轮",
+        compressed_summary="较早摘要",
+        recent_turns=[
+            RecentContextTurn(
+                user="你猜我现在多少岁",
+                assistant="我猜 20 岁",
+            ),
+            RecentContextTurn(
+                user="18",
+                assistant="原来是 18 岁",
+            ),
+        ],
+        turn_count=7,
+    )
+
+    loaded = memory_store.get_recent_context_summary_for_conversation(
+        user_id="default",
+        conversation_id="rolling",
+    )
+
+    assert loaded == saved
+    assert loaded is not None
+    assert loaded.turn_count == 7
+    assert loaded.recent_turns[1].user == "18"
+
+
+def test_conversation_branch_nodes_keep_sibling_context_snapshots(
+    memory_store: MemoryStore,
+) -> None:
+    common = {
+        "user_id": "default",
+        "conversation_id": None,
+        "parent_history_fingerprint": "a" * 64,
+        "turn_fingerprint": "b" * 64,
+        "summary": "用户：同一个问题",
+        "compressed_summary": "",
+        "turn_count": 1,
+    }
+    first = memory_store.upsert_conversation_branch_node(
+        **common,
+        history_fingerprint="c" * 64,
+        assistant_digest="d" * 64,
+        recent_turns=[
+            RecentContextTurn(user="同一个问题", assistant="回答 A"),
+        ],
+    )
+    second = memory_store.upsert_conversation_branch_node(
+        **common,
+        history_fingerprint="e" * 64,
+        assistant_digest="f" * 64,
+        recent_turns=[
+            RecentContextTurn(user="同一个问题", assistant="回答 B"),
+        ],
+    )
+
+    loaded_first = memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint="c" * 64,
+    )
+    loaded_second = memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint="e" * 64,
+    )
+
+    assert loaded_first == first
+    assert loaded_second == second
+    assert loaded_first is not None
+    assert loaded_second is not None
+    assert loaded_first.recent_turns[0].assistant == "回答 A"
+    assert loaded_second.recent_turns[0].assistant == "回答 B"
+    assert len(
+        memory_store.list_conversation_branch_nodes(user_id="default")
+    ) == 2
+    assert (
+        memory_store.get_conversation_branch_node(
+            user_id="other",
+            history_fingerprint="c" * 64,
+        )
+        is None
+    )
+
+
+def test_conversation_branch_subtree_is_archived_and_can_be_recreated(
+    memory_store: MemoryStore,
+) -> None:
+    root = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="1" * 64,
+        parent_history_fingerprint="",
+        turn_fingerprint="2" * 64,
+        assistant_digest="3" * 64,
+        summary="根节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="根问题", assistant="根回答")],
+        turn_count=1,
+    )
+    child = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="4" * 64,
+        parent_history_fingerprint=root.history_fingerprint,
+        turn_fingerprint="5" * 64,
+        assistant_digest="6" * 64,
+        summary="子节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="子问题", assistant="子回答")],
+        turn_count=2,
+    )
+    grandchild = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="7" * 64,
+        parent_history_fingerprint=child.history_fingerprint,
+        turn_fingerprint="8" * 64,
+        assistant_digest="9" * 64,
+        summary="孙节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="孙问题", assistant="孙回答")],
+        turn_count=3,
+    )
+    sibling = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint="a" * 64,
+        parent_history_fingerprint=root.history_fingerprint,
+        turn_fingerprint="b" * 64,
+        assistant_digest="c" * 64,
+        summary="兄弟节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="兄弟问题", assistant="兄弟回答")],
+        turn_count=2,
+    )
+
+    assert memory_store.count_conversation_branch_nodes(user_id="default") == 4
+    assert (
+        memory_store.archive_conversation_branch_subtree(
+            node_id=child.id,
+            user_id="default",
+        )
+        == 2
+    )
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=child.history_fingerprint,
+    ) is None
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=grandchild.history_fingerprint,
+    ) is None
+    assert memory_store.get_conversation_branch_node(
+        user_id="default",
+        history_fingerprint=sibling.history_fingerprint,
+    ) is not None
+    assert memory_store.count_conversation_branch_nodes(user_id="default") == 2
+    assert memory_store.count_conversation_branch_nodes(
+        user_id="default",
+        archived=True,
+    ) == 2
+    assert {
+        node.id
+        for node in memory_store.list_conversation_branch_nodes(
+            user_id="default",
+            archived=True,
+        )
+    } == {child.id, grandchild.id}
+
+    assert (
+        memory_store.restore_conversation_branch_subtree(
+            node_id=child.id,
+            user_id="default",
+        )
+        == 2
+    )
+    assert memory_store.count_conversation_branch_nodes(user_id="default") == 4
+
+    assert (
+        memory_store.archive_conversation_branch_subtree(
+            node_id=child.id,
+            user_id="default",
+        )
+        == 2
+    )
+
+    recreated = memory_store.upsert_conversation_branch_node(
+        user_id="default",
+        conversation_id=None,
+        history_fingerprint=child.history_fingerprint,
+        parent_history_fingerprint=root.history_fingerprint,
+        turn_fingerprint="d" * 64,
+        assistant_digest="e" * 64,
+        summary="重新建立的子节点",
+        compressed_summary="",
+        recent_turns=[RecentContextTurn(user="新问题", assistant="新回答")],
+        turn_count=2,
+    )
+    assert recreated.id == child.id
+    assert recreated.archived == 0
+    assert recreated.summary == "重新建立的子节点"
+
+
+def test_legacy_recent_context_table_gets_rolling_state_columns(tmp_path) -> None:
+    store = MemoryStore(str(tmp_path / "legacy-recent.db"))
+    with store._connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE recent_context_summaries (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                conversation_id TEXT,
+                summary TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                archived INTEGER DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO recent_context_summaries (
+                id, user_id, conversation_id, summary,
+                created_at, updated_at, archived
+            )
+            VALUES (
+                'legacy-recent', 'default', 'legacy-conv', '旧的滚动原文',
+                'now', 'now', 0
+            )
+            """
+        )
+
+    store.init_db()
+
+    loaded = store.get_recent_context_summary_for_conversation(
+        user_id="default",
+        conversation_id="legacy-conv",
+    )
+    assert loaded is not None
+    assert loaded.summary == "旧的滚动原文"
+    assert loaded.compressed_summary == ""
+    assert loaded.recent_turns == []
+    assert loaded.turn_count == 0
 
 
 def test_recent_context_default_reads_latest_and_exact_global_is_distinct(
@@ -1517,4 +1767,3 @@ def _set_memory_status(memory_store: MemoryStore, memory_id: str, status: str) -
             """,
             (status, now, memory_id, "default"),
         )
-

@@ -9,6 +9,7 @@ import anyio
 from app.knowledge.models import KnowledgeSearchHit
 from app.knowledge.store import KnowledgeStore
 from app.memory.search import EmbeddingClient, NullEmbeddingClient
+from app.usage.context import model_usage_scope
 
 
 class KnowledgeEmbeddingIndexer:
@@ -91,9 +92,13 @@ class KnowledgeEmbeddingIndexer:
         try:
             for start in range(0, len(chunks), self.batch_size):
                 batch = chunks[start : start + self.batch_size]
-                embedded = await self.embedding_client.embed_many(
-                    [chunk.content for chunk in batch]
-                )
+                with model_usage_scope(
+                    user_id=user_id,
+                    operation="knowledge_index",
+                ):
+                    embedded = await self.embedding_client.embed_many(
+                        [chunk.content for chunk in batch]
+                    )
                 for chunk, vector in zip(batch, embedded, strict=False):
                     if vector:
                         vectors[chunk.ref] = vector
@@ -160,7 +165,11 @@ class KnowledgeRetrievalService:
             )
         )
         try:
-            query_vector = await self.embedding_client.embed(query)
+            with model_usage_scope(
+                user_id=user_id,
+                operation="knowledge_search",
+            ):
+                query_vector = await self.embedding_client.embed(query)
         except Exception:
             query_vector = None
         keyword_hits = await keyword_task

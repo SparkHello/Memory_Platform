@@ -17,6 +17,7 @@ from app.llm.routing import (
     retry_after_seconds,
 )
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.usage.recorder import UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,13 @@ class OpenAICompatibleClient:
         transport: httpx.AsyncBaseTransport | None = None,
         cooldowns: ProviderCooldowns | None = None,
         wall_clock: Any = time.time,
+        usage_recorder: UsageRecorder | None = None,
     ):
         self.settings = settings
         self.transport = transport
         self.cooldowns = cooldowns or GLOBAL_PROVIDER_COOLDOWNS
         self._wall_clock = wall_clock
+        self.usage_recorder = usage_recorder
 
     async def create_chat_completion(
         self,
@@ -111,12 +114,22 @@ class OpenAICompatibleClient:
             time.monotonic() - started_at,
         )
         try:
-            return _json_from_utf8_bytes(response)
+            data = _json_from_utf8_bytes(response)
         except json.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="上游模型 API 返回了无法解析的 JSON",
             ) from exc
+        if self.usage_recorder is not None:
+            self.usage_recorder.record_response(
+                payload=data,
+                model=provider.model,
+                kind="chat",
+                provider_code=provider.code,
+                base_url=provider.base_url,
+                operation=request.model,
+            )
+        return data
 
     async def _request_with_failover(
         self,
@@ -194,34 +207,7 @@ class OpenAICompatibleClient:
             return response
 
     def _providers(self) -> dict[Literal["M", "K", "D"], LLMProvider]:
-        deepseek = LLMProvider(
-            code="D",
-            base_url=self.settings.llm_deepseek_base_url,
-            api_key=self.settings.llm_deepseek_api_key,
-            model=self.settings.llm_deepseek_flash_model,
-        )
-        if not deepseek.configured:
-            deepseek = LLMProvider(
-                code="D",
-                base_url=self.settings.upstream_base_url,
-                api_key=self.settings.upstream_api_key,
-                model=self.settings.upstream_model,
-            )
-        return {
-            "M": LLMProvider(
-                code="M",
-                base_url=self.settings.llm_mimo_base_url,
-                api_key=self.settings.llm_mimo_api_key,
-                model=self.settings.llm_mimo_model,
-            ),
-            "K": LLMProvider(
-                code="K",
-                base_url=self.settings.llm_kimi_base_url,
-                api_key=self.settings.llm_kimi_api_key,
-                model=self.settings.llm_kimi_model,
-            ),
-            "D": deepseek,
-        }
+        return configured_llm_providers(self.settings)
 
     def _defer_after_429(
         self,
@@ -248,6 +234,40 @@ def _safe_error_detail(response: httpx.Response) -> str:
     except (UnicodeError, json.JSONDecodeError):
         return response.content.decode("utf-8", errors="replace")[:500]
     return str(data)[:500]
+
+
+def configured_llm_providers(
+    settings: Settings,
+) -> dict[Literal["M", "K", "D"], LLMProvider]:
+    """Build the provider map shared by internal tasks and the chat gateway."""
+    deepseek = LLMProvider(
+        code="D",
+        base_url=settings.llm_deepseek_base_url,
+        api_key=settings.llm_deepseek_api_key,
+        model=settings.llm_deepseek_flash_model,
+    )
+    if not deepseek.configured:
+        deepseek = LLMProvider(
+            code="D",
+            base_url=settings.upstream_base_url,
+            api_key=settings.upstream_api_key,
+            model=settings.upstream_model,
+        )
+    return {
+        "M": LLMProvider(
+            code="M",
+            base_url=settings.llm_mimo_base_url,
+            api_key=settings.llm_mimo_api_key,
+            model=settings.llm_mimo_model,
+        ),
+        "K": LLMProvider(
+            code="K",
+            base_url=settings.llm_kimi_base_url,
+            api_key=settings.llm_kimi_api_key,
+            model=settings.llm_kimi_model,
+        ),
+        "D": deepseek,
+    }
 
 
 def _provider_payload(
@@ -285,9 +305,7 @@ def _provider_payload(
 
 
 def _kimi_requires_temperature_one(provider: LLMProvider) -> bool:
-    if provider.code != "K":
-        return False
-    model = provider.model.lower()
+    model = provider.model.lower().rsplit("/", 1)[-1]
     return model.startswith("kimi-k2.7") or model.startswith("kimi-for-coding")
 
 
@@ -329,7 +347,7 @@ def _thinking_payload(
     thinking: Literal["enabled", "disabled"] = "enabled",
 ) -> dict:
     provider_text = base_url.lower()
-    model_text = model.lower()
+    model_text = model.lower().rsplit("/", 1)[-1]
     if "moonshot" in provider_text or "kimi" in provider_text:
         if model_text.startswith("kimi-k3"):
             return {"reasoning_effort": "max"} if thinking == "enabled" else {}

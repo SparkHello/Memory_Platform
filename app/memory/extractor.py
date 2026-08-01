@@ -1,5 +1,7 @@
 import json
 import re
+from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -13,6 +15,7 @@ from app.memory.models import CandidateMemory, MemorySensitivity
 from app.memory.review_policy import normalize_time_uncertain_candidate
 from app.memory.utils import _parse_json_object, _terms
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.usage.context import model_usage_scope
 
 # 命中这些表达的句子被视为假设场景，一律不写入记忆
 ASSUMPTION_MARKERS = (
@@ -48,6 +51,33 @@ EXPLICIT_MEMORY_MARKERS = (
     "以后记得",
     "remember",
     "don't forget",
+)
+
+ExtractionReasonCode = Literal[
+    "has_candidates",
+    "no_long_term_value",
+    "temporary_or_one_off",
+    "hypothetical_or_uncertain",
+    "not_user_asserted",
+    "sensitive_without_explicit_request",
+    "insufficient_context",
+    "other",
+    "unclassified",
+    "invalid_model_output",
+    "upstream_unavailable",
+]
+
+_MODEL_EXTRACTION_REASON_CODES = frozenset(
+    {
+        "has_candidates",
+        "no_long_term_value",
+        "temporary_or_one_off",
+        "hypothetical_or_uncertain",
+        "not_user_asserted",
+        "sensitive_without_explicit_request",
+        "insufficient_context",
+        "other",
+    }
 )
 
 _SENSITIVITY_RANK = {"normal": 0, "private": 1, "sensitive": 2}
@@ -174,6 +204,31 @@ _EMAIL_PATTERN = re.compile(
 )
 _LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[\s()\-./]?){4,}(?!\d)")
 _TOKEN_SECRET_PATTERN = re.compile(r"\b(?:sk|pk|token)[-_][A-Za-z0-9_-]{4,}\b", re.IGNORECASE)
+_CURRENT_AGE_QUOTE_PATTERN = re.compile(
+    r"(?:我|本人)?\s*(?:现在|目前|今年)\s*(\d{1,3})\s*岁"
+    r"|(?:i am|i'm)\s*(?:currently\s*)?(\d{1,3})(?:\s*years?\s+old)?",
+    re.IGNORECASE,
+)
+_AGE_MEMORY_PATTERN = re.compile(
+    r"(?:自称|现在|目前|今年)\s*(\d{1,3})\s*岁"
+    r"|年龄\s*(?:是|为)?\s*(\d{1,3})\s*岁?"
+    r"|(\d{1,3})\s*岁"
+    r"|(?:currently\s*)?(\d{1,3})(?:\s*years?\s+old)",
+    re.IGNORECASE,
+)
+_BARE_AGE_ANSWER_PATTERN = re.compile(r"^\s*(\d{1,3})\s*[。.!！]?\s*$")
+_AGE_CONTEXT_PATTERN = re.compile(
+    r"(?:多少\s*岁|多大(?:了)?|年龄(?:是)?多少|几岁)"
+    r"|\bhow\s+old\b|\bage\b",
+    re.IGNORECASE,
+)
+_CURRENT_DATE_PREFIX_PATTERN = re.compile(
+    r"^\s*截至\s*"
+    r"(?P<year>\d{4})\s*(?:-|/|\.|年)\s*"
+    r"(?P<month>\d{1,2})"
+    r"(?:\s*(?:-|/|\.|月)\s*(?P<day>\d{1,2})\s*日?)?"
+    r"\s*[,，:：]?\s*"
+)
 
 _GENERIC_ENTITIES = {"用户", "本人", "我", "user", "me", "myself"}
 _GROUNDING_GENERIC_TERMS = {
@@ -266,6 +321,7 @@ class ExtractionBatchOutcome(BaseModel):
 
     outcomes: list[ExtractionOutcome] = Field(default_factory=list)
     reason: str = ""
+    reason_code: ExtractionReasonCode = "unclassified"
     raw_output: str = ""
     retryable_error: bool = False
     error_code: str | None = None
@@ -274,8 +330,14 @@ class ExtractionBatchOutcome(BaseModel):
 class LLMMemoryExtractor:
     """调用上游模型分析本轮对话，产出符合严格 JSON 格式的候选记忆。"""
 
-    def __init__(self, *, llm_client: OpenAICompatibleClient):
+    def __init__(
+        self,
+        *,
+        llm_client: OpenAICompatibleClient,
+        user_id: str = "default",
+    ):
         self.llm_client = llm_client
+        self.user_id = user_id
 
     async def extract(self, *, user_message: str, assistant_message: str) -> ExtractionOutcome:
         try:
@@ -341,16 +403,20 @@ class LLMMemoryExtractor:
         *,
         source_text: str,
         assistant_message: str | None = None,
+        conversation_context: str | None = None,
+        context_quote_source: str | None = None,
     ) -> ExtractionBatchOutcome:
         try:
             raw_output = await self._call_llm_many(
                 source_text=source_text,
                 assistant_message=assistant_message,
+                conversation_context=conversation_context,
             )
         except Exception as exc:
             return ExtractionBatchOutcome(
                 outcomes=[],
                 reason=f"调用提取模型失败：{exc}",
+                reason_code="upstream_unavailable",
                 retryable_error=_is_retryable_upstream_error(exc),
                 error_code="upstream_unavailable",
             )
@@ -366,6 +432,7 @@ class LLMMemoryExtractor:
                     )
                 ],
                 reason=reason,
+                reason_code="invalid_model_output",
                 raw_output=raw_output[:500],
             )
 
@@ -374,6 +441,7 @@ class LLMMemoryExtractor:
             return ExtractionBatchOutcome(
                 outcomes=[],
                 reason=str(data.get("reason") or "没有值得保存的长期记忆"),
+                reason_code=_batch_reason_code(data, has_candidates=False),
                 raw_output=raw_output[:500],
             )
 
@@ -397,6 +465,7 @@ class LLMMemoryExtractor:
                 candidate,
                 user_message=source_text,
                 require_quote_in_user_message=True,
+                conversation_context=context_quote_source,
             )
             if source_rejection:
                 outcomes.append(
@@ -408,7 +477,10 @@ class LLMMemoryExtractor:
                 )
                 continue
 
-            candidate = normalize_time_uncertain_candidate(candidate)
+            candidate = normalize_time_uncertain_candidate(
+                candidate,
+                source_text=context_quote_source,
+            )
             candidate = apply_extraction_hints(candidate)
             normalized_candidate_json = json.dumps(candidate.model_dump(), ensure_ascii=False)
             rejection = _validate_candidate_for_save(
@@ -438,6 +510,7 @@ class LLMMemoryExtractor:
         return ExtractionBatchOutcome(
             outcomes=outcomes,
             reason=str(data.get("reason") or "拆分完成"),
+            reason_code=_batch_reason_code(data, has_candidates=True),
             raw_output=raw_output[:500],
         )
 
@@ -452,7 +525,11 @@ class LLMMemoryExtractor:
             temperature=0.0,
             stream=False,
         )
-        response = await self.llm_client.create_chat_completion(request=request, messages=messages)
+        with model_usage_scope(user_id=self.user_id):
+            response = await self.llm_client.create_chat_completion(
+                request=request,
+                messages=messages,
+            )
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -464,10 +541,12 @@ class LLMMemoryExtractor:
         *,
         source_text: str,
         assistant_message: str | None,
+        conversation_context: str | None,
     ) -> str:
         messages = render_memory_batch_extraction_messages(
             source_text=source_text,
             assistant_message=assistant_message,
+            conversation_context=conversation_context,
         )
         request = ChatCompletionRequest(
             model="memory-ingester",
@@ -475,7 +554,11 @@ class LLMMemoryExtractor:
             temperature=0.0,
             stream=False,
         )
-        response = await self.llm_client.create_chat_completion(request=request, messages=messages)
+        with model_usage_scope(user_id=self.user_id):
+            response = await self.llm_client.create_chat_completion(
+                request=request,
+                messages=messages,
+            )
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -493,6 +576,19 @@ def _candidate_payloads_from_data(data: dict) -> list[dict]:
     if data.get("action") in {"create", "update", "ignore"}:
         return [data]
     return []
+
+
+def _batch_reason_code(
+    data: dict,
+    *,
+    has_candidates: bool,
+) -> ExtractionReasonCode:
+    if has_candidates:
+        return "has_candidates"
+    raw = str(data.get("reason_code") or "").strip().lower()
+    if raw in _MODEL_EXTRACTION_REASON_CODES and raw != "has_candidates":
+        return raw  # type: ignore[return-value]
+    return "unclassified"
 
 
 def _is_retryable_upstream_error(exc: Exception) -> bool:
@@ -602,6 +698,7 @@ def _raw_candidate_source_gate_reason(
     *,
     user_message: str | None,
     require_quote_in_user_message: bool,
+    conversation_context: str | None = None,
 ) -> str | None:
     """Validate model evidence before any post-extraction mutation."""
     if candidate.action == "ignore":
@@ -614,8 +711,114 @@ def _raw_candidate_source_gate_reason(
     )
     if quote_rejection:
         return quote_rejection
+    context_rejection = _context_quote_gate_reason(
+        candidate,
+        conversation_context=conversation_context,
+    )
+    if context_rejection:
+        return context_rejection
     _apply_sensitivity_floor(candidate)
-    return _grounding_gate_reason(candidate, quote=quote)
+    grounding_candidate = _candidate_for_raw_grounding(
+        candidate,
+        quote=quote,
+        context_quote_verified=bool(candidate.context_quote.strip()),
+    )
+    return _grounding_gate_reason(grounding_candidate, quote=quote)
+
+
+def _candidate_for_raw_grounding(
+    candidate: CandidateMemory,
+    *,
+    quote: str,
+    context_quote_verified: bool = False,
+    now: datetime | None = None,
+) -> CandidateMemory:
+    """Remove only a trusted system-date prefix from a current-age candidate.
+
+    The extraction prompt includes the current date. Older prompt versions also
+    asked the model to put that date into ``candidate.memory`` even though it
+    could not appear in the verbatim user quote. Treat that exact current-date
+    prefix as backend metadata only when the quote and memory carry the same
+    current age. Every other structured value remains subject to grounding.
+    """
+    prefix_match = _CURRENT_DATE_PREFIX_PATTERN.match(candidate.memory)
+    if prefix_match is None:
+        return candidate
+
+    quote_age = _matched_age(_CURRENT_AGE_QUOTE_PATTERN.search(quote))
+    if quote_age is None and context_quote_verified:
+        quote_age = _contextual_age_answer(quote, candidate.context_quote)
+    memory_age = _matched_age(_AGE_MEMORY_PATTERN.search(candidate.memory[prefix_match.end() :]))
+    if quote_age is None or quote_age != memory_age:
+        return candidate
+
+    base = now or datetime.now(UTC)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=UTC)
+    else:
+        base = base.astimezone(UTC)
+    if int(prefix_match.group("year")) != base.year:
+        return candidate
+    if int(prefix_match.group("month")) != base.month:
+        return candidate
+    day = prefix_match.group("day")
+    if day is not None and int(day) != base.day:
+        return candidate
+
+    grounded_memory = candidate.memory[prefix_match.end() :].strip()
+    if not grounded_memory:
+        return candidate
+    return candidate.model_copy(update={"memory": grounded_memory})
+
+
+def _matched_age(match: re.Match[str] | None) -> int | None:
+    if match is None:
+        return None
+    raw_age = next((value for value in match.groups() if value is not None), None)
+    if raw_age is None:
+        return None
+    age = int(raw_age)
+    return age if 0 < age < 130 else None
+
+
+def _context_quote_gate_reason(
+    candidate: CandidateMemory,
+    *,
+    conversation_context: str | None,
+) -> str | None:
+    context_quote = candidate.context_quote.strip()
+    if context_quote:
+        if not conversation_context:
+            return "candidate.context_quote 缺少较早对话上下文支撑"
+        if context_quote not in conversation_context:
+            return "context_quote 不是较早对话原文，疑似模型自行编造"
+
+    if _bare_age_answer(candidate.source_quote, candidate.memory) is not None:
+        if not context_quote:
+            return "仅凭数字无法判断年龄语义，缺少 context_quote"
+        if not _AGE_CONTEXT_PATTERN.search(context_quote):
+            return "context_quote 未明确询问年龄，无法解释本轮数字回答"
+    return None
+
+
+def _contextual_age_answer(source_quote: str, context_quote: str) -> int | None:
+    if not _AGE_CONTEXT_PATTERN.search(context_quote):
+        return None
+    return _bare_age_answer(source_quote, "")
+
+
+def _bare_age_answer(source_quote: str, memory: str) -> int | None:
+    match = _BARE_AGE_ANSWER_PATTERN.fullmatch(source_quote)
+    if match is None:
+        return None
+    age = int(match.group(1))
+    if not 0 < age < 130:
+        return None
+    if memory:
+        memory_age = _matched_age(_AGE_MEMORY_PATTERN.search(memory))
+        if memory_age != age:
+            return None
+    return age
 
 
 def _source_quote_gate_reason(

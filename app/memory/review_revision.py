@@ -31,6 +31,7 @@ from app.memory.utils import (
     _term_jaccard,
 )
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.usage.context import model_usage_scope
 
 
 class ReviewRevisionError(Exception):
@@ -163,12 +164,13 @@ async def preview_review_revision(
         stream=False,
     )
     try:
-        response = await llm_client.create_chat_completion(
-            request=request,
-            messages=messages,
-            thinking="enabled",
-            structured_tool=_review_revision_structured_tool(),
-        )
+        with model_usage_scope(user_id=user_id):
+            response = await llm_client.create_chat_completion(
+                request=request,
+                messages=messages,
+                thinking="enabled",
+                structured_tool=_review_revision_structured_tool(),
+            )
         raw_output = _review_revision_raw_output(response["choices"][0]["message"])
     except HTTPException as exc:
         raise ReviewRevisionError(

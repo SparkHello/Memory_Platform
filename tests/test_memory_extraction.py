@@ -5,6 +5,7 @@
 """
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1150,7 +1151,11 @@ def test_empty_candidate_model_reason_is_hashed_in_decision_log(
 ) -> None:
     identifier = "123456789012345678"
     fake_llm.extraction_content = json.dumps(
-        {"memories": [], "reason": f"身份证号是 {identifier}"},
+        {
+            "memories": [],
+            "reason_code": "no_long_term_value",
+            "reason": f"身份证号是 {identifier}",
+        },
         ensure_ascii=False,
     )
 
@@ -1160,9 +1165,287 @@ def test_empty_candidate_model_reason_is_hashed_in_decision_log(
     log = memory_store.list_decision_logs()[0]
     audit = json.loads(log.candidate_json)
     assert audit["model_reason_redacted"] is True
+    assert audit["model_reason_code"] == "no_long_term_value"
     assert len(audit["model_reason_sha256"]) == 64
+    assert "原因码=no_long_term_value" in log.reason
     assert identifier not in log.candidate_json
     assert identifier not in log.reason
+
+
+def test_empty_candidate_without_valid_reason_code_is_marked_unclassified(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [],
+            "reason_code": "model_invented_code",
+            "reason": "模型没有遵守原因码枚举",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我喜欢咖啡。")
+
+    assert response.json()["ignored"] == 1
+    log = memory_store.list_decision_logs()[0]
+    audit = json.loads(log.candidate_json)
+    assert audit["model_reason_code"] == "unclassified"
+    assert "原因码=unclassified" in log.reason
+    assert "模型没有遵守原因码枚举" not in log.candidate_json
+
+
+def test_batch_extraction_prompt_requires_age_candidate_and_reason_code(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [],
+            "reason_code": "other",
+            "reason": "测试提示词",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我现在 18 岁。")
+
+    assert response.status_code == 200
+    system_prompt = fake_llm.extraction_messages[0]["content"]
+    assert '"reason_code"' in system_prompt
+    assert "不能仅因会变化而归类为 temporary_or_one_off" in system_prompt
+    assert "必须输出候选" in system_prompt
+    assert "memory 只写原话可支撑的“用户现在 X 岁”" in system_prompt
+    assert "后端会在逐字证据校验通过后改写" in system_prompt
+
+
+def test_batch_current_age_with_system_date_anchor_is_saved(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    now = datetime.now(UTC)
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": f"截至 {now.date().isoformat()}，用户自称 18 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "stability": "medium",
+                    "source_quote": "我现在 18 岁",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "用户明确陈述当前年龄",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我现在 18 岁。")
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.content == f"截至 {now.strftime('%Y-%m')}，用户自称 18 岁。"
+    assert memory.stability == "medium"
+    assert memory.review_after is not None
+
+
+def test_batch_current_age_does_not_trust_another_date_anchor(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "截至 1900-01-01，用户自称 18 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "stability": "medium",
+                    "source_quote": "我现在 18 岁",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "用户明确陈述当前年龄",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我现在 18 岁。")
+
+    assert response.status_code == 200
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "结构化数字" in memory_store.list_decision_logs()[0].reason
+
+
+def test_batch_current_age_still_rejects_another_fabricated_number(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    now = datetime.now(UTC)
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": (
+                        f"截至 {now.date().isoformat()}，"
+                        "用户自称 18 岁，账号为 123456。"
+                    ),
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "stability": "medium",
+                    "source_quote": "我现在 18 岁",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "用户明确陈述当前年龄",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "我现在 18 岁。")
+
+    assert response.status_code == 200
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "结构化数字" in memory_store.list_decision_logs()[0].reason
+
+
+def test_batch_bare_age_answer_requires_verified_context_quote(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户现在 18 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "source_quote": "18",
+                    "context_quote": "",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "测试缺少上下文引用",
+        },
+        ensure_ascii=False,
+    )
+
+    response = _post_ingest(client, auth_headers, "18")
+
+    assert response.json()["ignored"] == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "缺少 context_quote" in memory_store.list_decision_logs()[0].reason
+
+
+@pytest.mark.asyncio
+async def test_batch_bare_age_answer_rejects_fabricated_context_quote(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户现在 18 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "source_quote": "18",
+                    "context_quote": "你今年到底多少岁",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "测试伪造上下文引用",
+        },
+        ensure_ascii=False,
+    )
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(
+        user_id="default",
+        text="18",
+        conversation_context="用户：你喜欢什么颜色",
+        context_quote_source="用户：你喜欢什么颜色",
+    )
+
+    assert result.ignored == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "不是较早对话原文" in memory_store.list_decision_logs()[0].reason
+
+
+@pytest.mark.asyncio
+async def test_compressed_summary_cannot_authorize_bare_age_answer(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": "用户现在 18 岁。",
+                    "type": "semantic",
+                    "importance": 7,
+                    "confidence": 0.85,
+                    "source_quote": "18",
+                    "context_quote": "用户此前让助手猜自己的年龄",
+                }
+            ],
+            "reason_code": "has_candidates",
+            "reason": "测试压缩摘要不能作为逐字证据",
+        },
+        ensure_ascii=False,
+    )
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(
+        user_id="default",
+        text="18",
+        conversation_context=(
+            "<compressed_summary_non_authoritative>\n"
+            "用户此前让助手猜自己的年龄\n"
+            "</compressed_summary_non_authoritative>\n\n"
+            "<recent_dialogue_quote_source>\n用户：最近在聊电影\n"
+            "</recent_dialogue_quote_source>"
+        ),
+        context_quote_source="用户：最近在聊电影",
+    )
+
+    assert result.ignored == 1
+    assert memory_store.list_memories(user_id="default") == []
+    assert "不是较早对话原文" in memory_store.list_decision_logs()[0].reason
 
 
 def test_batch_age_hint_does_not_overwrite_another_candidate(
@@ -1261,4 +1544,3 @@ def test_invalid_quote_is_rejected_before_age_normalization(
     log_payload = json.loads(memory_store.list_decision_logs()[0].candidate_json)
     assert log_payload["memory"] == "用户喜欢咖啡。"
     assert "source_quote" in memory_store.list_decision_logs()[0].reason
-

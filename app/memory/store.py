@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import (
+    ConversationBranchNode,
     CoreMemorySection,
     CoreMemorySectionHistory,
     CoreMemorySectionName,
@@ -23,6 +24,7 @@ from app.memory.models import (
     MemoryStability,
     MemoryType,
     RecentContextSummary,
+    RecentContextTurn,
     normalize_iso_text,
     normalize_memory_type,
     normalize_optional_text,
@@ -37,6 +39,9 @@ _TIME_RIPPLE_MAX_CANDIDATES = 100
 _SENSITIVITY_RANK = {"normal": 0, "private": 1, "sensitive": 2}
 # 每用户决策日志保留上限：超出后按创建时间从旧到新裁剪，避免全库无界增长。
 _DECISION_LOG_RETENTION_LIMIT = 5000
+# Branch snapshots are an operational context index, not an unlimited transcript
+# archive. Old nodes can always fall back to the visible history sent by the client.
+_CONVERSATION_BRANCH_NODE_RETENTION_LIMIT = 5000
 
 
 class _ClosingSQLiteConnection(sqlite3.Connection):
@@ -250,12 +255,16 @@ class MemoryStore:
                     user_id TEXT,
                     conversation_id TEXT,
                     summary TEXT,
+                    compressed_summary TEXT DEFAULT '',
+                    recent_turns_json TEXT DEFAULT '[]',
+                    turn_count INTEGER DEFAULT 0,
                     created_at TEXT,
                     updated_at TEXT,
                     archived INTEGER DEFAULT 0
                 )
                 """
             )
+            self._ensure_recent_context_summary_columns(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_recent_context_user_updated
@@ -287,6 +296,49 @@ class MemoryStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_recent_context_user_global_active
                 ON recent_context_summaries(user_id)
                 WHERE archived = 0 AND conversation_id IS NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_branch_nodes (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    conversation_id TEXT,
+                    history_fingerprint TEXT NOT NULL,
+                    parent_history_fingerprint TEXT DEFAULT '',
+                    turn_fingerprint TEXT NOT NULL,
+                    assistant_digest TEXT NOT NULL,
+                    summary TEXT DEFAULT '',
+                    compressed_summary TEXT DEFAULT '',
+                    recent_turns_json TEXT DEFAULT '[]',
+                    turn_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived INTEGER DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_conversation_branch_user_history
+                ON conversation_branch_nodes(user_id, history_fingerprint)
+                WHERE archived = 0
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_branch_user_parent
+                ON conversation_branch_nodes(
+                    user_id, parent_history_fingerprint, archived, updated_at DESC
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_branch_user_conversation
+                ON conversation_branch_nodes(
+                    user_id, conversation_id, archived, updated_at DESC
+                )
                 """
             )
 
@@ -1040,7 +1092,31 @@ class MemoryStore:
         conversation_id: str | None,
         summary: str,
     ) -> RecentContextSummary:
+        return self.upsert_recent_context_state(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            summary=summary,
+            compressed_summary=summary,
+            recent_turns=[],
+            turn_count=0,
+        )
+
+    def upsert_recent_context_state(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        summary: str,
+        compressed_summary: str,
+        recent_turns: list[RecentContextTurn],
+        turn_count: int,
+    ) -> RecentContextSummary:
         normalized_summary = summary.strip()
+        normalized_compressed_summary = compressed_summary.strip()
+        recent_turns_json = json.dumps(
+            [turn.model_dump() for turn in recent_turns],
+            ensure_ascii=False,
+        )
         existing = self.get_recent_context_summary_for_conversation(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -1051,10 +1127,19 @@ class MemoryStore:
                 connection.execute(
                     """
                     UPDATE recent_context_summaries
-                    SET summary = ?, updated_at = ?
+                    SET summary = ?, compressed_summary = ?,
+                        recent_turns_json = ?, turn_count = ?, updated_at = ?
                     WHERE id = ? AND user_id = ? AND archived = 0
                     """,
-                    (normalized_summary, now, existing.id, user_id),
+                    (
+                        normalized_summary,
+                        normalized_compressed_summary,
+                        recent_turns_json,
+                        max(0, turn_count),
+                        now,
+                        existing.id,
+                        user_id,
+                    ),
                 )
             updated = self.get_recent_context_summary_for_conversation(
                 user_id=user_id,
@@ -1067,6 +1152,9 @@ class MemoryStore:
             user_id=user_id,
             conversation_id=conversation_id,
             summary=normalized_summary,
+            compressed_summary=normalized_compressed_summary,
+            recent_turns=recent_turns,
+            turn_count=max(0, turn_count),
             created_at=now,
             updated_at=now,
             archived=0,
@@ -1076,15 +1164,20 @@ class MemoryStore:
                 connection.execute(
                     """
                     INSERT INTO recent_context_summaries (
-                        id, user_id, conversation_id, summary, created_at, updated_at, archived
+                        id, user_id, conversation_id, summary,
+                        compressed_summary, recent_turns_json, turn_count,
+                        created_at, updated_at, archived
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         recent_summary.id,
                         recent_summary.user_id,
                         recent_summary.conversation_id,
                         recent_summary.summary,
+                        recent_summary.compressed_summary,
+                        recent_turns_json,
+                        recent_summary.turn_count,
                         recent_summary.created_at,
                         recent_summary.updated_at,
                         recent_summary.archived,
@@ -1092,11 +1185,243 @@ class MemoryStore:
                 )
             return recent_summary
         except sqlite3.IntegrityError:
-            return self.upsert_recent_context_summary(
+            return self.upsert_recent_context_state(
                 user_id=user_id,
                 conversation_id=conversation_id,
                 summary=normalized_summary,
+                compressed_summary=normalized_compressed_summary,
+                recent_turns=recent_turns,
+                turn_count=max(0, turn_count),
             )
+
+    def get_conversation_branch_node(
+        self,
+        *,
+        user_id: str,
+        history_fingerprint: str,
+    ) -> ConversationBranchNode | None:
+        normalized = history_fingerprint.strip()
+        if not normalized:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_branch_nodes
+                WHERE user_id = ? AND history_fingerprint = ? AND archived = 0
+                LIMIT 1
+                """,
+                (user_id, normalized),
+            ).fetchone()
+        return self._row_to_conversation_branch_node(row) if row else None
+
+    def list_conversation_branch_nodes(
+        self,
+        *,
+        user_id: str,
+        limit: int = 5000,
+        archived: bool = False,
+    ) -> list[ConversationBranchNode]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversation_branch_nodes
+                WHERE user_id = ? AND archived = ?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (
+                    user_id,
+                    int(archived),
+                    max(1, min(limit, _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT)),
+                ),
+            ).fetchall()
+        return [self._row_to_conversation_branch_node(row) for row in rows]
+
+    def count_conversation_branch_nodes(
+        self,
+        *,
+        user_id: str,
+        archived: bool = False,
+    ) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM conversation_branch_nodes
+                WHERE user_id = ? AND archived = ?
+                """,
+                (user_id, int(archived)),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def archive_conversation_branch_subtree(
+        self,
+        *,
+        node_id: str,
+        user_id: str,
+    ) -> int:
+        """Soft-delete one branch node and every active descendant."""
+
+        now = utc_now_iso()
+        with self._connect() as connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                WITH RECURSIVE subtree(history_fingerprint) AS (
+                    SELECT history_fingerprint
+                    FROM conversation_branch_nodes
+                    WHERE id = ? AND user_id = ? AND archived = 0
+
+                    UNION
+
+                    SELECT child.history_fingerprint
+                    FROM conversation_branch_nodes AS child
+                    JOIN subtree AS parent
+                      ON child.parent_history_fingerprint = parent.history_fingerprint
+                    WHERE child.user_id = ? AND child.archived = 0
+                )
+                UPDATE conversation_branch_nodes
+                SET archived = 1, updated_at = ?
+                WHERE user_id = ? AND archived = 0
+                  AND history_fingerprint IN (
+                      SELECT history_fingerprint FROM subtree
+                  )
+                """,
+                (node_id, user_id, user_id, now, user_id),
+            )
+            return connection.total_changes - before
+
+    def restore_conversation_branch_subtree(
+        self,
+        *,
+        node_id: str,
+        user_id: str,
+    ) -> int:
+        """Restore one archived branch node and every archived descendant."""
+
+        now = utc_now_iso()
+        with self._connect() as connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                WITH RECURSIVE subtree(history_fingerprint) AS (
+                    SELECT history_fingerprint
+                    FROM conversation_branch_nodes
+                    WHERE id = ? AND user_id = ? AND archived = 1
+
+                    UNION
+
+                    SELECT child.history_fingerprint
+                    FROM conversation_branch_nodes AS child
+                    JOIN subtree AS parent
+                      ON child.parent_history_fingerprint = parent.history_fingerprint
+                    WHERE child.user_id = ? AND child.archived = 1
+                )
+                UPDATE conversation_branch_nodes
+                SET archived = 0, updated_at = ?
+                WHERE user_id = ? AND archived = 1
+                  AND history_fingerprint IN (
+                      SELECT history_fingerprint FROM subtree
+                  )
+                """,
+                (node_id, user_id, user_id, now, user_id),
+            )
+            return connection.total_changes - before
+
+    def upsert_conversation_branch_node(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        history_fingerprint: str,
+        parent_history_fingerprint: str,
+        turn_fingerprint: str,
+        assistant_digest: str,
+        summary: str,
+        compressed_summary: str,
+        recent_turns: list[RecentContextTurn],
+        turn_count: int,
+    ) -> ConversationBranchNode:
+        normalized_history = history_fingerprint.strip()
+        if not normalized_history:
+            raise ValueError("history_fingerprint must not be empty")
+        now = utc_now_iso()
+        node_id = "branch-" + hashlib.sha256(
+            f"{user_id}\0{normalized_history}".encode("utf-8")
+        ).hexdigest()[:32]
+        recent_turns_json = json.dumps(
+            [turn.model_dump() for turn in recent_turns],
+            ensure_ascii=False,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO conversation_branch_nodes (
+                    id, user_id, conversation_id, history_fingerprint,
+                    parent_history_fingerprint, turn_fingerprint,
+                    assistant_digest, summary, compressed_summary,
+                    recent_turns_json, turn_count, created_at, updated_at, archived
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(id)
+                DO UPDATE SET
+                    user_id = excluded.user_id,
+                    conversation_id = excluded.conversation_id,
+                    history_fingerprint = excluded.history_fingerprint,
+                    parent_history_fingerprint = excluded.parent_history_fingerprint,
+                    turn_fingerprint = excluded.turn_fingerprint,
+                    assistant_digest = excluded.assistant_digest,
+                    summary = excluded.summary,
+                    compressed_summary = excluded.compressed_summary,
+                    recent_turns_json = excluded.recent_turns_json,
+                    turn_count = excluded.turn_count,
+                    updated_at = excluded.updated_at,
+                    archived = 0
+                """,
+                (
+                    node_id,
+                    user_id,
+                    conversation_id,
+                    normalized_history,
+                    parent_history_fingerprint.strip(),
+                    turn_fingerprint.strip(),
+                    assistant_digest.strip(),
+                    summary.strip(),
+                    compressed_summary.strip(),
+                    recent_turns_json,
+                    max(0, turn_count),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM conversation_branch_nodes
+                WHERE user_id = ? AND id IN (
+                    SELECT id
+                    FROM conversation_branch_nodes
+                    WHERE user_id = ? AND archived = 0
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (
+                    user_id,
+                    user_id,
+                    _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_branch_nodes
+                WHERE user_id = ? AND history_fingerprint = ? AND archived = 0
+                LIMIT 1
+                """,
+                (user_id, normalized_history),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("conversation branch node write did not persist")
+        return self._row_to_conversation_branch_node(row)
 
     def archive_memory(self, *, memory_id: str, user_id: str) -> bool:
         now = utc_now_iso()
@@ -2646,6 +2971,30 @@ class MemoryStore:
             )
 
     @staticmethod
+    def _ensure_recent_context_summary_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(recent_context_summaries)"
+            ).fetchall()
+        }
+        if "compressed_summary" not in columns:
+            connection.execute(
+                "ALTER TABLE recent_context_summaries "
+                "ADD COLUMN compressed_summary TEXT DEFAULT ''"
+            )
+        if "recent_turns_json" not in columns:
+            connection.execute(
+                "ALTER TABLE recent_context_summaries "
+                "ADD COLUMN recent_turns_json TEXT DEFAULT '[]'"
+            )
+        if "turn_count" not in columns:
+            connection.execute(
+                "ALTER TABLE recent_context_summaries "
+                "ADD COLUMN turn_count INTEGER DEFAULT 0"
+            )
+
+    @staticmethod
     def _ensure_decision_logs_user_id(connection: sqlite3.Connection) -> None:
         columns = {
             row["name"]
@@ -2816,7 +3165,27 @@ class MemoryStore:
 
     @staticmethod
     def _row_to_recent_context_summary(row: sqlite3.Row) -> RecentContextSummary:
-        return RecentContextSummary(**dict(row))
+        data = dict(row)
+        raw_turns = data.pop("recent_turns_json", None)
+        try:
+            parsed_turns = json.loads(raw_turns) if raw_turns else []
+        except json.JSONDecodeError:
+            parsed_turns = []
+        data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
+        return RecentContextSummary(**data)
+
+    @staticmethod
+    def _row_to_conversation_branch_node(
+        row: sqlite3.Row,
+    ) -> ConversationBranchNode:
+        data = dict(row)
+        raw_turns = data.pop("recent_turns_json", None)
+        try:
+            parsed_turns = json.loads(raw_turns) if raw_turns else []
+        except json.JSONDecodeError:
+            parsed_turns = []
+        data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
+        return ConversationBranchNode(**data)
 
 
 def _json_string_list(raw_value: str | None) -> list[str]:

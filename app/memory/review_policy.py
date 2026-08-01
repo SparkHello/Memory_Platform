@@ -43,15 +43,18 @@ def normalize_time_uncertain_candidate(
     source_text: str | None = None,
     now: datetime | None = None,
 ) -> CandidateMemory:
-    # Kept only for call compatibility; age evidence must be candidate-scoped.
-    del source_text
     if candidate.action == "ignore":
         return candidate
 
-    # Age is rewritten only when the candidate's exact quote carries the age.
-    # Reading the whole submitted message here can overwrite an unrelated
-    # candidate extracted from another sentence in the same batch.
+    # Age is rewritten only when the candidate's exact source quote carries
+    # the age, either explicitly or as a bare answer to a verified age question.
     age = _unanchored_age(candidate.source_quote)
+    if age is None and source_text and candidate.context_quote:
+        age = _contextual_age_answer(
+            source_quote=candidate.source_quote,
+            context_quote=candidate.context_quote,
+            context_text=source_text,
+        )
     if age is None:
         return candidate
 
@@ -134,6 +137,28 @@ def _has_time_or_birth_anchor(text: str) -> bool:
         "birthday",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _contextual_age_answer(
+    *,
+    source_quote: str,
+    context_quote: str,
+    context_text: str,
+) -> int | None:
+    if context_quote not in context_text:
+        return None
+    if not re.search(
+        r"(?:多少\s*岁|多大(?:了)?|年龄(?:是)?多少|几岁)"
+        r"|\bhow\s+old\b|\bage\b",
+        context_quote,
+        re.IGNORECASE,
+    ):
+        return None
+    match = re.fullmatch(r"\s*(\d{1,3})\s*[。.!！]?\s*", source_quote)
+    if not match:
+        return None
+    age = int(match.group(1))
+    return age if 0 < age < 130 else None
 
 
 def _utc_now(now: datetime | None) -> datetime:

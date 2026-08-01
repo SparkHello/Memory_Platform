@@ -2,9 +2,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
+import hashlib
 import json
 import math
 import re
+import threading
 import time
 
 import anyio
@@ -15,6 +17,8 @@ from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.store import MemoryStore
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
+from app.usage.context import model_usage_scope
+from app.usage.recorder import UsageRecorder
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +34,8 @@ _EMBEDDING_CACHE_MAX = 512
 _SEARCH_CACHE_MAX = 256
 _EMBEDDING_CACHE_TTL = 300   # 5 分钟
 _SEARCH_CACHE_TTL = 120       # 2 分钟
+_CACHE_METRICS: dict[str, dict[str, int]] = {}
+_CACHE_METRICS_LOCK = threading.Lock()
 _RECALL_LIMIT = 20
 # SQLite/FTS 候选生成接入前，宁可扫描当前个人库，也不能按重要度提前丢掉
 # 低频但精确匹配的旧记忆。该上限只是异常数据量保护，不参与相关性裁剪。
@@ -90,9 +96,56 @@ _NEAR_EXPIRY_DAYS = 14
 _LOW_LIFE_THRESHOLD = 30.0
 
 
+def _record_cache_metric(user_id: str, name: str) -> None:
+    with _CACHE_METRICS_LOCK:
+        metrics = _CACHE_METRICS.setdefault(user_id, {})
+        metrics[name] = metrics.get(name, 0) + 1
+
+
+def search_cache_stats(user_id: str) -> dict[str, object]:
+    """Return process-local, user-isolated cache counters and cache policy."""
+    with _CACHE_METRICS_LOCK:
+        metrics = dict(_CACHE_METRICS.get(user_id, {}))
+    recall_hits = metrics.get("recall_hits", 0)
+    recall_misses = metrics.get("recall_misses", 0)
+    embedding_hits = metrics.get("embedding_hits", 0)
+    embedding_misses = metrics.get("embedding_misses", 0)
+
+    def _rate(hits: int, misses: int) -> float | None:
+        attempts = hits + misses
+        return round(hits / attempts, 4) if attempts else None
+
+    return {
+        "scope": "current_process",
+        "user_id": user_id,
+        "recall": {
+            "hits": recall_hits,
+            "misses": recall_misses,
+            "hit_rate": _rate(recall_hits, recall_misses),
+            "ttl_seconds": _SEARCH_CACHE_TTL,
+            "max_entries": _SEARCH_CACHE_MAX,
+        },
+        "embedding": {
+            "hits": embedding_hits,
+            "misses": embedding_misses,
+            "hit_rate": _rate(embedding_hits, embedding_misses),
+            "ttl_seconds": _EMBEDDING_CACHE_TTL,
+            "max_entries": _EMBEDDING_CACHE_MAX,
+        },
+        "note": (
+            "Counters reset when the service process restarts. Empty queries and "
+            "cache-disabled searches are excluded."
+        ),
+    }
+
+
 def _normalize_query(query: str) -> str:
-    """规范化 query 用于缓存 key：去空格、小写、截断至前 200 字符。"""
-    return " ".join(query.split()).lower()[:200]
+    """Normalize a cache key without colliding on long chat messages."""
+    normalized = " ".join(query.split()).lower()
+    if len(normalized) <= 200:
+        return normalized
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"{normalized[:200]}:{digest}"
 
 
 def _semantic_query_text(query: str) -> str:
@@ -183,6 +236,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         dimensions: int = 1024,
         timeout_seconds: float = 60.0,
         allow_sensitive_egress: bool = False,
+        usage_recorder: UsageRecorder | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -190,6 +244,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self.dimensions = dimensions
         self.timeout_seconds = timeout_seconds
         self.allow_sensitive_egress = allow_sensitive_egress
+        self.usage_recorder = usage_recorder
 
     async def embed(self, text: str) -> list[float] | None:
         if not self.allow_sensitive_egress and detect_text_sensitivity(text) != "normal":
@@ -239,6 +294,13 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return []
 
+        if self.usage_recorder is not None and isinstance(data, dict):
+            self.usage_recorder.record_response(
+                payload=data,
+                model=self.model,
+                kind="embedding",
+                base_url=self.base_url,
+            )
         try:
             items = data.get("data")
             if not isinstance(items, list):
@@ -273,6 +335,8 @@ class MemorySearchService:
         # 评测等隔离场景关闭进程级缓存：缓存 key 只含 (user, query, limit)，
         # 不区分数据源/检索模式，复用会让 keyword 与 embedding 基线互相污染。
         self.enable_cache = enable_cache
+        self.last_cache_status = "bypass"
+        self.last_embedding_cache_status = "bypass"
         self.time_ripple_delta = max(0.0, min(1.0, float(time_ripple_delta or 0.0)))
         self.time_ripple_window_hours = max(1, min(720, int(time_ripple_window_hours or 48)))
 
@@ -305,6 +369,8 @@ class MemorySearchService:
     ) -> list[MemorySearchHit]:
         normalized = _normalize_query(query)
         if not normalized:
+            self.last_cache_status = "empty"
+            self.last_embedding_cache_status = "empty"
             return []
         capped_limit = max(1, min(limit, 20))
         now = _now()
@@ -321,7 +387,14 @@ class MemorySearchService:
                 )
             )
             if cached_hits is not None:
+                self.last_cache_status = "hit"
+                self.last_embedding_cache_status = "not-needed"
+                _record_cache_metric(user_id, "recall_hits")
                 return cached_hits
+            self.last_cache_status = "miss"
+            _record_cache_metric(user_id, "recall_misses")
+        else:
+            self.last_cache_status = "bypass"
 
         query_embedding = await self._query_embedding(
             query=query,
@@ -456,10 +529,22 @@ class MemorySearchService:
         if self.enable_cache and l1_key in _EMBEDDING_CACHE:
             l1_expires_at, l1_vector = _EMBEDDING_CACHE[l1_key]
             if now < l1_expires_at:
+                self.last_embedding_cache_status = "hit"
+                _record_cache_metric(user_id, "embedding_hits")
                 return l1_vector
             del _EMBEDDING_CACHE[l1_key]
 
-        query_embedding = await self.embedding_client.embed(_semantic_query_text(query))
+        if isinstance(self.embedding_client, NullEmbeddingClient):
+            self.last_embedding_cache_status = "disabled"
+        elif self.enable_cache:
+            self.last_embedding_cache_status = "miss"
+            _record_cache_metric(user_id, "embedding_misses")
+        else:
+            self.last_embedding_cache_status = "bypass"
+        with model_usage_scope(user_id=user_id, operation="memory_search"):
+            query_embedding = await self.embedding_client.embed(
+                _semantic_query_text(query)
+            )
         if query_embedding and self.enable_cache:
             self._cache_embedding(l1_key, query_embedding, now)
         return query_embedding

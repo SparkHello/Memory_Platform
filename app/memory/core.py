@@ -9,6 +9,7 @@ from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRe
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.usage.context import model_usage_scope
 
 
 MIN_CORE_CONFIDENCE = 0.75
@@ -53,6 +54,7 @@ class CoreMemoryConsolidator:
         )
         try:
             raw_output = await self._call_llm(
+                user_id=user_id,
                 memories=memories,
                 current_sections=current_sections,
             )
@@ -115,6 +117,7 @@ class CoreMemoryConsolidator:
     async def _call_llm(
         self,
         *,
+        user_id: str,
         memories: list[MemoryRecord],
         current_sections: list[CoreMemorySection],
     ) -> str:
@@ -128,7 +131,11 @@ class CoreMemoryConsolidator:
             temperature=0.0,
             stream=False,
         )
-        response = await self.llm_client.create_chat_completion(request=request, messages=messages)
+        with model_usage_scope(user_id=user_id):
+            response = await self.llm_client.create_chat_completion(
+                request=request,
+                messages=messages,
+            )
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):

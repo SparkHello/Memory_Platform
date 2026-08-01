@@ -28,9 +28,14 @@ class TestNormalizeQuery:
     def test_lowercase(self):
         assert _normalize_query("Hello WORLD") == "hello world"
 
-    def test_truncate(self):
+    def test_long_queries_keep_prefix_and_collision_resistant_hash(self):
         long_text = "a" * 300
-        assert len(_normalize_query(long_text)) == 200
+        other_text = ("a" * 299) + "b"
+        normalized = _normalize_query(long_text)
+
+        assert normalized.startswith(("a" * 200) + ":")
+        assert len(normalized) == 200 + 1 + 64
+        assert normalized != _normalize_query(other_text)
 
     def test_collapse_whitespace(self):
         assert _normalize_query("  hello    world  ") == "hello world"

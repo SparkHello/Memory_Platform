@@ -77,14 +77,27 @@ from app.memory.report import (
     restore_memory_export,
 )
 from app.memory.redaction import redact_memory_payload
-from app.memory.search import EmbeddingClient, MemorySearchService, NullEmbeddingClient
+from app.memory.search import (
+    EmbeddingClient,
+    MemorySearchService,
+    NullEmbeddingClient,
+    search_cache_stats,
+)
 from app.memory.store import MemoryStore
+from app.usage.context import model_usage_scope
 
 router = APIRouter(
     prefix="/memories",
     tags=["memories"],
     dependencies=[Depends(require_api_key)],
 )
+
+
+@router.get("/cache-stats")
+def memory_search_cache_stats(
+    user_id: Annotated[str, Depends(get_user_id)],
+) -> dict[str, object]:
+    return search_cache_stats(user_id)
 
 
 class MemorySearchRequest(BaseModel):
@@ -513,6 +526,81 @@ def upsert_recent_context_summary(
     return {"data": summary.model_dump()}
 
 
+@router.get("/conversation-branches")
+def list_conversation_branches(
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    limit: int = Query(default=500, ge=1, le=1000),
+    status_filter: Literal["active", "archived"] = Query(
+        default="active",
+        alias="status",
+    ),
+) -> dict[str, object]:
+    archived = status_filter == "archived"
+    nodes = store.list_conversation_branch_nodes(
+        user_id=user_id,
+        limit=limit,
+        archived=archived,
+    )
+    total = store.count_conversation_branch_nodes(
+        user_id=user_id,
+        archived=archived,
+    )
+    return {
+        "data": [node.model_dump() for node in nodes],
+        "meta": {
+            "status": status_filter,
+            "total": total,
+            "returned": len(nodes),
+            "truncated": total > len(nodes),
+        },
+    }
+
+
+@router.delete("/conversation-branches/{node_id}")
+def archive_conversation_branch(
+    node_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict[str, object]:
+    archived_count = store.archive_conversation_branch_subtree(
+        node_id=node_id,
+        user_id=user_id,
+    )
+    if archived_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="对话分支不存在或已清理",
+        )
+    return {
+        "id": node_id,
+        "archived": True,
+        "archived_count": archived_count,
+    }
+
+
+@router.post("/conversation-branches/{node_id}/restore")
+def restore_conversation_branch(
+    node_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict[str, object]:
+    restored_count = store.restore_conversation_branch_subtree(
+        node_id=node_id,
+        user_id=user_id,
+    )
+    if restored_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="已清理的对话分支不存在或已经恢复",
+        )
+    return {
+        "id": node_id,
+        "restored": True,
+        "restored_count": restored_count,
+    }
+
+
 @router.get("/core")
 def list_core_memory(
     user_id: Annotated[str, Depends(get_user_id)],
@@ -879,7 +967,8 @@ async def re_embed_memories(
         if memory.sensitivity != "normal" and not body.include_sensitive:
             failed.append(memory_id)
             continue
-        embedding = await embedding_client.embed(memory.content)
+        with model_usage_scope(user_id=user_id, operation="memory_reembed"):
+            embedding = await embedding_client.embed(memory.content)
         if embedding is None:
             failed.append(memory_id)
             continue

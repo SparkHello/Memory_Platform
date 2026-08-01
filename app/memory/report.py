@@ -3,7 +3,7 @@ import json
 import re
 import zipfile
 
-from app.memory.models import MemoryRecord, utc_now_iso
+from app.memory.models import MemoryRecord, RecentContextTurn, utc_now_iso
 from app.memory.store import MemoryStore
 
 
@@ -78,7 +78,7 @@ def build_memory_export(
         else []
     )
     return {
-        "version": 2,
+        "version": 3,
         "exported_at": utc_now_iso(),
         "user_id": user_id,
         "embedding_included": False,
@@ -88,6 +88,7 @@ def build_memory_export(
                 "memories",
                 "deleted_memories",
                 "recent_context_summaries",
+                "conversation_branch_nodes",
             ],
             "snapshot_only_sections": [
                 "core_memory_sections",
@@ -128,6 +129,13 @@ def build_memory_export(
                 limit=10000,
             )
         ],
+        "conversation_branch_nodes": [
+            node.model_dump()
+            for node in store.list_conversation_branch_nodes(
+                user_id=user_id,
+                limit=5000,
+            )
+        ],
         "decision_logs": [
             log.model_dump()
             for log in store.list_decision_logs(user_id=user_id, limit=10000)
@@ -147,6 +155,7 @@ def restore_memory_export(
     deleted_records = export_data.get("deleted_memories", []) if include_deleted else []
     space_records = export_data.get("memory_spaces", [])
     recent_context_records = export_data.get("recent_context_summaries", [])
+    branch_node_records = export_data.get("conversation_branch_nodes", [])
     snapshot_only_sections = [
         name
         for name in (
@@ -165,6 +174,10 @@ def restore_memory_export(
         "recent_context_updated": 0,
         "recent_context_skipped": 0,
         "recent_context_invalid": 0,
+        "branch_nodes_created": 0,
+        "branch_nodes_updated": 0,
+        "branch_nodes_skipped": 0,
+        "branch_nodes_invalid": 0,
         "created": 0,
         "updated": 0,
         "skipped": 0,
@@ -228,6 +241,15 @@ def restore_memory_export(
                 store=store,
                 user_id=user_id,
                 raw_summary=raw_summary,
+                overwrite=overwrite,
+                result=result,
+            )
+    if isinstance(branch_node_records, list):
+        for raw_node in branch_node_records:
+            _restore_one_conversation_branch_node(
+                store=store,
+                user_id=user_id,
+                raw_node=raw_node,
                 overwrite=overwrite,
                 result=result,
             )
@@ -472,7 +494,19 @@ def _restore_one_recent_context_summary(
         result["recent_context_invalid"] += 1
         return
     summary_text = str(raw_summary.get("summary") or "").strip()
-    if not summary_text:
+    compressed_summary = str(
+        raw_summary.get("compressed_summary") or summary_text
+    ).strip()
+    raw_turns = raw_summary.get("recent_turns")
+    recent_turns: list[RecentContextTurn] = []
+    if isinstance(raw_turns, list):
+        for raw_turn in raw_turns:
+            try:
+                recent_turns.append(RecentContextTurn.model_validate(raw_turn))
+            except (TypeError, ValueError):
+                result["recent_context_invalid"] += 1
+                return
+    if not summary_text and not compressed_summary and not recent_turns:
         result["recent_context_invalid"] += 1
         return
     if int(raw_summary.get("archived") or 0) != 0:
@@ -491,18 +525,115 @@ def _restore_one_recent_context_summary(
     if existing is not None and not overwrite:
         result["recent_context_skipped"] += 1
         return
-    store.upsert_recent_context_summary(
-        user_id=user_id,
-        conversation_id=conversation_id,
-        summary=summary_text,
-    )
+    try:
+        turn_count = max(
+            len(recent_turns),
+            int(raw_summary.get("turn_count") or 0),
+        )
+    except (TypeError, ValueError):
+        result["recent_context_invalid"] += 1
+        return
+    if "compressed_summary" in raw_summary or "recent_turns" in raw_summary:
+        store.upsert_recent_context_state(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            summary=summary_text,
+            compressed_summary=compressed_summary,
+            recent_turns=recent_turns,
+            turn_count=turn_count,
+        )
+    else:
+        store.upsert_recent_context_summary(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            summary=summary_text,
+        )
     if existing is None:
         result["recent_context_created"] += 1
     else:
         result["recent_context_updated"] += 1
 
 
-def _format_memory_bullet(memory: dict, *, space_names_by_id: dict[str, str] | None = None) -> str:
+def _restore_one_conversation_branch_node(
+    *,
+    store: MemoryStore,
+    user_id: str,
+    raw_node: object,
+    overwrite: bool,
+    result: dict,
+) -> None:
+    if not isinstance(raw_node, dict) or int(raw_node.get("archived") or 0) != 0:
+        result["branch_nodes_invalid"] += 1
+        return
+    fingerprint_fields = (
+        "history_fingerprint",
+        "turn_fingerprint",
+        "assistant_digest",
+    )
+    fingerprints = {
+        name: str(raw_node.get(name) or "").strip()
+        for name in fingerprint_fields
+    }
+    parent_fingerprint = str(
+        raw_node.get("parent_history_fingerprint") or ""
+    ).strip()
+    if any(
+        not re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in fingerprints.values()
+    ):
+        result["branch_nodes_invalid"] += 1
+        return
+    if parent_fingerprint and not re.fullmatch(r"[0-9a-f]{64}", parent_fingerprint):
+        result["branch_nodes_invalid"] += 1
+        return
+    raw_turns = raw_node.get("recent_turns")
+    turns: list[RecentContextTurn] = []
+    if isinstance(raw_turns, list):
+        try:
+            turns = [RecentContextTurn.model_validate(turn) for turn in raw_turns]
+        except (TypeError, ValueError):
+            result["branch_nodes_invalid"] += 1
+            return
+    try:
+        turn_count = max(len(turns), int(raw_node.get("turn_count") or 0))
+    except (TypeError, ValueError):
+        result["branch_nodes_invalid"] += 1
+        return
+    existing = store.get_conversation_branch_node(
+        user_id=user_id,
+        history_fingerprint=fingerprints["history_fingerprint"],
+    )
+    if existing is not None and not overwrite:
+        result["branch_nodes_skipped"] += 1
+        return
+    raw_conversation_id = raw_node.get("conversation_id")
+    conversation_id = (
+        str(raw_conversation_id).strip()
+        if raw_conversation_id is not None and str(raw_conversation_id).strip()
+        else None
+    )
+    store.upsert_conversation_branch_node(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        history_fingerprint=fingerprints["history_fingerprint"],
+        parent_history_fingerprint=parent_fingerprint,
+        turn_fingerprint=fingerprints["turn_fingerprint"],
+        assistant_digest=fingerprints["assistant_digest"],
+        summary=str(raw_node.get("summary") or ""),
+        compressed_summary=str(raw_node.get("compressed_summary") or ""),
+        recent_turns=turns,
+        turn_count=turn_count,
+    )
+    result[
+        "branch_nodes_created" if existing is None else "branch_nodes_updated"
+    ] += 1
+
+
+def _format_memory_bullet(
+    memory: dict,
+    *,
+    space_names_by_id: dict[str, str] | None = None,
+) -> str:
     space_names_by_id = space_names_by_id or {}
     metadata = (
         f"type={memory['type']}, importance={memory['importance']}, "

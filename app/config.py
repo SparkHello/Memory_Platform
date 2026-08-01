@@ -9,6 +9,80 @@ from app.llm.routing import normalize_provider_priority
 
 class Settings(BaseSettings):
     gateway_api_key: str = Field(default="", validation_alias="GATEWAY_API_KEY")
+    chat_gateway_enabled: bool = Field(
+        default=True,
+        validation_alias="CHAT_GATEWAY_ENABLED",
+    )
+    chat_gateway_default_memory_mode: Literal["off", "read", "read-write"] = Field(
+        default="read-write",
+        validation_alias="CHAT_GATEWAY_DEFAULT_MEMORY_MODE",
+    )
+    chat_gateway_search_limit: int = Field(
+        default=8,
+        ge=1,
+        le=20,
+        validation_alias="CHAT_GATEWAY_SEARCH_LIMIT",
+    )
+    chat_gateway_context_max_chars: int = Field(
+        default=12000,
+        ge=1000,
+        le=100000,
+        validation_alias="CHAT_GATEWAY_CONTEXT_MAX_CHARS",
+    )
+    chat_gateway_recall_timeout_seconds: float = Field(
+        default=4.0,
+        ge=0.25,
+        le=30.0,
+        validation_alias="CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS",
+    )
+    chat_gateway_stream_read_timeout_seconds: float = Field(
+        default=600.0,
+        ge=30.0,
+        le=3600.0,
+        validation_alias="CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS",
+    )
+    chat_gateway_stream_write_timeout_seconds: float = Field(
+        default=120.0,
+        ge=30.0,
+        le=3600.0,
+        validation_alias="CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS",
+    )
+    chat_gateway_turn_ttl_seconds: float = Field(
+        default=3600.0,
+        ge=30.0,
+        le=86400.0,
+        validation_alias="CHAT_GATEWAY_TURN_TTL_SECONDS",
+    )
+    chat_gateway_extraction_context_turns: int = Field(
+        default=2,
+        ge=1,
+        le=6,
+        validation_alias="CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS",
+    )
+    chat_gateway_extraction_context_max_chars: int = Field(
+        default=8000,
+        ge=1000,
+        le=50000,
+        validation_alias="CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS",
+    )
+    chat_gateway_context_compact_after_turns: int = Field(
+        default=8,
+        ge=3,
+        le=50,
+        validation_alias="CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS",
+    )
+    chat_gateway_context_compact_after_chars: int = Field(
+        default=6000,
+        ge=1000,
+        le=100000,
+        validation_alias="CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS",
+    )
+    chat_gateway_compacted_summary_max_chars: int = Field(
+        default=4000,
+        ge=500,
+        le=20000,
+        validation_alias="CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS",
+    )
     upstream_base_url: str = Field(
         default="https://open.bigmodel.cn/api/paas/v4",
         validation_alias="UPSTREAM_BASE_URL",
