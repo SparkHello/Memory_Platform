@@ -20,8 +20,18 @@ def _load_sector_lambda_map() -> dict[str, float]:
         from app.config import get_settings
 
         raw = get_settings().decay_sector_lambda_map
-        SECTOR_LAMBDA_MAP = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise TypeError("sector lambda map must be an object")
+        SECTOR_LAMBDA_MAP = {
+            str(sector): float(value)
+            for sector, value in parsed.items()
+            if not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and 0.0 <= float(value) <= 10.0
+        }
+    except (json.JSONDecodeError, TypeError, ValueError):
         SECTOR_LAMBDA_MAP = {"semantic": 0.02}
     return SECTOR_LAMBDA_MAP
 
@@ -57,9 +67,17 @@ def score_memory(memory: MemoryRecord, *, now: datetime | None = None) -> Memory
 
     # 扇区 lambda 查表 (P0→P1: 当前所有记忆 type=semantic，P1 后自动激活)
     sector_lambda_map = _load_sector_lambda_map()
-    sector_lambda = memory.decay_lambda or sector_lambda_map.get(
-        memory.type, settings.decay_lambda_default
+    sector_lambda = sector_lambda_map.get(
+        memory.type,
+        settings.decay_lambda_default,
     )
+    if memory.decay_lambda is not None:
+        candidate_lambda = float(memory.decay_lambda)
+        # MemoryRecord rejects these values on every supported write path. Keep
+        # scoring defensive for legacy/corrupt rows and model_construct callers
+        # so math.exp cannot become an availability failure.
+        if math.isfinite(candidate_lambda) and 0.0 <= candidate_lambda <= 10.0:
+            sector_lambda = candidate_lambda
 
     alpha = settings.decay_alpha_default
 
@@ -76,7 +94,8 @@ def score_memory(memory: MemoryRecord, *, now: datetime | None = None) -> Memory
         time_weight = 1.0 - emotion_weight
 
     # 情绪因子：高唤起记忆在长期阶段保留得更久
-    arousal = float(getattr(memory, "arousal", 0.3) or 0.3)
+    raw_arousal = getattr(memory, "arousal", None)
+    arousal = 0.3 if raw_arousal is None else float(raw_arousal)
     emotion_factor = 0.2 + 0.8 * max(0.0, min(1.0, arousal))
 
     weighted_factor = (

@@ -540,8 +540,8 @@ def test_rest_ingest_persists_temporal_fields(
                     "sensitivity": "normal",
                     "temporal_subject": " user ",
                     "temporal_predicate": " current_employer ",
-                    "reason": "User explicitly described the current employer.",
-                    "source_quote": "I now work at Company B",
+                    "reason": "User explicitly described the current employer and start date.",
+                    "source_quote": "Since 2026-01-01 I work at Company B",
                 }
             ],
             "reason": "temporal fact",
@@ -553,7 +553,7 @@ def test_rest_ingest_persists_temporal_fields(
         "/memories/ingest",
         headers=auth_headers,
         json={
-            "text": "I now work at Company B",
+            "text": "Since 2026-01-01 I work at Company B",
             "conversation_id": "temporal-ingest",
         },
     )
@@ -564,6 +564,55 @@ def test_rest_ingest_persists_temporal_fields(
     assert memory.valid_from == "2026-01-01"
     assert memory.temporal_subject == "user"
     assert memory.temporal_predicate == "current_employer"
+
+
+def test_ingest_clears_temporal_date_not_grounded_in_source_quote(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="User works at Company B.",
+        source_quote="I now work at Company B",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+
+    response = _post_ingest(client, auth_headers, "I now work at Company B")
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+    memory = memory_store.list_memories(user_id="default")[0]
+    assert memory.valid_from is None
+    assert memory.temporal_predicate == "current_employer"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"temporal_subject": "user", "temporal_predicate": None},
+        {"valid_from": "2027-01-01", "valid_until": "2026-01-01"},
+    ],
+)
+def test_invalid_temporal_metadata_is_rejected_as_invalid_model_output(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+    overrides: dict,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="User works at Company B.",
+        source_quote="I work at Company B",
+        **overrides,
+    )
+
+    response = _post_ingest(client, auth_headers, "I work at Company B")
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 0
+    assert response.json()["ignored"] == 1
 
 
 def test_ingest_autofills_whitelisted_temporal_profile_key(
@@ -1544,3 +1593,553 @@ def test_invalid_quote_is_rejected_before_age_normalization(
     log_payload = json.loads(memory_store.list_decision_logs()[0].candidate_json)
     assert log_payload["memory"] == "用户喜欢咖啡。"
     assert "source_quote" in memory_store.list_decision_logs()[0].reason
+
+
+def test_grounding_rejects_candidate_with_a_second_unsupported_fact() -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户喜欢咖啡，并住在北京。",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote="我喜欢咖啡",
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message="我喜欢咖啡",
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "每个事实" in rejection
+
+
+def test_grounding_accepts_multiple_facts_when_each_has_quote_evidence() -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    quote = "我喜欢咖啡，我住在北京"
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户喜欢咖啡，并住在北京。",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    assert (
+        validate_candidate_for_save(
+            candidate,
+            user_message=quote,
+            require_quote_in_user_message=True,
+        )
+        is None
+    )
+
+
+def test_extraction_hints_never_use_model_memory_as_its_own_evidence() -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户喜欢咖啡，并住在北京。",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote="我喜欢咖啡",
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.type == "emotional"
+    assert hinted.temporal_subject is None
+    assert hinted.temporal_predicate is None
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("User has pets.", "I have no pets."),
+        ("User travels with pets.", "I never travel with pets."),
+        ("User drinks coffee with sugar.", "I drink coffee without sugar."),
+        ("用户有宠物。", "我没有宠物。"),
+    ],
+)
+def test_grounding_rejects_common_english_and_chinese_negation_inversions(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "否定含义" in rejection
+
+
+def test_english_negation_uses_word_boundaries() -> None:
+    from app.memory.utils import _has_negation
+
+    assert _has_negation("This is notable experience.") is False
+    assert _has_negation("This is not relevant.") is True
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户的银行卡密码是 123456。", "我记得银行卡密码是 123456"),
+        ("User's password is secret123.", "I remember my password is secret123"),
+        ("User's password is secret123.", "Remember when my password was secret123"),
+        ("User's password is secret123.", "Remember whether my password is secret123"),
+        ("User's password is secret123.", "Remember how my password became secret123"),
+        ("User's password is secret123.", "Remember that time my password was secret123"),
+    ],
+)
+def test_narrative_remember_is_not_sensitive_storage_authorization(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=9,
+        confidence=0.95,
+        sensitivity="sensitive",
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "明确要求记住" in rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户的银行卡密码是 123456。", "请记住：我的银行卡密码是 123456"),
+        ("User's password is secret123.", "Please remember: my password is secret123"),
+    ],
+)
+def test_imperative_remember_authorizes_scoped_sensitive_storage(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=9,
+        confidence=0.95,
+        sensitivity="sensitive",
+        source_quote=quote,
+    )
+
+    assert (
+        validate_candidate_for_save(
+            candidate,
+            user_message=quote,
+            require_quote_in_user_message=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户在 Acme 工作。", "我希望明年去 Acme 工作"),
+        ("用户在 Acme 工作。", "我明年在 Acme 工作"),
+        ("User works at Acme.", "I will work at Acme"),
+        ("用户住在上海。", "我不想住上海"),
+        ("用户住在北京。", "我下个月搬到北京"),
+    ],
+)
+def test_future_desire_or_negative_state_is_not_a_current_profile_fact(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.temporal_subject is None
+    assert hinted.temporal_predicate is None
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("User works at Acme.", "I applied to Acme."),
+        ("User lives in Paris.", "I visited Paris."),
+        ("用户购买咖啡。", "我喜欢咖啡。"),
+        ("User likes coffee and resides in Beijing.", "I like coffee."),
+        ("用户喜欢咖啡还住在北京。", "我喜欢咖啡。"),
+        ("用户喜欢咖啡又居住北京。", "我喜欢咖啡。"),
+    ],
+)
+def test_grounding_rejects_shared_entity_with_a_different_relation(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "每个事实" in rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户喜欢西瓜。", "我的猫喜欢西瓜"),
+        ("用户住在北京。", "我的朋友住在北京"),
+        ("User likes watermelon.", "My cat likes watermelon."),
+        ("User lives in Paris.", "My friend lives in Paris."),
+    ],
+)
+def test_grounding_rejects_relation_subject_drift(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "每个事实" in rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户在 Acme 工作。", "我申请了 Acme 的工作"),
+        ("用户住在北京。", "我去北京旅游时住在酒店"),
+        ("User works at Acme.", "I applied for an Acme job."),
+        ("User lives in Paris.", "I visited Paris and lived in a hotel."),
+    ],
+)
+def test_grounding_rejects_relation_bound_to_a_different_object(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "每个事实" in rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户的猫喜欢西瓜。", "我的猫喜欢西瓜"),
+        ("用户的朋友住在北京。", "我的朋友住在北京"),
+        ("User's cat likes watermelon.", "My cat likes watermelon."),
+        ("User's friend lives in Paris.", "My friend lives in Paris."),
+    ],
+)
+def test_grounding_accepts_an_explicitly_preserved_third_party_subject(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    assert (
+        validate_candidate_for_save(
+            candidate,
+            user_message=quote,
+            require_quote_in_user_message=True,
+        )
+        is None
+    )
+
+
+def test_normal_entity_must_be_bound_to_candidate_proposition() -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    quote = "我申请了 Acme"
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户住在北京。",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+        entities=["Acme"],
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "未绑定" in rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("User resides in Beijing.", "I live in Beijing."),
+        ("用户偏好无糖黑咖啡。", "我喜欢不加糖的黑咖啡。"),
+        ("用户使用 Kelivo。", "我现在主要用 Kelivo。"),
+        ("User lives in Paris.", "I not only live in Paris but work there."),
+        ("用户住在北京。", "我不但住在北京，而且在那里工作。"),
+        ("User drinks coffee.", "Without fail I drink coffee every morning."),
+    ],
+)
+def test_grounding_accepts_relation_paraphrase_and_additive_not_only(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    assert (
+        validate_candidate_for_save(
+            candidate,
+            user_message=quote,
+            require_quote_in_user_message=True,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "我住在北京，但我没有宠物",
+        "我住在北京，明年想去上海旅游",
+        "我不但住在北京，而且喜欢那里的公园",
+    ],
+)
+def test_temporal_hint_scopes_negation_and_future_markers_to_matching_clause(
+    quote: str,
+) -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户住在北京。",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.temporal_subject == "用户"
+    assert hinted.temporal_predicate == "current_city"
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户住在北京。", "我的朋友住在北京"),
+        ("User lives in Paris.", "She lives in Paris"),
+        ("用户主要用 Kelivo。", "我的同事主要用 Kelivo"),
+        ("用户住在北京。", "我喜欢住房设计"),
+        ("用户在某公司工作。", "我在远程工作"),
+        ("用户在北京工作。", "我在北京工作"),
+        ("User works at Python.", "I work in Python every day"),
+    ],
+)
+def test_temporal_hint_rejects_third_party_and_non_profile_values(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.temporal_subject is None
+    assert hinted.temporal_predicate is None
+
+
+def test_temporal_hint_keeps_grounded_committed_future_interval() -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="User will work at Acme from 2027-03-01.",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote="From 2027-03-01 I will work at Acme",
+        valid_from="2027-03-01",
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.temporal_subject == "用户"
+    assert hinted.temporal_predicate == "current_employer"
+
+
+@pytest.mark.parametrize("quote", ["不要叫我小王", "Don't call me Bob"])
+def test_negative_preferred_name_is_not_current_name(quote: str) -> None:
+    from app.memory.extraction_hints import apply_extraction_hints
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="User is called Bob.",
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    hinted = apply_extraction_hints(candidate)
+
+    assert hinted.temporal_subject is None
+    assert hinted.temporal_predicate is None
+
+
+@pytest.mark.parametrize("status_code", [500, 501])
+@pytest.mark.asyncio
+async def test_all_upstream_5xx_extraction_failures_are_retryable(
+    status_code: int,
+    memory_store: MemoryStore,
+    fake_llm,
+    monkeypatch,
+) -> None:
+    class UpstreamHTTPError(RuntimeError):
+        def __init__(self, code: int):
+            super().__init__(f"upstream returned {code}")
+            self.status_code = code
+
+    async def fail_upstream(*args, **kwargs):
+        raise UpstreamHTTPError(status_code)
+
+    monkeypatch.setattr(fake_llm, "create_chat_completion", fail_upstream)
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(user_id="default", text="我喜欢黑咖啡。")
+
+    assert result.status == "retryable_error"
+    assert result.retryable is True
+    assert result.ignored == 0

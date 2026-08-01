@@ -29,6 +29,7 @@ def test_memory_network_returns_core_evidence_and_similarity_edges(
         valence=0.78,
         arousal=0.4,
         embedding_json=json.dumps([0.98, 0.02]),
+        evidence_memory_ids=[coffee.id],
     )
     memory_store.upsert_core_memory_section(
         user_id="default",
@@ -53,6 +54,7 @@ def test_memory_network_returns_core_evidence_and_similarity_edges(
     assert nodes[coffee.id]["valence"] == 0.75
     assert nodes[pour_over.id]["arousal"] == 0.4
     assert ("core:preferences", coffee.id, "core_evidence") in edge_kinds
+    assert (pour_over.id, coffee.id, "memory_evidence") in edge_kinds
     assert any(edge["kind"] == "similarity" for edge in payload["edges"])
 
 
@@ -86,6 +88,40 @@ def test_memory_network_falls_back_to_text_similarity_without_embeddings(
         edge["kind"] == "similarity"
         and {edge["source"], edge["target"]} == {left.id, right.id}
         for edge in edges
+    )
+
+
+def test_memory_network_falls_back_to_text_for_mixed_embedding_dimensions(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    left = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢在早晨散步。",
+        type="emotional",
+        importance=6,
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    right = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢早晨散步。",
+        type="emotional",
+        importance=6,
+        embedding_json=json.dumps([1.0, 0.0, 0.0]),
+    )
+
+    response = client.post(
+        "/memories/network",
+        headers=auth_headers,
+        json={"limit": 20, "similarity_threshold": 0.2, "max_similarity_edges": 10},
+    )
+
+    assert response.status_code == 200
+    assert any(
+        edge["kind"] == "similarity"
+        and {edge["source"], edge["target"]} == {left.id, right.id}
+        for edge in response.json()["edges"]
     )
 
 
@@ -196,6 +232,41 @@ def test_memory_network_redacts_sensitive_node_content_only_in_response(
     assert stored.content == private.content
 
 
+def test_memory_network_omits_stale_core_after_evidence_becomes_sensitive(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    evidence = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        importance=8,
+    )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="preferences",
+        content="用户喜欢黑咖啡。",
+        evidence_memory_ids=[evidence.id],
+        confidence=0.9,
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET sensitivity = 'sensitive' WHERE id = ?",
+            (evidence.id,),
+        )
+
+    response = client.post(
+        "/memories/network",
+        headers=auth_headers,
+        json={"redact_sensitive": True},
+    )
+
+    assert response.status_code == 200
+    assert "core:preferences" not in {
+        node["id"] for node in response.json()["nodes"]
+    }
+
+
 def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -282,6 +353,92 @@ def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
     assert target.id not in shallow_ids
 
 
+def test_memory_network_traverse_spends_edge_budget_from_seed_frontier(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="seed",
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    reachable = memory_store.create_memory(
+        user_id="default",
+        content="reachable",
+        embedding_json=json.dumps([0.8, 0.6]),
+    )
+    for index, vector in enumerate(
+        ([0.0, 1.0], [0.01, 0.99995], [-0.01, 0.99995]),
+        start=1,
+    ):
+        memory_store.create_memory(
+            user_id="default",
+            content=f"unrelated-{index}",
+            embedding_json=json.dumps(vector),
+        )
+
+    response = client.post(
+        "/memories/network/traverse",
+        headers=auth_headers,
+        json={
+            "seed_id": seed.id,
+            "depth": 2,
+            "limit": 5,
+            "similarity_threshold": 0.75,
+            "max_candidates": 20,
+            "max_edges": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert reachable.id in {
+        item["memory"]["id"] for item in payload["results"]
+    }
+    assert payload["meta"]["edge_count"] <= 2
+
+
+def test_memory_network_traverse_uses_explicit_evidence_edge(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="Evidence seed.",
+        embedding_json=json.dumps([1.0, 0.0]),
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="Lexically unrelated reflection.",
+        origin="agent_derived",
+        evidence_memory_ids=[seed.id],
+        embedding_json=json.dumps([0.0, 1.0]),
+    )
+
+    response = client.post(
+        "/memories/network/traverse",
+        headers=auth_headers,
+        json={
+            "seed_id": seed.id,
+            "depth": 1,
+            "limit": 5,
+            "similarity_threshold": 0.99,
+            "max_candidates": 20,
+            "max_edges": 10,
+        },
+    )
+
+    assert response.status_code == 200
+    item = next(
+        result
+        for result in response.json()["results"]
+        if result["memory"]["id"] == derived.id
+    )
+    assert item["path"][0]["kind"] == "evidence"
+
+
 def test_memory_network_traverse_respects_user_boundary(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -302,4 +459,3 @@ def test_memory_network_traverse_respects_user_boundary(
     )
 
     assert response.status_code == 404
-

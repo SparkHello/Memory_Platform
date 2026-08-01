@@ -94,6 +94,66 @@ def test_diverse_library_marks_mechanisms_active(tmp_path: Path) -> None:
     assert _verdict(result, "graph_structure")["state"] == "active"
 
 
+def test_unique_tags_without_relationships_do_not_fake_an_active_graph(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    ids = _seed(store, 12)
+    with sqlite3.connect(store.database_path) as connection:
+        for index, memory_id in enumerate(ids):
+            connection.execute(
+                "UPDATE memories SET topics_json = ? WHERE id = ?",
+                (f'["unique-{index}"]', memory_id),
+            )
+
+    result = diagnose.run_diagnosis(store.database_path)
+
+    graph = result["metrics"]["graph"]
+    assert graph["topic_coverage"] == 1.0
+    assert graph["edge_count"] == 0
+    assert _verdict(result, "graph_structure")["state"] == "sparse"
+
+
+def test_temporal_health_requires_active_reciprocal_links(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    old = store.create_memory(
+        user_id="default",
+        content="User lived in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="city",
+    )
+    current = store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="city",
+    )
+
+    healthy = diagnose.run_diagnosis(store.database_path)
+    temporal = healthy["metrics"]["temporal"]
+    assert temporal["active_supersession_edge_count"] == 1
+    assert temporal["dangling_supersession_reference_count"] == 0
+    assert _verdict(healthy, "temporal_kg")["state"] == "active"
+
+    # Simulate a legacy/corrupt soft delete that did not detach the version
+    # chain. Historical columns alone must not be reported as healthy.
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE memories SET archived = 1 WHERE id = ?",
+            (current.id,),
+        )
+
+    unhealthy = diagnose.run_diagnosis(store.database_path)
+    temporal = unhealthy["metrics"]["temporal"]
+    assert temporal["active_supersession_edge_count"] == 0
+    assert temporal["trashed_supersession_link_count"] == 1
+    assert temporal["dangling_supersession_reference_count"] == 1
+    assert _verdict(unhealthy, "temporal_kg")["state"] == "degenerate"
+    assert old.id != current.id
+
+
 def test_never_recalled_count_tracks_zero_usage(tmp_path: Path) -> None:
     store = _store(tmp_path)
     ids = _seed(store, 3, type="semantic")
@@ -171,3 +231,42 @@ def test_recall_health_active_with_spread_usage(tmp_path: Path) -> None:
     assert recall["total_recalls"] == 18
     assert recall["top1_concentration"] < 0.5
     assert _verdict(result, "recall_health")["state"] == "active"
+
+
+def test_fractional_time_ripple_usage_is_preserved_as_activation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    ids = _seed(store, 12, type="semantic")
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE memories SET usage_count = 0.25 WHERE id = ?", (ids[0],))
+
+    result = diagnose.run_diagnosis(store.database_path)
+
+    recall = result["metrics"]["recall"]
+    assert recall["activated_memory_count"] == 1
+    assert recall["total_activation_count"] == 0.25
+    assert recall["total_recalls"] == 0.25
+    assert _verdict(result, "recall_health")["state"] == "active"
+
+
+def test_space_coverage_ignores_links_to_deleted_memories(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    space = store.upsert_memory_space(user_id="default", name="Work")
+    active = store.create_memory(
+        user_id="default",
+        content="Active linked fact.",
+        space_ids=[space.id],
+    )
+    deleted = store.create_memory(
+        user_id="default",
+        content="Deleted linked fact.",
+        space_ids=[space.id],
+    )
+    assert store.archive_memory(memory_id=deleted.id, user_id="default")
+
+    result = diagnose.run_diagnosis(store.database_path)
+
+    coverage = result["metrics"]["tag_coverage"]
+    assert result["memory_count"] == 1
+    assert coverage["space_linked"] == 1
+    assert coverage["space_coverage"] == 1.0
+    assert active.id != deleted.id

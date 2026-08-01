@@ -262,12 +262,15 @@ class OpenAICompatibleKnowledgeAgentClient:
             raise ValueError("knowledge agent response must be a JSON object")
         data.setdefault("model", provider.model)
         if self.usage_recorder is not None:
-            self.usage_recorder.record_response(
-                payload=data,
-                model=provider.model,
-                kind="chat",
-                provider_code=provider.code,
-                base_url=provider.base_url,
+            await anyio.to_thread.run_sync(
+                partial(
+                    self.usage_recorder.record_response,
+                    payload=data,
+                    model=provider.model,
+                    kind="chat",
+                    provider_code=provider.code,
+                    base_url=provider.base_url,
+                )
             )
         return data
 

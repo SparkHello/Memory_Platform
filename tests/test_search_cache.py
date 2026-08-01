@@ -1,5 +1,6 @@
 ﻿"""测试两层模块级缓存：L1 embedding 缓存 + L2 搜索结果缓存"""
 import time
+from datetime import UTC, datetime, timedelta
 
 from app.memory.search import (
     _EMBEDDING_CACHE,
@@ -199,6 +200,57 @@ class TestSearchCache:
         assert result == []
         # 空结果不应写入 L2
         assert len(SEARCH_CACHE) == cache_size_before
+
+    async def test_cache_expires_at_scheduled_temporal_boundary(self, memory_store):
+        now = datetime.now(UTC)
+        future_start = now + timedelta(seconds=0.2)
+        old = memory_store.create_memory(
+            user_id="default",
+            content="User city is Alpha.",
+            valid_from=(now - timedelta(days=1)).isoformat(),
+            temporal_subject="user",
+            temporal_predicate="current_city",
+        )
+        future = memory_store.create_memory(
+            user_id="default",
+            content="User city is Beta.",
+            valid_from=future_start.isoformat(),
+            temporal_subject="user",
+            temporal_predicate="current_city",
+        )
+        stable = memory_store.create_memory(
+            user_id="default",
+            content="User city research includes coffee.",
+        )
+        service = MemorySearchService(
+            store=memory_store,
+            embedding_client=NullEmbeddingClient(),
+        )
+
+        before = await service.search_hits(
+            query="user city coffee",
+            user_id="default",
+            limit=8,
+            record_usage=False,
+        )
+        assert old.id in {hit.memory.id for hit in before}
+        assert stable.id in {hit.memory.id for hit in before}
+        key = ("default", _normalize_query("user city coffee"), 8, False)
+        assert SEARCH_CACHE[key][0] <= future_start.timestamp()
+
+        time.sleep(0.25)
+        after = await service.search_hits(
+            query="user city coffee",
+            user_id="default",
+            limit=8,
+            record_usage=False,
+        )
+
+        after_ids = {hit.memory.id for hit in after}
+        assert service.last_cache_status == "miss"
+        assert future.id in after_ids
+        assert old.id not in after_ids
+        assert stable.id in after_ids
 
 
 class TestCacheMaxSize:

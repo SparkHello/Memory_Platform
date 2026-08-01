@@ -4,9 +4,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any
 from uuid import uuid4
 
+from app.schema_migrations import enable_wal_with_retry
 from app.usage.pricing import (
     ModelPrice,
     normalize_model_name,
@@ -18,6 +20,7 @@ from app.usage.pricing import (
 
 _NANOS_PER_UNIT = Decimal("1000000000")
 _TOKENS_PER_MILLION = Decimal("1000000")
+_USAGE_DB_INIT_LOCK = threading.Lock()
 
 
 class _ClosingSQLiteConnection(sqlite3.Connection):
@@ -36,48 +39,51 @@ class UsageStore:
         path = Path(self.database_path)
         if path.parent != Path("."):
             path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS model_usage_events (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    provider_code TEXT DEFAULT '',
-                    model TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    input_tokens INTEGER,
-                    cached_input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    total_tokens INTEGER,
-                    usage_available INTEGER DEFAULT 0,
-                    price_available INTEGER DEFAULT 0,
-                    cost_nanos INTEGER,
-                    currency TEXT DEFAULT 'CNY',
-                    price_key TEXT DEFAULT '',
-                    input_cache_hit_per_million TEXT DEFAULT '',
-                    input_cache_miss_per_million TEXT DEFAULT '',
-                    output_per_million TEXT DEFAULT '',
-                    pricing_as_of TEXT DEFAULT '',
-                    pricing_source_url TEXT DEFAULT '',
-                    source_request_id TEXT DEFAULT '',
-                    created_at TEXT NOT NULL
+        with _USAGE_DB_INIT_LOCK:
+            with self._connect() as connection:
+                enable_wal_with_retry(connection)
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS model_usage_events (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        provider_code TEXT DEFAULT '',
+                        model TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        input_tokens INTEGER,
+                        cached_input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        total_tokens INTEGER,
+                        usage_available INTEGER DEFAULT 0,
+                        price_available INTEGER DEFAULT 0,
+                        cost_nanos INTEGER,
+                        currency TEXT DEFAULT 'CNY',
+                        price_key TEXT DEFAULT '',
+                        input_cache_hit_per_million TEXT DEFAULT '',
+                        input_cache_miss_per_million TEXT DEFAULT '',
+                        output_per_million TEXT DEFAULT '',
+                        pricing_as_of TEXT DEFAULT '',
+                        pricing_source_url TEXT DEFAULT '',
+                        source_request_id TEXT DEFAULT '',
+                        created_at TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_model_usage_user_created
-                ON model_usage_events(user_id, created_at DESC)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_model_usage_user_model_created
-                ON model_usage_events(user_id, provider, model, created_at DESC)
-                """
-            )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_model_usage_user_created
+                    ON model_usage_events(user_id, created_at DESC)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_model_usage_user_model_created
+                    ON model_usage_events(user_id, provider, model, created_at DESC)
+                    """
+                )
 
     def record_response(
         self,
@@ -248,10 +254,10 @@ class UsageStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
+            timeout=5,
             factory=_ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=5000")
         return connection
 

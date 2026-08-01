@@ -107,7 +107,6 @@ def _combined_text(candidate: CandidateMemory, source_text: str) -> str:
         source_text,
         candidate.memory,
         candidate.source_quote,
-        candidate.reason,
         candidate.temporal_subject or "",
         candidate.temporal_predicate or "",
     ]
@@ -127,7 +126,14 @@ def _rule_topics(candidate: CandidateMemory, text: str) -> list[str]:
     elif candidate.type == "episodic":
         topics.append("经历")
 
-    if _contains_any(lowered, ["喜欢", "偏好", "讨厌", "不喜欢", "希望", "习惯", "口味", "雷点"]):
+    if _contains_any(
+        lowered,
+        [
+            "喜欢", "偏好", "讨厌", "不喜欢", "希望", "习惯", "口味", "雷点",
+            "prefer", "prefers", "preferred", "like", "likes", "liked",
+            "dislike", "dislikes", "hate", "hates",
+        ],
+    ):
         topics.append("偏好")
     if _contains_any(lowered, ["咖啡", "茶", "早餐", "午餐", "晚餐", "饮食", "吃", "喝"]):
         topics.append("饮食")
@@ -207,7 +213,14 @@ def _space_names(
         ],
     ):
         spaces.append(SPACE_TOOLS)
-    if candidate.type == "emotional" or _contains_any(lowered, ["喜欢", "偏好", "讨厌", "不喜欢", "希望", "习惯", "口味", "雷点"]):
+    if candidate.type == "emotional" or _contains_any(
+        lowered,
+        [
+            "喜欢", "偏好", "讨厌", "不喜欢", "希望", "习惯", "口味", "雷点",
+            "prefer", "prefers", "preferred", "like", "likes", "liked",
+            "dislike", "dislikes", "hate", "hates",
+        ],
+    ):
         spaces.append(SPACE_PREFERENCE)
     if _contains_any(
         lowered,
@@ -248,7 +261,7 @@ def _extract_entities(text: str) -> list[str]:
     }
     lowered = text.casefold()
     for key, display_name in known_entities.items():
-        if key in lowered:
+        if _contains_needle(lowered, key):
             entities.append(display_name)
 
     for city in ["上海", "北京", "深圳", "广州", "杭州", "成都", "重庆", "南京", "苏州", "东京", "纽约"]:
@@ -279,4 +292,23 @@ def _extract_entities(text: str) -> list[str]:
 
 
 def _contains_any(text: str, needles: list[str]) -> bool:
-    return any(needle.casefold() in text for needle in needles)
+    return any(_contains_needle(text, needle) for needle in needles)
+
+
+def _contains_needle(text: str, needle: str) -> bool:
+    """Match short Latin labels as tokens, not arbitrary substrings.
+
+    Rules such as ``pr``, ``ci``, ``ai`` and ``mac`` previously classified
+    ``prefers``/``decision``/``email``/``machine`` as work or tooling facts.
+    CJK phrases intentionally keep substring matching.
+    """
+    lowered_needle = needle.casefold()
+    if re.fullmatch(r"[a-z0-9.+#_-]+(?:\s+[a-z0-9.+#_-]+)*", lowered_needle):
+        return (
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(lowered_needle)}(?![a-z0-9])",
+                text,
+            )
+            is not None
+        )
+    return lowered_needle in text

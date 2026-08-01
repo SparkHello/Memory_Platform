@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import heapq
 from itertools import combinations
 
 from app.memory.models import MemoryRecord
@@ -77,6 +78,8 @@ def traverse_memory_network(
         memories=memories,
         threshold=threshold,
         max_edges=capped_edges,
+        seed_id=seed.id,
+        max_depth=capped_depth,
         vectors={memory.id: _memory_embedding_vector(memory) for memory in memories},
     )
     adjacency = _build_adjacency(edges)
@@ -136,9 +139,43 @@ def _build_similarity_edges(
     memories: list[MemoryRecord],
     threshold: float,
     max_edges: int,
+    seed_id: str,
+    max_depth: int,
     vectors: dict[str, list[float] | None],
 ) -> list[TraversalEdge]:
+    memory_by_id = {memory.id: memory for memory in memories}
     scored_edges: list[TraversalEdge] = []
+    explicit_keys: set[tuple[str, str, str]] = set()
+    for memory in memories:
+        if memory.supersedes and memory.supersedes in memory_by_id:
+            key = (*_edge_key_from_ids(memory.id, memory.supersedes), "temporal")
+            if key not in explicit_keys:
+                explicit_keys.add(key)
+                scored_edges.append(
+                    TraversalEdge(
+                        source=memory.id,
+                        target=memory.supersedes,
+                        weight=1.0,
+                        kind="temporal",
+                        label="时间替代",
+                    )
+                )
+        for evidence_id in memory.evidence_memory_ids:
+            if evidence_id == memory.id or evidence_id not in memory_by_id:
+                continue
+            key = (*_edge_key_from_ids(memory.id, evidence_id), "evidence")
+            if key in explicit_keys:
+                continue
+            explicit_keys.add(key)
+            scored_edges.append(
+                TraversalEdge(
+                    source=memory.id,
+                    target=evidence_id,
+                    weight=0.95,
+                    kind="evidence",
+                    label="证据",
+                )
+            )
     for left, right in combinations(memories, 2):
         score = memory_similarity(left, right, vectors=vectors)
         if score < threshold:
@@ -151,7 +188,105 @@ def _build_similarity_edges(
             )
         )
     scored_edges.sort(key=lambda edge: edge.weight, reverse=True)
-    return scored_edges[:max_edges] if max_edges else []
+    if not max_edges:
+        return []
+    if len(scored_edges) <= max_edges:
+        return scored_edges
+    return _select_seed_reachable_edges(
+        scored_edges,
+        seed_id=seed_id,
+        max_depth=max_depth,
+        max_edges=max_edges,
+    )
+
+
+def _select_seed_reachable_edges(
+    scored_edges: list[TraversalEdge],
+    *,
+    seed_id: str,
+    max_depth: int,
+    max_edges: int,
+) -> list[TraversalEdge]:
+    """Spend a tight edge budget on the seed component before global clusters."""
+    incident: dict[str, list[TraversalEdge]] = {}
+    for edge in scored_edges:
+        incident.setdefault(edge.source, []).append(edge)
+        incident.setdefault(edge.target, []).append(edge)
+
+    heap: list[tuple[float, str, str, TraversalEdge]] = []
+    queued: set[tuple[str, str]] = set()
+
+    def push(edge: TraversalEdge) -> None:
+        key = _edge_key(edge)
+        if key in queued:
+            return
+        queued.add(key)
+        heapq.heappush(heap, (-edge.weight, key[0], key[1], edge))
+
+    for edge in incident.get(seed_id, []):
+        push(edge)
+
+    depths = {seed_id: 0}
+    selected: list[TraversalEdge] = []
+    selected_keys: set[tuple[str, str]] = set()
+    deferred: list[TraversalEdge] = []
+
+    while heap and len(selected) < max_edges:
+        _, _, _, edge = heapq.heappop(heap)
+        key = _edge_key(edge)
+        source_depth = depths.get(edge.source)
+        target_depth = depths.get(edge.target)
+
+        if source_depth is not None and target_depth is not None:
+            deferred.append(edge)
+            continue
+
+        if source_depth is None and target_depth is None:
+            continue
+
+        known_id = edge.source if source_depth is not None else edge.target
+        unknown_id = edge.target if source_depth is not None else edge.source
+        unknown_depth = depths[known_id] + 1
+        if unknown_depth > max_depth:
+            deferred.append(edge)
+            continue
+
+        selected.append(edge)
+        selected_keys.add(key)
+        depths[unknown_id] = unknown_depth
+        for candidate in incident.get(unknown_id, []):
+            push(candidate)
+
+    if len(selected) < max_edges:
+        deferred.extend(
+            edge
+            for edge in scored_edges
+            if _edge_key(edge) not in queued
+            and edge.source in depths
+            and edge.target in depths
+        )
+        deferred.sort(key=lambda edge: edge.weight, reverse=True)
+        for edge in deferred:
+            key = _edge_key(edge)
+            if key in selected_keys:
+                continue
+            if edge.source not in depths or edge.target not in depths:
+                continue
+            selected.append(edge)
+            selected_keys.add(key)
+            if len(selected) >= max_edges:
+                break
+
+    selected.sort(key=lambda edge: edge.weight, reverse=True)
+    return selected
+
+
+def _edge_key(edge: TraversalEdge) -> tuple[str, str]:
+    return _edge_key_from_ids(edge.source, edge.target)
+
+
+def _edge_key_from_ids(left_id: str, right_id: str) -> tuple[str, str]:
+    return tuple(sorted((left_id, right_id)))
 
 
 def _build_adjacency(edges: list[TraversalEdge]) -> dict[str, list[tuple[str, TraversalEdge]]]:

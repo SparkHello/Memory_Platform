@@ -1,5 +1,11 @@
 ﻿from datetime import UTC, datetime, timedelta
 
+import math
+
+import pytest
+from pydantic import ValidationError
+
+from app.config import Settings
 from app.memory.decay import score_memory
 from app.memory.store import MemoryStore
 
@@ -122,6 +128,65 @@ def test_long_inactive_memory_decays(memory_store: MemoryStore) -> None:
     assert score_memory(recent, now=now).final_score > score_memory(old, now=now).final_score
 
 
+def test_explicit_zero_decay_and_arousal_are_not_replaced_by_defaults(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户希望这条测试记忆不随时间衰减。",
+        type="semantic",
+        importance=6,
+        arousal=0.0,
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET decay_lambda = 0.0 WHERE id = ?",
+            (memory.id,),
+        )
+    memory = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert memory is not None
+
+    score = score_memory(memory, now=datetime.now(UTC) + timedelta(days=365))
+
+    assert score.sector_lambda == 0.0
+    assert score.emotion_factor == pytest.approx(0.2)
+
+
+def test_decay_scoring_defends_against_corrupt_negative_lambda(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="legacy corrupt decay row",
+        importance=6,
+    )
+    corrupt = memory.model_copy(update={"decay_lambda": -1e308})
+
+    score = score_memory(
+        corrupt,
+        now=datetime.now(UTC) + timedelta(days=365),
+    )
+
+    assert 0.0 <= score.sector_lambda <= 10.0
+    assert math.isfinite(score.final_score)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("DECAY_LAMBDA_DEFAULT", -0.1),
+        ("DECAY_ALPHA_DEFAULT", -0.1),
+        ("DECAY_SHORT_TERM_TIME_WEIGHT", 1.1),
+        ("DECAY_RESOLVED_FACTOR", -0.1),
+        ("DECAY_SECTOR_LAMBDA_MAP", "[]"),
+        ("DECAY_SECTOR_LAMBDA_MAP", '{"semantic": -1}'),
+    ],
+)
+def test_invalid_decay_configuration_is_rejected(name: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{name: value})
+
+
 def _set_memory_times(
     memory_store: MemoryStore,
     memory_id: str,
@@ -145,4 +210,3 @@ def _set_memory_times(
             """,
             params,
         )
-

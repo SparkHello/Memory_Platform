@@ -72,10 +72,9 @@ def build_memory_export(
     user_id: str,
     include_deleted: bool = True,
 ) -> dict:
-    deleted_memories = (
-        store.list_archived_memories(user_id=user_id, limit=10000)
-        if include_deleted
-        else []
+    snapshot = store.read_memory_export_snapshot(
+        user_id=user_id,
+        include_deleted=include_deleted,
     )
     return {
         "version": 3,
@@ -102,43 +101,34 @@ def build_memory_export(
         },
         "memory_spaces": [
             space.model_dump()
-            for space in store.list_memory_spaces(user_id=user_id)
+            for space in snapshot["memory_spaces"]
         ],
         "memories": [
             _memory_to_public_dict(memory)
-            for memory in store.list_memories(user_id=user_id, limit=10000)
+            for memory in snapshot["memories"]
         ],
         "deleted_memories": [
-            _memory_to_public_dict(memory) for memory in deleted_memories
+            _memory_to_public_dict(memory) for memory in snapshot["deleted_memories"]
         ],
         "core_memory_sections": [
             section.model_dump()
-            for section in store.list_core_memory_sections(user_id=user_id)
+            for section in snapshot["core_memory_sections"]
         ],
         "core_memory_section_history": [
             item.model_dump()
-            for item in store.list_core_memory_section_history(
-                user_id=user_id,
-                limit=10000,
-            )
+            for item in snapshot["core_memory_section_history"]
         ],
         "recent_context_summaries": [
             summary.model_dump()
-            for summary in store.list_recent_context_summaries(
-                user_id=user_id,
-                limit=10000,
-            )
+            for summary in snapshot["recent_context_summaries"]
         ],
         "conversation_branch_nodes": [
             node.model_dump()
-            for node in store.list_conversation_branch_nodes(
-                user_id=user_id,
-                limit=5000,
-            )
+            for node in snapshot["conversation_branch_nodes"]
         ],
         "decision_logs": [
             log.model_dump()
-            for log in store.list_decision_logs(user_id=user_id, limit=10000)
+            for log in snapshot["decision_logs"]
         ],
     }
 
@@ -215,6 +205,37 @@ def restore_memory_export(
             if space is not None and old_id:
                 space_id_map[old_id] = space.id
 
+    source_memory_ids = [
+        str(raw_memory.get("id")).strip()
+        for raw_memory in [
+            *(_dict_list(active_records)),
+            *(_dict_list(deleted_records)),
+        ]
+        if raw_memory.get("id") is not None
+        and str(raw_memory.get("id")).strip()
+    ]
+    exported_user_id = str(export_data.get("user_id") or "").strip()
+    memory_id_map = store.plan_memory_import_ids(
+        user_id=user_id,
+        source_ids=source_memory_ids,
+        rebind_all=bool(exported_user_id and exported_user_id != user_id),
+    )
+    all_memory_records = [
+        *(_dict_list(active_records)),
+        *(_dict_list(deleted_records)),
+    ]
+    referenced_source_ids = _memory_reference_ids(all_memory_records)
+    preserve_existing_references = not exported_user_id or exported_user_id == user_id
+    allowed_existing_ids = (
+        store.filter_existing_memory_ids(
+            user_id=user_id,
+            memory_ids=referenced_source_ids,
+        )
+        if preserve_existing_references
+        else set()
+    )
+    imported_memory_ids: list[str] = []
+
     for raw_memory in active_records:
         _restore_one_memory(
             store=store,
@@ -223,6 +244,9 @@ def restore_memory_export(
             overwrite=overwrite,
             archived=0,
             space_id_map=space_id_map,
+            memory_id_map=memory_id_map,
+            allowed_existing_ids=allowed_existing_ids,
+            imported_memory_ids=imported_memory_ids,
             result=result,
         )
     for raw_memory in deleted_records:
@@ -233,8 +257,30 @@ def restore_memory_export(
             overwrite=overwrite,
             archived=1,
             space_id_map=space_id_map,
+            memory_id_map=memory_id_map,
+            allowed_existing_ids=allowed_existing_ids,
+            imported_memory_ids=imported_memory_ids,
             result=result,
         )
+    dangling_removed = store.prune_dangling_memory_references(
+        user_id=user_id,
+        memory_ids=imported_memory_ids,
+    )
+    result["dangling_references_removed"] = dangling_removed
+    final_existing_ids = store.filter_existing_memory_ids(
+        user_id=user_id,
+        memory_ids=[*memory_id_map.values(), *referenced_source_ids],
+    )
+    for restored_memory in result["restored_memories"]:
+        restored_memory["evidence_memory_ids"] = [
+            memory_id
+            for memory_id in _string_list(restored_memory.get("evidence_memory_ids"))
+            if memory_id in final_existing_ids
+        ]
+        for field_name in ("supersedes", "superseded_by"):
+            reference = restored_memory.get(field_name)
+            if reference not in final_existing_ids:
+                restored_memory[field_name] = None
     if isinstance(recent_context_records, list):
         for raw_summary in recent_context_records:
             _restore_one_recent_context_summary(
@@ -462,17 +508,26 @@ def _restore_one_memory(
     overwrite: bool,
     archived: int,
     space_id_map: dict[str, str],
+    memory_id_map: dict[str, str],
+    allowed_existing_ids: set[str],
+    imported_memory_ids: list[str],
     result: dict,
 ) -> None:
     if not isinstance(raw_memory, dict):
         result["invalid"] += 1
         return
+    rewritten_memory = _rewrite_memory_import_references(
+        raw_memory,
+        memory_id_map=memory_id_map,
+        allowed_existing_ids=allowed_existing_ids,
+    )
     action, memory = store.import_memory_record(
         user_id=user_id,
-        data=raw_memory,
+        data=rewritten_memory,
         overwrite=overwrite,
         archived=archived,
         space_id_map=space_id_map,
+        rebind_on_conflict=False,
     )
     if action in {"created", "updated", "skipped", "invalid"}:
         result[action] += 1
@@ -480,6 +535,50 @@ def _restore_one_memory(
         result["invalid"] += 1
     if memory is not None:
         result["restored_memories"].append(_memory_to_public_dict(memory))
+        if action in {"created", "updated"}:
+            imported_memory_ids.append(memory.id)
+
+
+def _rewrite_memory_import_references(
+    raw_memory: dict,
+    *,
+    memory_id_map: dict[str, str],
+    allowed_existing_ids: set[str],
+) -> dict:
+    rewritten = dict(raw_memory)
+    source_id = str(raw_memory.get("id") or "").strip()
+    if source_id and source_id in memory_id_map:
+        rewritten["id"] = memory_id_map[source_id]
+
+    evidence_ids: list[str] = []
+    for evidence_id in _string_list(raw_memory.get("evidence_memory_ids")):
+        mapped_id = memory_id_map.get(evidence_id)
+        if mapped_id is None and evidence_id in allowed_existing_ids:
+            mapped_id = evidence_id
+        if mapped_id and mapped_id not in evidence_ids:
+            evidence_ids.append(mapped_id)
+    rewritten["evidence_memory_ids"] = evidence_ids
+
+    for field_name in ("supersedes", "superseded_by"):
+        raw_reference = raw_memory.get(field_name)
+        reference = str(raw_reference).strip() if raw_reference is not None else ""
+        mapped_reference = memory_id_map.get(reference) if reference else None
+        if mapped_reference is None and reference in allowed_existing_ids:
+            mapped_reference = reference
+        rewritten[field_name] = mapped_reference
+    return rewritten
+
+
+def _memory_reference_ids(records: list[dict]) -> list[str]:
+    references: list[str] = []
+    for record in records:
+        references.extend(_string_list(record.get("evidence_memory_ids")))
+        for field_name in ("supersedes", "superseded_by"):
+            raw_reference = record.get(field_name)
+            reference = str(raw_reference).strip() if raw_reference is not None else ""
+            if reference:
+                references.append(reference)
+    return list(dict.fromkeys(references))
 
 
 def _restore_one_recent_context_summary(
@@ -509,7 +608,12 @@ def _restore_one_recent_context_summary(
     if not summary_text and not compressed_summary and not recent_turns:
         result["recent_context_invalid"] += 1
         return
-    if int(raw_summary.get("archived") or 0) != 0:
+    try:
+        archived = int(raw_summary.get("archived") or 0)
+    except (TypeError, ValueError):
+        result["recent_context_invalid"] += 1
+        return
+    if archived != 0:
         result["recent_context_skipped"] += 1
         return
     raw_conversation_id = raw_summary.get("conversation_id")
@@ -562,7 +666,15 @@ def _restore_one_conversation_branch_node(
     overwrite: bool,
     result: dict,
 ) -> None:
-    if not isinstance(raw_node, dict) or int(raw_node.get("archived") or 0) != 0:
+    if not isinstance(raw_node, dict):
+        result["branch_nodes_invalid"] += 1
+        return
+    try:
+        archived = int(raw_node.get("archived") or 0)
+    except (TypeError, ValueError):
+        result["branch_nodes_invalid"] += 1
+        return
+    if archived != 0:
         result["branch_nodes_invalid"] += 1
         return
     fingerprint_fields = (

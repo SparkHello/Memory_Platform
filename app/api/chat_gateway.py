@@ -152,9 +152,13 @@ class _ExpiringState:
         self._values.pop(oldest_key, None)
 
 
-_ACTIVATED_TURNS = _ExpiringState()
-_RECENT_TURNS = _ExpiringState()
-_INGESTED_TURNS = _ExpiringState()
+_TURN_SIDE_EFFECT_CACHE_MAX = 4096
+
+# FLIT 会在每个工具步骤用新 HTTP 请求重复同一轮前缀。这里需要短期幂等，
+# 但不能让任意 user/turn key 在长生命周期进程里无界增长。
+_ACTIVATED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
+_RECENT_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
+_INGESTED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
 _TOOL_REASONING = _ExpiringState(max_entries=256)
 _TURN_REASONING = _ExpiringState(max_entries=256)
 
@@ -471,14 +475,17 @@ async def chat_completions(
     except (UnicodeDecodeError, json.JSONDecodeError):
         upstream_json = {}
 
-    usage_recorder.record_response(
-        payload=upstream_json,
-        model=upstream_result.provider.model,
-        kind="chat",
-        provider_code=upstream_result.provider.code,
-        base_url=upstream_result.provider.base_url,
-        user_id=user_id,
-        operation="chat_completion",
+    await anyio.to_thread.run_sync(
+        partial(
+            usage_recorder.record_response,
+            payload=upstream_json,
+            model=upstream_result.provider.model,
+            kind="chat",
+            provider_code=upstream_result.provider.code,
+            base_url=upstream_result.provider.base_url,
+            user_id=user_id,
+            operation="chat_completion",
+        )
     )
 
     background = None
@@ -1275,18 +1282,21 @@ async def _finalize_stream_turn(
     user_id: str,
     provider,
 ) -> None:
-    usage_recorder.record_response(
-        payload={
-            "id": capture.response_id,
-            "model": capture.response_model,
-            "usage": capture.usage,
-        },
-        model=provider.model,
-        kind="chat",
-        provider_code=provider.code,
-        base_url=provider.base_url,
-        user_id=user_id,
-        operation="chat_completion",
+    await anyio.to_thread.run_sync(
+        partial(
+            usage_recorder.record_response,
+            payload={
+                "id": capture.response_id,
+                "model": capture.response_model,
+                "usage": capture.usage,
+            },
+            model=provider.model,
+            kind="chat",
+            provider_code=provider.code,
+            base_url=provider.base_url,
+            user_id=user_id,
+            operation="chat_completion",
+        )
     )
     if capture.is_final_text_response:
         await finalize(assistant_text=capture.assistant_text)

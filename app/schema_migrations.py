@@ -1,8 +1,36 @@
 from collections.abc import Callable, Sequence
 import sqlite3
+import time
 
 
 SchemaMigration = tuple[int, Callable[[sqlite3.Connection], None]]
+
+
+def enable_wal_with_retry(
+    connection: sqlite3.Connection,
+    *,
+    attempts: int = 20,
+    initial_delay_seconds: float = 0.01,
+) -> str:
+    """Enable WAL while tolerating the brief lock race during concurrent startup.
+
+    ``PRAGMA journal_mode=WAL`` may raise ``database is locked`` immediately even
+    when ``busy_timeout`` is configured.  Only that transient lock/busy case is
+    retried; configuration and filesystem errors still fail fast.
+    """
+    bounded_attempts = max(1, int(attempts))
+    delay = max(0.0, float(initial_delay_seconds))
+    for attempt in range(bounded_attempts):
+        try:
+            row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            return str(row[0]) if row else ""
+        except sqlite3.OperationalError as exc:
+            message = str(exc).casefold()
+            retryable = "locked" in message or "busy" in message
+            if not retryable or attempt + 1 >= bounded_attempts:
+                raise
+            time.sleep(min(delay * (2**attempt), 0.1))
+    raise RuntimeError("unreachable WAL initialization state")
 
 
 def validated_schema_version(

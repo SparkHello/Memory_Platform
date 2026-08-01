@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from app.memory.evaluation import EvaluationError, delete_user_eval_workspace
+from app.memory.evaluation import (
+    EvaluationError,
+    _label_validation_issues,
+    _validate_labels,
+    delete_user_eval_workspace,
+)
 from app.memory.search import EmbeddingClient, NullEmbeddingClient
 from app.memory.store import MemoryStore
 
@@ -39,6 +44,47 @@ def test_score_query_handles_complete_miss() -> None:
     assert row["recall"] == 0.0
     assert row["reciprocal_rank"] == 0.0
     assert row["ndcg"] == 0.0
+
+
+def test_score_query_distinguishes_precision_at_k_from_returned_precision() -> None:
+    row = eval_recall._score_query("q", ["a"], ["a"], k=4)
+
+    assert row["precision"] == 0.25
+    assert row["returned_precision"] == 1.0
+
+
+def test_identical_duplicate_queries_are_reported_and_collapsed(
+    memory_store: MemoryStore,
+) -> None:
+    coffee = memory_store.create_memory(user_id="default", content="用户喜欢咖啡。")
+    labels = [
+        {"id": "q1", "query": "咖啡", "judgment": "relevant", "relevant_ids": [coffee.id]},
+        {"id": "q2", "query": " 咖啡 ", "judgment": "relevant", "relevant_ids": [coffee.id]},
+    ]
+
+    issues = _label_validation_issues(labels, valid_ids={coffee.id})
+    result = eval_recall.run_eval(
+        snapshot_db=memory_store.database_path,
+        labels=labels,
+        user_id="default",
+        k=4,
+        embedding_client=NullEmbeddingClient(),
+    )
+
+    assert [issue["code"] for issue in issues] == ["duplicate_query"]
+    assert result["summary"]["queries_input"] == 2
+    assert result["summary"]["queries_total"] == 1
+    assert result["summary"]["duplicate_queries_collapsed"] == 1
+
+
+def test_conflicting_duplicate_query_is_blocking() -> None:
+    labels = [
+        {"id": "q1", "query": "咖啡", "judgment": "relevant", "relevant_ids": ["m1"]},
+        {"id": "q2", "query": "咖啡", "judgment": "no_answer", "relevant_ids": []},
+    ]
+
+    with pytest.raises(EvaluationError, match="query 相同但标注冲突"):
+        _validate_labels(labels, valid_ids={"m1"})
 
 
 def test_load_labels_skips_comments_and_blanks(tmp_path: Path) -> None:

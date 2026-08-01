@@ -182,9 +182,69 @@ class TestSaveMemoryEndpoint:
         )
         assert restored.status_code == 200
         restored_memory = restored.json()["memory"]
+        restored_id = restored_memory["id"]
+        assert restored_id not in {old_id, new_id}
         assert restored_memory["valid_until"] is None
         assert restored_memory["status"] == "dynamic"
-        assert memory_store.get_memory(memory_id=new_id, user_id="default").supersedes is None
+        assert restored_memory["supersedes"] == new_id
+
+        old_after = memory_store.get_memory(memory_id=old_id, user_id="default")
+        new_after = memory_store.get_memory(memory_id=new_id, user_id="default")
+        assert old_after is not None
+        assert new_after is not None
+        assert old_after.valid_until == "2026-01-01"
+        assert old_after.superseded_by == new_id
+        assert new_after.supersedes == old_id
+        assert new_after.valid_until == restored_memory["valid_from"]
+        assert new_after.superseded_by == restored_id
+
+    def test_patch_temporal_key_omits_old_synthesized_boundary(
+        self,
+        client,
+        auth_headers,
+        memory_store: MemoryStore,
+    ):
+        old = memory_store.create_memory(
+            user_id="default",
+            content="User lives in City A.",
+            valid_from="2025-01-01",
+            temporal_subject="user",
+            temporal_predicate="current_city",
+        )
+        latest = memory_store.create_memory(
+            user_id="default",
+            content="User lives in City B.",
+            valid_from="2026-01-01",
+            temporal_subject="user",
+            temporal_predicate="current_city",
+        )
+        assert memory_store.get_memory(
+            memory_id=old.id,
+            user_id="default",
+        ).valid_until == latest.valid_from
+
+        response = client.patch(
+            f"/memories/{old.id}",
+            headers=auth_headers,
+            json={"temporal_subject": "former_user"},
+        )
+
+        assert response.status_code == 200
+        moved = memory_store.get_memory(memory_id=old.id, user_id="default")
+        latest_after = memory_store.get_memory(
+            memory_id=latest.id,
+            user_id="default",
+        )
+        assert moved is not None
+        assert latest_after is not None
+        assert moved.temporal_subject == "former_user"
+        assert moved.valid_until is None
+        assert moved.status == "dynamic"
+        assert moved.supersedes is None
+        assert moved.superseded_by is None
+        assert latest_after.supersedes is None
+        assert latest_after.valid_until is None
+        assert latest_after.status == "dynamic"
 
     def test_reject_low_importance(self, client, auth_headers):
         response = client.post(

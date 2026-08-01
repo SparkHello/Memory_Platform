@@ -259,6 +259,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 ## 后续开发注意事项
 
+- MCP Python SDK 当前限定为 `>=1.10.0,<2`：1.9.x 缺少 `transport_security`，2.x 移除了现有 FastMCP v1 导入路径。完成 server/auth/测试迁移前不要移除该范围。
 - 新增记忆字段时，同步更新 `models.py`、`store.py`、REST 返回、MCP 返回、导出恢复和测试。
 - 新增 MCP 工具时，同步更新 `EXPECTED_TOOLS` 相关测试和 README。
 - 修改知识文档、索引、上传或 MCP 契约时，同步检查独立数据库路径、用户隔离、引用逐字性、代理 fallback、知识备份、README 与 `docs/client_integration.md`；不要让知识结果进入任何 memory 流程。

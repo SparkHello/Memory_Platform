@@ -167,7 +167,15 @@ def redact_memory_payload(
     if not redact_sensitive:
         return data
 
-    reason = sensitivity or data.get("sensitivity")
+    declared_reason = sensitivity or data.get("sensitivity")
+    declared_level: MemorySensitivity = (
+        declared_reason if declared_reason in _SENSITIVITY_RANK else "normal"
+    )
+    local_text = "\n".join(
+        str(data.get(field_name) or "")
+        for field_name in ("content", "source_message", "source_excerpt")
+    )
+    reason = sensitivity_floor(declared_level, local_text)
     if reason not in SENSITIVE_LEVELS:
         return data
 
@@ -181,6 +189,12 @@ def redact_memory_payload(
     if data.get("source_excerpt"):
         data["source_excerpt"] = REDACTED_SOURCE_TEXT
         redacted_fields.append("source_excerpt")
+    if data.get("label"):
+        data["label"] = "敏感记忆" if reason == "sensitive" else "私密记忆"
+        redacted_fields.append("label")
+    if data.get("entities"):
+        data["entities"] = []
+        redacted_fields.append("entities")
 
     data["redacted"] = True
     data["redaction_reason"] = reason

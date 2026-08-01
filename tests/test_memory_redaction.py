@@ -115,6 +115,23 @@ class TestRedactMemoryPayload:
         assert result["content"] == "喜欢黑咖啡"
         assert "redacted" not in result
 
+    def test_local_detection_redacts_mislabeled_legacy_payload(self) -> None:
+        payload = {
+            "content": "银行卡密码是 123456",
+            "source_message": "旧库错误地标成 normal",
+            "label": "银行卡密码是 123456",
+            "entities": ["123456"],
+            "sensitivity": "normal",
+        }
+
+        result = redact_memory_payload(payload, redact_sensitive=True)
+
+        assert result["content"] == REDACTED_CONTENT_TEXT
+        assert result["source_message"] == REDACTED_SOURCE_TEXT
+        assert result["label"] == "敏感记忆"
+        assert result["entities"] == []
+        assert result["redaction_reason"] == "sensitive"
+
     def test_missing_sensitivity_uses_payload_value(self) -> None:
         payload = {"content": "secret", "sensitivity": "sensitive"}
         result = redact_memory_payload(payload, redact_sensitive=True)

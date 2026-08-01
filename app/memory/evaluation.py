@@ -38,6 +38,7 @@ LABEL_JUDGMENTS = {"unlabeled", "relevant", "no_answer"}
 BLOCKING_LABEL_ISSUE_CODES = {
     "blank_query",
     "duplicate_label_id",
+    "duplicate_query_conflict",
     "invalid_judgment",
     "missing_relevant_ids",
     "no_answer_with_relevant_ids",
@@ -184,6 +185,13 @@ def run_diagnosis(
         metrics["type_distribution"] = type_dist
         metrics["status_distribution"] = status_dist
         metrics["tag_coverage"] = _tag_coverage(connection, columns, total, user_id=user_id)
+        metrics["graph"] = _graph_metrics(
+            connection,
+            columns,
+            total,
+            tag_coverage=metrics["tag_coverage"],
+            user_id=user_id,
+        )
         metrics["temporal"] = _temporal_metrics(connection, columns, user_id=user_id)
         metrics["importance"] = _numeric_summary(connection, "importance", user_id=user_id)
         metrics["usage_count"] = _numeric_summary(connection, "usage_count", user_id=user_id)
@@ -199,7 +207,7 @@ def run_diagnosis(
         verdicts.append(_sector_verdict(type_dist, total))
         verdicts.append(_lifecycle_verdict(status_dist, total))
         verdicts.append(_temporal_verdict(metrics["temporal"]))
-        verdicts.append(_graph_verdict(metrics["tag_coverage"], total))
+        verdicts.append(_graph_verdict(metrics["graph"], total))
         verdicts.append(_affect_verdict(metrics["affect"], total))
         verdicts.append(_recall_verdict(metrics["recall"], total))
 
@@ -357,6 +365,8 @@ def run_eval(
         _normalize_label_entry(label, index=index)
         for index, label in enumerate(labels, start=1)
     ]
+    input_query_count = len(normalized_labels)
+    normalized_labels = _deduplicate_identical_queries(normalized_labels)
     requested_mode = requested_mode or (
         "keyword" if embedding_client is None or isinstance(embedding_client, NullEmbeddingClient) else "embedding"
     )
@@ -385,7 +395,9 @@ def run_eval(
     )
 
     summary: dict[str, object] = {
+        "queries_input": input_query_count,
         "queries_total": len(normalized_labels),
+        "duplicate_queries_collapsed": input_query_count - len(normalized_labels),
         "queries_graded": graded_count,
         "queries_relevant": len(relevant_labels),
         "queries_no_answer": len(no_answer_labels),
@@ -399,6 +411,10 @@ def run_eval(
         relevant_results = [row for row in per_query if row["judgment"] == "relevant"]
         summary["hit_rate"] = round(_mean(row["hit"] for row in relevant_results), 4)
         summary["precision_at_k"] = round(_mean(row["precision"] for row in relevant_results), 4)
+        summary["returned_precision"] = round(
+            _mean(row["returned_precision"] for row in relevant_results),
+            4,
+        )
         summary["recall_at_k"] = round(_mean(row["recall"] for row in relevant_results), 4)
         summary["mrr"] = round(_mean(row["reciprocal_rank"] for row in relevant_results), 4)
         summary["ndcg_at_k"] = round(_mean(row["ndcg"] for row in relevant_results), 4)
@@ -569,7 +585,8 @@ def _score_query(
     hit_positions = [i for i, memory_id in enumerate(top_k, start=1) if memory_id in relevant_set]
     relevant_hits = len(hit_positions)
 
-    precision = relevant_hits / retrieved if retrieved else 0.0
+    precision_at_k = relevant_hits / k
+    returned_precision = relevant_hits / retrieved if retrieved else 0.0
     recall = relevant_hits / len(relevant_set) if relevant_set else 0.0
     reciprocal_rank = 1.0 / hit_positions[0] if hit_positions else 0.0
     dcg = sum(1.0 / math.log2(pos + 1) for pos in hit_positions)
@@ -587,7 +604,11 @@ def _score_query(
         "retrieved": retrieved,
         "relevant_hits": relevant_hits,
         "hit": 1.0 if relevant_hits else 0.0,
-        "precision": round(precision, 4),
+        # Keep the historical key for API/UI compatibility, but make it a real
+        # P@k.  The former denominator (number actually returned) is exposed
+        # separately so an abstaining retriever is not mislabeled as P@k=1.
+        "precision": round(precision_at_k, 4),
+        "returned_precision": round(returned_precision, 4),
         "recall": round(recall, 4),
         "reciprocal_rank": round(reciprocal_rank, 4),
         "ndcg": round(ndcg, 4),
@@ -641,9 +662,15 @@ def format_text_report(result: dict[str, object]) -> str:
             f"{summary.get('queries_no_answer', 0)} no-answer, "
             f"k={summary.get('effective_k', summary.get('k'))})"
         )
+        if summary.get("duplicate_queries_collapsed"):
+            lines.append(
+                f"- duplicate queries collapsed: {summary.get('duplicate_queries_collapsed')} "
+                f"(input={summary.get('queries_input')})"
+            )
         if summary.get("queries_relevant"):
             lines.append(f"- hit_rate@k:    {summary.get('hit_rate')}")
             lines.append(f"- precision@k:   {summary.get('precision_at_k')}")
+            lines.append(f"- returned precision: {summary.get('returned_precision')}")
             lines.append(f"- recall@k:      {summary.get('recall_at_k')}")
             lines.append(f"- MRR:           {summary.get('mrr')}")
             lines.append(f"- nDCG@k:        {summary.get('ndcg_at_k')}")
@@ -709,6 +736,7 @@ def format_diagnosis_text_report(result: dict[str, object]) -> str:
         lines.append(f"- type_distribution: {json.dumps(metrics.get('type_distribution'), ensure_ascii=False)}")
         lines.append(f"- status_distribution: {json.dumps(metrics.get('status_distribution'), ensure_ascii=False)}")
         lines.append(f"- tag_coverage: {json.dumps(metrics.get('tag_coverage'), ensure_ascii=False)}")
+        lines.append(f"- graph: {json.dumps(metrics.get('graph'), ensure_ascii=False)}")
         lines.append(f"- temporal: {json.dumps(metrics.get('temporal'), ensure_ascii=False)}")
         lines.append(f"- never_recalled_count: {metrics.get('never_recalled_count')}")
         lines.append(f"- affect: {json.dumps(metrics.get('affect'), ensure_ascii=False)}")
@@ -782,6 +810,8 @@ def _lifecycle_verdict(status_dist: dict[str, int], total: int) -> Verdict:
 def _temporal_verdict(temporal: dict[str, int]) -> Verdict:
     key_count = int(temporal.get("temporal_key_count", 0))
     supersession = int(temporal.get("supersession_link_count", 0))
+    active_edges = int(temporal.get("active_supersession_edge_count", supersession))
+    dangling = int(temporal.get("dangling_supersession_reference_count", 0))
     if key_count == 0:
         return Verdict(
             "temporal_kg",
@@ -797,7 +827,22 @@ def _temporal_verdict(temporal: dict[str, int]) -> Verdict:
             f"{key_count} 条记忆携带时间键，但尚未发生任何替代。",
             temporal,
         )
-    return Verdict("temporal_kg", "active", "时间键与替代链路均已出现。", temporal)
+    if dangling:
+        return Verdict(
+            "temporal_kg",
+            "degenerate",
+            f"检测到 {dangling} 个活跃但不互为反向引用、跨时间键或指向回收站的替代引用，"
+            "时间版本链需要修复。",
+            temporal,
+        )
+    if active_edges == 0:
+        return Verdict(
+            "temporal_kg",
+            "sparse",
+            "时间键已出现，但替代链仅存在于回收站/历史行，当前活跃版本图没有有效边。",
+            temporal,
+        )
+    return Verdict("temporal_kg", "active", "活跃时间键与双向一致的替代链路均已出现。", temporal)
 
 
 def _graph_verdict(tag_coverage: dict[str, object], total: int) -> Verdict:
@@ -809,15 +854,22 @@ def _graph_verdict(tag_coverage: dict[str, object], total: int) -> Verdict:
             tag_coverage,
         )
     topic_cov = float(tag_coverage.get("topic_coverage", 0.0))  # type: ignore[arg-type]
-    if topic_cov < SPARSE_TAG_COVERAGE:
+    edge_count = int(tag_coverage.get("edge_count", 0))
+    connected_share = float(tag_coverage.get("connected_node_share", 0.0))
+    if edge_count == 0 or connected_share < SPARSE_TAG_COVERAGE:
         return Verdict(
             "graph_structure",
             "sparse",
-            f"只有 {topic_cov:.0%} 的记忆带主题标签，"
-            f"记忆网络、图遍历和时间涟漪几乎没有可用的边。",
+            f"检测到 {edge_count} 条实际关系边，覆盖 {connected_share:.0%} 的记忆；"
+            f"主题覆盖率为 {topic_cov:.0%}，图遍历仍较稀疏。",
             tag_coverage,
         )
-    return Verdict("graph_structure", "active", "主题/空间标注让图谱拥有真实的边。", tag_coverage)
+    return Verdict(
+        "graph_structure",
+        "active",
+        f"检测到 {edge_count} 条 evidence、temporal 或共享标签/空间关系边。",
+        tag_coverage,
+    )
 
 
 def _affect_metrics(
@@ -916,7 +968,11 @@ def _recall_metrics(
     *,
     user_id: str | None,
 ) -> dict[str, object]:
-    """无需标注的召回健康度：被召回比例、总召回量、单条记忆的召回集中度。"""
+    """无需标注的激活健康度。
+
+    ``usage_count`` 同时包含直接召回与 Time Ripple 的小数增量，所以它是
+    activation_count，而不是精确的召回次数。保留旧键仅用于 API 兼容。
+    """
     where_sql, params = _active_memory_scope(user_id)
     row = connection.execute(
         f"SELECT COALESCE(SUM(usage_count), 0) AS total_recalls, "
@@ -924,30 +980,39 @@ def _recall_metrics(
         f"FROM memories WHERE {where_sql}",
         params,
     ).fetchone()
-    total_recalls = int(row["total_recalls"] or 0)
-    max_recalls = int(row["max_recalls"] or 0)
+    total_activation = float(row["total_recalls"] or 0.0)
+    max_activation = float(row["max_recalls"] or 0.0)
     recalled = max(0, total - int(never_recalled))
     return {
+        "activated_memory_count": recalled,
+        "activated_memory_share": round(recalled / total, 3) if total else 0.0,
+        "never_activated_count": int(never_recalled),
+        "total_activation_count": total_activation,
+        "max_activation_count": max_activation,
+        "top1_concentration": (
+            round(max_activation / total_activation, 3) if total_activation else 0.0
+        ),
+        # Backward-compatible aliases. These values are activation counts, not
+        # literal search-event counts.
         "recalled_count": recalled,
         "recalled_share": round(recalled / total, 3) if total else 0.0,
         "never_recalled_count": int(never_recalled),
-        "total_recalls": total_recalls,
-        "max_recalls": max_recalls,
-        "top1_concentration": round(max_recalls / total_recalls, 3) if total_recalls else 0.0,
+        "total_recalls": total_activation,
+        "max_recalls": max_activation,
     }
 
 
 def _recall_verdict(recall: dict[str, object], total: int) -> Verdict:
     if total == 0:
         return Verdict("recall_health", "insufficient_data", "暂无可评估的记忆。", recall)
-    recalled = int(recall.get("recalled_count", 0))  # type: ignore[arg-type]
-    total_recalls = int(recall.get("total_recalls", 0))  # type: ignore[arg-type]
+    recalled = int(recall.get("activated_memory_count", 0))  # type: ignore[arg-type]
+    total_activation = float(recall.get("total_activation_count", 0.0))  # type: ignore[arg-type]
     concentration = float(recall.get("top1_concentration", 0.0))  # type: ignore[arg-type]
-    if recalled == 0 or total_recalls == 0:
+    if recalled == 0 or total_activation <= 0.0:
         return Verdict(
             "recall_health",
             "dormant",
-            "还没有记忆被召回过，搜索/浮现尚未带来任何激活。",
+            "还没有记忆被激活过，搜索/浮现尚未带来任何激活。",
             recall,
         )
     if concentration >= RECALL_CONCENTRATION_WARN:
@@ -955,13 +1020,13 @@ def _recall_verdict(recall: dict[str, object], total: int) -> Verdict:
             "recall_health",
             "active",
             f"召回高度集中：最热的一条记忆占了全部激活的 {concentration:.0%}"
-            f"（{recalled}/{total} 条被召回过）。",
+            f"（{recalled}/{total} 条被激活过）。",
             recall,
         )
     return Verdict(
         "recall_health",
         "active",
-        f"{recalled}/{total} 条记忆被召回过，激活分布比较均匀。",
+        f"{recalled}/{total} 条记忆被激活过，激活分布比较均匀。",
         recall,
     )
 
@@ -1005,20 +1070,146 @@ def _tag_coverage(
         "entity_tagged": entities,
     }
     if _table_exists(connection, "memory_space_links"):
-        if user_id is None:
-            linked = _count(connection, "SELECT COUNT(DISTINCT memory_id) FROM memory_space_links")
-        else:
-            linked = _count(
-                connection,
-                "SELECT COUNT(DISTINCT memory_id) FROM memory_space_links WHERE user_id = ?",
-                (user_id,),
-            )
+        link_scope = "COALESCE(memory.archived, 0) = 0"
+        link_params: tuple[object, ...] = ()
+        if user_id is not None:
+            link_scope += " AND COALESCE(memory.user_id, 'default') = ? AND link.user_id = ?"
+            link_params = (user_id, user_id)
+        linked = _count(
+            connection,
+            "SELECT COUNT(DISTINCT link.memory_id) "
+            "FROM memory_space_links AS link "
+            "JOIN memories AS memory ON memory.id = link.memory_id "
+            f"WHERE {link_scope}",
+            link_params,
+        )
         coverage["space_coverage"] = round(linked / total, 3)
         coverage["space_linked"] = linked
     else:
         coverage["space_coverage"] = 0.0
         coverage["space_linked"] = 0
     return coverage
+
+
+def _graph_metrics(
+    connection: sqlite3.Connection,
+    columns: set[str],
+    total: int,
+    *,
+    tag_coverage: object,
+    user_id: str | None,
+) -> dict[str, object]:
+    """Measure relationships that actually connect active memory rows."""
+    metrics = dict(tag_coverage) if isinstance(tag_coverage, dict) else {}
+    if total <= 0:
+        metrics.update(
+            {
+                "edge_count": 0,
+                "connected_node_count": 0,
+                "connected_node_share": 0.0,
+                "edge_kinds": {},
+            }
+        )
+        return metrics
+
+    optional_columns = [
+        name
+        for name in (
+            "topics_json",
+            "entities_json",
+            "evidence_memory_ids_json",
+            "supersedes",
+        )
+        if name in columns
+    ]
+    where_sql, params = _active_memory_scope(user_id)
+    rows = connection.execute(
+        f"SELECT id{''.join(f', {name}' for name in optional_columns)} "
+        f"FROM memories WHERE {where_sql}",
+        params,
+    ).fetchall()
+    active_ids = {str(row["id"]) for row in rows}
+    edge_kinds: dict[str, set[tuple[str, str]]] = {
+        "evidence": set(),
+        "temporal": set(),
+        "topic": set(),
+        "entity": set(),
+        "space": set(),
+    }
+    groups: dict[tuple[str, str], list[str]] = {}
+
+    def json_strings(raw: object, *, normalize_label: bool = True) -> list[str]:
+        try:
+            values = json.loads(str(raw)) if raw else []
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(values, list):
+            return []
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        return [value.casefold() for value in cleaned] if normalize_label else cleaned
+
+    def edge(left_id: str, right_id: str) -> tuple[str, str] | None:
+        if left_id == right_id or right_id not in active_ids:
+            return None
+        return tuple(sorted((left_id, right_id)))
+
+    for row in rows:
+        memory_id = str(row["id"])
+        if "evidence_memory_ids_json" in optional_columns:
+            for evidence_id in json_strings(
+                row["evidence_memory_ids_json"],
+                normalize_label=False,
+            ):
+                pair = edge(memory_id, evidence_id)
+                if pair:
+                    edge_kinds["evidence"].add(pair)
+        if "supersedes" in optional_columns and row["supersedes"]:
+            pair = edge(memory_id, str(row["supersedes"]))
+            if pair:
+                edge_kinds["temporal"].add(pair)
+        for column_name, kind in (
+            ("topics_json", "topic"),
+            ("entities_json", "entity"),
+        ):
+            if column_name not in optional_columns:
+                continue
+            for label in json_strings(row[column_name]):
+                groups.setdefault((kind, label), []).append(memory_id)
+
+    if _table_exists(connection, "memory_space_links") and active_ids:
+        link_query = "SELECT memory_id, space_id FROM memory_space_links"
+        link_params: tuple[object, ...] = ()
+        if user_id is not None:
+            link_query += " WHERE user_id = ?"
+            link_params = (user_id,)
+        for row in connection.execute(link_query, link_params).fetchall():
+            memory_id = str(row["memory_id"])
+            if memory_id in active_ids:
+                groups.setdefault(("space", str(row["space_id"])), []).append(memory_id)
+
+    # A spanning star per shared label proves connectivity without materializing
+    # every O(n²) clique edge in large libraries.
+    for (kind, _), member_ids in groups.items():
+        unique_members = list(dict.fromkeys(member_ids))
+        if len(unique_members) < 2:
+            continue
+        anchor = unique_members[0]
+        for member_id in unique_members[1:]:
+            pair = edge(anchor, member_id)
+            if pair:
+                edge_kinds[kind].add(pair)
+
+    all_edges = set().union(*edge_kinds.values())
+    connected_ids = {memory_id for pair in all_edges for memory_id in pair}
+    metrics.update(
+        {
+            "edge_count": len(all_edges),
+            "connected_node_count": len(connected_ids),
+            "connected_node_share": round(len(connected_ids) / total, 3),
+            "edge_kinds": {kind: len(edges) for kind, edges in edge_kinds.items()},
+        }
+    )
+    return metrics
 
 
 def _temporal_metrics(
@@ -1039,11 +1230,62 @@ def _temporal_metrics(
     if {"supersedes", "superseded_by"}.issubset(columns):
         scope_sql = "1 = 1" if user_id is None else "user_id = ?"
         scope_params: tuple[object, ...] = () if user_id is None else (user_id,)
-        metrics["supersession_link_count"] = _count(
-            connection,
-            f"SELECT COUNT(*) FROM memories WHERE {scope_sql} "
-            "AND (supersedes IS NOT NULL OR superseded_by IS NOT NULL)",
+        rows = connection.execute(
+            f"SELECT id, user_id, archived, temporal_subject, temporal_predicate, "
+            f"supersedes, superseded_by FROM memories WHERE {scope_sql}",
             scope_params,
+        ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        linked_rows = [
+            row for row in rows if row["supersedes"] or row["superseded_by"]
+        ]
+        active_rows = [row for row in rows if not int(row["archived"] or 0)]
+        valid_edges: set[tuple[str, str]] = set()
+        valid_active_ids: set[str] = set()
+        dangling_references = 0
+
+        def same_temporal_key(left: sqlite3.Row, right: sqlite3.Row) -> bool:
+            return bool(
+                left["temporal_subject"]
+                and left["temporal_predicate"]
+                and left["temporal_subject"] == right["temporal_subject"]
+                and left["temporal_predicate"] == right["temporal_predicate"]
+            )
+
+        for row in active_rows:
+            memory_id = str(row["id"])
+            for field_name, reciprocal_name in (
+                ("supersedes", "superseded_by"),
+                ("superseded_by", "supersedes"),
+            ):
+                target_id = str(row[field_name] or "")
+                if not target_id:
+                    continue
+                target = by_id.get(target_id)
+                valid = bool(
+                    target is not None
+                    and not int(target["archived"] or 0)
+                    and str(target["user_id"]) == str(row["user_id"])
+                    and str(target[reciprocal_name] or "") == memory_id
+                    and same_temporal_key(row, target)
+                )
+                if not valid:
+                    dangling_references += 1
+                    continue
+                edge = tuple(sorted((memory_id, target_id)))
+                valid_edges.add(edge)
+                valid_active_ids.update(edge)
+
+        metrics.update(
+            {
+                "supersession_link_count": len(linked_rows),
+                "active_supersession_link_count": len(valid_active_ids),
+                "active_supersession_edge_count": len(valid_edges),
+                "trashed_supersession_link_count": sum(
+                    1 for row in linked_rows if int(row["archived"] or 0)
+                ),
+                "dangling_supersession_reference_count": dangling_references,
+            }
         )
     if "valid_from" in columns:
         metrics["valid_from_count"] = _count(
@@ -1375,15 +1617,44 @@ def _label_validation_issues(
 ) -> list[dict[str, object]]:
     issues: list[dict[str, object]] = []
     seen: set[str] = set()
+    seen_queries: dict[str, tuple[str, tuple[str, ...], str]] = {}
     for label in labels:
         label_id = str(label.get("id") or "")
-        if not str(label.get("query") or "").strip():
+        query = str(label.get("query") or "").strip()
+        if not query:
             issues.append({"code": "blank_query", "label_id": label_id, "message": "query 不能为空。"})
         if label_id in seen:
             issues.append({"code": "duplicate_label_id", "label_id": label_id, "message": f"标注 ID 重复:{label_id}"})
         seen.add(label_id)
         judgment = str(label.get("judgment") or "unlabeled")
         relevant_ids = list(label.get("relevant_ids", []))
+        normalized_query = " ".join(query.casefold().split())
+        query_signature = (
+            judgment,
+            tuple(sorted(str(memory_id) for memory_id in relevant_ids)),
+            label_id,
+        )
+        previous = seen_queries.get(normalized_query)
+        if normalized_query and previous is not None:
+            previous_judgment, previous_ids, previous_label_id = previous
+            same_annotation = (
+                judgment == previous_judgment
+                and query_signature[1] == previous_ids
+            )
+            issues.append(
+                {
+                    "code": "duplicate_query" if same_annotation else "duplicate_query_conflict",
+                    "label_id": label_id,
+                    "other_label_id": previous_label_id,
+                    "message": (
+                        f"{label_id} 与 {previous_label_id} 的 query 重复；评测时会折叠重复样本。"
+                        if same_annotation
+                        else f"{label_id} 与 {previous_label_id} 的 query 相同但标注冲突。"
+                    ),
+                }
+            )
+        elif normalized_query:
+            seen_queries[normalized_query] = query_signature
         if judgment not in LABEL_JUDGMENTS:
             issues.append(
                 {
@@ -1428,6 +1699,25 @@ def _label_validation_issues(
                     }
                 )
     return issues
+
+
+def _deduplicate_identical_queries(
+    labels: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Collapse exact duplicate samples so one query cannot silently reweight metrics."""
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for label in labels:
+        signature = (
+            " ".join(str(label.get("query") or "").casefold().split()),
+            str(label.get("judgment") or "unlabeled"),
+            tuple(sorted(str(value) for value in label.get("relevant_ids", []))),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(label)
+    return unique
 
 
 def _write_labels_atomic(labels_path: Path, labels: list[dict[str, object]]) -> None:

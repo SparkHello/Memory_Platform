@@ -12,7 +12,8 @@ dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
     "httpx>=0.27.0",
-    "mcp>=1.9.0",
+    # v1.10 introduces transport_security; v2 removes the FastMCP v1 import paths.
+    "mcp>=1.10.0,<2",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
     "python-dotenv>=1.0.1",

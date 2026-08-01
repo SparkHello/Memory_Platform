@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 import zipfile
 
+import app.api.memories as memories_api_module
 from app.memory.models import RecentContextTurn
+from app.memory.report import build_memory_export
 from app.memory.store import MemoryStore
 
 
@@ -57,6 +59,69 @@ def test_report_and_export_rest_endpoints(client, auth_headers, memory_store: Me
     )
     assert export_markdown_response.status_code == 200
     assert "Memory Export" in export_markdown_response.text
+
+
+def test_memory_export_includes_rows_beyond_legacy_ten_thousand_limit(
+    memory_store: MemoryStore,
+) -> None:
+    template = memory_store.create_memory(
+        user_id="default",
+        content="bulk export memory 0",
+        type="semantic",
+    )
+    with memory_store._connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM memories WHERE id = ?",
+            (template.id,),
+        ).fetchone()
+        assert row is not None
+        columns = list(row.keys())
+        id_index = columns.index("id")
+        content_index = columns.index("content")
+        values = list(row)
+        records: list[tuple] = []
+        for index in range(1, 10_001):
+            clone = list(values)
+            clone[id_index] = f"bulk-export-{index}"
+            clone[content_index] = f"bulk export memory {index}"
+            records.append(tuple(clone))
+        placeholders = ", ".join("?" for _ in columns)
+        connection.executemany(
+            f"INSERT INTO memories ({', '.join(columns)}) VALUES ({placeholders})",
+            records,
+        )
+
+    exported = build_memory_export(store=memory_store, user_id="default")
+
+    assert len(exported["memories"]) == 10_001
+    assert any(
+        memory["id"] == "bulk-export-10000"
+        for memory in exported["memories"]
+    )
+
+
+def test_memory_export_reads_all_partitions_from_one_connection_snapshot(
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    active = memory_store.create_memory(user_id="default", content="Active snapshot row.")
+    deleted = memory_store.create_memory(user_id="default", content="Deleted snapshot row.")
+    assert memory_store.archive_memory(memory_id=deleted.id, user_id="default")
+    original_connect = memory_store._connect
+    connection_calls = 0
+
+    def counted_connect():
+        nonlocal connection_calls
+        connection_calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(memory_store, "_connect", counted_connect)
+
+    exported = build_memory_export(store=memory_store, user_id="default")
+
+    assert connection_calls == 1
+    assert [memory["id"] for memory in exported["memories"]] == [active.id]
+    assert [memory["id"] for memory in exported["deleted_memories"]] == [deleted.id]
 
 
 def test_sensitive_redaction_for_rest_views_does_not_change_stored_or_exported_content(
@@ -409,7 +474,9 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     assert "SECRET-PURGE-123" not in purge_log.candidate_json
     assert "User has a private purge target" not in purge_log.candidate_json
     assert audit["scrubbed_artifacts"] == {
+        "dependent_memories_deleted": 1,
         "derived_memories_deleted": 1,
+        "temporal_references_relinked": 0,
         "core_sections_scrubbed": 1,
         "core_history_scrubbed": 1,
         "decision_logs_scrubbed": 1,
@@ -432,6 +499,42 @@ def test_deleted_memory_rest_purge_success_audit_and_exports(
     with zipfile.ZipFile(io.BytesIO(obsidian_export.content)) as archive:
         deleted_index = archive.read("Review/deleted-memories.md").decode("utf-8")
     assert "SECRET-PURGE-123" not in deleted_index
+
+
+def test_deleted_memory_purge_reports_eval_cleanup_failure_after_commit(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="Memory whose evaluation cleanup will fail.",
+    )
+    assert memory_store.archive_memory(memory_id=memory.id, user_id="default")
+
+    def fail_cleanup(*args, **kwargs):
+        raise PermissionError("forced cleanup failure")
+
+    monkeypatch.setattr(
+        memories_api_module,
+        "delete_user_eval_workspace",
+        fail_cleanup,
+    )
+    response = client.request(
+        "DELETE",
+        f"/memories/deleted/{memory.id}/purge",
+        headers=auth_headers,
+        json={"confirm_memory_id": memory.id},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["purged"] is True
+    assert payload["evaluation_cleanup"]["cleanup_failed"] is True
+    assert payload["warnings"]
+    assert memory_store.get_memory(memory_id=memory.id, user_id="default") is None
+    assert memory_store.list_archived_memories(user_id="default") == []
 
 
 def test_deleted_memory_rest_purge_rejects_unsafe_requests(
@@ -480,6 +583,11 @@ def test_deleted_memory_rest_purge_rejects_unsafe_requests(
     )
     assert unauthorized.status_code == 401
 
+    eval_init = client.post("/memories/evaluation/recall/init", headers=auth_headers)
+    assert eval_init.status_code == 200
+    snapshot_path = Path(eval_init.json()["snapshot"])
+    assert snapshot_path.exists()
+
     active_response = client.request(
         "DELETE",
         f"/memories/deleted/{active.id}/purge",
@@ -488,6 +596,7 @@ def test_deleted_memory_rest_purge_rejects_unsafe_requests(
     )
     assert active_response.status_code == 404
     assert memory_store.get_memory(memory_id=active.id, user_id="default") is not None
+    assert snapshot_path.exists()
 
     cross_user = client.request(
         "DELETE",
@@ -504,6 +613,7 @@ def test_deleted_memory_rest_purge_rejects_unsafe_requests(
         json={"confirm_memory_id": deleted.id},
     )
     assert success.status_code == 200
+    assert not snapshot_path.exists()
 
     repeat = client.request(
         "DELETE",
@@ -604,6 +714,263 @@ def test_restore_export_imports_memories_for_current_user(
     assert restored_spaces[0].name == "Coffee"
     assert restored_active[0].space_ids == [restored_spaces[0].id]
     assert restored_active[0].embedding_json is None
+
+
+def test_cross_user_restore_rebinds_memory_graph_references(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    source = memory_store.create_memory(
+        user_id="default",
+        content="Source memory for restore graph.",
+        type="semantic",
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="Derived memory for restore graph.",
+        type="reflective",
+        origin="agent_derived",
+        evidence_memory_ids=[source.id],
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET superseded_by = ? WHERE id = ? AND user_id = ?",
+            (derived.id, source.id, "default"),
+        )
+        connection.execute(
+            "UPDATE memories SET supersedes = ? WHERE id = ? AND user_id = ?",
+            (source.id, derived.id, "default"),
+        )
+
+    export = client.get("/memories/export", headers=auth_headers).json()
+    target_headers = {**auth_headers, "X-User-Id": "restore-graph-target"}
+    response = client.post(
+        "/memories/restore",
+        headers=target_headers,
+        json={"data": export},
+    )
+
+    assert response.status_code == 200
+    restored = {
+        memory.content: memory
+        for memory in memory_store.list_memories(user_id="restore-graph-target")
+    }
+    restored_source = restored[source.content]
+    restored_derived = restored[derived.content]
+    assert restored_source.id != source.id
+    assert restored_derived.id != derived.id
+    assert restored_derived.evidence_memory_ids == [restored_source.id]
+    assert restored_source.superseded_by == restored_derived.id
+    assert restored_derived.supersedes == restored_source.id
+    assert memory_store.get_memory(memory_id=source.id, user_id="default") is not None
+    assert memory_store.get_memory(memory_id=derived.id, user_id="default") is not None
+
+
+def test_same_user_partial_restore_preserves_existing_graph_reference(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    evidence = memory_store.create_memory(
+        user_id="default",
+        content="Existing evidence outside the partial restore.",
+    )
+    derived = memory_store.create_memory(
+        user_id="default",
+        content="Derived row restored by itself.",
+        origin="agent_derived",
+        evidence_memory_ids=[evidence.id],
+    )
+    export = build_memory_export(store=memory_store, user_id="default")
+    export["memories"] = [
+        memory for memory in export["memories"] if memory["id"] == derived.id
+    ]
+    export["deleted_memories"] = []
+
+    response = client.post(
+        "/memories/restore",
+        headers=auth_headers,
+        json={"data": export, "overwrite": True},
+    )
+
+    assert response.status_code == 200
+    restored = memory_store.get_memory(memory_id=derived.id, user_id="default")
+    assert restored is not None
+    assert restored.evidence_memory_ids == [evidence.id]
+    assert response.json()["dangling_references_removed"] == 0
+
+
+def test_partial_overwrite_restore_rebuilds_both_temporal_keys(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    latest = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    export = build_memory_export(store=memory_store, user_id="default")
+    [raw_old] = [
+        memory for memory in export["memories"] if memory["id"] == old.id
+    ]
+    raw_old["temporal_subject"] = "former_user"
+    export["memories"] = [raw_old]
+    export["deleted_memories"] = []
+
+    response = client.post(
+        "/memories/restore",
+        headers=auth_headers,
+        json={"data": export, "overwrite": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["updated"] == 1
+    moved = memory_store.get_memory(memory_id=old.id, user_id="default")
+    latest_after = memory_store.get_memory(
+        memory_id=latest.id,
+        user_id="default",
+    )
+    assert moved is not None
+    assert latest_after is not None
+    assert moved.temporal_subject == "former_user"
+    assert moved.valid_until is None
+    assert moved.supersedes is None
+    assert moved.superseded_by is None
+    assert moved.status == "dynamic"
+    assert latest_after.temporal_subject == "user"
+    assert latest_after.supersedes is None
+    assert latest_after.superseded_by is None
+    assert latest_after.valid_until is None
+    assert latest_after.status == "dynamic"
+    [restored_payload] = response.json()["restored_memories"]
+    assert restored_payload["superseded_by"] is None
+    assert restored_payload["valid_until"] is None
+
+
+def test_restore_prunes_reference_to_invalid_preallocated_source(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    export = {
+        "version": 3,
+        "user_id": "source-user",
+        "memories": [
+            {"id": "invalid-source", "content": ""},
+            {
+                "id": "valid-dependent",
+                "content": "A valid dependent row.",
+                "origin": "agent_derived",
+                "evidence_memory_ids": ["invalid-source"],
+            },
+        ],
+        "deleted_memories": [],
+    }
+    target_headers = {**auth_headers, "X-User-Id": "restore-invalid-target"}
+
+    response = client.post(
+        "/memories/restore",
+        headers=target_headers,
+        json={"data": export},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["invalid"] == 1
+    assert payload["created"] == 1
+    assert payload["dangling_references_removed"] == 1
+    [restored] = memory_store.list_memories(user_id="restore-invalid-target")
+    assert restored.evidence_memory_ids == []
+    assert payload["restored_memories"][0]["evidence_memory_ids"] == []
+
+
+def test_restore_counts_invalid_classification_instead_of_failing_request(
+    client,
+    auth_headers,
+) -> None:
+    response = client.post(
+        "/memories/restore",
+        headers=auth_headers,
+        json={
+            "data": {
+                "version": 3,
+                "user_id": "default",
+                "memories": [
+                    {
+                        "id": "invalid-long-topic",
+                        "content": "Valid content with corrupt metadata.",
+                        "topics": ["x" * 41],
+                    }
+                ],
+                "deleted_memories": [],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["invalid"] == 1
+
+
+def test_restore_counts_invalid_archived_context_metadata(
+    client,
+    auth_headers,
+) -> None:
+    response = client.post(
+        "/memories/restore",
+        headers=auth_headers,
+        json={
+            "data": {
+                "version": 3,
+                "user_id": "default",
+                "memories": [],
+                "deleted_memories": [],
+                "recent_context_summaries": [
+                    {"summary": "valid summary", "archived": "not-an-integer"}
+                ],
+                "conversation_branch_nodes": [
+                    {"archived": "not-an-integer"}
+                ],
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["recent_context_invalid"] == 1
+    assert payload["branch_nodes_invalid"] == 1
+
+
+def test_merge_and_review_request_limits_are_bounded(client, auth_headers) -> None:
+    too_many_ids = [f"memory-{index}" for index in range(101)]
+    assert client.post(
+        "/memories/merge",
+        headers=auth_headers,
+        json={"memory_ids": too_many_ids},
+    ).status_code == 422
+    assert client.post(
+        "/memories/merge",
+        headers=auth_headers,
+        json={"memory_ids": ["memory-a", "memory-b"], "content": "x" * 20_001},
+    ).status_code == 422
+    assert client.post(
+        "/memories/review?limit=0",
+        headers=auth_headers,
+    ).status_code == 422
+    assert client.post(
+        "/memories/review?limit=1001",
+        headers=auth_headers,
+    ).status_code == 422
 
 
 def test_restore_export_imports_recent_context_with_overwrite_policy(
@@ -937,6 +1304,15 @@ def test_decision_logs_rest_filter_by_memory_id(client, auth_headers, memory_sto
     )
     assert cross_user.status_code == 200
     assert cross_user.json()["data"] == []
+
+    assert client.get(
+        "/memories/decision-logs?limit=-1",
+        headers=auth_headers,
+    ).status_code == 422
+    assert client.get(
+        "/memories/core/history?limit=-1",
+        headers=auth_headers,
+    ).status_code == 422
 
 
 def test_restore_version_one_export_defaults_classification_fields(

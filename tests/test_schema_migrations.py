@@ -7,17 +7,65 @@
 - 版本已是最新时，即使表缺列也不再补（迁移只执行一次）。
 """
 
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from queue import Empty
+import sqlite3
+
 import pytest
 
 import app.memory.store as memory_store_module
 from app.knowledge.store import KnowledgeStore
 from app.memory.store import MemoryStore
+from app.schema_migrations import enable_wal_with_retry
+from app.usage.store import UsageStore
+
+
+def _initialize_memory_store_in_process(db_path: str, start, results) -> None:
+    start.wait()
+    try:
+        MemoryStore(db_path).init_db()
+    except Exception as exc:  # pragma: no cover - asserted in the parent process
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    else:
+        results.put(("ok", ""))
 
 
 def _user_version(db_path: str) -> int:
     store = MemoryStore(db_path)
     with store._connect() as connection:
         return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def test_enable_wal_retries_transient_lock_only(monkeypatch) -> None:
+    class TransientConnection:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, sql: str):
+            assert sql == "PRAGMA journal_mode=WAL"
+            self.calls += 1
+            if self.calls < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return self
+
+        @staticmethod
+        def fetchone():
+            return ("wal",)
+
+    connection = TransientConnection()
+    monkeypatch.setattr("app.schema_migrations.time.sleep", lambda _: None)
+
+    assert enable_wal_with_retry(connection) == "wal"
+    assert connection.calls == 3
+
+    class BrokenConnection:
+        @staticmethod
+        def execute(sql: str):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        enable_wal_with_retry(BrokenConnection())
 
 
 class TestMemorySchemaMigrations:
@@ -37,6 +85,68 @@ class TestMemorySchemaMigrations:
         assert memory is None
         rows = store.list_memories(user_id="default")
         assert len(rows) == 1
+
+    def test_concurrent_fresh_database_initialization_is_serialized(self, tmp_path) -> None:
+        db_path = str(tmp_path / "concurrent-memory.db")
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(lambda _: MemoryStore(db_path).init_db(), range(16)))
+
+        assert _user_version(db_path) == 1
+        with MemoryStore(db_path)._connect() as connection:
+            assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    def test_concurrent_processes_serialize_legacy_migration(self, tmp_path) -> None:
+        db_path = str(tmp_path / "multiprocess-legacy-memory.db")
+        legacy = MemoryStore(db_path)
+        with legacy._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE memories (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    content TEXT,
+                    type TEXT,
+                    importance INTEGER,
+                    confidence REAL,
+                    source_message TEXT,
+                    source_conversation_id TEXT,
+                    embedding_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    archived INTEGER DEFAULT 0
+                )
+                """
+            )
+            connection.execute("PRAGMA user_version = 0")
+
+        # ``spawn`` is available on macOS, Linux and Windows; the Event keeps
+        # startup concurrent after each child has imported the test module.
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_initialize_memory_store_in_process,
+                args=(db_path, start, results),
+            )
+            for _ in range(12)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=20)
+            assert process.exitcode == 0
+
+        outcomes = []
+        for _ in processes:
+            try:
+                outcomes.append(results.get(timeout=2))
+            except Empty:
+                pytest.fail("schema initializer process did not report a result")
+        assert outcomes == [("ok", "")] * len(processes)
+        assert _user_version(db_path) == 1
 
     def test_legacy_database_migrates_columns_and_backfills_once(self, tmp_path) -> None:
         db_path = tmp_path / "legacy-migrate.db"
@@ -183,6 +293,19 @@ class TestKnowledgeSchemaMigrations:
                 int(connection.execute("PRAGMA user_version").fetchone()[0]) == 1
             )
 
+    def test_concurrent_fresh_database_initialization_is_serialized(self, tmp_path) -> None:
+        db_path = str(tmp_path / "concurrent-knowledge.db")
+
+        def initialize(_: int) -> None:
+            KnowledgeStore(db_path, max_document_bytes=1024 * 1024).init_db()
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(initialize, range(16)))
+
+        with KnowledgeStore(db_path, max_document_bytes=1024 * 1024)._connect() as connection:
+            assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 1
+            assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
     def test_legacy_database_gets_source_document_ref(self, tmp_path) -> None:
         db_path = tmp_path / "legacy-knowledge.db"
         legacy = KnowledgeStore(str(db_path), max_document_bytes=1024 * 1024)
@@ -245,3 +368,18 @@ class TestKnowledgeSchemaMigrations:
                 "WHERE type = 'table' AND name = 'knowledge_documents'"
             ).fetchone()
         assert table is None
+
+
+def test_usage_store_concurrent_fresh_database_initialization_is_serialized(tmp_path) -> None:
+    db_path = str(tmp_path / "concurrent-usage.db")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(lambda _: UsageStore(db_path).init_db(), range(16)))
+
+    with UsageStore(db_path)._connect() as connection:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'model_usage_events'"
+        ).fetchone()
+        assert table is not None
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

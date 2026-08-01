@@ -1,4 +1,6 @@
 from functools import lru_cache
+import json
+import math
 from typing import Literal
 
 from pydantic import AliasChoices, Field, field_validator
@@ -241,17 +243,27 @@ class Settings(BaseSettings):
         return normalize_provider_priority(value)
 
     # 衰减引擎 (Ebbinghaus)
-    decay_lambda_default: float = Field(default=0.02, validation_alias="DECAY_LAMBDA_DEFAULT")
-    decay_alpha_default: float = Field(default=0.3, validation_alias="DECAY_ALPHA_DEFAULT")
-    decay_short_term_days: int = Field(default=3, validation_alias="DECAY_SHORT_TERM_DAYS")
+    decay_lambda_default: float = Field(
+        default=0.02, ge=0.0, le=10.0, validation_alias="DECAY_LAMBDA_DEFAULT"
+    )
+    decay_alpha_default: float = Field(
+        default=0.3, ge=0.0, le=2.0, validation_alias="DECAY_ALPHA_DEFAULT"
+    )
+    decay_short_term_days: int = Field(
+        default=3, ge=0, le=36500, validation_alias="DECAY_SHORT_TERM_DAYS"
+    )
     decay_short_term_time_weight: float = Field(
-        default=0.7, validation_alias="DECAY_SHORT_TERM_TIME_WEIGHT"
+        default=0.7, ge=0.0, le=1.0, validation_alias="DECAY_SHORT_TERM_TIME_WEIGHT"
     )
     decay_long_term_emotion_weight: float = Field(
-        default=0.7, validation_alias="DECAY_LONG_TERM_EMOTION_WEIGHT"
+        default=0.7, ge=0.0, le=1.0, validation_alias="DECAY_LONG_TERM_EMOTION_WEIGHT"
     )
-    decay_resolved_factor: float = Field(default=0.05, validation_alias="DECAY_RESOLVED_FACTOR")
-    decay_digested_factor: float = Field(default=0.02, validation_alias="DECAY_DIGESTED_FACTOR")
+    decay_resolved_factor: float = Field(
+        default=0.05, ge=0.0, le=1.0, validation_alias="DECAY_RESOLVED_FACTOR"
+    )
+    decay_digested_factor: float = Field(
+        default=0.02, ge=0.0, le=1.0, validation_alias="DECAY_DIGESTED_FACTOR"
+    )
     decay_sector_lambda_map: str = Field(
         default=(
             '{"emotional":0.01,"reflective":0.01,'
@@ -259,6 +271,29 @@ class Settings(BaseSettings):
         ),
         validation_alias="DECAY_SECTOR_LAMBDA_MAP",
     )
+
+    @field_validator("decay_sector_lambda_map")
+    @classmethod
+    def _validate_decay_sector_lambda_map(cls, value: str) -> str:
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("DECAY_SECTOR_LAMBDA_MAP must be a JSON object") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("DECAY_SECTOR_LAMBDA_MAP must be a JSON object")
+        for sector, raw_lambda in parsed.items():
+            if not isinstance(sector, str) or not sector.strip():
+                raise ValueError("decay sector names must be non-empty strings")
+            if (
+                isinstance(raw_lambda, bool)
+                or not isinstance(raw_lambda, (int, float))
+                or not math.isfinite(float(raw_lambda))
+                or not 0.0 <= float(raw_lambda) <= 10.0
+            ):
+                raise ValueError(
+                    "decay sector lambda values must be finite numbers between 0 and 10"
+                )
+        return value
     time_ripple_delta: float = Field(
         default=0.0,
         ge=0.0,

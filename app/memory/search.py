@@ -16,6 +16,11 @@ from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.store import MemoryStore
+from app.memory.temporal import (
+    memory_matches_temporal_mode,
+    temporal_query_mode,
+    temporal_query_window,
+)
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
 from app.usage.context import model_usage_scope
 from app.usage.recorder import UsageRecorder
@@ -26,9 +31,11 @@ from app.usage.recorder import UsageRecorder
 # ---------------------------------------------------------------------------
 _EMBEDDING_CACHE: dict[tuple, tuple[float, list[float]]] = {}
 """L1: (user_id, normalized_query) -> (expires_at, embedding_vector)"""
+_EMBEDDING_CACHE_LOCK = threading.Lock()
 
 SEARCH_CACHE: dict[tuple, tuple[float, str, int, list[dict[str, object]]]] = {}
 """L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, active_count, hit payloads)"""
+_SEARCH_CACHE_LOCK = threading.Lock()
 
 _EMBEDDING_CACHE_MAX = 512
 _SEARCH_CACHE_MAX = 256
@@ -36,6 +43,7 @@ _EMBEDDING_CACHE_TTL = 300   # 5 分钟
 _SEARCH_CACHE_TTL = 120       # 2 分钟
 _CACHE_METRICS: dict[str, dict[str, int]] = {}
 _CACHE_METRICS_LOCK = threading.Lock()
+_CACHE_METRICS_MAX_USERS = 1024
 _RECALL_LIMIT = 20
 # SQLite/FTS 候选生成接入前，宁可扫描当前个人库，也不能按重要度提前丢掉
 # 低频但精确匹配的旧记忆。该上限只是异常数据量保护，不参与相关性裁剪。
@@ -84,6 +92,77 @@ _KEYWORD_LOW_INFORMATION_PHRASES = (
     "信息",
     "情况",
 )
+_GENERIC_METADATA_LABELS = {
+    "偏好",
+    "工具",
+    "项目",
+    "经历",
+    "信息",
+    "情况",
+    "时间事实",
+    "沟通偏好",
+}
+# Keyword fallback cannot infer even common hypernym/hyponym relations from
+# character n-grams.  Keep a deliberately small, auditable taxonomy for broad
+# category questions; embeddings remain responsible for open-ended semantics.
+_KEYWORD_CATEGORY_EXPANSIONS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("宠物", "pet", "pets"),
+        ("宠物", "猫", "狗", "犬", "兔", "鸟", "hamster", "cat", "dog", "pet"),
+    ),
+    (
+        ("数码产品", "数码设备", "电子产品", "consumer electronics"),
+        (
+            "设备",
+            "硬件",
+            "电脑",
+            "笔记本",
+            "手机",
+            "平板",
+            "耳机",
+            "相机",
+            "镜头",
+            "显卡",
+            "散热器",
+            "computer",
+            "laptop",
+            "phone",
+            "tablet",
+            "headphone",
+            "camera",
+        ),
+    ),
+    (
+        ("电脑", "计算机", "computer", "pc"),
+        ("电脑", "计算机", "笔记本", "台式机", "主机", "computer", "laptop", "desktop", "pc"),
+    ),
+    (
+        ("拍照", "摄影", "photography"),
+        ("拍照", "摄影", "拍摄", "照片", "相片", "photo", "photography"),
+    ),
+)
+_USER_FOOD_PREFERENCE_QUERY_RE = re.compile(
+    r"(?:喜欢|爱|偏好).{0,4}(?:吃|喝|食物|饮食)|(?:吃|喝).{0,4}(?:什么|哪些)"
+    r"|\b(?:what|which).{0,20}(?:user|they|he|she).{0,20}(?:eat|drink|food)"
+    r"|\b(?:user|they|he|she).{0,20}(?:like|love|prefer).{0,10}(?:eat|drink|food)\b",
+    re.IGNORECASE,
+)
+_USER_FOOD_STATEMENT_RE = re.compile(
+    r"^(?:用户|我|本人)(?:自己|平时|通常|经常|常常|每天|早餐|午餐|晚餐|也|会)?"
+    r"(?:明确)?(?:(?:喜欢|爱|偏好|不喜欢|不爱).{0,4}(?:吃|喝|食物|饮食)"
+    r"|(?:常吃|常喝|吃|喝))"
+    r"|^(?:用户|我|本人).{0,8}(?:饮食|食物|口味)(?:偏好|习惯)"
+    r"|^(?:the\s+)?user.{0,12}(?:like|love|prefer|eat|drink|food)",
+    re.IGNORECASE,
+)
+_PHOTO_EQUIPMENT_QUERY_RE = re.compile(
+    r"(?:拍照|摄影|拍摄).{0,5}(?:设备|器材|相机|镜头|型号)"
+    r"|(?:设备|器材|相机|镜头|型号).{0,5}(?:拍照|摄影|拍摄)"
+)
+_PHOTO_EQUIPMENT_STATEMENT_RE = re.compile(
+    r"(?:拍照|摄影|拍摄).{0,12}(?:设备|器材|相机|镜头|型号)"
+    r"|(?:设备|器材|相机|镜头|型号).{0,12}(?:拍照|摄影|拍摄)"
+)
 _SURFACE_MODES: set[MemorySurfaceMode] = {
     "balanced",
     "important",
@@ -98,6 +177,8 @@ _LOW_LIFE_THRESHOLD = 30.0
 
 def _record_cache_metric(user_id: str, name: str) -> None:
     with _CACHE_METRICS_LOCK:
+        if user_id not in _CACHE_METRICS and len(_CACHE_METRICS) >= _CACHE_METRICS_MAX_USERS:
+            _CACHE_METRICS.pop(next(iter(_CACHE_METRICS)), None)
         metrics = _CACHE_METRICS.setdefault(user_id, {})
         metrics[name] = metrics.get(name, 0) + 1
 
@@ -295,11 +376,14 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
             return []
 
         if self.usage_recorder is not None and isinstance(data, dict):
-            self.usage_recorder.record_response(
-                payload=data,
-                model=self.model,
-                kind="embedding",
-                base_url=self.base_url,
+            await anyio.to_thread.run_sync(
+                partial(
+                    self.usage_recorder.record_response,
+                    payload=data,
+                    model=self.model,
+                    kind="embedding",
+                    base_url=self.base_url,
+                )
             )
         try:
             items = data.get("data")
@@ -382,6 +466,7 @@ class MemorySearchService:
                     self._cached_hits_with_usage,
                     l2_key,
                     user_id=user_id,
+                    query=query,
                     now=now,
                     record_usage=record_usage,
                 )
@@ -403,13 +488,14 @@ class MemorySearchService:
             now=now,
         )
 
+        candidate_limit = _RECALL_LIMIT * 2 if self.enable_cache else capped_limit
         hits = await anyio.to_thread.run_sync(
             partial(
                 self._recall_and_rank,
                 user_id=user_id,
                 query=query,
                 query_embedding=query_embedding,
-                limit=capped_limit,
+                limit=candidate_limit,
                 include_sensitive=include_sensitive,
             )
         )
@@ -423,6 +509,7 @@ class MemorySearchService:
                 user_id=user_id,
                 record_usage=record_usage,
                 now=now,
+                requested_limit=capped_limit,
             )
         )
 
@@ -431,10 +518,16 @@ class MemorySearchService:
         key: tuple,
         *,
         user_id: str,
+        query: str,
         now: float,
         record_usage: bool,
     ) -> list[MemorySearchHit] | None:
-        cached_hits = self._cached_search_hits(key, user_id=user_id, now=now)
+        cached_hits = self._cached_search_hits(
+            key,
+            user_id=user_id,
+            query=query,
+            now=now,
+        )
         if cached_hits is None:
             return None
         return self._record_hit_usage(
@@ -476,11 +569,15 @@ class MemorySearchService:
         user_id: str,
         record_usage: bool,
         now: float,
+        requested_limit: int,
     ) -> list[MemorySearchHit]:
-        hits = self._record_hit_usage(hits, user_id=user_id, record_usage=record_usage)
         if self.enable_cache:
             self._cache_search_hits(key, hits, user_id=user_id, now=now)
-        return hits
+        return self._record_hit_usage(
+            hits[:requested_limit],
+            user_id=user_id,
+            record_usage=record_usage,
+        )
 
     def surface_memories(
         self,
@@ -526,13 +623,19 @@ class MemorySearchService:
         now: float,
     ) -> list[float] | None:
         l1_key = (user_id, normalized_query)
-        if self.enable_cache and l1_key in _EMBEDDING_CACHE:
-            l1_expires_at, l1_vector = _EMBEDDING_CACHE[l1_key]
+        cached_embedding: tuple[float, list[float]] | None = None
+        if self.enable_cache:
+            with _EMBEDDING_CACHE_LOCK:
+                cached_embedding = _EMBEDDING_CACHE.get(l1_key)
+                if cached_embedding is not None and now >= cached_embedding[0]:
+                    _EMBEDDING_CACHE.pop(l1_key, None)
+                    cached_embedding = None
+        if cached_embedding is not None:
+            l1_expires_at, l1_vector = cached_embedding
             if now < l1_expires_at:
                 self.last_embedding_cache_status = "hit"
                 _record_cache_metric(user_id, "embedding_hits")
                 return l1_vector
-            del _EMBEDDING_CACHE[l1_key]
 
         if isinstance(self.embedding_client, NullEmbeddingClient):
             self.last_embedding_cache_status = "disabled"
@@ -558,11 +661,19 @@ class MemorySearchService:
         limit: int,
     ) -> list[MemorySearchHit]:
         now = datetime.now(UTC)
+        temporal_mode = temporal_query_mode(query, now=now)
+        temporal_window = temporal_query_window(query)
         combined: dict[str, MemorySearchHit] = {}
         memories = [
             memory
             for memory in memories
-            if not _query_memory_subject_conflict(query, memory)
+            if memory_matches_temporal_mode(
+                memory,
+                mode=temporal_mode,
+                now=now,
+                query_window=temporal_window,
+            )
+            and not _query_memory_subject_conflict(query, memory)
         ]
 
         if query_embedding:
@@ -584,22 +695,28 @@ class MemorySearchService:
         key: tuple,
         *,
         user_id: str,
+        query: str,
         now: float,
     ) -> list[MemorySearchHit] | None:
-        if key not in SEARCH_CACHE:
+        with _SEARCH_CACHE_LOCK:
+            cached_entry = SEARCH_CACHE.get(key)
+        if cached_entry is None:
             return None
 
-        expires_at, max_updated_at, active_count, payloads = SEARCH_CACHE[key]
+        expires_at, max_updated_at, active_count, payloads = cached_entry
         if now >= expires_at:
-            del SEARCH_CACHE[key]
+            _discard_search_cache_entry(key, cached_entry)
             return None
 
         current_max = self.store.get_memories_max_updated_at(user_id=user_id)
         current_count = self.store.get_active_memory_count(user_id=user_id)
         if not current_max or current_max != max_updated_at or current_count != active_count:
-            del SEARCH_CACHE[key]
+            _discard_search_cache_entry(key, cached_entry)
             return None
 
+        include_sensitive = bool(key[3]) if len(key) > 3 else False
+        temporal_mode = temporal_query_mode(query)
+        temporal_window = temporal_query_window(query)
         hits: list[MemorySearchHit] = []
         for payload in payloads:
             memory_id = payload.get("id")
@@ -607,6 +724,18 @@ class MemorySearchService:
                 continue
             memory = self.store.get_memory(memory_id=memory_id, user_id=user_id)
             if memory is None:
+                continue
+            if memory.origin != "user_asserted" or memory.status == "archived":
+                continue
+            if not include_sensitive and _memory_is_locally_sensitive(memory):
+                continue
+            if not memory_matches_temporal_mode(
+                memory,
+                mode=temporal_mode,
+                query_window=temporal_window,
+            ):
+                continue
+            if _query_memory_subject_conflict(query, memory):
                 continue
             decay = score_memory(memory)
             channels = payload.get("channels")
@@ -626,16 +755,32 @@ class MemorySearchService:
                 )
             )
             _refresh_hit_ranking(hits[-1])
-        if not hits:
-            del SEARCH_CACHE[key]
+        # Close the update window between the first generation check and the
+        # per-row reads. A sensitivity/status/content change must invalidate
+        # this reconstruction before any cached result can escape.
+        final_max = self.store.get_memories_max_updated_at(user_id=user_id)
+        final_count = self.store.get_active_memory_count(user_id=user_id)
+        with _SEARCH_CACHE_LOCK:
+            entry_is_current = SEARCH_CACHE.get(key) is cached_entry
+        if final_max != max_updated_at or final_count != active_count or not entry_is_current:
+            _discard_search_cache_entry(key, cached_entry)
             return None
-        return hits
+        if not hits:
+            _discard_search_cache_entry(key, cached_entry)
+            return None
+        hits.sort(
+            key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
+            reverse=True,
+        )
+        requested_limit = int(key[2]) if len(key) > 2 else len(hits)
+        return hits[:requested_limit]
 
     def _cache_embedding(self, key: tuple, vector: list[float], now: float) -> None:
-        if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
-            _cleanup_expired(_EMBEDDING_CACHE, now)
-        if len(_EMBEDDING_CACHE) < _EMBEDDING_CACHE_MAX:
-            _EMBEDDING_CACHE[key] = (now + _EMBEDDING_CACHE_TTL, vector)
+        with _EMBEDDING_CACHE_LOCK:
+            if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
+                _cleanup_expired(_EMBEDDING_CACHE, now)
+            if len(_EMBEDDING_CACHE) < _EMBEDDING_CACHE_MAX:
+                _EMBEDDING_CACHE[key] = (now + _EMBEDDING_CACHE_TTL, vector)
 
     def _cache_search_hits(
         self,
@@ -647,28 +792,37 @@ class MemorySearchService:
     ) -> None:
         if not hits:
             return
-        if len(SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
-            _cleanup_expired(SEARCH_CACHE, now)
-        if len(SEARCH_CACHE) < _SEARCH_CACHE_MAX:
-            max_updated = self.store.get_memories_max_updated_at(user_id=user_id)
-            active_count = self.store.get_active_memory_count(user_id=user_id)
-            if max_updated:
-                SEARCH_CACHE[key] = (
-                    now + _SEARCH_CACHE_TTL,
-                    max_updated,
-                    active_count,
-                    [
-                        {
-                            "id": hit.memory.id,
-                            "relevance": hit.relevance,
-                            "channels": hit.channels,
-                            "topic_score": hit.topic_score,
-                            "total_score": hit.total_score,
-                            "score_breakdown": hit.score_breakdown,
-                        }
-                        for hit in hits
-                    ],
-                )
+        max_updated = self.store.get_memories_max_updated_at(user_id=user_id)
+        active_count = self.store.get_active_memory_count(user_id=user_id)
+        if max_updated:
+            expires_at = now + _SEARCH_CACHE_TTL
+            next_boundary = self.store.get_next_temporal_boundary(
+                user_id=user_id,
+                after=datetime.fromtimestamp(now, tz=UTC),
+            )
+            if next_boundary is not None:
+                expires_at = min(expires_at, next_boundary.timestamp())
+            entry = (
+                expires_at,
+                max_updated,
+                active_count,
+                [
+                    {
+                        "id": hit.memory.id,
+                        "relevance": hit.relevance,
+                        "channels": hit.channels,
+                        "topic_score": hit.topic_score,
+                        "total_score": hit.total_score,
+                        "score_breakdown": hit.score_breakdown,
+                    }
+                    for hit in hits
+                ],
+            )
+            with _SEARCH_CACHE_LOCK:
+                if len(SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+                    _cleanup_expired(SEARCH_CACHE, now)
+                if len(SEARCH_CACHE) < _SEARCH_CACHE_MAX:
+                    SEARCH_CACHE[key] = entry
 
     def _score_by_embedding(
         self,
@@ -694,33 +848,109 @@ class MemorySearchService:
     ) -> list[tuple[float, MemoryRecord]]:
         keyword_query = _keyword_query_text(query)
         query_terms = _terms(keyword_query)
-        if not query_terms:
+        single_cjk_keyword = _single_cjk_keyword(keyword_query)
+        if not query_terms and single_cjk_keyword is None:
             return []
         scored: list[tuple[float, MemoryRecord]] = []
         query_lower = keyword_query.lower()
         compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_lower)
         allow_substring_match = len(compact_query) >= 2
+        category_markers = _keyword_category_markers(
+            query_lower=query_lower,
+            compact_query=compact_query,
+        )
 
+        indexed: list[
+            tuple[MemoryRecord, str, set[str], set[str], set[str], list[str]]
+        ] = []
+        document_frequency = {term: 0 for term in query_terms}
         for memory in memories:
             content_lower = memory.content.lower()
             content_terms = _terms(memory.content)
+            topic_terms = _terms(" ".join(memory.topics))
+            entity_terms = _terms(" ".join(memory.entities))
+            labels = [
+                label.strip().lower()
+                for label in (*memory.topics, *memory.entities)
+                if label.strip()
+            ]
+            indexed.append(
+                (memory, content_lower, content_terms, topic_terms, entity_terms, labels)
+            )
+            all_terms = content_terms | topic_terms | entity_terms
+            for term in query_terms & all_terms:
+                document_frequency[term] += 1
+
+        document_count = max(1, len(indexed))
+
+        for memory, content_lower, content_terms, topic_terms, entity_terms, labels in indexed:
             shared_terms = query_terms & content_terms
             substring_match = (
                 allow_substring_match
                 and bool(compact_query)
                 and compact_query in re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", content_lower)
             )
+            single_cjk_match = bool(
+                single_cjk_keyword and single_cjk_keyword in content_lower
+            )
             # 字符重叠只能参与精排，不能独自生成候选；否则所有以“用户”开头的
             # 记忆都会被“用户的年龄”之类的无答案 query 误召回。
-            if not shared_terms and not substring_match:
+            metadata_terms = topic_terms | entity_terms
+            shared_metadata_terms = query_terms & metadata_terms
+            exact_metadata_labels = [
+                label
+                for label in labels
+                if _is_strong_metadata_label_match(label, compact_query)
+            ]
+            category_match = bool(
+                category_markers
+                and _memory_matches_category_markers(
+                    memory,
+                    content_lower=content_lower,
+                    markers=category_markers,
+                )
+            )
+            if (
+                not shared_terms
+                and not substring_match
+                and not single_cjk_match
+                and not category_match
+            ):
                 continue
             term_score = min(45.0, len(shared_terms) * 18.0)
-            coverage_score = len(shared_terms) / len(query_terms) * 25.0
+            coverage_score = (
+                len(shared_terms) / len(query_terms) * 25.0
+                if query_terms
+                else 0.0
+            )
             substring_score = 35.0 if substring_match else 0.0
+            single_cjk_score = 45.0 if single_cjk_match else 0.0
             char_score = _char_overlap_score(query_lower, content_lower) * 15.0
+            metadata_idf_score = sum(
+                (
+                    math.log(
+                        (document_count + 1.0)
+                        / (document_frequency.get(term, 0) + 1.0)
+                    )
+                    + 1.0
+                )
+                * (8.0 if term in topic_terms else 5.0)
+                for term in shared_metadata_terms
+            )
+            metadata_score = min(
+                45.0,
+                metadata_idf_score + min(30.0, len(exact_metadata_labels) * 22.0),
+            )
+            category_score = 45.0 if category_match else 0.0
             score = min(
                 100.0,
-                term_score + coverage_score + substring_score + char_score,
+                term_score
+                + coverage_score
+                + substring_score
+                + single_cjk_score
+                + char_score
+                + metadata_score
+                + category_score,
             )
             if score >= KEYWORD_MIN_SCORE:
                 scored.append((score, memory))
@@ -754,7 +984,27 @@ class MemorySearchService:
 def _cleanup_expired(cache: dict, now: float) -> None:
     expired = [k for k, v in cache.items() if now >= v[0]]
     for k in expired:
-        del cache[k]
+        cache.pop(k, None)
+
+
+def _discard_search_cache_entry(key: tuple, entry: tuple) -> None:
+    with _SEARCH_CACHE_LOCK:
+        if SEARCH_CACHE.get(key) is entry:
+            SEARCH_CACHE.pop(key, None)
+
+
+_LOW_INFORMATION_SINGLE_CJK = frozenset("我的是有在了和与及他她它吗呢啊吧被把让")
+
+
+def _single_cjk_keyword(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", text)
+    if (
+        len(compact) == 1
+        and "\u4e00" <= compact <= "\u9fff"
+        and compact not in _LOW_INFORMATION_SINGLE_CJK
+    ):
+        return compact
+    return None
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -779,14 +1029,73 @@ def _char_overlap_score(query: str, content: str) -> float:
 def _query_memory_subject_conflict(query: str, memory: MemoryRecord) -> bool:
     """用户本人问题不应被宠物等其他主语的高相似文本截胡。"""
     compact_query = re.sub(r"\s+", "", query)
+    content = memory.content.lstrip()
+    if (
+        _USER_FOOD_PREFERENCE_QUERY_RE.search(compact_query)
+        and not _USER_FOOD_STATEMENT_RE.search(content)
+    ):
+        return True
+    if (
+        _PHOTO_EQUIPMENT_QUERY_RE.search(compact_query)
+        and not _PHOTO_EQUIPMENT_STATEMENT_RE.search(content)
+        and not any(
+            label.casefold() in {"拍照设备", "摄影设备", "摄影器材"}
+            for label in memory.topics
+        )
+    ):
+        return True
     if not _EXPLICIT_USER_QUERY_RE.match(compact_query):
         return False
     if any(term in compact_query for term in _RELATED_ENTITY_QUERY_TERMS):
         return False
     if memory.temporal_subject and memory.temporal_subject.lower() in {"用户", "user", "我"}:
         return False
-    content = memory.content.lstrip()
     return not content.startswith(("用户", "我", "本人"))
+
+
+def _keyword_category_markers(
+    *,
+    query_lower: str,
+    compact_query: str,
+) -> tuple[str, ...]:
+    markers: list[str] = []
+    for triggers, expansion in _KEYWORD_CATEGORY_EXPANSIONS:
+        if any(
+            (
+                bool(re.search(rf"\b{re.escape(trigger)}\b", query_lower))
+                if trigger.isascii()
+                else trigger in compact_query
+            )
+            for trigger in triggers
+        ):
+            markers.extend(expansion)
+    return tuple(dict.fromkeys(markers))
+
+
+def _memory_matches_category_markers(
+    memory: MemoryRecord,
+    *,
+    content_lower: str,
+    markers: tuple[str, ...],
+) -> bool:
+    searchable = " ".join(
+        (content_lower, *memory.topics, *memory.entities)
+    ).casefold()
+    return any(
+        (
+            bool(re.search(rf"\b{re.escape(marker.casefold())}(?:s)?\b", searchable))
+            if marker.isascii()
+            else marker.casefold() in searchable
+        )
+        for marker in markers
+    )
+
+
+def _is_strong_metadata_label_match(label: str, compact_query: str) -> bool:
+    compact_label = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", label.casefold())
+    if len(compact_label) < 2 or compact_label in _GENERIC_METADATA_LABELS:
+        return False
+    return compact_label in compact_query or compact_query in compact_label
 
 
 def _upsert_hit(

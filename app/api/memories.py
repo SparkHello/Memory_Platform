@@ -103,7 +103,7 @@ def memory_search_cache_stats(
 
 class MemorySearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    limit: int = Field(default=8, ge=1, le=50)
+    limit: int = Field(default=8, ge=1, le=20)
     include_sensitive: bool = False
     redact_sensitive: bool = False
 
@@ -141,8 +141,11 @@ class MemoryNetworkTraverseRequest(BaseModel):
 
 
 class MemoryMergeRequest(BaseModel):
-    memory_ids: list[str] = Field(min_length=2)
-    content: str | None = None
+    memory_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=2,
+        max_length=100,
+    )
+    content: str | None = Field(default=None, max_length=20_000)
 
 
 class MemoryReviewRevisionPreviewRequest(BaseModel):
@@ -460,7 +463,7 @@ def list_decision_logs(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     conversation_id: str | None = None,
     memory_id: str | None = None,
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=5000),
 ) -> dict[str, list[dict]]:
     logs = store.list_decision_logs(
         user_id=user_id,
@@ -616,7 +619,7 @@ def list_core_memory_history(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     section: CoreMemorySectionName | None = None,
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=5000),
 ) -> dict[str, list[dict]]:
     history = store.list_core_memory_section_history(
         user_id=user_id,
@@ -801,7 +804,7 @@ def merge_memories(
 def review_memories(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
-    limit: int = 200,
+    limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict:
     reviewer = MemoryReviewer(store=store)
     return reviewer.review(user_id=user_id, limit=limit).model_dump()
@@ -1653,6 +1656,16 @@ def update_memory(
             detail=f"无效的 status 值: {body.status}，仅支持 dynamic/resolved/archived/pinned",
         )
 
+    temporal_updates = {
+        field_name: updates[field_name]
+        for field_name in (
+            "valid_from",
+            "valid_until",
+            "temporal_subject",
+            "temporal_predicate",
+        )
+        if field_name in body.model_fields_set
+    }
     try:
         memory = store.update_memory(
             memory_id=memory_id,
@@ -1670,16 +1683,13 @@ def update_memory(
             ),
             embedding_json=embedding_json,
             stability=updates.get("stability", existing.stability),
-            valid_from=updates.get("valid_from", existing.valid_from),
-            valid_until=updates.get("valid_until", existing.valid_until),
             review_after=updates.get("review_after", existing.review_after),
             sensitivity=updates.get("sensitivity", existing.sensitivity),
             evidence_memory_ids=existing.evidence_memory_ids,
             topics=updates.get("topics", existing.topics),
             entities=updates.get("entities", existing.entities),
-            temporal_subject=updates.get("temporal_subject", existing.temporal_subject),
-            temporal_predicate=updates.get("temporal_predicate", existing.temporal_predicate),
             status=updates.get("status", None),
+            **temporal_updates,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -1763,18 +1773,9 @@ def purge_deleted_memory(
             detail="confirm_memory_id 必须与路径中的 memory_id 完全一致",
         )
 
-    archived = store.list_archived_memories(user_id=user_id, limit=10000)
-    if not any(memory.id == memory_id for memory in archived):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory does not exist or is not deleted.",
-        )
-
-    eval_cleanup = delete_user_eval_workspace(settings.eval_dir, user_id=user_id)
-    affected_core_sections = _affected_core_sections_for_memory_ids(
-        store=store,
+    affected_core_sections = store.list_purge_affected_core_sections(
+        memory_id=memory_id,
         user_id=user_id,
-        memory_ids=[memory_id],
     )
     affected_payload = [section.model_dump() for section in affected_core_sections]
     result = store.purge_archived_memory(
@@ -1789,13 +1790,41 @@ def purge_deleted_memory(
             detail="Memory does not exist or is not deleted.",
         )
     _, log = result
-    return {
+    try:
+        purge_audit = json.loads(log.candidate_json)
+    except (TypeError, ValueError):
+        purge_audit = {}
+    actual_affected = purge_audit.get("affected_core_sections")
+    if isinstance(actual_affected, list):
+        affected_payload = actual_affected
+    purge_effects = purge_audit.get("scrubbed_artifacts")
+    warnings: list[str] = []
+    try:
+        eval_cleanup = delete_user_eval_workspace(settings.eval_dir, user_id=user_id)
+    except Exception:
+        # The database purge above has already committed.  Report that irreversible
+        # success truthfully while making the remaining local cleanup explicit.
+        eval_cleanup = {
+            "workspace_removed": False,
+            "legacy_artifacts_removed": 0,
+            "cleanup_failed": True,
+        }
+        warnings.append(
+            "记忆已永久删除，但本地评测工作区清理失败；"
+            "请检查 EVAL_DIR 权限并手动清理残留评测文件。"
+        )
+    payload = {
         "purged": True,
         "id": memory_id,
         "audit_log_id": log.id,
         "affected_core_memory_sections": affected_payload,
         "evaluation_cleanup": eval_cleanup,
     }
+    if isinstance(purge_effects, dict):
+        payload["purge_effects"] = purge_effects
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 
 @router.get("/{memory_id}/why")

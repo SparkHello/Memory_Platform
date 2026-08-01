@@ -1,5 +1,3 @@
-from datetime import UTC, datetime
-
 from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
@@ -8,7 +6,8 @@ from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRecord
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.store import MemoryStore
-from app.memory.utils import _parse_iso_datetime, _parse_json_object
+from app.memory.temporal import is_current_temporal_memory
+from app.memory.utils import _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.context import model_usage_scope
 
@@ -190,7 +189,7 @@ def _is_safe_core_source(memory: MemoryRecord) -> bool:
     )
     return (
         detect_text_sensitivity(text) == "normal"
-        and not _is_expired_non_stable(memory)
+        and is_current_temporal_memory(memory)
     )
 
 
@@ -206,13 +205,6 @@ def _select_current_sections(
         and set(section.evidence_memory_ids).issubset(valid_memory_ids)
         and detect_text_sensitivity(section.content) == "normal"
     ]
-
-
-def _is_expired_non_stable(memory: MemoryRecord) -> bool:
-    if memory.stability == "stable":
-        return False
-    valid_until = _parse_iso_datetime(memory.valid_until)
-    return valid_until is not None and valid_until < datetime.now(UTC)
 
 
 def _candidate_rejection(

@@ -247,7 +247,7 @@ curl \
 | `EVAL_DIR` | `eval` | 按 user id 哈希分目录保存召回评估快照、标注和结果。应保持 gitignored。 |
 | `UI_DIST_DIR` | 空 | Web 控制台静态文件目录；为空时使用后端旁的 `<repo>/ui/dist`。显式配置必须指向含 `index.html` 与 `assets/` 的专用 Vite 构建目录；服务只暴露 UI 入口、已知根资源和 `assets/*`。 |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | 上游 HTTP 请求超时。 |
-| `DECAY_*` | 见 `app/config.py` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数。 |
+| `DECAY_*` | 见 `.env.example` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数；lambda/alpha 不得为负，权重与生命周期因子范围为 `[0,1]`。 |
 | `TIME_RIPPLE_DELTA` | `0.0` | 实验性邻近记忆激活增量。`0.0` 表示关闭。 |
 | `TIME_RIPPLE_WINDOW_HOURS` | `48` | Time Ripple 的时间邻近窗口。 |
 
@@ -302,7 +302,9 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 
 - 最后一条用户消息的纯文本部分是检索词，也是新事实的唯一权威来源；图片 URL、音频 base64 不进入记忆 embedding。
 - 自动提取最多附带最近两轮可见用户/助手文本用于消歧，不包含 system、工具内容、tool call 或 reasoning。依赖上下文的候选必须同时通过本轮逐字 `source_quote` 和较早逐字 `context_quote` 校验，所以“前文询问年龄，本轮回答 18”可以保存，孤立的“18”会忽略。
+- 自动提取还会逐命题绑定主语、关系、对象和局部否定：朋友/宠物/第三人的事实不能降成用户事实，申请岗位不能变成已经任职，旅游住宿不能变成当前常住地；候选若保留“用户的猫/朋友”这一真实主语则仍可保存。
 - 去重会直接忽略完全相同、被旧文本逐字包含的候选；对于措辞不同的笼统改写，只有在同类型有效旧记忆同时满足向量相似、实体全覆盖、主题重合、无新增结构化值且没有冲突/时序变化时，才视为“已有更完整的语义等价记忆”。同主题的新细节仍会创建并交给体检确认。
+- 关键词回退不是把分类标签直接拼进正文：正文、主题和实体分字段打分，低频标签按查询内 IDF 加权；只有可审计的小型类别层级（如宠物、数码设备、电脑、拍照）能够单独扩展候选，并继续经过用户/宠物主语与“饮食偏好、拍照设备”等关系门控，避免宽泛标签制造无答案误召。
 - 自动注入只包含本地复核为普通级别的长期记忆、安全核心记忆和已匹配的普通级别分支摘要。物理隔离的知识库永不自动注入。
 - 动态记忆块插在客户端已有的稳定 system/developer 前缀之后，以尽量保留上游 prompt-prefix cache；记忆内容仍按每轮检索结果重新生成。
 - 原始多模态消息、`tools`、`tool_calls`、工具结果、上游 `reasoning_content`、usage chunk 和未知厂商字段继续透明转发。BigModel/Mistral 不兼容时才移除 `stream_options`。
@@ -340,7 +342,7 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 | 召回结果 L2 | 用户、规范化后的完整查询、limit、敏感选项 | 120 秒 | 256 | FLIT 同一轮 tools 多次请求相同用户消息 |
 | Query embedding L1 | 用户、规范化后的完整查询 | 300 秒 | 512 | 相同问题以大小写/多余空白差异重复请求 |
 
-L2 命中时仍会校验当前用户的记忆更新时间和活跃数量，并从 SQLite 重新读取记录；删除、归档或敏感度变化不会通过旧正文缓存泄露。空召回结果不写入 L2，因此重复的无结果查询仍显示 L2 miss，但 query embedding 可能命中。普通连续聊天的措辞通常不同，命中率自然会低于同一工具轮次。
+L2 命中时仍会校验当前用户的记忆更新时间和活跃数量，并从 SQLite 重新读取记录；删除、归档或敏感度变化不会通过旧正文缓存泄露。若存在即将到来的 `valid_from` / `valid_until`，缓存会在该时间边界提前失效，避免继续遗漏刚生效的事实。空召回结果不写入 L2，因此重复的无结果查询仍显示 L2 miss，但 query embedding 可能命中。普通连续聊天的措辞通常不同，命中率自然会低于同一工具轮次。
 
 响应 Header 可观察单次请求：
 
@@ -490,9 +492,9 @@ curl \
 | `PATCH` | `/memories/{memory_id}/spaces` | 替换记忆空间绑定，可按名称创建新空间。 |
 | `POST` | `/memories/forget` | 按自然语言查询批量软删除。 |
 | `DELETE` | `/memories/{memory_id}` | 软删除。 |
-| `POST` | `/memories/{memory_id}/restore` | 从回收站恢复。 |
-| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆及其本地派生/审计副本，需要 `confirm_memory_id` 完整匹配。外部导出和用户自行复制的备份不受影响。 |
-| `POST` | `/memories/merge` | 合并多条记忆。 |
+| `POST` | `/memories/{memory_id}/restore` | 从回收站恢复；若属于时态版本链，会在同一事务中按有效时间重新接链。 |
+| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆及其 evidence 派生/审计副本，需要 `confirm_memory_id` 完整匹配。外部导出和用户自行复制的备份不受影响；若提交后的本地 eval 清理失败，响应仍明确 `purged=true` 并附带 warning。 |
+| `POST` | `/memories/merge` | 合并 2–100 条记忆；可选合并正文上限 20,000 字符。 |
 | `POST` | `/memories/re-embed` | 对指定记忆或扫描出的缺失/无效 embedding 重新生成向量。 |
 | `POST` | `/memories/archive-expired` | 归档过期记忆。 |
 
@@ -502,10 +504,12 @@ curl \
 | --- | --- | --- |
 | `GET` | `/memories/spaces` | 列出记忆空间及活跃记忆计数。 |
 | `GET` | `/memories/spaces/{space_id}` | 读取空间详情和空间内记忆。 |
-| `POST` | `/memories/network` | 构建记忆网络图，可按空间、类型、敏感度、情绪范围过滤。 |
+| `POST` | `/memories/network` | 构建记忆网络图，可按空间、类型、敏感度、情绪范围过滤；边包含相似度、evidence、temporal 与核心证据关系。 |
 | `POST` | `/memories/network/traverse` | 实验性：从种子记忆做 bounded-depth Personalized PageRank 遍历。 |
 | `GET` | `/memories/timeline` | 按 `subject` 和可选 `predicate` 查询时间线。 |
 | `POST` | `/memories/{memory_id}/temporal/restore` | 恢复被 Temporal 失效的记忆，并写审计日志。 |
+
+普通检索默认只返回当前有效版本；以前/曾经/过去时问法进入 history，未来问法进入 future，显式年份、前年/后年和上月/下月会生成日历窗口。软删除、恢复、PATCH 和覆盖导入都在即时写事务中重建受影响的双向版本链；服务初始化还会幂等修复旧版本遗留的 active→recycle-bin 引用。
 
 ### 核心记忆、体检、评估、报告
 
@@ -530,7 +534,7 @@ curl \
 | `POST` | `/memories/evaluation/recall/init` | 从真实数据库只读生成召回评估快照和标注文件。 |
 | `GET` | `/memories/evaluation/recall/workbench` | 读取召回评估工作台数据。 |
 | `PUT` | `/memories/evaluation/recall/labels` | 原子保存 `unlabeled/relevant/no_answer` 三态人工标注。 |
-| `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 评估，`k` 为 1–20，包含无答案误召、拒答及实际 fallback 信息。 |
+| `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 评估，`k` 为 1–20；P@k 使用固定 `k` 作分母，另返回实际返回集精确率；完全重复 query 会折叠，冲突重复标注会拒绝运行。结果还包含无答案误召、拒答及实际 fallback 信息。 |
 | `GET` | `/memories/report?format=json\|markdown` | 生成记忆报告。 |
 | `GET` | `/memories/export?format=json\|markdown\|obsidian_markdown` | 导出备份或 Obsidian zip 单向镜像。 |
 | `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆、近期摘要和对话分支节点；核心历史与决策日志仅供审计，不写回，响应会显式列出。 |
@@ -667,7 +671,7 @@ Windows 服务辅助脚本：
 - 不要提交 `.env`、`data/*.db`、`eval/`、`logs/` 或真实 provider key。
 - `data/memory.db` 除长期记忆外还包含近期摘要、分支节点中的最近原始轮次和压缩摘要；JSON/Markdown/Obsidian 导出也可能含私人内容，都应按敏感数据处理。
 - `redact_sensitive=true` 只是响应期遮罩，不会改写数据库，也不会让备份变成脱敏备份。
-- 永久删除不可恢复，只作用于回收站记忆，并会清理依赖它的 agent-derived 记忆、脱敏相关核心历史和旧决策日志、删除该用户评测工作区。
+- 永久删除不可恢复，只作用于回收站记忆，并会沿 evidence 依赖闭包清理所有依赖记忆（包括保留 `user_asserted` 来源的合并结果）、脱敏相关核心历史和旧决策日志、删除该用户评测工作区。若数据库删除提交后 eval 文件清理失败，接口会返回成功和显式 warning，避免把已完成的不可逆删除伪装成整体失败。
 - 永久删除一条长期记忆不会删除客户端自身的聊天记录，也不会自动搜索并改写近期摘要或 `conversation_branch_nodes` 中可能重复出现的原始对话。Web Console 的“对话上下文”页可按分支节点软删除该节点及其后代，并从“已清理”状态恢复；当前仍没有按长期 memory ID 自动定位并清理重复对话原文的能力。需要彻底清除时，还应处理客户端聊天、相关摘要和导出副本。
 - 永久删除无法控制已经复制到工作区外的 JSON/Markdown/Obsidian 导出或第三方备份；这些副本必须按各自保留策略删除。
 - `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、体检和知识代理的默认安全边界；它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。

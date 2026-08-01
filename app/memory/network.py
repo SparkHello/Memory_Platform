@@ -1,5 +1,6 @@
 from itertools import combinations
 
+from app.memory.core import safe_core_memory_sections
 from app.memory.models import MemoryRecord
 from app.memory.redaction import redact_memory_payload
 from app.memory.search import cosine_similarity
@@ -50,7 +51,14 @@ def build_memory_network(
     memory_by_id = {memory.id: memory for memory in memories}
     # 两两比较前一次性解析全部候选向量（带缓存），避免 O(n²) 次重复 json.loads。
     vectors = {memory.id: _memory_embedding_vector(memory) for memory in memories}
-    core_sections = store.list_core_memory_sections(user_id=user_id)
+    # Core summaries are denormalized model output. In redacted views, revalidate
+    # their evidence so a later sensitivity/temporal change cannot expose stale
+    # core text. The explicit unredacted management view keeps the full graph.
+    core_sections = (
+        safe_core_memory_sections(store=store, user_id=user_id)
+        if redact_sensitive
+        else store.list_core_memory_sections(user_id=user_id)
+    )
 
     nodes = [_core_node(section) for section in core_sections]
     nodes.extend(
@@ -75,6 +83,36 @@ def build_memory_network(
                     "kind": "core_evidence",
                     "weight": 1.0,
                     "label": "核心证据",
+                },
+            )
+
+    for memory in memories:
+        if memory.supersedes and memory.supersedes in memory_by_id:
+            _append_edge(
+                edges,
+                edge_keys,
+                {
+                    "id": f"temporal:{memory.id}:{memory.supersedes}",
+                    "source": memory.id,
+                    "target": memory.supersedes,
+                    "kind": "temporal",
+                    "weight": 1.0,
+                    "label": "时间替代",
+                },
+            )
+        for evidence_id in memory.evidence_memory_ids:
+            if evidence_id == memory.id or evidence_id not in memory_by_id:
+                continue
+            _append_edge(
+                edges,
+                edge_keys,
+                {
+                    "id": f"memory_evidence:{memory.id}:{evidence_id}",
+                    "source": memory.id,
+                    "target": evidence_id,
+                    "kind": "memory_evidence",
+                    "weight": 0.95,
+                    "label": "证据",
                 },
             )
 
@@ -229,7 +267,14 @@ def memory_similarity(
     else:
         left_vector = vectors.get(left.id)
         right_vector = vectors.get(right.id)
-    if left_vector is not None and right_vector is not None:
+    if (
+        left_vector is not None
+        and right_vector is not None
+        and len(left_vector) == len(right_vector)
+        and bool(left_vector)
+        and any(value != 0.0 for value in left_vector)
+        and any(value != 0.0 for value in right_vector)
+    ):
         return max(0.0, cosine_similarity(left_vector, right_vector))
 
     text_score = max(

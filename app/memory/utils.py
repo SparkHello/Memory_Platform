@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import json
 import math
 import re
+import threading
 
 
 # 进程内有界缓存：(memory_id, updated_at) -> 解析后的 embedding 向量。
@@ -10,6 +11,7 @@ import re
 # 由 LRU 上限挤出，不会读到旧向量。
 _EMBEDDING_VECTOR_CACHE_MAX = 2048
 _embedding_vector_cache: OrderedDict[tuple[str, str], list[float] | None] = OrderedDict()
+_embedding_vector_cache_lock = threading.Lock()
 
 
 def parse_embedding_vector(raw_json: str | None) -> list[float] | None:
@@ -40,14 +42,15 @@ def _cached_embedding_vector(
     embedding_json: str | None,
 ) -> list[float] | None:
     key = (memory_id, updated_at or "")
-    if key in _embedding_vector_cache:
-        _embedding_vector_cache.move_to_end(key)
-        return _embedding_vector_cache[key]
-    vector = parse_embedding_vector(embedding_json)
-    if len(_embedding_vector_cache) >= _EMBEDDING_VECTOR_CACHE_MAX:
-        _embedding_vector_cache.popitem(last=False)
-    _embedding_vector_cache[key] = vector
-    return vector
+    with _embedding_vector_cache_lock:
+        if key in _embedding_vector_cache:
+            _embedding_vector_cache.move_to_end(key)
+            return _embedding_vector_cache[key]
+        vector = parse_embedding_vector(embedding_json)
+        if len(_embedding_vector_cache) >= _EMBEDDING_VECTOR_CACHE_MAX:
+            _embedding_vector_cache.popitem(last=False)
+        _embedding_vector_cache[key] = vector
+        return vector
 
 
 def _memory_embedding_vector(memory) -> list[float] | None:
@@ -122,22 +125,25 @@ def _char_overlap(left: str, right: str) -> float:
 
 
 def _has_negation(text: str) -> bool:
-    lowered = text.lower()
-    markers = (
-        "不",
-        "不是",
-        "不再",
-        "没有",
-        "没",
-        "停止",
-        "戒掉",
-        "讨厌",
-        "不喜欢",
-        "不喝",
-        "no longer",
-        "not",
+    """Return whether text carries an explicit negative polarity.
+
+    Chinese negators are characters/short words, while English negators must be
+    matched on token boundaries.  A raw substring check for ``not`` both missed
+    common forms such as ``no``/``never`` and incorrectly marked words such as
+    ``notable`` as negative.
+    """
+    if re.search(r"从未|并非|绝不|不再|没有|未|无|不|没|停止|戒掉|讨厌", text):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:no|not|never|without|none|neither|nor|cannot|"
+            r"dislike(?:s|d)?|hate(?:s|d)?)\b"
+            r"|\b(?:isn|aren|wasn|weren|don|doesn|didn|can|couldn|"
+            r"won|wouldn|shouldn|hasn|haven|hadn)['’]t\b",
+            text,
+            flags=re.IGNORECASE,
+        )
     )
-    return any(marker in lowered for marker in markers)
 
 
 def _normalize(text: str) -> str:

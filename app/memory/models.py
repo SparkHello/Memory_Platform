@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 MemoryType = Literal[
@@ -60,6 +60,34 @@ def normalize_iso_text(value: object) -> object:
     except ValueError as exc:
         raise ValueError("must be an ISO date or datetime") from exc
     return normalized
+
+
+def _validate_temporal_metadata(
+    *,
+    temporal_subject: str | None,
+    temporal_predicate: str | None,
+    valid_from: str | None,
+    valid_until: str | None,
+) -> None:
+    has_subject = bool(temporal_subject)
+    has_predicate = bool(temporal_predicate)
+    if has_subject != has_predicate:
+        raise ValueError("temporal_subject and temporal_predicate must be provided together")
+    if not valid_from or not valid_until:
+        return
+
+    starts_at = datetime.fromisoformat(valid_from)
+    ends_at = datetime.fromisoformat(valid_until)
+    if starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=UTC)
+    else:
+        starts_at = starts_at.astimezone(UTC)
+    if ends_at.tzinfo is None:
+        ends_at = ends_at.replace(tzinfo=UTC)
+    else:
+        ends_at = ends_at.astimezone(UTC)
+    if starts_at > ends_at:
+        raise ValueError("valid_from must not be later than valid_until")
 
 MemoryAction = Literal["create", "update", "ignore"]
 
@@ -197,7 +225,12 @@ class MemoryRecord(BaseModel):
     temporal_predicate: str | None = None
     status: MemoryStatus = "dynamic"
     digested: bool = False
-    decay_lambda: float | None = None
+    decay_lambda: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        allow_inf_nan=False,
+    )
     supersedes: str | None = None
     superseded_by: str | None = None
     created_at: str
@@ -219,6 +252,16 @@ class MemoryRecord(BaseModel):
     @classmethod
     def _normalize_datetime_fields(cls, value: object) -> object:
         return normalize_iso_text(value)
+
+    @model_validator(mode="after")
+    def _validate_temporal_metadata(self) -> "MemoryRecord":
+        _validate_temporal_metadata(
+            temporal_subject=self.temporal_subject,
+            temporal_predicate=self.temporal_predicate,
+            valid_from=self.valid_from,
+            valid_until=self.valid_until,
+        )
+        return self
 
 
 class MemorySpace(BaseModel):
@@ -323,6 +366,16 @@ class CandidateMemory(BaseModel):
     @classmethod
     def _normalize_datetime_fields(cls, value: object) -> object:
         return normalize_iso_text(value)
+
+    @model_validator(mode="after")
+    def _validate_temporal_metadata(self) -> "CandidateMemory":
+        _validate_temporal_metadata(
+            temporal_subject=self.temporal_subject,
+            temporal_predicate=self.temporal_predicate,
+            valid_from=self.valid_from,
+            valid_until=self.valid_until,
+        )
+        return self
 
 
 class ResolveResult(BaseModel):

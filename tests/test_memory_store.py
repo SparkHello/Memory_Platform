@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -6,6 +7,7 @@ import pytest
 
 from app.memory.models import RecentContextTurn
 from app.memory.store import MemoryStore
+from app.memory.temporal import is_current_temporal_memory
 
 
 def test_existing_database_gets_default_emotion_columns(tmp_path) -> None:
@@ -463,6 +465,54 @@ def test_import_memory_record_enforces_local_sensitivity_floor(
     assert restored.sensitivity == "sensitive"
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"temporal_subject": "user"},
+        {"valid_from": "2027-01-01", "valid_until": "2026-01-01"},
+        {"decay_lambda": -1},
+        {"decay_lambda": 11},
+    ],
+)
+def test_import_memory_record_rejects_invalid_temporal_and_decay_metadata(
+    memory_store: MemoryStore,
+    overrides: dict,
+) -> None:
+    action, restored = memory_store.import_memory_record(
+        user_id="default",
+        data={"content": "invalid imported memory", **overrides},
+    )
+
+    assert action == "invalid"
+    assert restored is None
+
+
+def test_import_memory_record_never_overwrites_another_users_id(
+    memory_store: MemoryStore,
+) -> None:
+    existing = memory_store.create_memory(
+        user_id="other",
+        content="Other user's original memory.",
+    )
+    import_data = {
+        **existing.model_dump(exclude={"embedding_json"}),
+        "content": "Current user's restored memory.",
+    }
+
+    action, restored = memory_store.import_memory_record(
+        user_id="default",
+        data=import_data,
+        overwrite=True,
+    )
+
+    assert action == "created"
+    assert restored is not None
+    assert restored.id != existing.id
+    unchanged = memory_store.get_memory(memory_id=existing.id, user_id="other")
+    assert unchanged is not None
+    assert unchanged.content == existing.content
+
+
 def test_create_memory_with_validity_and_sensitivity(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
@@ -575,6 +625,213 @@ def test_temporal_invalidation_closes_older_fact_and_logs(
     assert payload["superseded_memory_ids"] == [old.id]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"temporal_subject": "user"},
+        {"valid_from": "2027-01-01", "valid_until": "2026-01-01"},
+        {"decay_lambda": -0.01},
+        {"decay_lambda": 10.01},
+    ],
+)
+def test_create_memory_rejects_invalid_temporal_and_decay_metadata(
+    memory_store: MemoryStore,
+    overrides: dict,
+) -> None:
+    with pytest.raises(ValueError):
+        memory_store.create_memory(
+            user_id="default",
+            content="invalid metadata must not be stored",
+            **overrides,
+        )
+    assert memory_store.list_memories(user_id="default") == []
+
+
+def test_update_memory_validates_before_writing_and_rebuilds_temporal_chain(
+    memory_store: MemoryStore,
+) -> None:
+    first = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    moved = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    current = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City C.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    with pytest.raises(ValueError):
+        memory_store.update_memory(
+            memory_id=moved.id,
+            user_id="default",
+            content=moved.content,
+            type=moved.type,
+            importance=moved.importance,
+            confidence=moved.confidence,
+            valence=moved.valence,
+            arousal=moved.arousal,
+            temporal_predicate=None,
+        )
+    unchanged = memory_store.get_memory(memory_id=moved.id, user_id="default")
+    assert unchanged is not None
+    assert unchanged.temporal_predicate == "current_city"
+
+    updated = memory_store.update_memory(
+        memory_id=moved.id,
+        user_id="default",
+        content=moved.content,
+        type=moved.type,
+        importance=moved.importance,
+        confidence=moved.confidence,
+        valence=moved.valence,
+        arousal=moved.arousal,
+        valid_from="2027-01-01",
+    )
+    assert updated is not None
+    first_after = memory_store.get_memory(memory_id=first.id, user_id="default")
+    current_after = memory_store.get_memory(memory_id=current.id, user_id="default")
+    assert first_after is not None
+    assert current_after is not None
+    assert first_after.valid_until == current.valid_from
+    assert first_after.superseded_by == current.id
+    assert current_after.supersedes == first.id
+    assert current_after.valid_until == updated.valid_from
+    assert current_after.superseded_by == updated.id
+    assert updated.supersedes == current.id
+
+
+def test_update_memory_reads_and_returns_row_inside_write_transaction(
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="Original content.",
+    )
+
+    def fail_external_read(*args, **kwargs):
+        raise AssertionError("update_memory must not read through get_memory")
+
+    monkeypatch.setattr(memory_store, "get_memory", fail_external_read)
+    updated = memory_store.update_memory(
+        memory_id=memory.id,
+        user_id="default",
+        content="Updated inside one write transaction.",
+        type=memory.type,
+        importance=memory.importance,
+        confidence=memory.confidence,
+        valence=memory.valence,
+        arousal=memory.arousal,
+    )
+
+    assert updated is not None
+    assert updated.content == "Updated inside one write transaction."
+
+
+def test_future_temporal_replacement_keeps_current_fact_active_until_effective(
+    memory_store: MemoryStore,
+) -> None:
+    now = datetime.now(UTC)
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from=(now - timedelta(days=30)).isoformat(),
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    future_start = (now + timedelta(days=30)).isoformat()
+    future = memory_store.create_memory(
+        user_id="default",
+        content="User will live in City B.",
+        valid_from=future_start,
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    future_after = memory_store.get_memory(memory_id=future.id, user_id="default")
+    assert old_after is not None
+    assert future_after is not None
+    assert old_after.valid_until == future_start
+    assert old_after.status == "dynamic"
+    assert old_after.superseded_by == future.id
+    assert future_after.supersedes == old.id
+
+    payload = json.loads(memory_store.list_decision_logs(user_id="default")[0].candidate_json)
+    assert payload["after"] == [
+        {
+            "id": old.id,
+            "valid_until": future_start,
+            "status": "dynamic",
+            "superseded_by": future.id,
+        }
+    ]
+
+
+def test_backdated_temporal_insert_relinks_predecessor_and_successor(
+    memory_store: MemoryStore,
+) -> None:
+    now = datetime.now(UTC)
+    old_start = (now - timedelta(days=60)).isoformat()
+    middle_start = (now - timedelta(days=10)).isoformat()
+    future_start = (now + timedelta(days=30)).isoformat()
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from=old_start,
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    future = memory_store.create_memory(
+        user_id="default",
+        content="User will live in City C.",
+        valid_from=future_start,
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    middle = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from=middle_start,
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    middle_after = memory_store.get_memory(memory_id=middle.id, user_id="default")
+    future_after = memory_store.get_memory(memory_id=future.id, user_id="default")
+    assert old_after is not None
+    assert middle_after is not None
+    assert future_after is not None
+    assert old_after.valid_until == middle_start
+    assert old_after.superseded_by == middle.id
+    assert middle_after.supersedes == old.id
+    assert middle_after.valid_until == future_start
+    assert middle_after.superseded_by == future.id
+    assert middle_after.status == "dynamic"
+    assert future_after.supersedes == middle.id
+
+    timeline = memory_store.list_memory_timeline(
+        user_id="default",
+        subject="user",
+        predicate="current_city",
+    )
+    assert [memory.id for memory in timeline] == [old.id, middle.id, future.id]
+
+
 def test_list_decision_logs_filters_by_memory_id(memory_store: MemoryStore) -> None:
     old_job = memory_store.create_memory(
         user_id="default",
@@ -616,6 +873,42 @@ def test_list_decision_logs_filters_by_memory_id(memory_store: MemoryStore) -> N
     assert memory_store.list_decision_logs(user_id="default", memory_id="missing-id") == []
 
 
+def test_list_decision_logs_finds_old_exact_reference_beyond_recent_window(
+    memory_store: MemoryStore,
+) -> None:
+    target_id = "old-target-memory"
+    target_log = memory_store.create_decision_log(
+        user_id="default",
+        conversation_id="target-conversation",
+        candidate_json=json.dumps({"memory_id": target_id, "note": "target"}),
+        decision="update",
+        reason="old target log",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id="false-positive",
+        candidate_json=json.dumps({"note": target_id}),
+        decision="ignore",
+        reason="the id is text, not a memory reference",
+    )
+    for index in range(600):
+        memory_store.create_decision_log(
+            user_id="default",
+            conversation_id=f"noise-{index}",
+            candidate_json=json.dumps({"memory_id": f"noise-memory-{index}"}),
+            decision="ignore",
+            reason="noise",
+        )
+
+    logs = memory_store.list_decision_logs(
+        user_id="default",
+        memory_id=target_id,
+        limit=10,
+    )
+
+    assert [log.id for log in logs] == [target_log.id]
+
+
 def test_temporal_invalidation_compares_offset_datetimes_by_instant(
     memory_store: MemoryStore,
 ) -> None:
@@ -643,14 +936,9 @@ def test_temporal_invalidation_compares_offset_datetimes_by_instant(
     assert new.supersedes == old.id
 
 
-def test_temporal_invalidation_skips_unsafe_candidates(
+def test_temporal_invalidation_preserves_pin_but_closes_its_interval(
     memory_store: MemoryStore,
 ) -> None:
-    missing_key = memory_store.create_memory(
-        user_id="default",
-        content="User works somewhere.",
-        temporal_subject="user",
-    )
     other_user = memory_store.create_memory(
         user_id="other",
         content="Other user works at Company A.",
@@ -675,7 +963,7 @@ def test_temporal_invalidation_skips_unsafe_candidates(
         content="Lifecycle archived employer fact.",
         valid_from="2025-01-01",
         temporal_subject="user",
-        temporal_predicate="current_employer",
+        temporal_predicate="archived_employer",
     )
     memory_store.update_memory_statuses(
         user_id="default",
@@ -687,11 +975,11 @@ def test_temporal_invalidation_skips_unsafe_candidates(
         content="Deleted employer fact.",
         valid_from="2025-01-01",
         temporal_subject="user",
-        temporal_predicate="current_employer",
+        temporal_predicate="deleted_employer",
     )
     assert memory_store.archive_memory(memory_id=soft_deleted.id, user_id="default")
 
-    memory_store.create_memory(
+    replacement = memory_store.create_memory(
         user_id="default",
         content="User works at Company B.",
         valid_from="2026-01-01",
@@ -699,8 +987,11 @@ def test_temporal_invalidation_skips_unsafe_candidates(
         temporal_predicate="current_employer",
     )
 
-    assert memory_store.get_memory(memory_id=missing_key.id, user_id="default").superseded_by is None
-    assert memory_store.get_memory(memory_id=pinned.id, user_id="default").superseded_by is None
+    pinned_after = memory_store.get_memory(memory_id=pinned.id, user_id="default")
+    assert pinned_after is not None
+    assert pinned_after.status == "pinned"
+    assert pinned_after.valid_until == replacement.valid_from
+    assert pinned_after.superseded_by == replacement.id
     assert memory_store.get_memory(memory_id=archived_status.id, user_id="default").superseded_by is None
     assert memory_store.get_memory(memory_id=other_user.id, user_id="other").superseded_by is None
 
@@ -733,13 +1024,181 @@ def test_temporal_timeline_and_restore(memory_store: MemoryStore) -> None:
         user_id="default",
     )
     assert restored is not None
+    assert restored.id not in {old.id, new.id}
     assert restored.valid_until is None
     assert restored.status == "dynamic"
     assert restored.superseded_by is None
-    assert memory_store.get_memory(memory_id=new.id, user_id="default").supersedes is None
+    assert restored.supersedes == new.id
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    new_after = memory_store.get_memory(memory_id=new.id, user_id="default")
+    assert old_after is not None
+    assert new_after is not None
+    assert old_after.valid_from == "2025-01-01"
+    assert old_after.valid_until == "2026-01-01"
+    assert old_after.superseded_by == new.id
+    assert new_after.supersedes == old.id
+    assert new_after.valid_until == restored.valid_from
+    assert new_after.superseded_by == restored.id
+    assert sum(
+        is_current_temporal_memory(memory)
+        for memory in (old_after, new_after, restored)
+    ) == 1
+
+    timeline = memory_store.list_memory_timeline(
+        user_id="default",
+        subject="user",
+        predicate="primary_tool",
+    )
+    assert [memory.id for memory in timeline] == [old.id, new.id, restored.id]
 
     logs = memory_store.list_decision_logs(user_id="default")
-    assert json.loads(logs[0].candidate_json)["source"] == "temporal_restore"
+    payload = json.loads(logs[0].candidate_json)
+    assert payload["source"] == "temporal_restore"
+    assert payload["source_memory_id"] == old.id
+    assert payload["restored_memory_id"] == restored.id
+
+
+def test_soft_deleted_temporal_head_rejoins_chain_after_newer_fact(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    deleted_head = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    assert memory_store.archive_memory(
+        memory_id=deleted_head.id,
+        user_id="default",
+    )
+
+    latest = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City C.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    restored = memory_store.restore_memory(
+        memory_id=deleted_head.id,
+        user_id="default",
+    )
+
+    assert restored is not None
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    latest_after = memory_store.get_memory(memory_id=latest.id, user_id="default")
+    assert old_after is not None
+    assert latest_after is not None
+    assert old_after.superseded_by == restored.id
+    assert old_after.valid_until == restored.valid_from
+    assert restored.supersedes == old.id
+    assert restored.superseded_by == latest.id
+    assert restored.valid_until == latest.valid_from
+    assert restored.status == "resolved"
+    assert latest_after.supersedes == restored.id
+    assert latest_after.superseded_by is None
+    assert latest_after.valid_until is None
+    assert sum(
+        is_current_temporal_memory(memory)
+        for memory in (old_after, restored, latest_after)
+    ) == 1
+
+
+def test_soft_delete_rebuilds_active_temporal_links_without_dangling_ids(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    middle = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    latest = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City C.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    assert memory_store.archive_memory(memory_id=middle.id, user_id="default")
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    latest_after = memory_store.get_memory(memory_id=latest.id, user_id="default")
+    assert old_after is not None
+    assert latest_after is not None
+    assert old_after.superseded_by == latest.id
+    assert latest_after.supersedes == old.id
+    assert middle.id not in {
+        old_after.supersedes,
+        old_after.superseded_by,
+        latest_after.supersedes,
+        latest_after.superseded_by,
+    }
+
+
+def test_init_repairs_legacy_active_links_into_recycle_bin(tmp_path) -> None:
+    database_path = tmp_path / "legacy-temporal-links.db"
+    store = MemoryStore(str(database_path))
+    store.init_db()
+    old = store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    middle = store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    latest = store.create_memory(
+        user_id="default",
+        content="User lives in City C.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    assert store.archive_memory(memory_id=middle.id, user_id="default")
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET superseded_by = ? WHERE id = ?",
+            (middle.id, old.id),
+        )
+        connection.execute(
+            "UPDATE memories SET supersedes = ? WHERE id = ?",
+            (middle.id, latest.id),
+        )
+
+    reopened = MemoryStore(str(database_path))
+    reopened.init_db()
+
+    old_after = reopened.get_memory(memory_id=old.id, user_id="default")
+    latest_after = reopened.get_memory(memory_id=latest.id, user_id="default")
+    assert old_after is not None
+    assert latest_after is not None
+    assert old_after.superseded_by == latest.id
+    assert latest_after.supersedes == old.id
 
 
 def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
@@ -1033,6 +1492,82 @@ def test_merge_memories_archives_fragments_and_keeps_evidence(memory_store: Memo
     assert len(memory_store.list_memories(user_id="default")) == 1
 
 
+def test_merge_memories_rejects_different_temporal_versions(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    current = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+
+    result = memory_store.merge_memories(
+        user_id="default",
+        memory_ids=[old.id, current.id],
+    )
+
+    assert result.action == "ignore"
+    assert "不同时间版本" in result.reason
+    assert memory_store.get_memory(memory_id=old.id, user_id="default") is not None
+    assert memory_store.get_memory(memory_id=current.id, user_id="default") is not None
+
+
+def test_merge_memories_rolls_back_target_links_and_sources_on_archive_failure(
+    memory_store: MemoryStore,
+) -> None:
+    first_space = memory_store.upsert_memory_space(user_id="default", name="First")
+    second_space = memory_store.upsert_memory_space(user_id="default", name="Second")
+    first = memory_store.create_memory(
+        user_id="default",
+        content="First merge fragment.",
+        embedding_json="[0.1]",
+        space_ids=[first_space.id],
+    )
+    second = memory_store.create_memory(
+        user_id="default",
+        content="Second merge fragment.",
+        space_ids=[second_space.id],
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_merge_archive
+            BEFORE UPDATE OF archived ON memories
+            WHEN NEW.archived = 1
+            BEGIN
+                SELECT RAISE(ABORT, 'forced merge archive failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced merge archive failure"):
+        memory_store.merge_memories(
+            user_id="default",
+            memory_ids=[first.id, second.id],
+            content="Merged content that must roll back.",
+        )
+
+    restored_first = memory_store.get_memory(memory_id=first.id, user_id="default")
+    restored_second = memory_store.get_memory(memory_id=second.id, user_id="default")
+    assert restored_first is not None
+    assert restored_second is not None
+    assert restored_first.content == first.content
+    assert restored_first.embedding_json == "[0.1]"
+    assert restored_first.evidence_memory_ids == []
+    assert restored_first.space_ids == [first_space.id]
+    assert restored_second.space_ids == [second_space.id]
+    assert memory_store.list_archived_memories(user_id="default") == []
+
+
 def test_memory_source_explanation_marks_core_evidence(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
@@ -1089,6 +1624,42 @@ def test_core_memory_section_history_is_saved_before_update(
     assert len(history) == 1
     assert history[0].version == 1
     assert history[0].content == "- 用户喜欢黑咖啡。"
+
+
+def test_store_list_limits_do_not_treat_negative_values_as_unbounded(
+    memory_store: MemoryStore,
+) -> None:
+    for index in range(3):
+        memory_store.create_decision_log(
+            user_id="default",
+            conversation_id=None,
+            candidate_json=json.dumps({"memory_id": f"memory-{index}"}),
+            decision="create",
+            reason="limit test",
+        )
+    for index in range(3):
+        memory_store.upsert_core_memory_section(
+            user_id="default",
+            section="profile",
+            content=f"core version {index}",
+            evidence_memory_ids=[f"memory-{index}"],
+            confidence=0.8,
+        )
+
+    assert len(memory_store.list_decision_logs(user_id="default", limit=-1)) == 1
+    assert len(
+        memory_store.list_core_memory_section_history(
+            user_id="default",
+            limit=-1,
+        )
+    ) == 1
+    assert len(memory_store.list_decision_logs(user_id="default", limit=None)) == 3
+    assert len(
+        memory_store.list_core_memory_section_history(
+            user_id="default",
+            limit=None,
+        )
+    ) == 2
 
 
 def test_recent_context_summary_upsert(memory_store: MemoryStore) -> None:
@@ -1582,6 +2153,154 @@ def test_purge_scrubs_logs_linked_by_memory_ids_and_source_conversation(
     ] == 3
 
 
+def test_purge_deletes_transitive_cycle_safe_derived_closure_for_current_user(
+    memory_store: MemoryStore,
+) -> None:
+    root = memory_store.create_memory(
+        user_id="default",
+        content="Root fact that must be permanently removed.",
+        sensitivity="private",
+    )
+    first = memory_store.create_memory(
+        user_id="default",
+        content="First derived fact.",
+        origin="agent_derived",
+        evidence_memory_ids=[root.id],
+    )
+    second = memory_store.create_memory(
+        user_id="default",
+        content="Second derived fact.",
+        origin="agent_derived",
+        evidence_memory_ids=[first.id],
+    )
+    first_with_cycle = memory_store.update_memory(
+        memory_id=first.id,
+        user_id="default",
+        content=first.content,
+        type=first.type,
+        importance=first.importance,
+        confidence=first.confidence,
+        valence=first.valence,
+        arousal=first.arousal,
+        sensitivity=first.sensitivity,
+        evidence_memory_ids=[root.id, second.id],
+    )
+    assert first_with_cycle is not None
+    other_user = memory_store.create_memory(
+        user_id="other",
+        content="Another user's derived fact must remain.",
+        origin="agent_derived",
+        evidence_memory_ids=[root.id, first.id],
+    )
+    _, core = memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="profile",
+        content="Core content derived only through the transitive child.",
+        evidence_memory_ids=[second.id],
+        confidence=0.9,
+    )
+    assert memory_store.archive_memory(memory_id=root.id, user_id="default")
+
+    result = memory_store.purge_archived_memory(
+        memory_id=root.id,
+        user_id="default",
+    )
+
+    assert result is not None
+    _, purge_log = result
+    assert memory_store.get_memory(memory_id=first.id, user_id="default") is None
+    assert memory_store.get_memory(memory_id=second.id, user_id="default") is None
+    assert memory_store.get_memory(memory_id=other_user.id, user_id="other") is not None
+    assert memory_store.list_core_memory_sections(user_id="default") == []
+    audit = json.loads(purge_log.candidate_json)
+    assert audit["affected_core_sections"] == [
+        {
+            "section": "profile",
+            "id": core.id,
+            "version": 1,
+        }
+    ]
+    assert audit["scrubbed_artifacts"]["dependent_memories_deleted"] == 2
+    assert audit["scrubbed_artifacts"]["derived_memories_deleted"] == 2
+    assert audit["scrubbed_artifacts"]["core_sections_scrubbed"] == 1
+
+
+def test_purge_deletes_user_asserted_merge_that_retains_purged_evidence(
+    memory_store: MemoryStore,
+) -> None:
+    primary = memory_store.create_memory(
+        user_id="default",
+        content="SECRET-A",
+        sensitivity="private",
+    )
+    fragment = memory_store.create_memory(
+        user_id="default",
+        content="SECRET-B",
+        sensitivity="private",
+    )
+    merged = memory_store.merge_memories(
+        user_id="default",
+        memory_ids=[primary.id, fragment.id],
+        content="SECRET-A and SECRET-B",
+    )
+    assert merged.memory is not None
+    assert merged.memory.origin == "user_asserted"
+
+    result = memory_store.purge_archived_memory(
+        memory_id=fragment.id,
+        user_id="default",
+    )
+
+    assert result is not None
+    assert memory_store.get_memory(memory_id=primary.id, user_id="default") is None
+    assert memory_store.list_memories(user_id="default", status="all") == []
+    audit = json.loads(result[1].candidate_json)
+    assert audit["scrubbed_artifacts"]["dependent_memories_deleted"] == 1
+    assert audit["scrubbed_artifacts"]["derived_memories_deleted"] == 1
+
+
+def test_purge_preserves_temporal_references_repaired_at_soft_delete(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    middle = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    latest = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City C.",
+        valid_from="2026-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    assert memory_store.archive_memory(memory_id=middle.id, user_id="default")
+
+    result = memory_store.purge_archived_memory(
+        memory_id=middle.id,
+        user_id="default",
+    )
+
+    assert result is not None
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    latest_after = memory_store.get_memory(memory_id=latest.id, user_id="default")
+    assert old_after is not None
+    assert latest_after is not None
+    assert old_after.superseded_by == latest.id
+    assert latest_after.supersedes == old.id
+    audit = json.loads(result[1].candidate_json)
+    assert audit["scrubbed_artifacts"]["temporal_references_relinked"] == 0
+
+
 def test_purge_rejects_active_memory(memory_store: MemoryStore) -> None:
     memory = memory_store.create_memory(
         user_id="default",
@@ -1702,6 +2421,34 @@ def test_archive_expired_memories(memory_store: MemoryStore) -> None:
     # 再次调用不应重复归档
     count2 = memory_store.archive_expired_memories(user_id="default")
     assert count2 == 0
+
+
+def test_archive_expired_memories_preserves_temporal_version_history(
+    memory_store: MemoryStore,
+) -> None:
+    old_version = memory_store.create_memory(
+        user_id="default",
+        content="User lives in City A.",
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="User lives in City B.",
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    temporary = memory_store.create_memory(
+        user_id="default",
+        content="ordinary temporary fact",
+        valid_until=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+    )
+
+    assert memory_store.archive_expired_memories(user_id="default") == 1
+    assert memory_store.get_memory(memory_id=old_version.id, user_id="default") is not None
+    assert memory_store.get_memory(memory_id=temporary.id, user_id="default") is None
 
 
 def test_archive_expired_memories_compares_instants_across_timezones(

@@ -5,9 +5,11 @@ from functools import partial
 import anyio
 
 from app.memory.classification import classify_memory, normalize_classification_values
+from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
 from app.memory.search import EmbeddingClient, cosine_similarity
 from app.memory.store import MemoryStore
+from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (
     _char_overlap,
     _has_negation,
@@ -74,11 +76,13 @@ class MemoryResolver:
         auto_classify: bool = True,
     ) -> ResolveResult:
         existing = await anyio.to_thread.run_sync(
-            partial(self.store.list_memories, user_id=user_id, limit=200)
+            partial(self.store.list_memories_for_resolution, user_id=user_id)
         )
         normalized_new = _normalize(candidate.memory)
 
         for memory in existing:
+            if not _can_suppress_new_candidate(candidate, memory):
+                continue
             normalized_old = _normalize(memory.content)
             if normalized_old == normalized_new:
                 return ResolveResult(
@@ -118,7 +122,9 @@ class MemoryResolver:
                 self._classification_kwargs,
                 user_id=user_id,
                 candidate=candidate,
-                source_text=source_message or candidate.source_quote or candidate.memory,
+                # Classification belongs to this candidate's grounded clause.
+                # The full turn may contain unrelated facts for other candidates.
+                source_text=candidate.source_quote or source_message or candidate.memory,
                 auto_classify=auto_classify,
             )
         )
@@ -190,6 +196,38 @@ class MemoryResolver:
         }
 
 
+def _can_suppress_new_candidate(
+    candidate: CandidateMemory,
+    memory: MemoryRecord,
+) -> bool:
+    """Only a live, user-asserted peer may suppress a newly asserted fact.
+
+    Historical/resolved rows must remain available for timelines, but an old
+    A value must not swallow a later A→B→A transition. Derived summaries also
+    cannot override a user's direct assertion merely because their text matches.
+    """
+    if (
+        memory.origin != "user_asserted"
+        or memory.status not in {"dynamic", "pinned"}
+        or not is_current_temporal_memory(memory)
+        or memory.type != candidate.type
+        or memory.sensitivity != candidate.sensitivity
+    ):
+        return False
+    candidate_has_key = bool(
+        candidate.temporal_subject and candidate.temporal_predicate
+    )
+    memory_has_key = bool(memory.temporal_subject and memory.temporal_predicate)
+    if candidate_has_key != memory_has_key:
+        return False
+    if candidate_has_key:
+        return (
+            memory.temporal_subject == candidate.temporal_subject
+            and memory.temporal_predicate == candidate.temporal_predicate
+        )
+    return True
+
+
 def _find_semantically_covering_memory(
     candidate: CandidateMemory,
     existing: list[MemoryRecord],
@@ -222,6 +260,7 @@ def _old_memory_covers_candidate(
         memory.type != candidate.type
         or memory.origin != "user_asserted"
         or memory.status not in {"dynamic", "pinned"}
+        or not is_current_temporal_memory(memory)
         or memory.sensitivity != candidate.sensitivity
         or memory.temporal_subject
         or memory.temporal_predicate
@@ -235,6 +274,14 @@ def _old_memory_covers_candidate(
         or _looks_superseding(new_content)
         or _has_intent_marker(new_content) != _has_intent_marker(old_content)
     ):
+        return False
+
+    # Embedding similarity plus shared labels is relatedness, not entailment.
+    # Before suppressing a user's new assertion, require the old text to ground
+    # the same proposition (actor, relation, object and polarity).  This keeps
+    # "works at Acme" from swallowing "applied to Acme" and preserves distinct
+    # facts about the same person, pet, product or place.
+    if not has_text_grounding_anchor(new_content, old_content):
         return False
 
     if len(_semantic_text(old_content)) < len(_semantic_text(new_content)):

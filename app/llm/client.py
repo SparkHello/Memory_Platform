@@ -121,7 +121,8 @@ class OpenAICompatibleClient:
                 detail="上游模型 API 返回了无法解析的 JSON",
             ) from exc
         if self.usage_recorder is not None:
-            self.usage_recorder.record_response(
+            await asyncio.to_thread(
+                self.usage_recorder.record_response,
                 payload=data,
                 model=provider.model,
                 kind="chat",

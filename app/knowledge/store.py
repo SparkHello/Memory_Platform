@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 import base64
 import hashlib
@@ -10,6 +11,7 @@ import json
 import math
 import re
 import sqlite3
+import threading
 from typing import Any, Final
 from uuid import uuid4
 
@@ -24,7 +26,11 @@ from app.knowledge.models import (
     KnowledgeUploadSession,
     KnowledgeVersion,
 )
-from app.schema_migrations import apply_schema_migrations, validated_schema_version
+from app.schema_migrations import (
+    apply_schema_migrations,
+    enable_wal_with_retry,
+    validated_schema_version,
+)
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -41,6 +47,16 @@ _MAX_RESTORE_TOTAL_BYTES: Final = 100 * 1024 * 1024
 _READ_MAX_CHARS: Final = 20_000
 _SEARCH_MAX_RESULTS: Final = 20
 _SEARCH_EXCERPT_CHARS: Final = 800
+_KNOWLEDGE_DB_INIT_LOCK = threading.Lock()
+
+
+def _serialize_knowledge_init(method):
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with _KNOWLEDGE_DB_INIT_LOCK:
+            return method(*args, **kwargs)
+
+    return wrapped
 
 # This deliberately small, deterministic floor protects the most common
 # credential and personal-data forms without involving a remote model.  It is
@@ -147,11 +163,13 @@ class KnowledgeStore:
         self.database_path = str(database_path)
         self.max_document_bytes = int(max_document_bytes)
 
+    @_serialize_knowledge_init
     def init_db(self) -> None:
         path = Path(self.database_path)
         if path.parent != Path("."):
             path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            enable_wal_with_retry(connection)
             validated_schema_version(
                 connection,
                 _KNOWLEDGE_SCHEMA_MIGRATIONS,
@@ -319,6 +337,14 @@ class KnowledgeStore:
                     tokenize='trigram'
                 )
                 """
+            )
+            # executescript commits implicitly, so acquire the cross-process
+            # migration lock only after the idempotent bootstrap DDL finishes.
+            connection.execute("BEGIN IMMEDIATE")
+            validated_schema_version(
+                connection,
+                _KNOWLEDGE_SCHEMA_MIGRATIONS,
+                schema_name="knowledge database",
             )
             self._run_migrations(connection)
 
@@ -2371,9 +2397,8 @@ class KnowledgeStore:
             factory=_ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _require_open_upload(

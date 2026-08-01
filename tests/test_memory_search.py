@@ -1,10 +1,16 @@
-﻿from datetime import UTC, datetime, timedelta
+﻿from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 import json
 
 import pytest
 
-from app.memory.search import MemorySearchService, NullEmbeddingClient
+from app.memory.search import MemorySearchService, NullEmbeddingClient, SEARCH_CACHE
 from app.memory.store import MemoryStore
+from app.memory.temporal import (
+    memory_matches_temporal_mode,
+    temporal_query_mode,
+    temporal_query_window,
+)
 
 
 class StaticEmbeddingClient:
@@ -190,6 +196,106 @@ async def test_cached_search_hits_still_apply_time_ripple(
     assert refreshed_neighbor is not None
     assert refreshed_seed.usage_count == 2
     assert refreshed_neighbor.usage_count == 0.5
+
+
+@pytest.mark.asyncio
+async def test_cached_candidates_are_reranked_after_activation_changes(
+    memory_store: MemoryStore,
+) -> None:
+    initially_top = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢咖啡。",
+        type="emotional",
+        importance=8,
+    )
+    later_active = memory_store.create_memory(
+        user_id="default",
+        content="用户也喜欢咖啡。",
+        type="emotional",
+        importance=7,
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+    )
+
+    first = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=1,
+        record_usage=False,
+    )
+    for _ in range(20):
+        memory_store.mark_memories_used(
+            memory_ids=[later_active.id],
+            user_id="default",
+        )
+    second = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=1,
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in first] == [initially_top.id]
+    assert [memory.id for memory in second] == [later_active.id]
+    assert service.last_cache_status == "hit"
+
+
+@pytest.mark.asyncio
+async def test_cached_result_rechecks_local_sensitivity_before_returning(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢咖啡。",
+        importance=8,
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+    )
+    assert await service.search(
+        query="咖啡",
+        user_id="default",
+        record_usage=False,
+    )
+
+    # Keep the cache generation deliberately unchanged to exercise the
+    # defense-in-depth row eligibility check, as in a concurrent update window.
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET sensitivity = 'sensitive' WHERE id = ?",
+            (memory.id,),
+        )
+
+    assert await service.search(
+        query="咖啡",
+        user_id="default",
+        record_usage=False,
+    ) == []
+
+
+def test_concurrent_expired_cache_reads_do_not_raise(memory_store: MemoryStore) -> None:
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+    )
+    key = ("default", "咖啡", 8, False)
+    SEARCH_CACHE[key] = (0.0, "unused", 0, [])
+
+    def read(_: int):
+        return service._cached_search_hits(
+            key,
+            user_id="default",
+            query=str(key[1]),
+            now=1.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(read, range(100)))
+
+    assert results == [None] * 100
 
 
 @pytest.mark.asyncio
@@ -467,7 +573,9 @@ async def test_old_situational_memory_decays_in_ranking(memory_store: MemoryStor
 
 
 @pytest.mark.asyncio
-async def test_expired_temporary_memory_is_downranked(memory_store: MemoryStore) -> None:
+async def test_default_search_excludes_expired_temporal_memory(
+    memory_store: MemoryStore,
+) -> None:
     expired = memory_store.create_memory(
         user_id="default",
         content="用户最近在减少咖啡摄入。",
@@ -482,7 +590,11 @@ async def test_expired_temporary_memory_is_downranked(memory_store: MemoryStore)
         type="emotional",
         importance=3,
     )
-    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
 
     results = await service.search(
         query="咖啡",
@@ -491,7 +603,186 @@ async def test_expired_temporary_memory_is_downranked(memory_store: MemoryStore)
         record_usage=False,
     )
 
-    assert [memory.id for memory in results] == [stable.id, expired.id]
+    assert [memory.id for memory in results] == [stable.id]
+
+
+def test_temporal_intent_prefers_explicit_current_fact_and_supports_relative_windows() -> None:
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+
+    assert temporal_query_mode("之前记住的我现在住哪里", now=now) == "current"
+    assert temporal_query_mode("以后回答时依据我现在住哪里", now=now) == "current"
+    assert temporal_query_mode("用户以前的当前城市是什么", now=now) == "history"
+    assert temporal_query_window("我去年住在哪里", now=now) == (
+        datetime(2025, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("我前年住在哪里", now=now) == (
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2025, 1, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("我明年住在哪里", now=now) == (
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2028, 1, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("我后年住在哪里", now=now) == (
+        datetime(2028, 1, 1, tzinfo=UTC),
+        datetime(2029, 1, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("上个月参加了什么", now=now) == (
+        datetime(2026, 7, 1, tzinfo=UTC),
+        datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("next month plans", now=now) == (
+        datetime(2026, 9, 1, tzinfo=UTC),
+        datetime(2026, 10, 1, tzinfo=UTC),
+    )
+
+    january = datetime(2026, 1, 15, tzinfo=UTC)
+    december = datetime(2026, 12, 15, tzinfo=UTC)
+    assert temporal_query_window("last month", now=january) == (
+        datetime(2025, 12, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert temporal_query_window("下月", now=december) == (
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2027, 2, 1, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "我什么时候住在北京？",
+        "我住过哪些城市？",
+        "Where did I live?",
+        "Which cities have I lived in?",
+    ],
+)
+def test_temporal_intent_understands_past_tense_questions(query: str) -> None:
+    assert temporal_query_mode(query) == "history"
+
+
+def test_timestamped_point_event_remains_eligible_in_history_mode(
+    memory_store: MemoryStore,
+) -> None:
+    point = memory_store.create_memory(
+        user_id="default",
+        content="用户在 2025 年参加了一次马拉松。",
+        type="episodic",
+        valid_from="2025-06-01T08:00:00+00:00",
+    )
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    last_year = temporal_query_window("去年参加了什么", now=now)
+
+    assert memory_matches_temporal_mode(point, mode="history", now=now)
+    assert memory_matches_temporal_mode(point, mode="current", now=now)
+    assert not memory_matches_temporal_mode(point, mode="future", now=now)
+    assert last_year is not None
+    assert memory_matches_temporal_mode(
+        point,
+        mode="history",
+        now=now,
+        query_window=last_year,
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_selects_temporal_version_from_explicit_query_intent(
+    memory_store: MemoryStore,
+) -> None:
+    now = datetime.now(UTC)
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户的当前城市是旧城。",
+        type="semantic",
+        importance=8,
+        valid_from=(now - timedelta(days=730)).isoformat(),
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    current = memory_store.create_memory(
+        user_id="default",
+        content="用户的当前城市是新城。",
+        type="semantic",
+        importance=8,
+        valid_from=(now - timedelta(days=365)).isoformat(),
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    future = memory_store.create_memory(
+        user_id="default",
+        content="用户的当前城市将是未来城。",
+        type="semantic",
+        importance=8,
+        valid_from=(now + timedelta(days=30)).isoformat(),
+        temporal_subject="user",
+        temporal_predicate="current_city",
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    current_results = await service.search(
+        query="用户的当前城市是什么？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+    history_results = await service.search(
+        query="用户以前的当前城市是什么？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+    future_results = await service.search(
+        query="用户未来的当前城市是什么？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in current_results] == [current.id]
+    assert [memory.id for memory in history_results] == [old.id]
+    assert [memory.id for memory in future_results] == [future.id]
+
+
+@pytest.mark.asyncio
+async def test_search_uses_explicit_calendar_window_for_temporal_version(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户在这段时间的雇主是 Acme。",
+        importance=8,
+        valid_from="2024-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    current = memory_store.create_memory(
+        user_id="default",
+        content="用户在这段时间的雇主是 Beta。",
+        importance=8,
+        valid_from="2025-01-01",
+        temporal_subject="user",
+        temporal_predicate="current_employer",
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    results = await service.search(
+        query="用户在 2024 年的雇主是什么？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [old.id]
+    assert current.id not in {memory.id for memory in results}
 
 
 @pytest.mark.asyncio
@@ -625,6 +916,140 @@ async def test_keyword_search_keeps_meaningful_terms_after_query_normalization(
     )
 
     assert [memory.id for memory in results] == [kelivo.id]
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_uses_auditable_category_expansion(
+    memory_store: MemoryStore,
+) -> None:
+    pets = memory_store.create_memory(
+        user_id="default",
+        content="用户养了两只猫，分别叫糯米和十一。",
+        topics=["宠物", "猫"],
+    )
+    laptop = memory_store.create_memory(
+        user_id="default",
+        content="用户使用的笔记本是华硕枪神。",
+        topics=["设备", "硬件配置"],
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    pet_results = await service.search(
+        query="用户有什么宠物",
+        user_id="default",
+        record_usage=False,
+    )
+    computer_results = await service.search(
+        query="用户的电脑是什么",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in pet_results] == [pets.id]
+    assert [memory.id for memory in computer_results] == [laptop.id]
+
+
+@pytest.mark.asyncio
+async def test_fielded_metadata_reranks_the_matching_domain(
+    memory_store: MemoryStore,
+) -> None:
+    photography = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢用手机拍猫，经常分享猫的照片。",
+        topics=["拍照", "偏好"],
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="用户对 AI 模型的信息分析有强烈风格偏好。",
+        topics=["AI分析", "偏好"],
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    results = await service.search(
+        query="用户拍照风格",
+        user_id="default",
+        limit=1,
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [photography.id]
+
+
+@pytest.mark.asyncio
+async def test_relation_gates_keep_metadata_from_answering_a_different_question(
+    memory_store: MemoryStore,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喂西瓜很有分寸，吃完后会控制糖分。",
+        topics=["宠物", "饮食"],
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢给猫准备西瓜，十一吃得很开心。",
+        topics=["宠物", "饮食"],
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢用手机拍猫，经常分享猫的照片。",
+        topics=["拍照", "偏好"],
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    food = await service.search(
+        query="用户喜欢吃什么",
+        user_id="default",
+        record_usage=False,
+    )
+    equipment = await service.search(
+        query="用户的拍照设备",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert food == []
+    assert equipment == []
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_supports_meaningful_single_cjk_character(
+    memory_store: MemoryStore,
+) -> None:
+    cat = memory_store.create_memory(
+        user_id="default",
+        content="用户养了两只猫。",
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    results = await service.search(
+        query="猫",
+        user_id="default",
+        record_usage=False,
+    )
+    low_information = await service.search(
+        query="我",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [cat.id]
+    assert low_information == []
 
 
 @pytest.mark.asyncio

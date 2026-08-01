@@ -17,6 +17,7 @@ from app.usage.context import model_usage_scope
 
 
 logger = logging.getLogger(__name__)
+_MAX_RETAINED_RECENT_TURNS = 200
 
 
 @dataclass(slots=True)
@@ -214,7 +215,7 @@ async def evolve_recent_context(
     compactable = [
         turn
         for turn in older_turns
-        if allow_sensitive_egress or turn.sensitivity == "normal"
+        if allow_sensitive_egress or _turn_is_locally_normal(turn)
     ]
     retained_sensitive = [turn for turn in older_turns if turn not in compactable]
     compactable_text = render_recent_turns(compactable)
@@ -248,6 +249,10 @@ async def evolve_recent_context(
             )
             turns = [*retained_sensitive, *newest_turns]
 
+    # This state is an operational disambiguation window, not an unlimited
+    # transcript archive. Sensitive turns and failed compactions can otherwise
+    # grow the SQLite row without bound.
+    turns = turns[-_MAX_RETAINED_RECENT_TURNS:]
     materialized = materialize_recent_context(
         compressed_summary=compressed_summary,
         recent_turns=turns,
@@ -341,7 +346,7 @@ def _safe_recent_messages(
     safe_stored_turns = [
         turn
         for turn in stored_turns
-        if allow_sensitive_egress or turn.sensitivity == "normal"
+        if allow_sensitive_egress or _turn_is_locally_normal(turn)
     ]
     stored_messages = _messages_from_turns(safe_stored_turns)
     safe_request_messages = [
@@ -353,6 +358,17 @@ def _safe_recent_messages(
     return _latest_user_turns(
         _deduplicated_messages([*stored_messages, *safe_request_messages]),
         limit=recent_turn_limit,
+    )
+
+
+def _turn_is_locally_normal(turn: RecentContextTurn) -> bool:
+    if turn.sensitivity != "normal":
+        return False
+    return (
+        detect_text_sensitivity(
+            "\n".join(part for part in (turn.user, turn.assistant) if part)
+        )
+        == "normal"
     )
 
 
