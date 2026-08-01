@@ -222,15 +222,15 @@ async def chat_completions(
             request.headers.get("X-Memory-Mode"),
             default=settings.chat_gateway_default_memory_mode,
         )
+        conversation_id = _conversation_id(
+            request.headers.get("X-Conversation-Id")
+            or validated.conversation_id
+            or body.get("conversation_id")
+        )
     except RequestValidationError as exc:
         return _request_validation_error_response(exc)
     except HTTPException as exc:
         return _local_gateway_error_response(exc)
-    conversation_id = _conversation_id(
-        request.headers.get("X-Conversation-Id")
-        or validated.conversation_id
-        or body.get("conversation_id")
-    )
 
     raw_messages = body.get("messages")
     messages = deepcopy(raw_messages) if isinstance(raw_messages, list) else []
@@ -536,7 +536,15 @@ def _conversation_id(value: Any) -> str | None:
     normalized = value.strip()
     if not normalized:
         return None
-    return normalized[:_MAX_CONVERSATION_ID_CHARS]
+    if len(normalized) > _MAX_CONVERSATION_ID_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "X-Conversation-Id/conversation_id 最多支持 "
+                f"{_MAX_CONVERSATION_ID_CHARS} 个字符"
+            ),
+        )
+    return normalized
 
 
 def _latest_user_text(messages: list[Any]) -> tuple[str, int]:
@@ -1254,7 +1262,7 @@ def _request_validation_error_response(exc: RequestValidationError) -> Response:
             message=f"Chat Completions 请求无效：{detail}",
             code="memory_gateway_http_422",
         ),
-        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        status_code=422,
         media_type="application/json; charset=utf-8",
     )
 
@@ -1342,7 +1350,9 @@ async def _finalize_turn(
         branch_messages=branch_messages,
         assistant_text=assistant_text,
     )
-    branch_key = f"{user_id}\0{completed_history_fingerprint}"
+    branch_key = (
+        f"{user_id}\0{conversation_id or ''}\0{completed_history_fingerprint}"
+    )
     source_conversation_id = conversation_id
     if completed_history_fingerprint and _RECENT_TURNS.claim(
         branch_key, settings.chat_gateway_turn_ttl_seconds

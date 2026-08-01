@@ -125,7 +125,7 @@ class UsageStore:
                 """,
                 (
                     event_id,
-                    _bounded_text(user_id or "default", 300),
+                    str(user_id or "default"),
                     _bounded_text(operation or "unspecified", 120),
                     _bounded_text(provider or "custom", 60),
                     _bounded_text(provider_code, 10),

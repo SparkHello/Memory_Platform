@@ -307,7 +307,7 @@ class OpenAIChatGatewayClient:
         requested = requested_model.strip()
         if not requested:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                status_code=422,
                 detail="model 不能为空",
             )
         ordered = ordered_configured_providers(

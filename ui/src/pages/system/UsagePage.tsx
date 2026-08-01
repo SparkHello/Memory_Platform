@@ -135,7 +135,28 @@ export function UsagePage({ api }: { api: MemoryApi }) {
                     <span><i className="output" />输出</span>
                   </div>
                 </div>
-                <div className="usage-chart" role="img" aria-label="每日输入和输出 Token 柱状图">
+                <table className="sr-only">
+                  <caption>每日输入、输出 Token 与可计费金额</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">日期</th>
+                      <th scope="col">输入 Token</th>
+                      <th scope="col">输出 Token</th>
+                      <th scope="col">可计费金额</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleDaily.map((day) => (
+                      <tr key={day.date}>
+                        <th scope="row">{day.date}</th>
+                        <td>{tokenText(day.input_tokens)}</td>
+                        <td>{tokenText(day.output_tokens)}</td>
+                        <td>{coverageAmountText(day)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="usage-chart" aria-hidden="true">
                   {visibleDaily.map((day) => {
                     const inputHeight = day.input_tokens
                       ? Math.max(2, (day.input_tokens / maxDailyTokens) * 100)
@@ -144,11 +165,11 @@ export function UsagePage({ api }: { api: MemoryApi }) {
                       ? Math.max(2, (day.output_tokens / maxDailyTokens) * 100)
                       : 0;
                     return (
-                    <div
-                      className="usage-day"
-                      key={day.date}
-                      title={`${day.date} · 输入 ${tokenText(day.input_tokens)} · 输出 ${tokenText(day.output_tokens)} · ${coverageAmountText(day)}`}
-                    >
+                      <div
+                        className="usage-day"
+                        key={day.date}
+                        title={`${day.date} · 输入 ${tokenText(day.input_tokens)} · 输出 ${tokenText(day.output_tokens)} · ${coverageAmountText(day)}`}
+                      >
                         <div className="usage-bar">
                           <span className="usage-bar-output" style={{ height: `${outputHeight}%` }} />
                           <span className="usage-bar-input" style={{ height: `${inputHeight}%` }} />

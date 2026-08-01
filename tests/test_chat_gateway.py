@@ -469,6 +469,67 @@ def test_gateway_uses_persisted_recent_turns_with_dynamic_conversation_id(
     assert state.turn_count == 2
 
 
+def test_identical_dynamic_conversations_keep_separate_recent_context(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    body = {
+        "model": "memory-auto",
+        "messages": [{"role": "user", "content": "你好"}],
+    }
+
+    first = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Conversation-Id": "conversation-a"},
+        json=body,
+    )
+    second = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Conversation-Id": "conversation-b"},
+        json=body,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    for conversation_id in ("conversation-a", "conversation-b"):
+        state = memory_store.get_recent_context_summary_for_conversation(
+            user_id="default",
+            conversation_id=conversation_id,
+        )
+        assert state is not None
+        assert state.turn_count == 1
+
+
+def test_gateway_rejects_overlong_conversation_ids(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_gateway,
+) -> None:
+    long_id = "c" * 201
+    requests = (
+        (
+            {**auth_headers, "X-Conversation-Id": long_id},
+            _chat_body(),
+        ),
+        (
+            auth_headers,
+            {**_chat_body(), "conversation_id": long_id},
+        ),
+    )
+
+    for headers, body in requests:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json=body,
+        )
+        assert response.status_code == 400
+        assert "最多支持 200 个字符" in response.json()["error"]["message"]
+
+    assert fake_gateway.payloads == []
+
+
 def test_gateway_matches_persisted_branch_without_client_conversation_id(
     client: TestClient,
     auth_headers: dict[str, str],

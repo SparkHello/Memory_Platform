@@ -323,7 +323,7 @@ export function RecentContextPage({
                 action={{ label: "清除搜索", onClick: () => setQuery("") }}
               />
             ) : (
-              <div className="branch-tree" role="tree" aria-label="对话上下文分支树">
+              <div className="branch-tree">
                 {tree.roots.map((node) => (
                   <BranchNodeView
                     key={node.id}
@@ -516,7 +516,7 @@ function BranchNodeView({
       </div>
 
       {open && children.length > 0 && (
-        <div className="branch-children" role="group">
+        <div className="branch-children">
           {children.map((child) => (
             <BranchNodeView
               key={child.id}

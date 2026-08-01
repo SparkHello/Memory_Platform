@@ -32,8 +32,8 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# starlette 1.3 的 TestClient 优先使用 httpx2，缺失时回退 httpx 并发出该条
-# StarletteDeprecationWarning；此处仅精准过滤这一条，不隐藏其他警告。
+# 新版 Starlette 的 TestClient 优先使用 httpx2，缺失时回退 httpx 并发出该条
+# 警告；按完整消息过滤可同时兼容其不同版本使用的警告类别。
 filterwarnings = [
-    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:Warning",
 ]

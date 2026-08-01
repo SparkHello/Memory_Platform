@@ -46,6 +46,32 @@ def test_parse_usage_supports_openai_and_deepseek_cache_fields() -> None:
     assert parse_usage(None)["available"] is False
 
 
+def test_usage_store_preserves_full_user_isolation_key(tmp_path) -> None:
+    store = UsageStore(str(tmp_path / "usage.db"))
+    store.init_db()
+    shared_prefix = "u" * 300
+    long_user_id = f"{shared_prefix}-alice"
+
+    store.record_response(
+        user_id=long_user_id,
+        operation="chat_completion",
+        provider="deepseek",
+        provider_code="D",
+        model="deepseek-v4-flash",
+        kind="chat",
+        payload={
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            }
+        },
+    )
+
+    assert store.summary(user_id=long_user_id, days=None)["totals"]["calls"] == 1
+    assert store.summary(user_id=shared_prefix, days=None)["totals"]["calls"] == 0
+
+
 def test_usage_store_prices_known_models_and_keeps_unknowns_visible(
     tmp_path,
 ) -> None:

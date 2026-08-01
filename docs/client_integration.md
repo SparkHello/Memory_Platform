@@ -38,7 +38,8 @@ per completed history node. A normal continuation selects its exact parent; edit
 older message or regenerating an answer creates a sibling branch rather than mutating
 the other path. Clients that can send a genuinely dynamic conversation ID may still
 use either `X-Conversation-Id` or the local `conversation_id` request-body extension,
-especially when they send only incremental messages.
+especially when they send only incremental messages. Both forms accept at most 200
+characters; the gateway rejects longer values with HTTP 400 instead of truncating them.
 
 The default memory behavior is `read-write`. It can be overridden per request:
 
