@@ -225,6 +225,7 @@ class Settings(BaseSettings):
         validation_alias="KNOWLEDGE_AGENT_TIMEOUT_SECONDS",
     )
     eval_dir: str = Field(default="eval", validation_alias="EVAL_DIR")
+    ui_dist_dir: str = Field(default="", validation_alias="UI_DIST_DIR")
     request_timeout_seconds: float = Field(
         default=60.0,
         validation_alias="REQUEST_TIMEOUT_SECONDS",

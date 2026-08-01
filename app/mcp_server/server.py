@@ -39,6 +39,9 @@ from app.mcp_server.context import current_user_id
 
 logger = logging.getLogger(__name__)
 
+# MCP 工具的 recent context summary 单条长度上限（工具契约，不随配置变化）。
+MAX_RECENT_CONTEXT_SUMMARY_CHARS = 12000
+
 SERVER_INSTRUCTIONS = """这是用户的长期记忆与独立长文本知识服务。
 
 长期记忆工具用于用户个人背景、偏好、关系、习惯、计划和过去经历：
@@ -989,8 +992,13 @@ async def update_recent_context_summary(conversation_id: str = "", summary: str 
     summary_text = (summary or "").strip()
     if not summary_text:
         return _dump({"updated": False, "error": "summary is required"})
-    if len(summary_text) > 12000:
-        return _dump({"updated": False, "error": "summary exceeds 12000 characters"})
+    if len(summary_text) > MAX_RECENT_CONTEXT_SUMMARY_CHARS:
+        return _dump(
+            {
+                "updated": False,
+                "error": f"summary exceeds {MAX_RECENT_CONTEXT_SUMMARY_CHARS} characters",
+            }
+        )
     store, _ = _services()
     saved = await anyio.to_thread.run_sync(
         partial(

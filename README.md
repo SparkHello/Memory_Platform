@@ -222,6 +222,7 @@ curl.exe `
 | `KNOWLEDGE_AGENT_TIMEOUT_SECONDS` | `25` | 单次知识代理搜索总超时。 |
 | `LLM_RATE_LIMIT_COOLDOWN_SECONDS` | `300` | 任一共享 provider 返回 429 后的进程内最短冷却秒数；更长的 `Retry-After` 优先。冷却状态在记忆任务和知识代理间共享，只保存在内存中，不回写 `.env`。 |
 | `EVAL_DIR` | `eval` | 按 user id 哈希分目录保存召回评估快照、标注和结果。应保持 gitignored。 |
+| `UI_DIST_DIR` | 空 | Web 控制台静态文件目录；为空时使用后端旁的 `<repo>/ui/dist`。 |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | 上游 HTTP 请求超时。 |
 | `DECAY_*` | 见 `app/config.py` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数。 |
 | `TIME_RIPPLE_DELTA` | `0.0` | 实验性邻近记忆激活增量。`0.0` 表示关闭。 |

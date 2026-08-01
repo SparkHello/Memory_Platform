@@ -25,6 +25,13 @@ UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
 logger = logging.getLogger(__name__)
 
 
+def _resolve_ui_dist_dir(settings) -> Path:
+    configured = settings.ui_dist_dir.strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return UI_DIST_DIR
+
+
 class UTF8JSONResponse(JSONResponse):
     # Windows PowerShell 5.1 等旧客户端在 Content-Type 缺少 charset 时按 ISO-8859-1 解码，中文会乱码
     media_type = "application/json; charset=utf-8"
@@ -92,7 +99,11 @@ def create_app() -> FastAPI:
 
     app.mount(
         "/ui",
-        UIStaticFiles(directory=UI_DIST_DIR, html=True, check_dir=False),
+        UIStaticFiles(
+            directory=_resolve_ui_dist_dir(get_settings()),
+            html=True,
+            check_dir=False,
+        ),
         name="memory-console",
     )
     # MCP streamable HTTP 子应用兜底挂载在根路径，实际端点是 /mcp（FastAPI 自有路由优先匹配）
