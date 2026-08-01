@@ -4,8 +4,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import render_core_memory_consolidation_messages
-from app.memory.extractor import detect_text_sensitivity, has_text_grounding_anchor
+from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRecord
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime, _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest

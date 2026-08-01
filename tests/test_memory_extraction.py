@@ -886,7 +886,7 @@ async def test_deterministic_sensitive_floor_overrides_normal_llm_label(
 
 
 def test_detect_text_sensitivity_is_reusable_without_llm() -> None:
-    from app.memory.extractor import detect_text_sensitivity
+    from app.memory.redaction import detect_text_sensitivity
 
     assert detect_text_sensitivity("我喜欢黑咖啡") == "normal"
     assert detect_text_sensitivity("我的邮箱是 user@example.com") == "private"

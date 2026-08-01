@@ -41,9 +41,9 @@ from app.memory.conversation_context import (
     safe_context_quote_source,
     safe_extraction_context,
 )
-from app.memory.extractor import detect_text_sensitivity
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import MemoryRecord, RecentContextSummary
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.search import EmbeddingClient, MemorySearchService, NullEmbeddingClient
 from app.memory.store import MemoryStore
 from app.openai_compat.gateway_client import (

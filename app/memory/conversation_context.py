@@ -8,8 +8,8 @@ import anyio
 
 from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import render_conversation_context_compression_messages
-from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import RecentContextSummary, RecentContextTurn
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_json_object
 from app.openai_compat.schemas import ChatCompletionRequest

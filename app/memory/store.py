@@ -6,7 +6,6 @@ import sqlite3
 
 from pydantic import ValidationError
 
-from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import (
     ConversationBranchNode,
     CoreMemorySection,
@@ -31,6 +30,7 @@ from app.memory.models import (
     new_memory_id,
     utc_now_iso,
 )
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.utils import _parse_iso_datetime
 
 

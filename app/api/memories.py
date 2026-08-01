@@ -35,11 +35,7 @@ from app.memory.evaluation import (
     run_recall_eval,
     save_labels,
 )
-from app.memory.extractor import (
-    detect_text_sensitivity,
-    sensitivity_floor,
-    validate_candidate_for_save,
-)
+from app.memory.extractor import validate_candidate_for_save
 from app.memory.graph_traverse import traverse_memory_network
 from app.memory.health import MemoryHealthChecker
 from app.memory.ingest import MemoryIngestService
@@ -76,7 +72,11 @@ from app.memory.report import (
     format_memory_export,
     restore_memory_export,
 )
-from app.memory.redaction import redact_memory_payload
+from app.memory.redaction import (
+    detect_text_sensitivity,
+    redact_memory_payload,
+    sensitivity_floor,
+)
 from app.memory.search import (
     EmbeddingClient,
     MemorySearchService,

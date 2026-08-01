@@ -5,9 +5,9 @@ from app.llm.client import OpenAICompatibleClient
 from app.memory.extractor import (
     ExtractionOutcome,
     LLMMemoryExtractor,
-    detect_text_sensitivity,
 )
 from app.memory.models import MemoryIngestItemResult, MemoryIngestResult
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.resolver import MemoryResolver
 from app.memory.search import EmbeddingClient
 from app.memory.store import MemoryStore

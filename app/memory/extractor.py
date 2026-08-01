@@ -11,7 +11,11 @@ from app.llm.prompts import (
     render_memory_extraction_messages,
 )
 from app.memory.extraction_hints import apply_extraction_hints
-from app.memory.models import CandidateMemory, MemorySensitivity
+from app.memory.models import CandidateMemory
+from app.memory.redaction import (
+    detected_sensitive_categories,
+    sensitivity_floor,
+)
 from app.memory.review_policy import normalize_time_uncertain_candidate
 from app.memory.utils import _parse_json_object, _terms
 from app.openai_compat.schemas import ChatCompletionRequest
@@ -79,118 +83,6 @@ _MODEL_EXTRACTION_REASON_CODES = frozenset(
         "other",
     }
 )
-
-_SENSITIVITY_RANK = {"normal": 0, "private": 1, "sensitive": 2}
-
-# These patterns intentionally require either a high-risk context word or a
-# recognizable identifier shape. They are a local safety floor, not a general
-# purpose PII classifier.
-_SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
-    "credential": (
-        r"密码",
-        r"口令",
-        r"验证码",
-        r"密钥",
-        r"私钥",
-        r"助记词",
-        r"\bpass(?:word|code)\b",
-        r"\bpin\s*(?:code)?\b",
-        r"\botp\b",
-        r"\bapi[-_ ]?key\b",
-        r"\baccess[-_ ]?token\b",
-        r"\bsecret[-_ ]?key\b",
-        r"\bprivate[-_ ]?key\b",
-        r"\bseed phrase\b",
-        r"\b(?:sk|pk|token)[-_][A-Za-z0-9_-]{4,}\b",
-        r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
-        r"\bAKIA[A-Z0-9]{16}\b",
-    ),
-    "government_id": (
-        r"身份证",
-        r"护照号",
-        r"社保号",
-        r"驾驶证号",
-        r"\bpassport (?:number|no\.?|id)\b",
-        r"\bsocial security\b",
-        r"\bssn\b",
-        r"(?<!\d)\d{17}[\dXx](?!\d)",
-    ),
-    "health": (
-        r"健康隐私",
-        r"病历",
-        r"确诊",
-        r"诊断",
-        r"疾病",
-        r"患有",
-        r"过敏",
-        r"用药",
-        r"药物",
-        r"处方",
-        r"病史",
-        r"症状",
-        r"治疗",
-        r"手术",
-        r"血糖",
-        r"血压",
-        r"心率",
-        r"糖尿病",
-        r"癌症",
-        r"抑郁症",
-        r"焦虑症",
-        r"\bmedical\b",
-        r"\bdiagnos(?:is|ed)\b",
-        r"\bdisease\b",
-        r"\ballerg(?:y|ic)\b",
-        r"\bmedication\b",
-        r"\bprescription\b",
-    ),
-    "financial_account": (
-        r"银行卡",
-        r"信用卡",
-        r"银行账户",
-        r"银行账号",
-        r"支付账号",
-        r"账户余额",
-        r"\bcredit card\b",
-        r"\bdebit card\b",
-        r"\bbank account\b",
-        r"\baccount balance\b",
-        r"(?<!\d)(?:\d[\s-]?){13,19}(?!\d)",
-    ),
-    "precise_address": (
-        r"家庭住址",
-        r"家庭地址",
-        r"详细地址",
-        r"门牌号",
-        r"收货地址",
-        r"\bhome address\b",
-        r"\bstreet address\b",
-        r"(?:省|市|区|县).{0,20}(?:路|街|道|巷|弄).{0,10}\d+\s*号",
-        r"\b\d{1,6}\s+[A-Za-z][A-Za-z .'-]{1,40}\s+(?:Street|St|Road|Rd|Avenue|Ave)\b",
-    ),
-}
-
-_PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
-    "contact": (
-        r"手机号",
-        r"电话号码",
-        r"电子邮箱",
-        r"邮箱地址",
-        r"\bphone number\b",
-        r"\be-?mail address\b",
-        r"(?<!\d)1[3-9]\d{9}(?!\d)",
-        r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])",
-    ),
-    "private_finance": (
-        r"工资",
-        r"收入",
-        r"债务",
-        r"负债",
-        r"\bsalary\b",
-        r"\bincome\b",
-        r"\bdebt\b",
-    ),
-}
 
 _CREDENTIAL_VALUE_PATTERN = re.compile(
     r"(?:密码|口令|验证码|密钥|私钥|助记词|password|passcode|"
@@ -281,25 +173,6 @@ _GROUNDING_NEGATION_MARKERS = (
     "dislike",
     "hate",
 )
-
-
-def detect_text_sensitivity(text: str) -> MemorySensitivity:
-    """Return the deterministic local sensitivity floor for arbitrary text."""
-    sensitive_categories, private_categories = _detected_sensitive_categories(text)
-    if sensitive_categories:
-        return "sensitive"
-    if private_categories:
-        return "private"
-    return "normal"
-
-
-def sensitivity_floor(
-    declared: MemorySensitivity,
-    *texts: str | None,
-) -> MemorySensitivity:
-    """Raise a declared sensitivity to the deterministic local floor."""
-    detected = detect_text_sensitivity("\n".join(text for text in texts if text))
-    return max((declared, detected), key=_SENSITIVITY_RANK.__getitem__)
 
 
 def has_text_grounding_anchor(candidate_text: str, evidence_text: str) -> bool:
@@ -851,8 +724,8 @@ def _apply_sensitivity_floor(candidate: CandidateMemory) -> None:
 
 
 def _grounding_gate_reason(candidate: CandidateMemory, *, quote: str) -> str | None:
-    memory_sensitive, memory_private = _detected_sensitive_categories(candidate.memory)
-    quote_sensitive, quote_private = _detected_sensitive_categories(quote)
+    memory_sensitive, memory_private = detected_sensitive_categories(candidate.memory)
+    quote_sensitive, quote_private = detected_sensitive_categories(quote)
     unsupported_categories = (memory_sensitive - quote_sensitive) | (memory_private - quote_private)
     if unsupported_categories:
         categories = ", ".join(sorted(unsupported_categories))
@@ -928,20 +801,6 @@ def _grounding_has_negation(text: str) -> bool:
     return any(marker in lowered for marker in _GROUNDING_NEGATION_MARKERS)
 
 
-def _detected_sensitive_categories(text: str) -> tuple[set[str], set[str]]:
-    sensitive = {
-        category
-        for category, patterns in _SENSITIVE_CATEGORY_PATTERNS.items()
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-    }
-    private = {
-        category
-        for category, patterns in _PRIVATE_CATEGORY_PATTERNS.items()
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-    }
-    return sensitive, private
-
-
 def _structured_values(text: str) -> set[tuple[str, str]]:
     values: set[tuple[str, str]] = set()
     values.update(("邮箱", match.group(0)) for match in _EMAIL_PATTERN.finditer(text))
@@ -999,10 +858,10 @@ def _sensitive_evidence_quotes(candidate: CandidateMemory, quote: str) -> list[s
     if value_clauses:
         return value_clauses
 
-    memory_sensitive, memory_private = _detected_sensitive_categories(candidate.memory)
+    memory_sensitive, memory_private = detected_sensitive_categories(candidate.memory)
     category_clauses: list[str] = []
     for clause in clauses:
-        clause_sensitive, clause_private = _detected_sensitive_categories(clause)
+        clause_sensitive, clause_private = detected_sensitive_categories(clause)
         if (memory_sensitive & clause_sensitive) or (memory_private & clause_private):
             category_clauses.append(clause)
     return category_clauses or [quote]

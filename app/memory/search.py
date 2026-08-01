@@ -13,8 +13,8 @@ import anyio
 import httpx
 
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
-from app.memory.extractor import detect_text_sensitivity
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.store import MemoryStore
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
 from app.usage.context import model_usage_scope
