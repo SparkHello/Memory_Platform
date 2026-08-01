@@ -323,6 +323,7 @@ class KnowledgeStore:
         for version, step in _KNOWLEDGE_SCHEMA_MIGRATIONS:
             if current >= version:
                 continue
+            assert isinstance(version, int)  # 迁移表必须全部是 int 字面量版本号
             step(connection)
             connection.execute(f"PRAGMA user_version = {version}")
 
