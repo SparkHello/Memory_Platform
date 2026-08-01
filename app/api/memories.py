@@ -515,7 +515,7 @@ def upsert_recent_context_summary(
     summary_text = body.summary.strip()
     if not summary_text:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="summary must not be empty",
         )
     conversation_id = body.conversation_id.strip() if body.conversation_id else None
@@ -868,7 +868,7 @@ def memory_evaluation_recall_workbench(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except EvaluationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.put("/evaluation/recall/labels")
@@ -886,7 +886,7 @@ def memory_evaluation_recall_labels(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except EvaluationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/evaluation/recall/run")
@@ -912,7 +912,7 @@ def memory_evaluation_recall_run(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except EvaluationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/re-embed")
@@ -940,7 +940,7 @@ async def re_embed_memories(
         memory_ids = list(dict.fromkeys(body.memory_ids))  # 去重保序
         if not memory_ids:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="memory_ids 不能为空列表",
             )
     elif body.scan:
@@ -951,7 +951,7 @@ async def re_embed_memories(
         )
     else:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="请指定 memory_ids 或设置 scan=true",
         )
 
@@ -1108,7 +1108,7 @@ def apply_memory_review_action(
         )
         if result.memory is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=result.reason,
             )
         results.append(
@@ -1191,7 +1191,7 @@ async def preview_memory_review_revision(
             detect_text_sensitivity(review_text) != "normal"
         ):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "敏感内容未发送给远程体检模型；如确需处理，请显式启用 "
                     "ALLOW_SENSITIVE_EGRESS"
@@ -1519,7 +1519,7 @@ def create_search_feedback(
     memory_id = body.memory_id.strip() if body.memory_id else None
     if body.feedback != "missing" and not memory_id:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="memory_id 是必填项",
         )
     if memory_id and store.get_memory(memory_id=memory_id, user_id=user_id) is None:
@@ -1570,7 +1570,7 @@ def update_memory_spaces(
         )
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     if memory is None:
@@ -1608,24 +1608,24 @@ def update_memory(
     if "content" in body.model_fields_set:
         if body.content is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="content 不能为 null",
             )
         content = body.content.strip()
         if not content:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="content 不能为空",
             )
         updates["content"] = content
     if "topics" in body.model_fields_set and body.topics is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="topics 不能为 null",
         )
     if "entities" in body.model_fields_set and body.entities is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="entities 不能为 null",
         )
 
@@ -1634,7 +1634,7 @@ def update_memory(
             updates["valid_from"] = normalize_iso_text(body.valid_from)
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="valid_from must be an ISO date or datetime",
             ) from exc
     if "temporal_subject" in body.model_fields_set:
@@ -1649,7 +1649,7 @@ def update_memory(
     # 校验 status 值
     if "status" in body.model_fields_set and body.status not in {"dynamic", "resolved", "archived", "pinned"}:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"无效的 status 值: {body.status}，仅支持 dynamic/resolved/archived/pinned",
         )
 
@@ -1683,7 +1683,7 @@ def update_memory(
         )
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     if memory is None:
@@ -1759,7 +1759,7 @@ def purge_deleted_memory(
 ) -> dict:
     if body.confirm_memory_id != memory_id:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="confirm_memory_id 必须与路径中的 memory_id 完全一致",
         )
 
