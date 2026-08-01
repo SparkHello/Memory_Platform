@@ -4,7 +4,7 @@ import time
 from app.memory.search import (
     _EMBEDDING_CACHE,
     _EMBEDDING_CACHE_TTL,
-    _SEARCH_CACHE,
+    SEARCH_CACHE,
     _SEARCH_CACHE_TTL,
     _normalize_query,
     _now,
@@ -194,11 +194,11 @@ class TestSearchCache:
         fake = FakeEmbeddingClient(vector=[0.5, 0.5, 0.5])
         service = MemorySearchService(store=memory_store, embedding_client=fake)
 
-        cache_size_before = len(_SEARCH_CACHE)
+        cache_size_before = len(SEARCH_CACHE)
         result = await service.search(query="nothing", user_id="default", limit=5)
         assert result == []
         # 空结果不应写入 L2
-        assert len(_SEARCH_CACHE) == cache_size_before
+        assert len(SEARCH_CACHE) == cache_size_before
 
 
 class TestCacheMaxSize:
@@ -237,7 +237,7 @@ class TestEvalCacheBypass:
         )
         assert hits  # 确实命中
         # 评测搜索不得污染线上共享缓存
-        assert _SEARCH_CACHE == {}
+        assert SEARCH_CACHE == {}
 
     async def test_disabled_cache_ignores_existing_entry(self, memory_store):
         coffee = memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡。")
@@ -246,7 +246,7 @@ class TestEvalCacheBypass:
         # 投毒：手工塞入一个对该 (user, query, limit) 校验有效、但指向无关记忆的缓存条目，
         # 模拟另一种模式（或线上检索）先跑过、把结果留在了共享缓存里。
         key = ("default", _normalize_query("咖啡"), 8, False)
-        _SEARCH_CACHE[key] = (
+        SEARCH_CACHE[key] = (
             _now() + 999,
             memory_store.get_memories_max_updated_at(user_id="default"),
             memory_store.get_active_memory_count(user_id="default"),

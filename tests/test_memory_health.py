@@ -1,7 +1,7 @@
 import json
 
 from app.memory.health import MemoryHealthChecker
-from app.memory.search import _SEARCH_CACHE
+from app.memory.search import SEARCH_CACHE
 from app.memory.store import MemoryStore
 
 
@@ -193,7 +193,7 @@ def test_memory_health_turns_export_failure_into_issue(monkeypatch, memory_store
 def test_memory_health_reports_search_cache_and_decision_log_info(
     memory_store: MemoryStore,
 ):
-    _SEARCH_CACHE[("default", "coffee", 5)] = (
+    SEARCH_CACHE[("default", "coffee", 5)] = (
         9999999999.0,
         "2026-06-16T00:00:00+00:00",
         1,

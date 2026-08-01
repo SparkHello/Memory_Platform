@@ -41,7 +41,7 @@ from app.memory.extractor import (
     validate_candidate_for_save,
 )
 from app.memory.graph_traverse import traverse_memory_network
-from app.memory.health import MemoryHealthChecker, _embedding_vector
+from app.memory.health import MemoryHealthChecker
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
     CandidateMemory,
@@ -84,6 +84,7 @@ from app.memory.search import (
     search_cache_stats,
 )
 from app.memory.store import MemoryStore
+from app.memory.utils import parse_embedding_vector
 from app.usage.context import model_usage_scope
 
 router = APIRouter(

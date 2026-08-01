@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from itertools import combinations
 
 from app.memory.models import MemoryRecord
-from app.memory.network import _memory_similarity
+from app.memory.network import memory_similarity
 from app.memory.store import MemoryStore
 from app.memory.utils import _memory_embedding_vector
 
@@ -140,7 +140,7 @@ def _build_similarity_edges(
 ) -> list[TraversalEdge]:
     scored_edges: list[TraversalEdge] = []
     for left, right in combinations(memories, 2):
-        score = _memory_similarity(left, right, vectors=vectors)
+        score = memory_similarity(left, right, vectors=vectors)
         if score < threshold:
             continue
         scored_edges.append(

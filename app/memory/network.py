@@ -80,7 +80,7 @@ def build_memory_network(
 
     similarity_edges = []
     for left, right in combinations(memories, 2):
-        score = _memory_similarity(left, right, vectors=vectors)
+        score = memory_similarity(left, right, vectors=vectors)
         if score < threshold:
             continue
         similarity_edges.append((score, left.id, right.id))
@@ -217,7 +217,7 @@ def _append_edge(edges: list[dict], edge_keys: set[tuple[str, str, str]], edge: 
     edges.append(edge)
 
 
-def _memory_similarity(
+def memory_similarity(
     left: MemoryRecord,
     right: MemoryRecord,
     *,

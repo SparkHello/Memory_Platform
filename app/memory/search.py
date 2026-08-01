@@ -27,7 +27,7 @@ from app.usage.recorder import UsageRecorder
 _EMBEDDING_CACHE: dict[tuple, tuple[float, list[float]]] = {}
 """L1: (user_id, normalized_query) -> (expires_at, embedding_vector)"""
 
-_SEARCH_CACHE: dict[tuple, tuple[float, str, int, list[dict[str, object]]]] = {}
+SEARCH_CACHE: dict[tuple, tuple[float, str, int, list[dict[str, object]]]] = {}
 """L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, active_count, hit payloads)"""
 
 _EMBEDDING_CACHE_MAX = 512
@@ -586,18 +586,18 @@ class MemorySearchService:
         user_id: str,
         now: float,
     ) -> list[MemorySearchHit] | None:
-        if key not in _SEARCH_CACHE:
+        if key not in SEARCH_CACHE:
             return None
 
-        expires_at, max_updated_at, active_count, payloads = _SEARCH_CACHE[key]
+        expires_at, max_updated_at, active_count, payloads = SEARCH_CACHE[key]
         if now >= expires_at:
-            del _SEARCH_CACHE[key]
+            del SEARCH_CACHE[key]
             return None
 
         current_max = self.store.get_memories_max_updated_at(user_id=user_id)
         current_count = self.store.get_active_memory_count(user_id=user_id)
         if not current_max or current_max != max_updated_at or current_count != active_count:
-            del _SEARCH_CACHE[key]
+            del SEARCH_CACHE[key]
             return None
 
         hits: list[MemorySearchHit] = []
@@ -627,7 +627,7 @@ class MemorySearchService:
             )
             _refresh_hit_ranking(hits[-1])
         if not hits:
-            del _SEARCH_CACHE[key]
+            del SEARCH_CACHE[key]
             return None
         return hits
 
@@ -647,13 +647,13 @@ class MemorySearchService:
     ) -> None:
         if not hits:
             return
-        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
-            _cleanup_expired(_SEARCH_CACHE, now)
-        if len(_SEARCH_CACHE) < _SEARCH_CACHE_MAX:
+        if len(SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            _cleanup_expired(SEARCH_CACHE, now)
+        if len(SEARCH_CACHE) < _SEARCH_CACHE_MAX:
             max_updated = self.store.get_memories_max_updated_at(user_id=user_id)
             active_count = self.store.get_active_memory_count(user_id=user_id)
             if max_updated:
-                _SEARCH_CACHE[key] = (
+                SEARCH_CACHE[key] = (
                     now + _SEARCH_CACHE_TTL,
                     max_updated,
                     active_count,

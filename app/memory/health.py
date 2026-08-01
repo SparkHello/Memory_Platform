@@ -10,8 +10,9 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.report import build_memory_export
-from app.memory.search import _SEARCH_CACHE
+from app.memory.search import SEARCH_CACHE
 from app.memory.store import MemoryStore
+from app.memory.utils import parse_embedding_vector
 
 
 class MemoryHealthChecker:
@@ -243,7 +244,7 @@ class MemoryHealthChecker:
                     )
                 )
                 continue
-            vector = _embedding_vector(raw_embedding)
+            vector = parse_embedding_vector(raw_embedding)
             if vector is None:
                 issues.append(
                     _issue(
@@ -327,7 +328,7 @@ class MemoryHealthChecker:
         active_memory_ids: set[str],
     ) -> list[DatabaseHealthIssue]:
         issues: list[DatabaseHealthIssue] = []
-        for key, value in list(_SEARCH_CACHE.items()):
+        for key, value in list(SEARCH_CACHE.items()):
             if not isinstance(key, tuple) or not key or key[0] != user_id:
                 continue
             if not isinstance(value, tuple) or len(value) < 4:
@@ -466,19 +467,6 @@ def _string_values(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item]
-
-
-def _embedding_vector(raw_value: str) -> list[float] | None:
-    try:
-        values = json.loads(raw_value)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(values, list):
-        return None
-    try:
-        return [float(value) for value in values]
-    except (TypeError, ValueError):
-        return None
 
 
 def _extract_memory_references(value: Any) -> set[str]:

@@ -11,7 +11,7 @@ _EMBEDDING_VECTOR_CACHE_MAX = 2048
 _embedding_vector_cache: OrderedDict[tuple[str, str], list[float] | None] = OrderedDict()
 
 
-def _parse_embedding_vector(raw_json: str | None) -> list[float] | None:
+def parse_embedding_vector(raw_json: str | None) -> list[float] | None:
     if not raw_json:
         return None
     try:
@@ -36,7 +36,7 @@ def _cached_embedding_vector(
     if key in _embedding_vector_cache:
         _embedding_vector_cache.move_to_end(key)
         return _embedding_vector_cache[key]
-    vector = _parse_embedding_vector(embedding_json)
+    vector = parse_embedding_vector(embedding_json)
     if len(_embedding_vector_cache) >= _EMBEDDING_VECTOR_CACHE_MAX:
         _embedding_vector_cache.popitem(last=False)
     _embedding_vector_cache[key] = vector

@@ -44,7 +44,7 @@ _DECISION_LOG_RETENTION_LIMIT = 5000
 _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT = 5000
 
 
-class _ClosingSQLiteConnection(sqlite3.Connection):
+class ClosingSQLiteConnection(sqlite3.Connection):
     """sqlite3 的 context manager 只负责 commit/rollback，不关闭连接。
 
     本项目的所有访问都写成 `with self._connect() as connection:`，
@@ -2830,7 +2830,7 @@ class MemoryStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
-            factory=_ClosingSQLiteConnection,
+            factory=ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")

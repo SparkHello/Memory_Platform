@@ -502,7 +502,10 @@ class KnowledgeSearchAgent:
         except asyncio.TimeoutError:
             metadata.fallback_reason = "local_search_timeout"
             return self._finish([], metadata, started)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "knowledge local search failed: %s", exc, exc_info=True
+            )
             metadata.fallback_reason = "local_search_failed"
             return self._finish([], metadata, started)
 
@@ -653,6 +656,12 @@ class KnowledgeSearchAgent:
                 used_model = _response_model(raw, fallback=model)
                 calls = _extract_tool_calls(raw)
             except Exception as exc:
+                logger.warning(
+                    "knowledge agent %s phase LLM call failed: %s",
+                    phase,
+                    _agent_failure_reason(exc),
+                    exc_info=True,
+                )
                 return _LoopOutcome(
                     selected_refs=[],
                     rounds=round_number,
@@ -725,7 +734,13 @@ class KnowledgeSearchAgent:
                     tool_payload = {"ok": False, "error": exc.reason}
                     selection = None
                     needs_pro = False
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "knowledge agent tool %s failed: %s",
+                        call.name,
+                        exc,
+                        exc_info=True,
+                    )
                     round_invalid = True
                     last_failure = "local_tool_failed"
                     metadata.tool_steps.append(

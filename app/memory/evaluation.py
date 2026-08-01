@@ -21,7 +21,7 @@ from app.memory.search import (
     RECALL_CANDIDATE_POOL,
     _memory_is_locally_sensitive,
 )
-from app.memory.store import MemoryStore, _ClosingSQLiteConnection
+from app.memory.store import MemoryStore, ClosingSQLiteConnection
 
 
 DEFAULT_EVAL_DIR = "eval"
@@ -88,7 +88,7 @@ class _EvaluationMemoryStore(MemoryStore):
         connection = sqlite3.connect(
             f"file:{uri_path}?mode=ro",
             uri=True,
-            factory=_ClosingSQLiteConnection,
+            factory=ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=5000")
