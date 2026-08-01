@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from datetime import UTC, datetime
 import json
+import math
 import re
 
 
@@ -18,12 +19,18 @@ def parse_embedding_vector(raw_json: str | None) -> list[float] | None:
         data = json.loads(raw_json)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, list):
+    if not isinstance(data, list) or not data:
+        return None
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in data
+    ):
         return None
     try:
-        return [float(value) for value in data]
-    except (TypeError, ValueError):
+        vector = [float(value) for value in data]
+    except (OverflowError, TypeError, ValueError):
         return None
+    return vector if all(math.isfinite(value) for value in vector) else None
 
 
 def _cached_embedding_vector(

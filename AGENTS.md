@@ -124,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - API schema 使用 Pydantic model。
 - 路由依赖放在 `app/api/deps.py`，不要在每个路由里重复解析配置。
 - 记忆相关字段尽量先写入 `app/memory/models.py`，再扩展 store/API/MCP/tests。
-- 数据库 schema 变更要在 `MemoryStore.init_db()` 中兼容旧库，参考 `_ensure_*` 方法。
+- 数据库 schema 变更要在对应 store 的版本迁移表中追加严格递增的正整数版本，并通过 `_ensure_*` 方法兼容旧库；共享版本校验位于 `app/schema_migrations.py`，旧程序会拒绝打开未来版本数据库。
 - 不要让后台记忆提取失败影响聊天接口本身。
 - REST 和 MCP 的行为应尽量一致，尤其是鉴权、用户隔离、保存门槛和返回字段。
 - 中文内容要用 UTF-8；响应 JSON 应保持 `application/json; charset=utf-8`。
@@ -167,7 +167,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/mcp_server/context.py`：用 contextvar 保存当前 MCP 请求的 user id。
 - `app/mcp_server/server.py`：FastMCP server、instructions 和全部 MCP 工具。
 - `app/memory/models.py`：记忆、核心记忆、候选记忆、体检建议、决策日志等 Pydantic 模型。
-- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、空间/主题/实体分类、Time Ripple 邻近激活、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要、对话分支节点和决策日志。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`_ClosingSQLiteConnection`）。
+- `app/schema_migrations.py`：记忆库与知识库共用的 `PRAGMA user_version` 校验与迁移执行器；拒绝非正整数、重复、乱序迁移版本和高于当前程序支持范围的未来数据库。
+- `app/memory/store.py`：SQLite 表结构、兼容迁移、CRUD、空间/主题/实体分类、Time Ripple 邻近激活、软删除、恢复、合并、导入、核心记忆版本历史、近期摘要、对话分支节点和决策日志。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`ClosingSQLiteConnection`）。
 - `app/memory/conversation_context.py`：会话/分支级滚动上下文。以无存储副作用的状态演进生成压缩摘要和最近原始轮次，为记忆提取构造敏感过滤后的消歧上下文，并在阈值到达时通过共享 LLM provider 后台压缩较早普通轮次。
 - `app/memory/search.py`：embedding/中文关键词召回、拒绝阈值、多模式自然浮现、敏感硬过滤、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
@@ -199,7 +200,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | `/v1` 透明代理、FLIT tools/多模态、流式、幂等、故障切换 | `pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test_chat_streaming.py` |
 | MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
 | 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
-| SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_memory_store.py` |
+| SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_schema_migrations.py tests/test_memory_store.py` |
 | 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
 | 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts\audit_memory_db.py --database data\memory.db --env-file .env` |
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |

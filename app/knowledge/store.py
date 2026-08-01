@@ -24,6 +24,7 @@ from app.knowledge.models import (
     KnowledgeUploadSession,
     KnowledgeVersion,
 )
+from app.schema_migrations import apply_schema_migrations, validated_schema_version
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -151,6 +152,11 @@ class KnowledgeStore:
         if path.parent != Path("."):
             path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            validated_schema_version(
+                connection,
+                _KNOWLEDGE_SCHEMA_MIGRATIONS,
+                schema_name="knowledge database",
+            )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
@@ -319,13 +325,11 @@ class KnowledgeStore:
     @staticmethod
     def _run_migrations(connection: sqlite3.Connection) -> None:
         """按 PRAGMA user_version 顺序执行一次性的 schema/数据迁移。"""
-        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        for version, step in _KNOWLEDGE_SCHEMA_MIGRATIONS:
-            if current >= version:
-                continue
-            assert isinstance(version, int)  # 迁移表必须全部是 int 字面量版本号
-            step(connection)
-            connection.execute(f"PRAGMA user_version = {version}")
+        apply_schema_migrations(
+            connection,
+            _KNOWLEDGE_SCHEMA_MIGRATIONS,
+            schema_name="knowledge database",
+        )
 
     @staticmethod
     def _ensure_documents_source_document_ref(connection: sqlite3.Connection) -> None:

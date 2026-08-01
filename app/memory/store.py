@@ -33,6 +33,7 @@ from app.memory.models import (
 )
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.utils import _parse_iso_datetime
+from app.schema_migrations import apply_schema_migrations, validated_schema_version
 
 
 _UNSET = object()
@@ -85,6 +86,11 @@ class MemoryStore:
         if path.parent != Path("."):
             path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            validated_schema_version(
+                connection,
+                _MEMORY_SCHEMA_MIGRATIONS,
+                schema_name="memory database",
+            )
             self._create_tables(connection)
             self._run_migrations(connection)
             self._create_indexes(connection)
@@ -357,13 +363,11 @@ class MemoryStore:
         建表语句保持幂等并在每次启动执行；迁移只运行尚未应用的版本，
         避免老库每次启动都重复全表 UPDATE 回填。
         """
-        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        for version, step in _MEMORY_SCHEMA_MIGRATIONS:
-            if current >= version:
-                continue
-            assert isinstance(version, int)  # 迁移表必须全部是 int 字面量版本号
-            step(connection)
-            connection.execute(f"PRAGMA user_version = {version}")
+        apply_schema_migrations(
+            connection,
+            _MEMORY_SCHEMA_MIGRATIONS,
+            schema_name="memory database",
+        )
 
     def create_memory(
         self,

@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -22,14 +22,39 @@ from app.usage.store import UsageStore
 
 
 UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
+_UI_ROOT_STATIC_FILES = frozenset(
+    {
+        "index.html",
+        "backdrop.svg",
+        "backdrop.jpg",
+        "backdrop-credit.txt",
+    }
+)
 logger = logging.getLogger(__name__)
 
 
 def _resolve_ui_dist_dir(settings) -> Path:
     configured = settings.ui_dist_dir.strip()
     if configured:
-        return Path(configured).expanduser().resolve()
+        resolved = Path(configured).expanduser().resolve()
+        if not (
+            resolved.is_dir()
+            and (resolved / "index.html").is_file()
+            and (resolved / "assets").is_dir()
+        ):
+            raise RuntimeError(
+                "UI_DIST_DIR 必须指向包含 index.html 和 assets/ 的专用 UI 构建目录"
+            )
+        return resolved
     return UI_DIST_DIR
+
+
+def _normalized_ui_request_path(path: str) -> str | None:
+    candidate = PurePosixPath(path)
+    if any(part == ".." or part.startswith(".") for part in candidate.parts):
+        return None
+    normalized = candidate.as_posix()
+    return "" if normalized == "." else normalized
 
 
 class UTF8JSONResponse(JSONResponse):
@@ -39,14 +64,17 @@ class UTF8JSONResponse(JSONResponse):
 
 class UIStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope):
-        try:
-            return await super().get_response(path, scope)
-        except StarletteHTTPException as exc:
-            if exc.status_code != 404:
-                raise
-            if Path(path).suffix or path.startswith("assets/"):
-                raise
+        normalized = _normalized_ui_request_path(path)
+        if normalized is None:
+            raise StarletteHTTPException(status_code=404)
+        is_static_file = normalized in _UI_ROOT_STATIC_FILES or normalized.startswith(
+            "assets/"
+        )
+        if not is_static_file:
+            if PurePosixPath(normalized).suffix:
+                raise StarletteHTTPException(status_code=404)
             return await super().get_response("index.html", scope)
+        return await super().get_response(normalized, scope)
 
 
 def create_app() -> FastAPI:

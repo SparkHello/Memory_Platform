@@ -160,6 +160,11 @@ def test_memory_health_reports_invalid_and_mismatched_embeddings(
         content="User has short embedding.",
         embedding_json="[0.1, 0.2]",
     )
+    non_finite = memory_store.create_memory(
+        user_id="default",
+        content="User has a non-finite embedding.",
+        embedding_json="[NaN, 0.2, 0.3]",
+    )
 
     result = MemoryHealthChecker(
         store=memory_store,
@@ -171,6 +176,7 @@ def test_memory_health_reports_invalid_and_mismatched_embeddings(
     issues_by_related_id = {issue.related_id: issue for issue in result.issues}
     assert issues_by_related_id[invalid.id].type == "embedding_invalid"
     assert issues_by_related_id[mismatch.id].type == "embedding_dimension_mismatch"
+    assert issues_by_related_id[non_finite.id].type == "embedding_invalid"
 
 
 def test_memory_health_turns_export_failure_into_issue(monkeypatch, memory_store: MemoryStore):
@@ -275,4 +281,3 @@ def _issue_types(payload: dict) -> set[str]:
 
 def _vector_json(dimensions: int) -> str:
     return json.dumps([0.01] * dimensions)
-

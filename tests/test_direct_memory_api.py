@@ -868,13 +868,13 @@ class TestReEmbedEndpoint:
         assert response.status_code == 400
 
     def test_re_embed_scan_with_fake_embedding(self, client, auth_headers, memory_store):
-        """scan 模式走通缺失向量扫描路径（回归：_embedding_vector 曾漏改导致 NameError）。"""
+        """scan 模式重建维度正确但包含非有限数的损坏向量。"""
         import app.api.deps as deps
 
         memory_store.create_memory(
             user_id="default",
             content="需要重新生成向量的记忆",
-            embedding_json="not-valid-json",
+            embedding_json="[NaN, 0.0, 0.0, 0.0]",
         )
 
         class FakeEmbeddingClient:
@@ -964,4 +964,3 @@ class TestArchiveExpiredEndpoint:
     def test_requires_auth(self, client):
         response = client.post("/memories/archive-expired")
         assert response.status_code == 401
-

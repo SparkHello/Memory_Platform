@@ -7,6 +7,9 @@
 - 版本已是最新时，即使表缺列也不再补（迁移只执行一次）。
 """
 
+import pytest
+
+import app.memory.store as memory_store_module
 from app.knowledge.store import KnowledgeStore
 from app.memory.store import MemoryStore
 
@@ -127,6 +130,48 @@ class TestMemorySchemaMigrations:
             }
             assert "valence" not in columns  # 迁移未重跑
 
+    def test_future_database_version_is_rejected_before_creating_tables(
+        self,
+        tmp_path,
+    ) -> None:
+        db_path = str(tmp_path / "future-memory.db")
+        store = MemoryStore(db_path)
+        with store._connect() as connection:
+            connection.execute("PRAGMA user_version = 99")
+
+        with pytest.raises(RuntimeError, match="newer than supported"):
+            store.init_db()
+
+        with store._connect() as connection:
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+            ).fetchone()
+        assert table is None
+
+    @pytest.mark.parametrize(
+        "migrations",
+        [
+            [(2, lambda connection: None), (1, lambda connection: None)],
+            [(1, lambda connection: None), (1, lambda connection: None)],
+            [(True, lambda connection: None)],
+        ],
+    )
+    def test_invalid_migration_table_is_rejected(
+        self,
+        tmp_path,
+        monkeypatch,
+        migrations,
+    ) -> None:
+        db_path = str(tmp_path / "invalid-memory-migrations.db")
+        monkeypatch.setattr(
+            memory_store_module,
+            "_MEMORY_SCHEMA_MIGRATIONS",
+            migrations,
+        )
+        with MemoryStore(db_path)._connect() as connection:
+            with pytest.raises(RuntimeError, match="migration versions"):
+                MemoryStore._run_migrations(connection)
+
 
 class TestKnowledgeSchemaMigrations:
     def test_fresh_database_reaches_latest_version(self, tmp_path) -> None:
@@ -181,3 +226,22 @@ class TestKnowledgeSchemaMigrations:
             assert (
                 int(connection.execute("PRAGMA user_version").fetchone()[0]) == 1
             )
+
+    def test_future_database_version_is_rejected_before_creating_tables(
+        self,
+        tmp_path,
+    ) -> None:
+        db_path = str(tmp_path / "future-knowledge.db")
+        store = KnowledgeStore(db_path, max_document_bytes=1024 * 1024)
+        with store._connect() as connection:
+            connection.execute("PRAGMA user_version = 99")
+
+        with pytest.raises(RuntimeError, match="newer than supported"):
+            store.init_db()
+
+        with store._connect() as connection:
+            table = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'knowledge_documents'"
+            ).fetchone()
+        assert table is None
