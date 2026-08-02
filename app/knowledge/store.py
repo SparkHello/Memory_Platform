@@ -218,6 +218,7 @@ class KnowledgeStore:
                     indexed_at TEXT,
                     embedding_status TEXT NOT NULL DEFAULT 'pending',
                     embedding_model TEXT NOT NULL DEFAULT '',
+                    embedding_space_id TEXT NOT NULL DEFAULT '',
                     embedded_at TEXT,
                     embedding_error TEXT,
                     FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
@@ -289,6 +290,7 @@ class KnowledgeStore:
                     version_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    embedding_space_id TEXT NOT NULL DEFAULT '',
                     dimensions INTEGER NOT NULL,
                     vector_json TEXT NOT NULL,
                     content_sha256 TEXT NOT NULL,
@@ -434,6 +436,41 @@ class KnowledgeStore:
                 connection.execute(
                     f"ALTER TABLE knowledge_versions ADD COLUMN {name} {sql_type}"
                 )
+
+    @staticmethod
+    def _ensure_embedding_space_columns(connection: sqlite3.Connection) -> None:
+        version_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_versions)"
+            ).fetchall()
+        }
+        if "embedding_space_id" not in version_columns:
+            connection.execute(
+                "ALTER TABLE knowledge_versions "
+                "ADD COLUMN embedding_space_id TEXT NOT NULL DEFAULT ''"
+            )
+
+        embedding_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(knowledge_chunk_embeddings)"
+            ).fetchall()
+        }
+        if "embedding_space_id" not in embedding_columns:
+            # Existing derived vectors deliberately remain in the empty,
+            # unknown space. A later index run is the only safe way to bind
+            # them to a configured vector space.
+            connection.execute(
+                "ALTER TABLE knowledge_chunk_embeddings "
+                "ADD COLUMN embedding_space_id TEXT NOT NULL DEFAULT ''"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_knowledge_embeddings_user_space
+            ON knowledge_chunk_embeddings(user_id, embedding_space_id, version_id)
+            """
+        )
 
     @staticmethod
     def _ensure_upload_metadata_columns(connection: sqlite3.Connection) -> None:
@@ -1584,6 +1621,7 @@ class KnowledgeStore:
         *,
         status: str,
         model: str = "",
+        embedding_space_id: str = "",
         error: str = "",
     ) -> None:
         if status not in {
@@ -1598,6 +1636,7 @@ class KnowledgeStore:
         user_id = _required_text(user_id, "user_id", 256)
         version_id = self._version_id(version_ref)
         model = _optional_text(model, "embedding model", 300)
+        embedding_space_id = _optional_embedding_space_id(embedding_space_id)
         error = _optional_text(error, "embedding error", 1000)
         embedded_at = _utc_now() if status in {"ready", "partial"} else None
         with self._connect() as connection:
@@ -1605,10 +1644,18 @@ class KnowledgeStore:
                 """
                 UPDATE knowledge_versions
                 SET embedding_status = ?, embedding_model = ?,
-                    embedded_at = ?, embedding_error = ?
+                    embedding_space_id = ?, embedded_at = ?, embedding_error = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (status, model, embedded_at, error or None, version_id, user_id),
+                (
+                    status,
+                    model,
+                    embedding_space_id,
+                    embedded_at,
+                    error or None,
+                    version_id,
+                    user_id,
+                ),
             )
             if result.rowcount != 1:
                 raise KnowledgeNotFoundError("knowledge version not found")
@@ -1619,12 +1666,14 @@ class KnowledgeStore:
         version_ref: str,
         *,
         model: str,
+        embedding_space_id: str,
         vectors: dict[str, list[float]],
         total_chunks: int,
     ) -> dict[str, int | str]:
         user_id = _required_text(user_id, "user_id", 256)
         version_id = self._version_id(version_ref)
         model = _required_text(model, "embedding model", 300)
+        embedding_space_id = _required_embedding_space_id(embedding_space_id)
         total_chunks = _bounded_int(
             total_chunks, "total_chunks", minimum=1, maximum=100_000
         )
@@ -1669,8 +1718,9 @@ class KnowledgeStore:
                     """
                     INSERT INTO knowledge_chunk_embeddings (
                         chunk_id, document_id, version_id, user_id, model,
+                        embedding_space_id,
                         dimensions, vector_json, content_sha256, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chunk_id,
@@ -1678,6 +1728,7 @@ class KnowledgeStore:
                         version_id,
                         user_id,
                         model,
+                        embedding_space_id,
                         len(vector),
                         _json_dump(vector),
                         hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest(),
@@ -1698,12 +1749,13 @@ class KnowledgeStore:
                 """
                 UPDATE knowledge_versions
                 SET embedding_status = ?, embedding_model = ?,
-                    embedded_at = ?, embedding_error = ?
+                    embedding_space_id = ?, embedded_at = ?, embedding_error = ?
                 WHERE id = ? AND user_id = ?
                 """,
                 (
                     status,
                     model,
+                    embedding_space_id,
                     now if stored else None,
                     error,
                     version["id"],
@@ -1718,6 +1770,7 @@ class KnowledgeStore:
         query_vector: Sequence[float],
         *,
         model: str,
+        embedding_space_id: str,
         query: str = "",
         limit: int = 20,
         document_refs: Sequence[str] | None = None,
@@ -1727,6 +1780,7 @@ class KnowledgeStore:
         user_id = _required_text(user_id, "user_id", 256)
         vector = _validated_vector(query_vector)
         model = _required_text(model, "embedding model", 300)
+        embedding_space_id = _required_embedding_space_id(embedding_space_id)
         query = _optional_text(query, "query", 8000)
         limit = _bounded_int(limit, "limit", minimum=1, maximum=_SEARCH_MAX_RESULTS)
         document_ids = self._document_ids(document_refs or [])
@@ -1735,13 +1789,21 @@ class KnowledgeStore:
         conditions = [
             "e.user_id = ?",
             "e.model = ?",
+            "e.embedding_space_id = ?",
             "e.dimensions = ?",
             "d.status = 'active'",
             "d.current_version_id = c.version_id",
             "v.index_status = 'ready'",
             "v.embedding_status IN ('ready', 'partial')",
+            "v.embedding_space_id = ?",
         ]
-        params: list[Any] = [user_id, model, len(vector)]
+        params: list[Any] = [
+            user_id,
+            model,
+            embedding_space_id,
+            len(vector),
+            embedding_space_id,
+        ]
         if not include_sensitive:
             conditions.append("d.sensitivity = 'normal'")
         if document_ids:
@@ -2453,7 +2515,8 @@ class KnowledgeStore:
             UPDATE knowledge_versions
             SET index_status = 'indexing', index_error = NULL, indexed_at = NULL,
                 embedding_status = 'pending', embedding_model = '',
-                embedded_at = NULL, embedding_error = NULL
+                embedding_space_id = '', embedded_at = NULL,
+                embedding_error = NULL
             WHERE id = ? AND user_id = ?
             """,
             (version_id, user_id),
@@ -2855,6 +2918,7 @@ class KnowledgeStore:
             indexed_at=row["indexed_at"],
             embedding_status=row["embedding_status"],
             embedding_model=row["embedding_model"],
+            embedding_space_id=row["embedding_space_id"],
             embedded_at=row["embedded_at"],
             embedding_error=row["embedding_error"],
             content=row["content"] if include_content else None,
@@ -3092,6 +3156,14 @@ def _optional_text(value: str, field: str, maximum: int) -> str:
     if "\x00" in value:
         raise KnowledgeValidationError(f"{field} must not contain NUL")
     return value
+
+
+def _required_embedding_space_id(value: str) -> str:
+    return " ".join(_required_text(value, "embedding space id", 300).split())
+
+
+def _optional_embedding_space_id(value: str) -> str:
+    return " ".join(_optional_text(value, "embedding space id", 300).split())
 
 
 def _bounded_int(value: int, field: str, *, minimum: int, maximum: int) -> int:
@@ -3341,7 +3413,8 @@ def _last_touched_line(text: str, start: int, end: int) -> int:
 # Schema migrations (PRAGMA user_version)
 #
 # v1 汇总历史遗留的一次性列补齐（老库升级路径）；新库建表已含全部列，
-# v1 对空表运行无副作用。新增 schema 变更时在此追加 (2, _knowledge_migration_v2)。
+# v1 对空表运行无副作用。v2 给派生 chunk embedding 增加不可猜测的
+# 空间标识；遗留向量保持空值，只有重新生成后才进入已知空间。
 
 
 def _knowledge_migration_v1(connection: sqlite3.Connection) -> None:
@@ -3352,6 +3425,11 @@ def _knowledge_migration_v1(connection: sqlite3.Connection) -> None:
     KnowledgeStore._ensure_upload_metadata_columns(connection)
 
 
+def _knowledge_migration_v2(connection: sqlite3.Connection) -> None:
+    KnowledgeStore._ensure_embedding_space_columns(connection)
+
+
 _KNOWLEDGE_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _knowledge_migration_v1),
+    (2, _knowledge_migration_v2),
 ]

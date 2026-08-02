@@ -95,17 +95,22 @@ class UsageStore:
         model: str,
         kind: str,
         payload: dict[str, Any],
+        use_local_pricing: bool = True,
     ) -> str:
         usage = parse_usage(payload.get("usage"))
-        price = price_for(
-            provider=provider,
-            model=model,
-            kind=kind,
-            input_tokens=(
-                int(usage["input_tokens"])
-                if usage["input_tokens"] is not None
-                else None
-            ),
+        price = (
+            price_for(
+                provider=provider,
+                model=model,
+                kind=kind,
+                input_tokens=(
+                    int(usage["input_tokens"])
+                    if usage["input_tokens"] is not None
+                    else None
+                ),
+            )
+            if use_local_pricing
+            else None
         )
         cost_nanos = (
             calculate_cost_nanos(usage=usage, price=price)

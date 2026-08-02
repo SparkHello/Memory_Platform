@@ -18,6 +18,8 @@ from app.knowledge.store import KnowledgeStore
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
+from app.model_catalog import validate_catalog_and_routes
+from app.usage.pricing import configure_pricing_catalog
 from app.usage.store import UsageStore
 
 
@@ -85,6 +87,11 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         settings = get_settings()
+        validate_catalog_and_routes(
+            catalog_path=settings.model_catalog_path,
+            routes_path=settings.model_routes_path,
+        )
+        configure_pricing_catalog(settings.pricing_catalog_path)
         _validate_database_paths(settings.database_path, settings.knowledge_database_path)
         MemoryStore(settings.database_path).init_db()
         UsageStore(settings.database_path).init_db()

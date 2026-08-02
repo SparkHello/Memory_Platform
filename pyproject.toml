@@ -26,9 +26,15 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 
+[project.scripts]
+memgw = "app.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["catalog/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

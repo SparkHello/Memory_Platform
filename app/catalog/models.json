@@ -1,0 +1,86 @@
+{
+  "$schema": "./models.schema.json",
+  "version": 1,
+  "models": [
+    {
+      "id": "mimo/mimo-v2.5-pro-ultraspeed",
+      "provider": "mimo",
+      "model": "mimo-v2.5-pro-ultraspeed",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://mimo.mi.com/models/en-US/mimo-v2.5-pro-ultraspeed"
+    },
+    {
+      "id": "kimi/kimi-k2.7-code",
+      "provider": "kimi",
+      "model": "kimi-k2.7-code",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://platform.kimi.com/docs/pricing/chat-k27-code"
+    },
+    {
+      "id": "kimi/kimi-k2.7-code-highspeed",
+      "provider": "kimi",
+      "model": "kimi-k2.7-code-highspeed",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://platform.kimi.com/docs/pricing/chat-k27-code"
+    },
+    {
+      "id": "deepseek/deepseek-v4-flash",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
+    },
+    {
+      "id": "upstream/glm-5.1",
+      "provider": "upstream",
+      "model": "glm-5.1",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://bigmodel.cn/pricing"
+    },
+    {
+      "id": "upstream/glm-5.2",
+      "provider": "upstream",
+      "model": "glm-5.2",
+      "kind": "chat",
+      "capabilities": ["streaming", "tools", "reasoning", "structured-output"],
+      "official_url": "https://bigmodel.cn/pricing"
+    },
+    {
+      "id": "embedding/text-embedding-v4",
+      "provider": "embedding",
+      "model": "text-embedding-v4",
+      "kind": "embedding",
+      "capabilities": ["embedding"],
+      "official_url": "https://help.aliyun.com/zh/model-studio/text-embedding-v4"
+    },
+    {
+      "id": "embedding/qwen3.7-text-embedding",
+      "provider": "embedding",
+      "model": "qwen3.7-text-embedding",
+      "kind": "embedding",
+      "capabilities": ["embedding"],
+      "official_url": "https://help.aliyun.com/zh/model-studio/qwen3-7-text-embedding"
+    },
+    {
+      "id": "embedding/embedding-3",
+      "provider": "embedding",
+      "model": "embedding-3",
+      "kind": "embedding",
+      "capabilities": ["embedding"],
+      "official_url": "https://docs.bigmodel.cn/cn/guide/models/embedding/embedding-3"
+    }
+  ]
+}

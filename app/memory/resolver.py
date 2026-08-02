@@ -7,7 +7,7 @@ import anyio
 from app.memory.classification import classify_memory, normalize_classification_values
 from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
-from app.memory.search import EmbeddingClient, cosine_similarity
+from app.memory.search import EmbeddingClient, cosine_similarity, embedding_space_id_for
 from app.memory.store import MemoryStore
 from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (
@@ -101,10 +101,19 @@ class MemoryResolver:
 
         with model_usage_scope(user_id=user_id, operation="memory_write"):
             vector = await self.embedding_client.embed(candidate.memory)
+        embedding_space_id = embedding_space_id_for(self.embedding_client)
+        if not embedding_space_id:
+            vector = None
         embedding_json = json.dumps(vector, ensure_ascii=False) if vector else None
 
         covered_by = await anyio.to_thread.run_sync(
-            partial(_find_semantically_covering_memory, candidate, existing, vector)
+            partial(
+                _find_semantically_covering_memory,
+                candidate,
+                existing,
+                vector,
+                embedding_space_id,
+            )
         )
         if covered_by is not None:
             return ResolveResult(
@@ -115,7 +124,14 @@ class MemoryResolver:
             )
 
         target, related_reason, relation = await anyio.to_thread.run_sync(
-            partial(_find_related_memory, candidate, existing, vector, normalized_new)
+            partial(
+                _find_related_memory,
+                candidate,
+                existing,
+                vector,
+                embedding_space_id,
+                normalized_new,
+            )
         )
         classification_kwargs = await anyio.to_thread.run_sync(
             partial(
@@ -141,6 +157,7 @@ class MemoryResolver:
                 source_message=source_message,
                 source_conversation_id=conversation_id,
                 embedding_json=embedding_json,
+                embedding_space_id=embedding_space_id if embedding_json else None,
                 stability=candidate.stability,
                 valid_from=candidate.valid_from,
                 valid_until=candidate.valid_until,
@@ -232,6 +249,7 @@ def _find_semantically_covering_memory(
     candidate: CandidateMemory,
     existing: list[MemoryRecord],
     vector: list[float] | None,
+    embedding_space_id: str,
 ) -> MemoryRecord | None:
     """Find an active old fact that conservatively entails a broader paraphrase."""
     if not vector or candidate.temporal_subject or candidate.temporal_predicate:
@@ -242,7 +260,10 @@ def _find_semantically_covering_memory(
     for memory in existing:
         if not _old_memory_covers_candidate(candidate, memory):
             continue
-        old_vector = _memory_embedding_vector(memory)
+        old_vector = _memory_embedding_vector(
+            memory,
+            expected_space_id=embedding_space_id,
+        )
         if old_vector is None:
             continue
         score = cosine_similarity(vector, old_vector)
@@ -354,6 +375,7 @@ def _find_related_memory(
     candidate: CandidateMemory,
     existing: list[MemoryRecord],
     vector: list[float] | None,
+    embedding_space_id: str,
     normalized_new: str,
 ) -> tuple[MemoryRecord | None, str, MemoryRelation]:
     # 新内容完整包含旧内容：记录为补充，但不直接覆盖旧记忆。
@@ -366,7 +388,10 @@ def _find_related_memory(
     if vector:
         best, best_score = None, 0.0
         for memory in existing:
-            old_vector = _memory_embedding_vector(memory)
+            old_vector = _memory_embedding_vector(
+                memory,
+                expected_space_id=embedding_space_id,
+            )
             if old_vector is None:
                 continue
             score = cosine_similarity(vector, old_vector)

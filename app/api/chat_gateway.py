@@ -91,6 +91,13 @@ class _ProviderReasoningState:
     reasoning: str
     provider_code: str
     provider_model: str
+    deployment_id: str = ""
+    connection_id: str = ""
+    vendor: str = ""
+
+    @property
+    def affinity_key(self) -> str:
+        return self.deployment_id or self.provider_code
 
 
 class _ExpiringState:
@@ -275,7 +282,9 @@ async def chat_completions(
         messages,
         user_id=user_id,
         conversation_id=conversation_id,
-        strip_unknown=is_auto_model_id(validated.model),
+        strip_unknown=(
+            is_auto_model_id(validated.model) or settings.model_gateway_enabled
+        ),
     )
     context = GatewayTurnContext(text="", memory_ids=[], hit_count=0)
     if memory_mode != "off":
@@ -475,16 +484,15 @@ async def chat_completions(
     except (UnicodeDecodeError, json.JSONDecodeError):
         upstream_json = {}
 
+    usage_provider = _usage_provider_arguments(upstream_result.provider)
     await anyio.to_thread.run_sync(
         partial(
             usage_recorder.record_response,
             payload=upstream_json,
-            model=upstream_result.provider.model,
             kind="chat",
-            provider_code=upstream_result.provider.code,
-            base_url=upstream_result.provider.base_url,
             user_id=user_id,
             operation="chat_completion",
+            **usage_provider,
         )
     )
 
@@ -868,9 +876,7 @@ def _restore_tool_reasoning(
     known_states = [
         state for _, _, state in cached_messages if state is not None
     ]
-    preferred_provider_code = (
-        known_states[-1].provider_code if known_states else None
-    )
+    preferred_provider_code = known_states[-1].affinity_key if known_states else None
     proven_messages: set[int] = set()
     for _, message, state in cached_messages:
         if state is None:
@@ -878,7 +884,7 @@ def _restore_tool_reasoning(
                 message.pop("reasoning_content", None)
                 message.pop("reasoning", None)
             continue
-        if state.provider_code != preferred_provider_code:
+        if state.affinity_key != preferred_provider_code:
             # A memory-auto history can contain tool turns produced by several
             # providers. Never replay one provider's hidden state to another.
             message.pop("reasoning_content", None)
@@ -926,12 +932,18 @@ def _cache_tool_reasoning(
 ) -> None:
     provider_code = str(getattr(provider, "code", "") or "")
     provider_model = str(getattr(provider, "model", "") or "")
-    if provider_code not in {"M", "K", "D"}:
+    deployment_id = str(getattr(provider, "deployment_id", "") or "")
+    connection_id = str(getattr(provider, "connection_id", "") or "")
+    vendor = str(getattr(provider, "vendor", "") or "")
+    if not deployment_id and provider_code not in {"M", "K", "D"}:
         return
     state = _ProviderReasoningState(
         reasoning=reasoning,
         provider_code=provider_code,
         provider_model=provider_model,
+        deployment_id=deployment_id,
+        connection_id=connection_id,
+        vendor=vendor,
     )
     for tool_call_id in tool_call_ids:
         if not tool_call_id:
@@ -960,7 +972,13 @@ def _cache_turn_reasoning(
 ) -> None:
     provider_code = str(getattr(provider, "code", "") or "")
     provider_model = str(getattr(provider, "model", "") or "")
-    if provider_code not in {"M", "K", "D"} or not tool_call_ids:
+    deployment_id = str(getattr(provider, "deployment_id", "") or "")
+    connection_id = str(getattr(provider, "connection_id", "") or "")
+    vendor = str(getattr(provider, "vendor", "") or "")
+    if (
+        (not deployment_id and provider_code not in {"M", "K", "D"})
+        or not tool_call_ids
+    ):
         return
     _TURN_REASONING.put(
         _turn_reasoning_key(
@@ -973,6 +991,9 @@ def _cache_turn_reasoning(
             reasoning=reasoning,
             provider_code=provider_code,
             provider_model=provider_model,
+            deployment_id=deployment_id,
+            connection_id=connection_id,
+            vendor=vendor,
         ),
         ttl_seconds,
     )
@@ -1282,6 +1303,7 @@ async def _finalize_stream_turn(
     user_id: str,
     provider,
 ) -> None:
+    usage_provider = _usage_provider_arguments(provider)
     await anyio.to_thread.run_sync(
         partial(
             usage_recorder.record_response,
@@ -1290,16 +1312,31 @@ async def _finalize_stream_turn(
                 "model": capture.response_model,
                 "usage": capture.usage,
             },
-            model=provider.model,
             kind="chat",
-            provider_code=provider.code,
-            base_url=provider.base_url,
             user_id=user_id,
             operation="chat_completion",
+            **usage_provider,
         )
     )
     if capture.is_final_text_response:
         await finalize(assistant_text=capture.assistant_text)
+
+
+def _usage_provider_arguments(provider: Any) -> dict[str, Any]:
+    deployment_id = str(getattr(provider, "deployment_id", "") or "").strip()
+    vendor = str(getattr(provider, "vendor", "") or "").strip()
+    return {
+        "model": str(getattr(provider, "model", "") or ""),
+        "provider_code": (
+            "" if deployment_id else str(getattr(provider, "code", "") or "")
+        ),
+        "base_url": str(getattr(provider, "base_url", "") or ""),
+        # A central gateway may expose a reseller's deployment of a familiar
+        # model. Missing origin metadata must stay unpriced instead of being
+        # guessed from the model name as the official first-party provider.
+        "provider_override": (vendor or "model-gateway") if deployment_id else "",
+        "use_local_pricing": not bool(deployment_id),
+    }
 
 
 async def _finalize_turn(

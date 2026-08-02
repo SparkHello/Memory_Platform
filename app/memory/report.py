@@ -497,7 +497,7 @@ def _report_from_export(export_data: dict) -> str:
 
 
 def _memory_to_public_dict(memory: MemoryRecord) -> dict:
-    return memory.model_dump(exclude={"embedding_json"})
+    return memory.model_dump(exclude={"embedding_json", "embedding_space_id"})
 
 
 def _restore_one_memory(

@@ -2337,12 +2337,14 @@ def test_update_memory_embedding(memory_store: MemoryStore) -> None:
         memory_id=memory.id,
         user_id="default",
         embedding_json=new_embedding,
+        embedding_space_id="test-space",
     )
     assert result is True
 
     updated = memory_store.get_memory(memory_id=memory.id, user_id="default")
     assert updated is not None
     assert updated.embedding_json == new_embedding
+    assert updated.embedding_space_id == "test-space"
     assert updated.updated_at > memory.updated_at
 
 
@@ -2359,8 +2361,47 @@ def test_update_memory_embedding_ignores_archived(memory_store: MemoryStore) -> 
         memory_id=memory.id,
         user_id="default",
         embedding_json=json.dumps([0.5, 0.5, 0.5]),
+        embedding_space_id="test-space",
     )
     assert result is False
+
+
+def test_content_change_clears_embedding_and_space(memory_store: MemoryStore) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
+    )
+
+    updated = memory_store.update_memory(
+        memory_id=memory.id,
+        user_id="default",
+        content="用户现在喜欢拿铁",
+        type=memory.type,
+        importance=memory.importance,
+        confidence=memory.confidence,
+        valence=memory.valence,
+        arousal=memory.arousal,
+        source_message=memory.source_message,
+        source_conversation_id=memory.source_conversation_id,
+        embedding_json=memory.embedding_json,
+        embedding_space_id=memory.embedding_space_id,
+        stability=memory.stability,
+        valid_from=memory.valid_from,
+        valid_until=memory.valid_until,
+        review_after=memory.review_after,
+        sensitivity=memory.sensitivity,
+        evidence_memory_ids=memory.evidence_memory_ids,
+        topics=memory.topics,
+        entities=memory.entities,
+        temporal_subject=memory.temporal_subject,
+        temporal_predicate=memory.temporal_predicate,
+    )
+
+    assert updated is not None
+    assert updated.embedding_json is None
+    assert updated.embedding_space_id is None
 
 
 def test_get_active_memory_count(memory_store: MemoryStore) -> None:

@@ -63,6 +63,7 @@ class KnowledgeVersion(BaseModel):
     indexed_at: str | None = None
     embedding_status: KnowledgeEmbeddingStatus = "pending"
     embedding_model: str = ""
+    embedding_space_id: str = ""
     embedded_at: str | None = None
     embedding_error: str | None = None
     content: str | None = None

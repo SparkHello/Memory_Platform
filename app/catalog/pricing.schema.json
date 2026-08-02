@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-gateway.local/schemas/pricing.schema.json",
+  "title": "memory-gateway pricing catalog",
+  "type": "object",
+  "required": ["version", "as_of", "currency", "models"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {"type": "string"},
+    "version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+    "note": {"type": "string"},
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "provider", "provider_label", "model", "kind", "input_cache_hit_per_million", "input_cache_miss_per_million", "output_per_million", "source_url"],
+        "additionalProperties": false,
+        "properties": {
+          "key": {"type": "string", "minLength": 1},
+          "provider": {"type": "string", "minLength": 1},
+          "provider_label": {"type": "string", "minLength": 1},
+          "model": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["chat", "embedding"]},
+          "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+          "input_cache_hit_per_million": {"type": ["string", "number"]},
+          "input_cache_miss_per_million": {"type": ["string", "number"]},
+          "output_per_million": {"type": ["string", "number"]},
+          "source_url": {"type": "string", "format": "uri", "pattern": "^https://"},
+          "input_token_min": {"type": "integer", "minimum": 0},
+          "input_token_max": {"type": ["integer", "null"], "minimum": 0},
+          "input_range_label": {"type": "string"},
+          "as_of": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}

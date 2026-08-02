@@ -72,6 +72,56 @@ def test_usage_store_preserves_full_user_isolation_key(tmp_path) -> None:
     assert store.summary(user_id=shared_prefix, days=None)["totals"]["calls"] == 0
 
 
+def test_usage_recorder_accepts_authoritative_gateway_vendor(tmp_path) -> None:
+    database = str(tmp_path / "usage.db")
+    store = UsageStore(database)
+    store.init_db()
+    recorder = UsageRecorder(database)
+    recorder.record_response(
+        payload={
+            "model": "deepseek-v4-flash",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        },
+        model="deepseek-v4-flash",
+        kind="chat",
+        base_url="http://127.0.0.1:2030/v1",
+        provider_override="siliconflow",
+        user_id="alice",
+    )
+
+    event = store.summary(user_id="alice", days=None)["recent"][0]
+    assert event["provider"] == "siliconflow"
+    assert event["model"] == "deepseek-v4-flash"
+    assert event["price_available"] is False
+
+
+def test_central_gateway_usage_never_reuses_local_provider_price(tmp_path) -> None:
+    database = str(tmp_path / "usage.db")
+    store = UsageStore(database)
+    store.init_db()
+    UsageRecorder(database).record_response(
+        payload={
+            "model": "deepseek-v4-flash",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+            },
+        },
+        model="deepseek-v4-flash",
+        kind="chat",
+        provider_override="deepseek",
+        use_local_pricing=False,
+        user_id="alice",
+    )
+
+    event = store.summary(user_id="alice", days=None)["recent"][0]
+    assert event["provider"] == "deepseek"
+    assert event["usage_available"] is True
+    assert event["price_available"] is False
+    assert event["cost_cny"] is None
+
+
 def test_usage_store_prices_known_models_and_keeps_unknowns_visible(
     tmp_path,
 ) -> None:

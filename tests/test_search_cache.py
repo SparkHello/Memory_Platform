@@ -18,6 +18,7 @@ class FakeEmbeddingClient:
     """可控的 fake embedding client，记录调用次数"""
     def __init__(self, vector: list[float] | None = None):
         self.vector = vector or [0.1, 0.2, 0.3]
+        self.embedding_space_id = "test-space"
         self.call_count = 0
 
     async def embed(self, text: str) -> list[float] | None:
@@ -92,6 +93,7 @@ class TestSearchCache:
             importance=8,
             confidence=0.95,
             embedding_json='[0.5, 0.5, 0.5]',
+            embedding_space_id="test-space",
         )
         fake = FakeEmbeddingClient(vector=[0.5, 0.5, 0.5])
         service = MemorySearchService(store=memory_store, embedding_client=fake)
@@ -120,6 +122,7 @@ class TestSearchCache:
             importance=8,
             confidence=0.95,
             embedding_json='[0.5, 0.5, 0.5]',
+            embedding_space_id="test-space",
         )
         import time as _time
         _time.sleep(0.01)  # 确保 updated_at 有时间差
@@ -144,6 +147,7 @@ class TestSearchCache:
             importance=8,
             confidence=0.95,
             embedding_json='[0.5, 0.5, 0.5]',
+            embedding_space_id="test-space",
         )
         _time.sleep(0.02)
         m2 = memory_store.create_memory(
@@ -153,6 +157,7 @@ class TestSearchCache:
             importance=8,
             confidence=0.95,
             embedding_json='[0.5, 0.5, 0.5]',
+            embedding_space_id="test-space",
         )
 
         fake = FakeEmbeddingClient(vector=[0.5, 0.5, 0.5])
@@ -182,6 +187,7 @@ class TestSearchCache:
             importance=8,
             confidence=0.95,
             embedding_json='[0.5, 0.5, 0.5]',
+            embedding_space_id="test-space",
         )
         fake = FakeEmbeddingClient(vector=[0.5, 0.5, 0.5])
         service = MemorySearchService(store=memory_store, embedding_client=fake)
@@ -235,7 +241,7 @@ class TestSearchCache:
         )
         assert old.id in {hit.memory.id for hit in before}
         assert stable.id in {hit.memory.id for hit in before}
-        key = ("default", _normalize_query("user city coffee"), 8, False)
+        key = ("default", _normalize_query("user city coffee"), 8, False, "")
         assert SEARCH_CACHE[key][0] <= future_start.timestamp()
 
         time.sleep(0.25)
@@ -297,7 +303,7 @@ class TestEvalCacheBypass:
 
         # 投毒：手工塞入一个对该 (user, query, limit) 校验有效、但指向无关记忆的缓存条目，
         # 模拟另一种模式（或线上检索）先跑过、把结果留在了共享缓存里。
-        key = ("default", _normalize_query("咖啡"), 8, False)
+        key = ("default", _normalize_query("咖啡"), 8, False, "")
         SEARCH_CACHE[key] = (
             _now() + 999,
             memory_store.get_memories_max_updated_at(user_id="default"),

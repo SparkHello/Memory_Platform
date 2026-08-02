@@ -1,5 +1,7 @@
 import hashlib
 
+from app.config import Settings, get_settings
+
 
 def _headers(auth_headers: dict[str, str], user_id: str = "default") -> dict[str, str]:
     return {**auth_headers, "X-User-Id": user_id}
@@ -352,3 +354,47 @@ def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers)
     assert payload["llm_rate_limit_cooldown_seconds"] == 300.0
     assert payload["max_document_bytes"] == 50 * 1024 * 1024
     assert payload["embedding_batch_size"] == 20
+
+
+def test_knowledge_status_reports_central_gateway_instead_of_legacy_providers(
+    client,
+    auth_headers,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="test-gateway-key",
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL="knowledge.fast.central",
+        MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL="knowledge.pro.central",
+        MODEL_GATEWAY_EMBEDDING_MODEL="memory.embedding.central",
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="",
+        LLM_PROVIDER_PRIORITY="MKD",
+        LLM_MIMO_API_KEY="legacy-mimo-key",
+        LLM_KIMI_API_KEY="legacy-kimi-key",
+        LLM_DEEPSEEK_API_KEY="legacy-deepseek-key",
+        EMBEDDING_API_KEY="legacy-embedding-key",
+        KNOWLEDGE_AGENT_EGRESS_POLICY="normal",
+    )
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        response = client.get("/knowledge/status", headers=auth_headers)
+    finally:
+        client.app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["model_gateway_enabled"] is True
+    assert payload["agent_enabled"] is True
+    assert payload["agent_provider_priority"] == "G"
+    assert payload["agent_configured_providers"] == ["G"]
+    assert payload["llm_provider_priority"] == "G"
+    assert payload["llm_configured_providers"] == ["G"]
+    assert payload["agent_rate_limit_cooldown_seconds"] == 0.0
+    assert payload["llm_rate_limit_cooldown_seconds"] == 0.0
+    assert payload["agent_mimo_model"] == ""
+    assert payload["agent_kimi_model"] == ""
+    assert payload["agent_flash_model"] == "knowledge.fast.central"
+    assert payload["agent_pro_model"] == "knowledge.pro.central"
+    assert payload["embedding_enabled"] is False
+    assert payload["embedding_model"] == ""

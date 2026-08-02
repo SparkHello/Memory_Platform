@@ -25,6 +25,8 @@ class UsageRecorder:
         kind: str,
         provider_code: str = "",
         base_url: str = "",
+        provider_override: str = "",
+        use_local_pricing: bool = True,
         user_id: str | None = None,
         operation: str | None = None,
     ) -> None:
@@ -39,7 +41,7 @@ class UsageRecorder:
             if isinstance(response_model, str) and response_model.strip()
             else model
         )
-        provider = provider_slug(
+        provider = provider_override.strip().lower() or provider_slug(
             provider_code=provider_code,
             model=actual_model,
             base_url=base_url,
@@ -53,6 +55,7 @@ class UsageRecorder:
                 model=actual_model,
                 kind=kind,
                 payload=payload,
+                use_local_pricing=use_local_pricing,
             )
         except Exception:
             logger.exception(

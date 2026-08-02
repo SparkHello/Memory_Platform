@@ -138,6 +138,7 @@ class MemoryStore:
                 source_conversation_id TEXT,
                 origin TEXT DEFAULT 'user_asserted',
                 embedding_json TEXT,
+                embedding_space_id TEXT,
                 last_used_at TEXT,
                 usage_count REAL DEFAULT 0.0,
                 stability TEXT DEFAULT 'stable',
@@ -408,6 +409,7 @@ class MemoryStore:
         source_conversation_id: str | None = None,
         origin: MemoryOrigin = "user_asserted",
         embedding_json: str | None = None,
+        embedding_space_id: str | None = None,
         stability: MemoryStability = "stable",
         valid_from: str | None = None,
         valid_until: str | None = None,
@@ -449,6 +451,7 @@ class MemoryStore:
             source_conversation_id=source_conversation_id,
             origin=origin,
             embedding_json=embedding_json,
+            embedding_space_id=embedding_space_id,
             last_used_at=None,
             usage_count=0,
             stability=stability,
@@ -503,6 +506,7 @@ class MemoryStore:
         source_message: str | None = None,
         source_conversation_id: str | None = None,
         embedding_json: str | None = None,
+        embedding_space_id: object = _UNSET,
         stability: MemoryStability = "stable",
         valid_from: object = _UNSET,
         valid_until: object = _UNSET,
@@ -551,6 +555,18 @@ class MemoryStore:
                 temporal_predicate = existing.temporal_predicate
             if decay_lambda is _UNSET:
                 decay_lambda = existing.decay_lambda
+            content_changed = content != existing.content
+            if content_changed:
+                embedding_json = None
+                embedding_space_id = None
+            elif embedding_json is None:
+                embedding_space_id = None
+            elif embedding_space_id is _UNSET:
+                embedding_space_id = (
+                    existing.embedding_space_id
+                    if embedding_json == existing.embedding_json
+                    else None
+                )
             if (
                 valid_until_was_unset
                 and existing.superseded_by
@@ -595,6 +611,7 @@ class MemoryStore:
                     "source_message": source_message,
                     "source_conversation_id": source_conversation_id,
                     "embedding_json": embedding_json,
+                    "embedding_space_id": embedding_space_id,
                     "stability": stability,
                     "valid_from": valid_from,
                     "valid_until": valid_until,
@@ -640,7 +657,8 @@ class MemoryStore:
                 UPDATE memories
                 SET content = ?, type = ?, importance = ?, confidence = ?,
                     valence = ?, arousal = ?, source_message = ?, source_conversation_id = ?,
-                    embedding_json = ?, stability = ?, valid_from = ?, valid_until = ?,
+                    embedding_json = ?, embedding_space_id = ?,
+                    stability = ?, valid_from = ?, valid_until = ?,
                     review_after = ?, sensitivity = ?,
                     evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
                     temporal_subject = ?, temporal_predicate = ?, status = ?,
@@ -657,6 +675,7 @@ class MemoryStore:
                     prospective.source_message,
                     prospective.source_conversation_id,
                     prospective.embedding_json,
+                    prospective.embedding_space_id,
                     prospective.stability,
                     prospective.valid_from,
                     prospective.valid_until,
@@ -1486,6 +1505,7 @@ class MemoryStore:
                 SET content = ?, type = ?, importance = ?, confidence = ?,
                     valence = ?, arousal = ?, source_message = ?,
                     source_conversation_id = ?, embedding_json = NULL,
+                    embedding_space_id = NULL,
                     stability = ?, valid_from = ?, valid_until = ?,
                     review_after = ?, sensitivity = ?,
                     evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
@@ -2068,17 +2088,23 @@ class MemoryStore:
         memory_id: str,
         user_id: str,
         embedding_json: str,
+        embedding_space_id: str,
     ) -> bool:
         """仅更新活跃记忆的 embedding，用于 re-embed 流程。"""
+        normalized_space_id = " ".join(embedding_space_id.strip().split())
+        if not normalized_space_id:
+            raise ValueError("embedding_space_id 不能为空")
+        if len(normalized_space_id) > 300:
+            raise ValueError("embedding_space_id 最多 300 个字符")
         now = utc_now_iso()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE memories
-                SET embedding_json = ?, updated_at = ?
+                SET embedding_json = ?, embedding_space_id = ?, updated_at = ?
                 WHERE id = ? AND user_id = ? AND archived = 0
                 """,
-                (embedding_json, now, memory_id, user_id),
+                (embedding_json, normalized_space_id, now, memory_id, user_id),
             )
         return cursor.rowcount > 0
 
@@ -2770,6 +2796,7 @@ class MemoryStore:
                 source_conversation_id=data.get("source_conversation_id"),
                 origin=data.get("origin", "user_asserted"),
                 embedding_json=None,
+                embedding_space_id=None,
                 last_used_at=data.get("last_used_at"),
                 usage_count=max(0.0, _coerce_float(data.get("usage_count"), default=0.0)),
                 stability=data.get("stability", "stable"),
@@ -2890,6 +2917,7 @@ class MemoryStore:
                 memory.source_conversation_id,
                 memory.origin,
                 memory.embedding_json,
+                memory.embedding_space_id,
                 memory.last_used_at,
                 memory.usage_count,
                 memory.stability,
@@ -2920,6 +2948,7 @@ class MemoryStore:
                     SET user_id = ?, content = ?, type = ?, importance = ?,
                         confidence = ?, valence = ?, arousal = ?, source_message = ?,
                         source_conversation_id = ?, origin = ?, embedding_json = ?,
+                        embedding_space_id = ?,
                         last_used_at = ?, usage_count = ?, stability = ?,
                         valid_from = ?, valid_until = ?, review_after = ?, sensitivity = ?,
                         evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
@@ -4000,13 +4029,14 @@ class MemoryStore:
                 id, user_id, content, type, importance, confidence,
                 valence, arousal,
                 source_message, source_conversation_id, origin, embedding_json,
+                embedding_space_id,
                 last_used_at, usage_count, stability, valid_from, valid_until, review_after,
                 sensitivity, evidence_memory_ids_json, topics_json, entities_json,
                 temporal_subject, temporal_predicate,
                 status, digested, decay_lambda, supersedes, superseded_by,
                 created_at, updated_at, archived_at, archived
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -4021,6 +4051,7 @@ class MemoryStore:
                 memory.source_conversation_id,
                 memory.origin,
                 memory.embedding_json,
+                memory.embedding_space_id,
                 memory.last_used_at,
                 memory.usage_count,
                 memory.stability,
@@ -4146,6 +4177,7 @@ class MemoryStore:
             )
             """
         )
+
         connection.execute(
             """
             UPDATE memories
@@ -4176,6 +4208,20 @@ class MemoryStore:
                )
             """
         )
+
+    @staticmethod
+    def _ensure_memories_embedding_space_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "embedding_space_id" not in columns:
+            # Existing vectors intentionally remain unidentified. Inferring a
+            # space from the current model or dimensions could mix vectors
+            # generated by a previous provider/model configuration.
+            connection.execute(
+                "ALTER TABLE memories ADD COLUMN embedding_space_id TEXT"
+            )
 
     @staticmethod
     def _ensure_core_memory_sections_columns(connection: sqlite3.Connection) -> None:
@@ -4376,6 +4422,9 @@ class MemoryStore:
         data["entities"] = _json_string_list(raw_entities)
         data["type"] = normalize_memory_type(data.get("type") or "semantic")
         data["origin"] = data.get("origin") or "user_asserted"
+        data.setdefault("embedding_space_id", None)
+        if not data.get("embedding_json"):
+            data["embedding_space_id"] = None
         data["usage_count"] = float(data.get("usage_count") or 0)
         data["digested"] = bool(data.get("digested"))
         data["temporal_subject"] = normalize_optional_text(data.get("temporal_subject"))
@@ -5101,9 +5150,9 @@ def _earliest_datetime_text(values: list[str]) -> str | None:
 # ---------------------------------------------------------------------------
 # Schema migrations (PRAGMA user_version)
 #
-# 每次启动只执行尚未应用的版本。v1 汇总了历史遗留的一次性修复：老库缺列
-# 补齐与遗留值回填；新库建表已含全部列，v1 对空表运行无副作用。
-# 新增 schema 变更时在此追加 (2, _memory_migration_v2) 并递增版本。
+# 每次启动只执行尚未应用的版本。v1 汇总了历史遗留的一次性修复；v2
+# 为向量增加显式空间标识，且故意不回填旧向量。新增 schema 变更时继续
+# 追加严格递增的版本。
 
 
 def _memory_migration_v1(connection: sqlite3.Connection) -> None:
@@ -5114,6 +5163,11 @@ def _memory_migration_v1(connection: sqlite3.Connection) -> None:
     MemoryStore._archive_duplicate_recent_context_summaries(connection)
 
 
+def _memory_migration_v2(connection: sqlite3.Connection) -> None:
+    MemoryStore._ensure_memories_embedding_space_column(connection)
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
+    (2, _memory_migration_v2),
 ]

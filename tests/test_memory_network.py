@@ -19,6 +19,7 @@ def test_memory_network_returns_core_evidence_and_similarity_edges(
         valence=0.75,
         arousal=0.35,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     pour_over = memory_store.create_memory(
         user_id="default",
@@ -29,6 +30,7 @@ def test_memory_network_returns_core_evidence_and_similarity_edges(
         valence=0.78,
         arousal=0.4,
         embedding_json=json.dumps([0.98, 0.02]),
+        embedding_space_id="test-space",
         evidence_memory_ids=[coffee.id],
     )
     memory_store.upsert_core_memory_section(
@@ -102,6 +104,7 @@ def test_memory_network_falls_back_to_text_for_mixed_embedding_dimensions(
         type="emotional",
         importance=6,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     right = memory_store.create_memory(
         user_id="default",
@@ -109,6 +112,7 @@ def test_memory_network_falls_back_to_text_for_mixed_embedding_dimensions(
         type="emotional",
         importance=6,
         embedding_json=json.dumps([1.0, 0.0, 0.0]),
+        embedding_space_id="test-space",
     )
 
     response = client.post(
@@ -119,6 +123,38 @@ def test_memory_network_falls_back_to_text_for_mixed_embedding_dimensions(
 
     assert response.status_code == 200
     assert any(
+        edge["kind"] == "similarity"
+        and {edge["source"], edge["target"]} == {left.id, right.id}
+        for edge in response.json()["edges"]
+    )
+
+
+def test_memory_network_does_not_compare_vectors_from_different_spaces(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    left = memory_store.create_memory(
+        user_id="default",
+        content="用户正在准备越野跑。",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="space-a",
+    )
+    right = memory_store.create_memory(
+        user_id="default",
+        content="用户收藏了一台老式相机。",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="space-b",
+    )
+
+    response = client.post(
+        "/memories/network",
+        headers=auth_headers,
+        json={"limit": 20, "similarity_threshold": 0.95, "max_similarity_edges": 10},
+    )
+
+    assert response.status_code == 200
+    assert not any(
         edge["kind"] == "similarity"
         and {edge["source"], edge["target"]} == {left.id, right.id}
         for edge in response.json()["edges"]
@@ -278,6 +314,7 @@ def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
         type="semantic",
         importance=8,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     bridge = memory_store.create_memory(
         user_id="default",
@@ -285,6 +322,7 @@ def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
         type="semantic",
         importance=7,
         embedding_json=json.dumps([0.8, 0.6]),
+        embedding_space_id="test-space",
     )
     target = memory_store.create_memory(
         user_id="default",
@@ -292,6 +330,7 @@ def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
         type="semantic",
         importance=7,
         embedding_json=json.dumps([0.28, 0.96]),
+        embedding_space_id="test-space",
     )
     unrelated = memory_store.create_memory(
         user_id="default",
@@ -299,6 +338,7 @@ def test_memory_network_traverse_returns_multihop_paths_with_depth_limit(
         type="emotional",
         importance=7,
         embedding_json=json.dumps([-1.0, 0.0]),
+        embedding_space_id="test-space",
     )
 
     response = client.post(
@@ -362,11 +402,13 @@ def test_memory_network_traverse_spends_edge_budget_from_seed_frontier(
         user_id="default",
         content="seed",
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     reachable = memory_store.create_memory(
         user_id="default",
         content="reachable",
         embedding_json=json.dumps([0.8, 0.6]),
+        embedding_space_id="test-space",
     )
     for index, vector in enumerate(
         ([0.0, 1.0], [0.01, 0.99995], [-0.01, 0.99995]),
@@ -376,6 +418,7 @@ def test_memory_network_traverse_spends_edge_budget_from_seed_frontier(
             user_id="default",
             content=f"unrelated-{index}",
             embedding_json=json.dumps(vector),
+            embedding_space_id="test-space",
         )
 
     response = client.post(
@@ -408,6 +451,7 @@ def test_memory_network_traverse_uses_explicit_evidence_edge(
         user_id="default",
         content="Evidence seed.",
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     derived = memory_store.create_memory(
         user_id="default",
@@ -415,6 +459,7 @@ def test_memory_network_traverse_uses_explicit_evidence_edge(
         origin="agent_derived",
         evidence_memory_ids=[seed.id],
         embedding_json=json.dumps([0.0, 1.0]),
+        embedding_space_id="test-space",
     )
 
     response = client.post(
@@ -450,6 +495,7 @@ def test_memory_network_traverse_respects_user_boundary(
         type="semantic",
         importance=8,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
 
     response = client.post(

@@ -11,6 +11,15 @@ from app.knowledge.agent import (
     OpenAICompatibleKnowledgeAgentClient,
 )
 from app.llm.client import OpenAICompatibleClient, _thinking_payload
+from app.llm.model_gateway import (
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+    MODEL_GATEWAY_VENDOR_HEADER,
+)
 from app.llm.routing import ProviderCooldowns
 from app.openai_compat.schemas import ChatCompletionRequest
 
@@ -486,6 +495,197 @@ async def test_m_only_priority_uses_legacy_upstream_as_implicit_d_fallback() -> 
 
     assert calls == ["mimo-v2.5-pro-ultraspeed", "deepseek-v4-flash"]
     assert response["model"] == "deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected_model"),
+    [
+        ("memory-extractor", "route.extract"),
+        ("memory-ingester", "route.extract"),
+        ("memory-context-compactor", "route.compact"),
+        ("core-memory-consolidator", "route.core"),
+        ("memory-review-editor", "route.review"),
+    ],
+)
+async def test_model_gateway_routes_internal_operation_once_without_vendor_rewrite(
+    operation: str,
+    expected_model: str,
+) -> None:
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append(
+            {
+                "url": str(request.url),
+                "authorization": request.headers.get("Authorization"),
+                "payload": payload,
+            }
+        )
+        return httpx.Response(
+            200,
+            headers={
+                MODEL_GATEWAY_ROUTE_HEADER: expected_model,
+                MODEL_GATEWAY_DEPLOYMENT_HEADER: "deployment-primary",
+                MODEL_GATEWAY_CONNECTION_HEADER: "connection-primary",
+                MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER: "moonshot",
+                MODEL_GATEWAY_MODEL_AUTHOR_HEADER: "moonshot",
+                MODEL_GATEWAY_VENDOR_HEADER: "kimi",
+                MODEL_GATEWAY_UPSTREAM_MODEL_HEADER: "kimi-k2.7-code",
+            },
+            json={
+                "choices": [{"message": {"content": '{"operations":[]}'}}],
+                "model": expected_model,
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        MODEL_GATEWAY_MEMORY_EXTRACT_MODEL="route.extract",
+        MODEL_GATEWAY_MEMORY_COMPACT_MODEL="route.compact",
+        MODEL_GATEWAY_MEMORY_CORE_MODEL="route.core",
+        MODEL_GATEWAY_MEMORY_REVIEW_MODEL="route.review",
+        LLM_PROVIDER_PRIORITY="MKD",
+        LLM_MIMO_API_KEY="must-not-be-used",
+        LLM_KIMI_API_KEY="must-not-be-used",
+        LLM_DEEPSEEK_API_KEY="must-not-be-used",
+    )
+    client = OpenAICompatibleClient(
+        settings=settings,
+        transport=httpx.MockTransport(handler),
+    )
+    request = ChatCompletionRequest(
+        model=operation,
+        messages=[{"role": "user", "content": "只输出 JSON"}],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+
+    await client.create_chat_completion(
+        request=request,
+        messages=[{"role": "user", "content": "只输出 JSON"}],
+        structured_tool={
+            "name": "submit_result",
+            "parameters": {"type": "object"},
+        },
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://127.0.0.1:2030/v1/chat/completions"
+    assert calls[0]["authorization"] == "Bearer central-key"
+    assert calls[0]["payload"]["model"] == expected_model
+    assert calls[0]["payload"]["temperature"] == 0.0
+    assert calls[0]["payload"]["stream"] is False
+    assert calls[0]["payload"]["reasoning_effort"] == "high"
+    assert calls[0]["payload"]["tools"][0]["function"]["name"] == "submit_result"
+    assert calls[0]["payload"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_result"},
+    }
+    assert "response_format" not in calls[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_does_not_fall_back_to_legacy_provider() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            json={"error": {"message": "central route unavailable"}},
+        )
+
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        LLM_PROVIDER_PRIORITY="MKD",
+        LLM_MIMO_API_KEY="must-not-be-used",
+        LLM_KIMI_API_KEY="must-not-be-used",
+        LLM_DEEPSEEK_API_KEY="must-not-be-used",
+    )
+    client = OpenAICompatibleClient(
+        settings=settings,
+        transport=httpx.MockTransport(handler),
+    )
+    request = ChatCompletionRequest(
+        model="memory-review-editor",
+        messages=[{"role": "user", "content": "test"}],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await client.create_chat_completion(
+            request=request,
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert calls == 1
+    assert exc_info.value.status_code == 502
+    assert "central route unavailable" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_usage_uses_actual_upstream_model_header() -> None:
+    class CapturingUsageRecorder:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def record_response(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            headers={
+                MODEL_GATEWAY_ROUTE_HEADER: payload["model"],
+                MODEL_GATEWAY_DEPLOYMENT_HEADER: "deployment-deepseek",
+                MODEL_GATEWAY_CONNECTION_HEADER: "connection-official",
+                MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER: "deepseek",
+                MODEL_GATEWAY_MODEL_AUTHOR_HEADER: "deepseek",
+                MODEL_GATEWAY_VENDOR_HEADER: "deepseek",
+                MODEL_GATEWAY_UPSTREAM_MODEL_HEADER: "deepseek-v4-flash",
+            },
+            json={
+                "choices": [{"message": {"content": "{}"}}],
+                "model": payload["model"],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        )
+
+    recorder = CapturingUsageRecorder()
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+    )
+    client = OpenAICompatibleClient(
+        settings=settings,
+        transport=httpx.MockTransport(handler),
+        usage_recorder=recorder,  # type: ignore[arg-type]
+    )
+    request = ChatCompletionRequest(
+        model="memory-review-editor",
+        messages=[{"role": "user", "content": "test"}],
+    )
+
+    response = await client.create_chat_completion(
+        request=request,
+        messages=[{"role": "user", "content": "test"}],
+    )
+
+    assert response["model"] == "memory.review"
+    assert recorder.calls[0]["model"] == "deepseek-v4-flash"
+    assert recorder.calls[0]["payload"]["model"] == "deepseek-v4-flash"
+    assert recorder.calls[0]["base_url"] == "http://127.0.0.1:2030/v1"
+    assert recorder.calls[0]["provider_override"] == "deepseek"
+    assert recorder.calls[0]["use_local_pricing"] is False
+    assert recorder.calls[0]["operation"] == "memory-review-editor"
 
 
 def test_memory_and_knowledge_clients_share_process_cooldown_registry() -> None:

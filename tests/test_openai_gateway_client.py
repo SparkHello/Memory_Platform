@@ -1,5 +1,6 @@
 import json
 
+from fastapi import HTTPException
 import httpx
 import pytest
 
@@ -25,6 +26,32 @@ def _settings(**overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
+
+
+def _model_gateway_settings(**overrides) -> Settings:
+    return _settings(
+        MODEL_GATEWAY_BASE_URL="https://model-gateway.invalid/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        MODEL_GATEWAY_CHAT_MODEL="memory.chat",
+        **overrides,
+    )
+
+
+def _model_gateway_response_headers(
+    *,
+    deployment: str = "deploy-kimi-primary",
+    route: str = "memory.chat",
+) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Model-Gateway-Route": route,
+        "X-Model-Gateway-Deployment": deployment,
+        "X-Model-Gateway-Connection": "moonshot-official",
+        "X-Model-Gateway-Channel-Operator": "moonshot",
+        "X-Model-Gateway-Model-Author": "moonshot",
+        "X-Model-Gateway-Vendor": "kimi",
+        "X-Model-Gateway-Upstream-Model": "kimi-k2.7-code",
+    }
 
 
 @pytest.mark.asyncio
@@ -103,6 +130,206 @@ async def test_gateway_client_preserves_payload_and_fails_over() -> None:
     assert result.headers["x-request-id"] == "req-1"
 
 
+@pytest.mark.asyncio
+async def test_model_gateway_central_route_preserves_body_and_parses_origin() -> None:
+    seen: list[tuple[httpx.Request, dict]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "model": "kimi-k2.7-code",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok",
+                            "reasoning_content": "kept",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            headers=_model_gateway_response_headers(),
+        )
+
+    client = OpenAIChatGatewayClient(
+        _model_gateway_settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+    result = await client.complete(
+        {
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "vendor_extension": {"preserve": True},
+            "conversation_id": "local-only",
+        }
+    )
+
+    assert len(seen) == 1
+    request, forwarded = seen[0]
+    assert request.url == httpx.URL(
+        "https://model-gateway.invalid/v1/chat/completions"
+    )
+    assert request.headers["authorization"] == "Bearer central-key"
+    assert forwarded["model"] == "memory.chat"
+    assert forwarded["vendor_extension"] == {"preserve": True}
+    assert forwarded["stream"] is False
+    assert "conversation_id" not in forwarded
+    assert result.provider.deployment_id == "deploy-kimi-primary"
+    assert result.provider.connection_id == "moonshot-official"
+    assert result.provider.vendor == "moonshot"
+    assert result.provider.model_author == "moonshot"
+    assert result.provider.model == "kimi-k2.7-code"
+    assert "x-model-gateway-deployment" not in result.headers
+    assert client.list_models() == ["memory-auto", "memory.chat"]
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_public_chat_rejects_internal_routes_and_old_aliases() -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise AssertionError("rejected model must not reach Model Gateway")
+
+    client = OpenAIChatGatewayClient(
+        _model_gateway_settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+
+    configured = client._model_gateway_payload(
+        {
+            "model": "memory.chat",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        stream=False,
+    )
+    assert configured["model"] == "memory.chat"
+
+    for requested_model in (
+        "memory.extract",
+        "knowledge.pro",
+        "memory.embedding",
+        "memory-gateway",
+        "auto",
+        "default",
+    ):
+        with pytest.raises(HTTPException) as caught:
+            await client.complete(
+                {
+                    "model": requested_model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+        assert caught.value.status_code == 404
+
+    with pytest.raises(HTTPException) as stream_error:
+        await client.open_stream(
+            {
+                "model": "memory.review",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+    assert stream_error.value.status_code == 404
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_affinity_409_retries_once_without_private_reasoning() -> None:
+    seen: list[tuple[httpx.Request, dict]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        forwarded = json.loads(request.content)
+        seen.append((request, forwarded))
+        if len(seen) == 1:
+            return httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "model_gateway_affinity_unavailable",
+                        "message": "deployment is unavailable",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            headers=_model_gateway_response_headers(deployment="deploy-deepseek-backup"),
+        )
+
+    client = OpenAIChatGatewayClient(
+        _model_gateway_settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+    result = await client.complete(
+        {
+            "model": "memory-auto",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "deployment-private-state",
+                    "tool_calls": [{"id": "call_1", "type": "function"}],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+            ],
+        },
+        preferred_provider_code="deploy-kimi-primary",
+    )
+
+    assert len(seen) == 2
+    first_request, first_payload = seen[0]
+    second_request, second_payload = seen[1]
+    assert first_request.headers["x-model-gateway-require-deployment"] == (
+        "deploy-kimi-primary"
+    )
+    assert first_request.headers[
+        "x-model-gateway-reasoning-origin-deployment"
+    ] == "deploy-kimi-primary"
+    assert first_payload["messages"][1]["reasoning_content"] == (
+        "deployment-private-state"
+    )
+    assert "x-model-gateway-require-deployment" not in second_request.headers
+    assert "reasoning_content" not in second_payload["messages"][1]
+    assert result.provider.deployment_id == "deploy-deepseek-backup"
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_rejects_mismatched_affinity_response() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "unsafe"}}]},
+            headers=_model_gateway_response_headers(deployment="wrong-deployment"),
+        )
+
+    client = OpenAIChatGatewayClient(
+        _model_gateway_settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+
+    with pytest.raises(GatewayUpstreamHTTPError) as caught:
+        await client.complete(
+            {
+                "model": "memory-auto",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            preferred_provider_code="deploy-kimi-primary",
+        )
+
+    assert caught.value.status_code == 502
+    assert json.loads(caught.value.content)["error"]["code"] == (
+        "model_gateway_affinity_protocol_error"
+    )
+
+
 class _ChunkStream(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes]) -> None:
         self.chunks = chunks
@@ -157,6 +384,55 @@ async def test_gateway_client_opens_and_closes_stream_without_buffering() -> Non
     assert seen_payload["stream"] is True
     assert seen_payload["stream_options"] == {"include_usage": True}
     assert stream.headers["content-type"] == "text/event-stream"
+    assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_stream_preserves_sse_and_affinity_metadata() -> None:
+    chunks = [
+        b'data: {"choices":[{"delta":{"reasoning_content":"r"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    source = _ChunkStream(chunks)
+    captured: dict = {}
+    headers: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        headers.update(request.headers)
+        return httpx.Response(
+            200,
+            headers={
+                **_model_gateway_response_headers(),
+                "Content-Type": "text/event-stream",
+            },
+            stream=source,
+        )
+
+    client = OpenAIChatGatewayClient(
+        _model_gateway_settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+    stream = await client.open_stream(
+        {
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        preferred_provider_code="deploy-kimi-primary",
+    )
+    forwarded = [chunk async for chunk in stream.aiter_bytes()]
+    await stream.aclose()
+
+    assert forwarded == chunks
+    assert captured["model"] == "memory.chat"
+    assert captured["stream"] is True
+    assert headers["x-model-gateway-require-deployment"] == (
+        "deploy-kimi-primary"
+    )
+    assert stream.provider.deployment_id == "deploy-kimi-primary"
+    assert stream.metadata.vendor == "moonshot"
     assert source.closed is True
 
 

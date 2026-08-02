@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    embedding_runtime_enabled,
     get_knowledge_search_agent,
     get_knowledge_embedding_indexer,
     get_knowledge_store,
@@ -102,6 +103,54 @@ def knowledge_status(
     store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
+    runtime = _knowledge_runtime_status(settings)
+    init_error = str(getattr(request.app.state, "knowledge_init_error", "") or "")
+    if init_error:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "error": init_error,
+            **runtime,
+            "agent_enabled": False,
+        }
+    payload = _store_call(store.status, user_id=user_id)
+    return {
+        "available": True,
+        "status": "ok",
+        **payload,
+        **runtime,
+        "max_document_bytes": settings.knowledge_max_document_bytes,
+        "embedding_batch_size": settings.knowledge_embedding_batch_size,
+        "hybrid_vector_weight": settings.knowledge_hybrid_vector_weight,
+        "embedding_min_cosine": settings.knowledge_embedding_min_cosine,
+    }
+
+
+def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
+    if settings.model_gateway_enabled:
+        embedding_enabled = embedding_runtime_enabled(settings)
+        return {
+            "model_gateway_enabled": True,
+            "agent_enabled": settings.knowledge_agent_egress_policy != "none",
+            "agent_egress_policy": settings.knowledge_agent_egress_policy,
+            "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
+            "agent_provider_priority": "G",
+            "agent_configured_providers": ["G"],
+            "agent_rate_limit_cooldown_seconds": 0.0,
+            "llm_provider_priority": "G",
+            "llm_configured_providers": ["G"],
+            "llm_rate_limit_cooldown_seconds": 0.0,
+            "agent_mimo_model": "",
+            "agent_kimi_model": "",
+            "agent_flash_model": settings.model_gateway_knowledge_fast_model,
+            "agent_pro_model": settings.model_gateway_knowledge_pro_model,
+            "sensitive_egress_enabled": settings.allow_sensitive_egress,
+            "embedding_enabled": embedding_enabled,
+            "embedding_model": (
+                settings.model_gateway_embedding_model if embedding_enabled else ""
+            ),
+        }
+
     provider_priority = list(settings.llm_provider_priority)
     if provider_priority == ["M"]:
         provider_priority.append("D")
@@ -139,31 +188,9 @@ def knowledge_status(
     llm_configured_providers = [
         code for code in provider_priority if llm_provider_configured[code]
     ]
-    init_error = str(getattr(request.app.state, "knowledge_init_error", "") or "")
-    if init_error:
-        return {
-            "available": False,
-            "status": "unavailable",
-            "error": init_error,
-            "agent_enabled": False,
-            "agent_egress_policy": settings.knowledge_agent_egress_policy,
-            "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
-            "agent_provider_priority": settings.llm_provider_priority,
-            "agent_configured_providers": configured_providers,
-            "agent_rate_limit_cooldown_seconds": (
-                settings.llm_rate_limit_cooldown_seconds
-            ),
-            "llm_provider_priority": settings.llm_provider_priority,
-            "llm_configured_providers": llm_configured_providers,
-            "llm_rate_limit_cooldown_seconds": (
-                settings.llm_rate_limit_cooldown_seconds
-            ),
-        }
-    payload = _store_call(store.status, user_id=user_id)
+    embedding_enabled = embedding_runtime_enabled(settings)
     return {
-        "available": True,
-        "status": "ok",
-        **payload,
+        "model_gateway_enabled": False,
         "agent_enabled": bool(
             configured_providers
             and settings.knowledge_agent_egress_policy != "none"
@@ -183,12 +210,8 @@ def knowledge_status(
         "agent_flash_model": settings.llm_deepseek_flash_model,
         "agent_pro_model": settings.llm_deepseek_pro_model,
         "sensitive_egress_enabled": settings.allow_sensitive_egress,
-        "embedding_enabled": bool(settings.embedding_api_key and settings.embedding_model),
-        "embedding_model": settings.embedding_model if settings.embedding_api_key else "",
-        "max_document_bytes": settings.knowledge_max_document_bytes,
-        "embedding_batch_size": settings.knowledge_embedding_batch_size,
-        "hybrid_vector_weight": settings.knowledge_hybrid_vector_weight,
-        "embedding_min_cosine": settings.knowledge_embedding_min_cosine,
+        "embedding_enabled": embedding_enabled,
+        "embedding_model": settings.embedding_model if embedding_enabled else "",
     }
 
 

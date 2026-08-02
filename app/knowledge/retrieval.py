@@ -8,7 +8,11 @@ import anyio
 
 from app.knowledge.models import KnowledgeSearchHit
 from app.knowledge.store import KnowledgeStore
-from app.memory.search import EmbeddingClient, NullEmbeddingClient
+from app.memory.search import (
+    EmbeddingClient,
+    NullEmbeddingClient,
+    embedding_space_id_for,
+)
 from app.usage.context import model_usage_scope
 
 
@@ -29,12 +33,16 @@ class KnowledgeEmbeddingIndexer:
     @property
     def enabled(self) -> bool:
         return not isinstance(self.embedding_client, NullEmbeddingClient) and bool(
-            self.model
+            self.model and self.embedding_space_id
         )
 
     @property
     def model(self) -> str:
         return str(getattr(self.embedding_client, "model", "") or "")
+
+    @property
+    def embedding_space_id(self) -> str:
+        return embedding_space_id_for(self.embedding_client)
 
     @property
     def allow_sensitive_egress(self) -> bool:
@@ -48,14 +56,25 @@ class KnowledgeEmbeddingIndexer:
         user_id: str,
         version_ref: str,
     ) -> dict[str, int | str]:
-        if not self.enabled:
+        model = self.model
+        embedding_space_id = self.embedding_space_id
+        if (
+            isinstance(self.embedding_client, NullEmbeddingClient)
+            or not model
+            or not embedding_space_id
+        ):
             await anyio.to_thread.run_sync(
                 partial(
                     self.store.set_version_embedding_status,
                     user_id=user_id,
                     version_ref=version_ref,
                     status="disabled",
-                    error="embedding provider is not configured",
+                    embedding_space_id=embedding_space_id,
+                    error=(
+                        "embedding space is not configured"
+                        if model and not embedding_space_id
+                        else "embedding provider is not configured"
+                    ),
                 )
             )
             return {"status": "disabled", "stored": 0, "total": 0}
@@ -74,7 +93,8 @@ class KnowledgeEmbeddingIndexer:
                     user_id=user_id,
                     version_ref=version_ref,
                     status="disabled",
-                    model=self.model,
+                    model=model,
+                    embedding_space_id=embedding_space_id,
                     error="no eligible chunks; sensitive knowledge requires explicit egress approval",
                 )
             )
@@ -85,7 +105,8 @@ class KnowledgeEmbeddingIndexer:
                 user_id=user_id,
                 version_ref=version_ref,
                 status="indexing",
-                model=self.model,
+                model=model,
+                embedding_space_id=embedding_space_id,
             )
         )
         vectors: dict[str, list[float]] = {}
@@ -107,7 +128,8 @@ class KnowledgeEmbeddingIndexer:
                     self.store.replace_chunk_embeddings,
                     user_id=user_id,
                     version_ref=version_ref,
-                    model=self.model,
+                    model=model,
+                    embedding_space_id=embedding_space_id,
                     vectors=vectors,
                     total_chunks=len(chunks),
                 )
@@ -119,7 +141,8 @@ class KnowledgeEmbeddingIndexer:
                     user_id=user_id,
                     version_ref=version_ref,
                     status="failed",
-                    model=self.model,
+                    model=model,
+                    embedding_space_id=embedding_space_id,
                     error=_safe_embedding_error(exc),
                 )
             )
@@ -164,14 +187,17 @@ class KnowledgeRetrievalService:
                 )
             )
         )
-        try:
-            with model_usage_scope(
-                user_id=user_id,
-                operation="knowledge_search",
-            ):
-                query_vector = await self.embedding_client.embed(query)
-        except Exception:
-            query_vector = None
+        embedding_space_id = embedding_space_id_for(self.embedding_client)
+        query_vector = None
+        if embedding_space_id:
+            try:
+                with model_usage_scope(
+                    user_id=user_id,
+                    operation="knowledge_search",
+                ):
+                    query_vector = await self.embedding_client.embed(query)
+            except Exception:
+                query_vector = None
         keyword_hits = await keyword_task
         model = str(getattr(self.embedding_client, "model", "") or "")
         vector_hits: list[KnowledgeSearchHit] = []
@@ -182,6 +208,7 @@ class KnowledgeRetrievalService:
                     user_id=user_id,
                     query_vector=query_vector,
                     model=model,
+                    embedding_space_id=embedding_space_id,
                     query=query,
                     limit=candidate_limit,
                     document_refs=list(document_refs or []),

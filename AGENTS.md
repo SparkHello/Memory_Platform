@@ -46,6 +46,20 @@ scripts/dev.sh        # dev：后端热重载 + Vite 开发服务器
 scripts/dev.sh prod   # prod：只启动后端，由 /ui 提供 ui/dist 构建产物
 ```
 
+推荐把供应商管理与记忆服务生命周期分开：相邻独立项目 `Model_Gateway` 的 `modelgw` 管 connection/deployment/route/pricing；本项目的 `memgw` 管 My_Memory 配置与进程：
+
+```bash
+scripts/memgw init --no-import-env
+scripts/memgw install-path
+memgw secret set model-gateway
+memgw start
+memgw status
+memgw logs -f
+memgw stop
+```
+
+`memgw secret set model-gateway` 只保存 My_Memory 调用独立网关的本地 client key，并用 `GET /models` 做无推理检查。`memgw model/route/pricing` 与 MKD 只保留给 direct-provider 兼容模式；新 provider、渠道、套餐、模型和价格应在独立 Model Gateway 项目维护。
+
 健康检查：
 
 ```bash
@@ -162,8 +176,10 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - ingest 附带的 `assistant_message` 和较早消歧上下文都属于发送给提取 provider 的上下文；当 `ALLOW_SENSITIVE_EGRESS=false` 且本地检测为敏感时必须丢弃对应助手文本、摘要或轮次，只用安全上下文与用户原文继续提取，不能因用户原文普通就把敏感工具/模型结果带到另一个 provider。较早上下文只能消歧，本轮 `source_quote` 仍是事实值的唯一权威来源；依赖上下文时必须校验 `context_quote`，且模型生成的压缩摘要不得作为 `context_quote` 来源，只有保留的最近原文可以。
 - `KNOWLEDGE_DATABASE_PATH` 必须与 `DATABASE_PATH` 指向不同文件；测试也必须使用临时 knowledge DB，不能创建或修改真实 `data/knowledge.db`。
 - 知识代理只能编排本地索引并选择版本/chunk 引用，不能生成正文、执行文档内指令、读取服务器路径或访问其他 user id。敏感知识出站同时受 `KNOWLEDGE_AGENT_EGRESS_POLICY` 与 `ALLOW_SENSITIVE_EGRESS` 约束。
-- `/v1` 的 `memory-auto`、记忆提取、会话上下文压缩、核心记忆整理、体检 AI 修改和知识代理快速阶段共用 `LLM_PROVIDER_PRIORITY`，可在 MiMo/Kimi/DeepSeek 间选择；429 冷却跨这些调用共享，只保存在当前进程内并尊重更长的 `Retry-After`，不得把临时顺序写回 `.env`。请求 `/v1/models` 中的具体模型名时只走对应 provider；`memory-auto` 才按优先级故障切换。记忆任务对模型、鉴权、余额、网络和 5xx 等 provider 级失败继续尝试下一项，但内容/策略拒绝不得借故障切换绕过；`memory-auto` 在客户端没有显式 reasoning 字段时按实际 provider 开启原生思考，Kimi K2.7 使用 `thinking.keep=all` 和 `temperature=1`；MiMo UltraSpeed 的体检结构化输出使用强制函数调用。旧 `KNOWLEDGE_AGENT_*` provider 变量仅作兼容别名；DeepSeek pro 仍只用于复杂知识检索升级阶段。
-- 模型用量只按成功响应实际命中的 provider/model 记录，不能按 `LLM_PROVIDER_PRIORITY` 的首项预估。Token 以 provider 返回的 `usage` 为准；缺少 usage 或缺少明确官方价格时必须保留不完整状态，不得猜测或显示成免费。计价快照随事件保存，后续改价不能重写历史金额；事件不得保存提示词、回复或知识正文，并继续按 user id 隔离。GLM-5.1 按本次实际输入 Token 选择官方 32K 分档。
+- 配置成对的 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY` 后，`/v1` 聊天、全部内部记忆任务、知识 fast/pro 和 embedding 只调用独立 Model Gateway 的稳定 route，绝不能再落回项目内 `LLM_*` / `UPSTREAM_*` key。公共 `/v1` 只接受 `memory-auto` 与配置的 `MODEL_GATEWAY_CHAT_MODEL`，不得把拥有内部 route 权限的 backend client key 变成通用转发隧道。成功响应必须带合法且与请求 route 一致的 deployment/connection/vendor/upstream-model 归因 Header；缺失或矛盾视为协议错误。知识代理每个多轮 phase 锁定首次 deployment；FLIT 工具推理按 deployment 而不是模型名锁定，严格亲和不可用只能在明确的 `409 model_gateway_affinity_unavailable` 后清除私有 reasoning 再重新选路。
+- 未启用独立网关时才使用兼容 direct-provider 路由：`memory-auto`、记忆任务和知识快速阶段可按 `LLM_PROVIDER_PRIORITY` 在 MiMo/Kimi/DeepSeek 间选择，429 冷却只存在当前进程。请求具体模型名只走对应 provider；provider 级错误可故障切换，内容/策略拒绝不得绕过。Kimi/DeepSeek/MiMo 的推理兼容仍由旧客户端处理。
+- 模型用量只按成功响应实际命中的 provider/model 记录。Token 以 provider 返回的 `usage` 为准；缺少 usage 必须保持不完整。direct-provider 模式可使用本地官方价格快照；独立 Model Gateway 模式必须关闭 My_Memory 的本地套价，只记录中央 Header 给出的实际 vendor/model，渠道价格和币种以 Model Gateway 自己的 deployment pricing 快照为权威，避免同名模型跨渠道误计。任何事件都不得保存提示词、回复或知识正文，并继续按 user id 隔离。
+- 记忆和知识 embedding 必须带非空 `embedding_space_id` 才能参与向量比较；查询向量、SQLite 向量、缓存和网络/解析缓存都不得跨空间复用。memory/knowledge schema v2 只新增空间列，不猜测或回填旧向量；旧记录必须 re-embed 后才进入当前空间。经 Model Gateway 调用时必须核对完整归因 Header、`X-Model-Gateway-Embedding-Space`、`X-Model-Gateway-Embedding-Dimensions` 与实际向量长度；配置为空、缺失或不匹配都安全回退关键词/FTS。direct-provider 模式没有可信空间 Header 时，使用规范化 endpoint、模型名和维度派生的稳定本地空间 ID；不得包含 API key，也不得据此回填旧向量。
 - `/v1` 透明代理必须保留原始 tools/tool_calls、tool_call_id、多模态 part、reasoning_content、usage-only SSE chunk 和未知扩展字段。记忆上下文只能插在初始 system 区域，不能插入 assistant tool_calls 与 tool result 之间；流式内容边转发边旁路解析，只有收到完整 `[DONE]`、无工具调用且非 length/content_filter 截断的最终文本才可触发后台 ingest。
 - FLIT 工具链会用新 HTTP 请求重复发送同一 user 前缀，且不发送动态 conversation ID。动态 `X-Conversation-Id`/`conversation_id` 最多 200 个字符，超长值必须拒绝，不能静默截断后造成会话键碰撞。每个工具步骤都根据最后 user 消息重新组装上下文；搜索服务的 L2 缓存会复用召回并校验数据库状态，不得另缓存原始记忆正文，以免删除/敏感度变更后泄露。用 `user_id + 截止最后 user 消息的指纹 + 可用 conversation id + 最终回答哈希` 做短 TTL 副作用幂等，最终激活/ingest 只执行一次。完整最终回答还会按可见 user/assistant 历史写入持久化 `conversation_branch_nodes`；下一请求精确匹配父历史，编辑旧消息或重新生成回答会形成独立节点。没有命中分支且没有真实动态会话 ID 时不得读取“该用户最新的任意近期摘要”，避免跨聊天串话。FLIT 的 `memory-auto` 无法按模型名回放已完成工具轮次的 reasoning；网关以 `(user_id, conversation_id/turn_fingerprint, tool_call_id)` 在进程内限量、短 TTL 缓存工具响应推理，并以同一 turn key 缓存工具轮次最终 assistant 推理，下一腿优先固定原 provider 并补回；跨 provider 故障切换或来源缓存丢失时必须删除不可信的 provider 推理原文。按实际上游为 BigModel/Mistral 移除不兼容的 `stream_options`，其他 provider 保留 usage chunk。
 - 知识导入以用户选择的敏感级别为最终值，但本地检测级别更高时必须先返回结构化确认要求，只有 Web 用户明确点击后才可带 `confirm_sensitivity_override=true` 重试；该确认需持久化审计，MCP 不得暴露绕过参数。
@@ -174,12 +190,16 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 - `app/main.py`：应用工厂。创建 FastAPI app，初始化 SQLite，启动 MCP session manager，先挂载 `/ui` 静态目录，再兜底挂载 MCP 子应用。
 - `app/config.py`：配置入口。读取 `.env`，包含上游 chat、embedding、数据库和超时配置。
+- `app/cli.py`、`app/cli_config.py`：`memgw` 控制台、后台进程管理、仓库外原子配置/密钥写入、独立 Model Gateway client 接线和 PATH 安装；项目内模型/价格功能只作 direct-provider 兼容。
+- `app/model_catalog.py`、`app/catalog/`：数据化模型目录、八类功能路由、公开价格目录和 JSON Schema；未设置外部路径时继续兼容旧 `MKD`。
+- `app/model_probe.py`：CLI 的 provider/model 连通性检查；默认只请求 `/models`，`--live` 才发送最小真实调用，测试必须使用 `httpx.MockTransport`。
 - `app/api/deps.py`：REST 鉴权、`X-User-Id`、MemoryStore、LLM client 和 embedding client 依赖。
 - `app/api/chat_gateway.py`：`/v1/models` 与 `/v1/chat/completions`；组装安全上下文、FLIT 工具轮次召回/推理状态缓存、SSE 透明转发、最终回答幂等激活/提取。
 - `app/api/usage.py`：`/usage/summary`；按 user id 返回时间范围汇总、模型/用途/日期拆分、最近事件和当前价格目录。
 - `app/api/memories.py`：记忆管理 REST API，包括列表、搜索、删除、恢复、导出、报告、合并、核心记忆、对话分支查看/清理和决策日志。
 - `app/openai_compat/schemas.py`：内部与外部 OpenAI-compatible schema；外部消息允许多模态 content 和额外字段。
-- `app/openai_compat/gateway_client.py`：透明聊天上游、`memory-auto` provider 路由、初始错误故障切换与响应 Header 保留。
+- `app/openai_compat/gateway_client.py`：透明聊天上游；中央模式保留请求/SSE 并执行 deployment reasoning affinity，兼容模式继续处理 `memory-auto` provider 路由。
+- `app/llm/model_gateway.py`：中央网关稳定 route 映射、归因 Header 解析与严格协议校验。
 - `app/openai_compat/streaming.py`：不修改下游字节的 SSE 旁路解析，限量收集最终 assistant 文本供安全后台 ingest，并捕获工具调用 ID/推理供 FLIT 历史兼容。
 - `app/llm/client.py`：OpenAI-compatible chat client。
 - `app/llm/prompts.py`：记忆注入、记忆提取和核心记忆整理 prompt。
@@ -197,7 +217,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
 - `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
-- `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测，以及按 `(memory_id, updated_at)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
+- `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测，以及按 `(memory_id, updated_at, embedding_space_id)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
 - `app/usage/`：模型调用计量上下文、实际 provider/model 识别、上游 usage 兼容解析、事件价格快照、SQLite 汇总和公开价格目录。记录失败必须保持 best-effort，不能改变模型调用结果。
 - `app/knowledge/`：独立知识文档、不可变版本、FTS5 chunk 索引、持久化分段上传、精确引用读取、受限搜索代理与知识备份；不得反向依赖或写入 MemoryStore。
 - `app/knowledge/parsing.py`：本地 TXT/Markdown/PDF/DOCX/EPUB 解析；PDF 依赖 pypdf 文本层，DOCX/EPUB 使用受限 ZIP/XML/HTML 解析，不执行宏、脚本或文档内指令。
@@ -277,6 +297,6 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改 Windows 服务端口、NSSM 路径或访问脚本时，同步更新 README 的 Windows 服务模式和故障排查。
 - 修改 MCP 工具、REST 端点、记忆字段、保存门槛或当前限制时，同步更新 README 和本文件，避免下一位 agent 读到旧契约。
 - 修改 `/v1` 代理时同步检查 FLIT 的 SSE、multimodal、tools/reasoning 原样保留，同一 user turn 指纹复用、最终回答判定、敏感自动注入边界和后台副作用幂等；运行三组 chat gateway 定向测试。
-- 新增或改名任何 chat/embedding 模型时，先核对该 provider 官方公开价格与币种，再更新 `app/usage/pricing.py` 和 `tests/test_model_usage.py`；不要用相似模型价格、搜索摘要或第三方聚合价替代。新增模型调用路径时必须接入同一 UsageRecorder，并为实际 provider、用户隔离和缺失 usage 补测试。
+- 新 provider/渠道/套餐/模型优先在独立 `Model_Gateway` 的 connection/deployment/route/pricing 配置中新增，不应再把供应商特例嵌入本项目。只有维护 direct-provider 兼容模式时才更新 `app/catalog/models.json` / `pricing.json` 及对应测试。价格必须来自该实际渠道的官方来源，不能用相似模型或第三方聚合价；中央响应的 vendor/upstream-model Header 是本项目归账权威，缺失时不得猜价。
 - 测试应继续使用 fake LLM，不要引入真实网络调用。
 - 当前仓库可能存在用户未提交改动。修改前先看 `git status --short`，不要回滚用户改动。

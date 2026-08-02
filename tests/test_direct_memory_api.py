@@ -940,6 +940,7 @@ class TestReEmbedEndpoint:
         class FakeEmbeddingClient:
             def __init__(self) -> None:
                 self.dimensions = 4
+                self.embedding_space_id = "test-space"
 
             async def embed(self, text: str) -> list[float]:
                 return [0.1, 0.2, 0.3, 0.4]
@@ -956,6 +957,12 @@ class TestReEmbedEndpoint:
         payload = response.json()
         assert payload["re_embedded"] == 1
         assert len(payload["memory_ids"]) == 1
+        refreshed = memory_store.get_memory(
+            memory_id=payload["memory_ids"][0],
+            user_id="default",
+        )
+        assert refreshed is not None
+        assert refreshed.embedding_space_id == "test-space"
 
 
 class TestArchiveExpiredEndpoint:

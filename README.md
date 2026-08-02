@@ -38,7 +38,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - Temporal KG 基础：`valid_from`、`temporal_subject`、`temporal_predicate`、保守旧事实失效、时间线查询和恢复。
 - 可选 OpenAI 兼容 embedding 服务；没有 embedding key 时自动回退到关键词检索。
 - 独立长文本知识库：支持 UTF-8 文本/Markdown、PDF、DOCX、EPUB，不可变版本、标签/结构化元数据、FTS5 + chunk embedding 混合检索、精确片段引用、全文分页和独立备份恢复。
-- 记忆提取、核心记忆整理、体检 AI 修改与知识代理快速阶段可共用 MiMo / Kimi / DeepSeek 优先级和 429 进程内冷却；知识代理仍只编排本地索引和选择引用，最终正文始终由本地存储逐字返回。
+- 推荐通过独立 Model Gateway 为聊天、记忆提取、压缩、核心整理、体检、知识 fast/pro 和 embedding 分别配置稳定 route；旧 MiMo/Kimi/DeepSeek 优先级仍作为兼容模式。知识代理始终只编排本地索引和选择引用，最终正文由本地存储逐字返回。
 
 ## 技术栈
 
@@ -68,6 +68,69 @@ docs/               客户端接入和产品路线文档
 
 ## 快速启动
 
+推荐把两个职责分开：独立项目 `Model_Gateway` 管供应商账号、模型 deployment、功能路由、健康检查和价格；本项目的 `memgw` 只负责 My_Memory 的本地配置与进程生命周期。My_Memory 只持有一个本地 client key，不再保存每家供应商密钥。
+
+先安装并配置独立模型网关：
+
+```bash
+cd ../Model_Gateway
+python3.12 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/modelgw init
+.venv/bin/modelgw install-path
+```
+
+按 [Model Gateway README](../Model_Gateway/README.md) 添加 connection、deployment 和八条 `memory.*` / `knowledge.*` route，然后创建只允许这些 route 的 backend client，并启动服务：
+
+```bash
+modelgw client add memory-gateway \
+  --kind backend \
+  --route 'memory.*' \
+  --route 'knowledge.*' \
+  --set-secret
+modelgw doctor
+modelgw start
+```
+
+`--set-secret` 要求输入一枚你自己生成、保存在密码管理器里的本地 client key。它不是任何供应商 API Key；下一步在 `memgw` 中输入同一枚 key。
+
+再初始化 My_Memory 控制台：
+
+```bash
+cd /Users/spark/My_Memory
+scripts/memgw init --no-import-env
+scripts/memgw install-path
+```
+
+如果 `~/.local/bin` 尚未进入 PATH，按命令提示把它加入 `~/.zprofile`，重新打开终端后即可在任意目录使用：
+
+```bash
+memgw secret set gateway
+memgw secret set model-gateway
+# 仅在配置了 memory.embedding route 时填写它声明的精确空间 ID：
+memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<embedding-space-id>'
+memgw doctor
+memgw start
+memgw open
+```
+
+直接运行 `memgw` 会打开交互式控制台。常用命令还有：
+
+```bash
+memgw status
+memgw logs -f
+memgw restart
+memgw stop
+```
+
+`memgw secret set model-gateway` 默认使用 `http://127.0.0.1:2030/v1`，并只读取 `/models` 检查连接和鉴权，不发起推理。若网关位于其他 HTTPS 地址，先运行 `memgw config set MODEL_GATEWAY_BASE_URL https://.../v1`。`gateway` 是 FLIT/Web/MCP 访问 My_Memory 的本地密钥；`model-gateway` 是 My_Memory 访问独立模型网关的另一枚本地密钥，两者不要复用。
+
+macOS 的 My_Memory 用户配置默认位于 `~/Library/Application Support/memory-gateway/`；Model Gateway 使用自己独立的用户配置目录。两个程序的密钥文件都在仓库外且权限受限，项目 `.env` 只作为兼容输入。
+
+旧的项目内 `memgw model`、`memgw route`、`LLM_PROVIDER_PRIORITY=MKD` 和 `LLM_*` 仍保留作 direct-provider 兼容模式；新部署不需要同时维护两套路由。只要 `MODEL_GATEWAY_BASE_URL` 与 `MODEL_GATEWAY_API_KEY` 已配置，聊天、后台记忆任务和知识代理就只调用独立网关，中央路由失败也不会偷偷使用旧 `.env` key。此时对客户端开放的 `/v1/chat/completions` 只接受 `memory-auto` 和 `MODEL_GATEWAY_CHAT_MODEL` 配置的聊天 route；`memory.extract`、`knowledge.pro`、`memory.embedding` 等内部 route 不会通过公共聊天代理转发。
+
+下面是仍然支持的手工安装与启动方式：
+
 ```bash
 cd /Users/spark/My_Memory
 
@@ -78,43 +141,49 @@ python -m pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及 `/v1` 对话代理和记忆提取共用的上游模型：
+编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及独立 Model Gateway 接口：
 
 ```env
 GATEWAY_API_KEY=change-me
 DATABASE_PATH=data/memory.db
 KNOWLEDGE_DATABASE_PATH=data/knowledge.db
 
-UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-UPSTREAM_API_KEY=your-upstream-api-key
-UPSTREAM_MODEL=glm-5.1
+MODEL_GATEWAY_BASE_URL=http://127.0.0.1:2030/v1
+MODEL_GATEWAY_API_KEY=your-local-model-gateway-client-key
 ALLOW_SENSITIVE_EGRESS=false
 
 CHAT_GATEWAY_ENABLED=true
 CHAT_GATEWAY_DEFAULT_MEMORY_MODE=read-write
 ```
 
-需要语义检索时再配置 embedding；key 为空会自动使用本地关键词/FTS：
+需要语义检索时，在 Model Gateway 配好 `memory.embedding` route，再填写它的精确 immutable space 和维度；为空或与响应 Header/实际向量长度不一致时，会安全使用本地关键词/FTS：
 
 ```env
-EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_API_KEY=
-EMBEDDING_MODEL=text-embedding-v4
+MODEL_GATEWAY_EMBEDDING_MODEL=memory.embedding
+MODEL_GATEWAY_EMBEDDING_SPACE_ID=your-exact-embedding-space-id
 EMBEDDING_DIMENSIONS=1024
 ```
 
-要让记忆提取、核心记忆整理、体检 AI 修改和知识代理快速阶段共用 MiMo → Kimi → DeepSeek 编排，可再添加：
+若暂时不运行独立 Model Gateway，才使用下面的兼容 direct-provider 配置：
 
 ```env
+UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+UPSTREAM_API_KEY=your-upstream-api-key
+UPSTREAM_MODEL=glm-5.1
 LLM_PROVIDER_PRIORITY=MKD
 LLM_MIMO_API_KEY=
 LLM_KIMI_API_KEY=
 LLM_DEEPSEEK_API_KEY=
+EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_API_KEY=
+EMBEDDING_MODEL=text-embedding-v4
 KNOWLEDGE_AGENT_EGRESS_POLICY=normal
 LLM_RATE_LIMIT_COOLDOWN_SECONDS=300
 ```
 
-只会调用已填写 key 的 provider。`KNOWLEDGE_AGENT_EGRESS_POLICY` 只控制知识代理：`none` 保持知识检索完全本地，`normal` 只允许普通知识候选出站；记忆任务仍由 `ALLOW_SENSITIVE_EGRESS` 控制敏感内容边界。
+兼容模式只会调用已填写 key 的 provider。`KNOWLEDGE_AGENT_EGRESS_POLICY` 只控制知识代理：`none` 保持知识检索完全本地，`normal` 只允许普通知识候选出站；记忆任务仍由 `ALLOW_SENSITIVE_EGRESS` 控制敏感内容边界。
+
+direct-provider 模式会根据规范化后的 `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL` 和 `EMBEDDING_DIMENSIONS` 生成稳定、非空的本地 `embedding_space_id`；API Key 不参与，因此轮换密钥不会让已有向量失效。修改 endpoint、模型或维度会进入新空间。升级前没有空间标识的旧向量仍保持 unknown，不会按当前配置猜测，需显式 re-embed 后才能参与向量比较。
 
 启动后端：
 
@@ -216,21 +285,31 @@ curl \
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS` | `8` | 未压缩轮次达到该数量时，在聊天结束后的后台任务中压缩较早普通上下文。 |
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS` | `6000` | 较早普通上下文与已有摘要达到该字符数时触发后台压缩。 |
 | `CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS` | `4000` | 滚动压缩摘要的最大字符数。 |
+| `MODEL_GATEWAY_BASE_URL` | 空 | 推荐的独立 Model Gateway `/v1` 地址；只允许 HTTPS，或 `localhost`/回环地址上的 HTTP。必须与客户端 key 同时配置。 |
+| `MODEL_GATEWAY_API_KEY` | 空 | My_Memory 调用独立 Model Gateway 的 backend client key。可用 `memgw secret set model-gateway` 保存到仓库外。启用后不会回退到项目内 `LLM_*` / `UPSTREAM_*` provider。 |
+| `MODEL_GATEWAY_CHAT_MODEL` | `memory.chat` | `/v1` 透明聊天使用的稳定 route。 |
+| `MODEL_GATEWAY_MEMORY_*_MODEL` | 见 `.env.example` | 提取、压缩、核心整理和体检分别使用 `memory.extract`、`memory.compact`、`memory.core`、`memory.review`。 |
+| `MODEL_GATEWAY_KNOWLEDGE_*_MODEL` | 见 `.env.example` | 知识代理 fast/pro 阶段的两个独立 route。每个多轮阶段会锁定首次实际 deployment。 |
+| `MODEL_GATEWAY_EMBEDDING_MODEL` | `memory.embedding` | 记忆与知识向量化 route。网关要求该 route 的所有 fallback 使用同一向量空间和维度。 |
+| `MODEL_GATEWAY_EMBEDDING_SPACE_ID` | 空 | 必须与 Model Gateway deployment 声明的 immutable `embedding_space` 完全相同；为空，或空间/维度 Header 与 `EMBEDDING_DIMENSIONS` 不匹配时禁用向量并回退关键词/FTS，绝不混用旧空间。 |
 | `UPSTREAM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 单 provider 兼容兜底 base URL；所选 `D` 未配置 `LLM_DEEPSEEK_API_KEY` 时，记忆任务和聊天代理仍可回退使用它。 |
 | `UPSTREAM_API_KEY` | 空 | 旧版单 provider 上游 key；保留用于兼容原有 DeepSeek、GLM 等配置。 |
 | `UPSTREAM_MODEL` | `glm-5.1` | 旧版单 provider 模型名；仅在使用 `UPSTREAM_*` 兼容兜底时生效。 |
 | `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 private/sensitive 的文本发送给远程提取、embedding、AI 体检或知识代理服务。仅在所有相关 provider 均获准处理敏感数据时开启。 |
-| `EMBEDDING_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 embedding base URL。 |
+| `EMBEDDING_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 embedding base URL；direct-provider 模式下参与稳定本地向量空间 ID 的生成。 |
 | `EMBEDDING_API_KEY` | 空 | 为空时使用关键词检索，不调用 embedding。 |
-| `EMBEDDING_MODEL` | `text-embedding-v4` | embedding 模型名。 |
-| `EMBEDDING_DIMENSIONS` | `1024` | embedding 向量维度。 |
+| `EMBEDDING_MODEL` | `text-embedding-v4` | embedding 模型名；direct-provider 模式下参与稳定本地向量空间 ID 的生成。 |
+| `EMBEDDING_DIMENSIONS` | `1024` | embedding 向量维度；direct-provider 模式下参与稳定本地向量空间 ID 的生成。 |
 | `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
 | `KNOWLEDGE_DATABASE_PATH` | `data/knowledge.db` | 独立知识库 SQLite 路径；不得与 `DATABASE_PATH` 相同。 |
 | `KNOWLEDGE_MAX_DOCUMENT_BYTES` | `52428800` | 单个知识源文件/版本的字节上限（默认 50 MiB）。 |
 | `KNOWLEDGE_EMBEDDING_BATCH_SIZE` | `20` | 知识 chunk 批量生成 embedding 时的批大小；兼容 `qwen3.7-text-embedding` 单次最多 20 行。 |
 | `KNOWLEDGE_EMBEDDING_MIN_COSINE` | `0.25` | 知识向量候选的最低余弦相似度。 |
 | `KNOWLEDGE_HYBRID_VECTOR_WEIGHT` | `0.65` | 混合检索中向量通道的 RRF 权重，范围 0–1。 |
-| `LLM_PROVIDER_PRIORITY` | `D` | 聊天代理 `memory-auto` 与所有快速 LLM 任务的共享优先级：`M`=MiMo、`K`=Kimi、`D`=DeepSeek，例如 `MKD`、`KD`、`D`；空值按 `D` 处理。只填 `M` 时会隐式追加 `D` 作为紧急兜底。 |
+| `LLM_PROVIDER_PRIORITY` | `D` | 兼容 direct-provider 模式的共享优先级：`M`=MiMo、`K`=Kimi、`D`=DeepSeek。独立 Model Gateway 启用时忽略。 |
+| `MODEL_CATALOG_PATH` | 空 | 兼容 direct-provider 模式的外部模型目录；新部署应在独立 Model Gateway 管理 deployment。 |
+| `MODEL_ROUTES_PATH` | 空 | 兼容 direct-provider 模式的功能路由；新部署应使用 `modelgw route`。 |
+| `PRICING_CATALOG_PATH` | 空 | 可选外部公开价格 JSON 目录；为空时使用随版本发布的内置价格目录。每条用量事件仍保存发生时的价格快照。 |
 | `LLM_MIMO_BASE_URL` | `https://api.xiaomimimo.com/v1` | MiMo OpenAI-compatible base URL。 |
 | `LLM_MIMO_API_KEY` | 空 | MiMo API key；为空时跳过 `M`。 |
 | `LLM_MIMO_MODEL` | `mimo-v2.5-pro-ultraspeed` | `M` 对应的快速模型。 |
@@ -268,6 +347,82 @@ curl \
 - 记忆任务遇到 provider 的模型不存在/不支持、鉴权失效、余额不足、请求超时、网络错误或 5xx 时，会继续尝试下一个已配置 provider；其他 400/403/422 等内容或契约错误仍直接返回，避免绕过安全拒绝。知识代理失败时安全回退本地检索结果。复杂知识检索的 Pro 升级阶段仍固定使用 DeepSeek Pro。
 - MiMo、Kimi、DeepSeek 的知识代理调用显式开启思考；多轮工具调用会保留并回传 `reasoning_content`。Kimi K2.7 使用 `keep=all` 和 `temperature=1`。MiMo UltraSpeed 的体检修改预览使用强制函数调用返回结构化参数；其他支持 JSON mode 的模型继续使用 `response_format=json_object`。DeepSeek 思考模式不发送不兼容的 `tool_choice`。
 - 旧的 `KNOWLEDGE_AGENT_PROVIDER_PRIORITY`、`KNOWLEDGE_AGENT_MIMO_*`、`KNOWLEDGE_AGENT_KIMI_*`、`KNOWLEDGE_AGENT_BASE_URL/API_KEY/FLASH_MODEL/PRO_MODEL` 和 `KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS` 仍作为兼容别名读取；新配置应使用 `LLM_*`。
+
+### 兼容模式：项目内 memgw 模型目录与按功能路由
+
+新部署请在独立项目中使用 `modelgw connection/deployment/route/pricing`。下面这套 `memgw model/route/pricing` 只用于不运行 Model Gateway 的 direct-provider 兼容模式；`memgw init` 会为它复制标准 JSON 到用户配置目录。
+
+当前功能路由包括：
+
+| 路由 | 用途 |
+| --- | --- |
+| `chat` | `/v1` 的 `memory-auto` 对话上游。 |
+| `memory.extract` | 长期记忆提取与 ingest。 |
+| `memory.compact` | 对话滚动上下文压缩。 |
+| `memory.core` | 核心记忆整理。 |
+| `memory.review` | 记忆体检 AI 修订。 |
+| `knowledge.fast` | 知识代理快速阶段。 |
+| `knowledge.pro` | 复杂知识检索升级阶段。 |
+| `pricing.research` | 官方价格页面结构化研究。 |
+
+运行 `memgw route guide` 可随时查看这张说明。设置路由时，后面的值就是模型故障切换顺序：`M` 代表 MiMo、`K` 代表 Kimi、`D` 代表 DeepSeek，可以连写成 `MKD`，也可以输入完整模型 ID。不写模型时会显示编号列表供选择：
+
+```bash
+memgw route set chat MKD
+memgw route set memory.extract M K D
+memgw route set memory.core
+memgw route set knowledge.pro D
+```
+
+例如 `MKD` 表示先尝试 MiMo，遇到可故障切换的 provider 错误后再试 Kimi、DeepSeek。`knowledge.pro` 是例外，目前只接受 DeepSeek 或 `upstream` 模型；在这条路由里输入 `D` 会选择 `deepseek-v4-pro`，其余路由的 `D` 选择 flash。
+
+例如把体检改成 Kimi HighSpeed → DeepSeek：
+
+```bash
+memgw route set memory.review \
+  kimi/kimi-k2.7-code-highspeed \
+  deepseek/deepseek-v4-flash
+memgw restart
+```
+
+新增现有适配器下的 OpenAI-compatible 模型：
+
+```bash
+memgw model add kimi/kimi-new-model \
+  --provider kimi \
+  --model kimi-new-model \
+  --capability streaming \
+  --capability tools \
+  --official-url https://platform.kimi.com/official-model-page
+```
+
+目前数据化 provider 支持 `mimo`、`kimi`、`deepseek`、单个 `upstream` 兼容上游和当前 `embedding` 上游。新增模型通常只改目录；新增协议行为不同的 provider 仍需添加一个小型 adapter 和契约测试，不能仅凭价格信息自动判定兼容。
+
+手动写入已经核对的官方价格：
+
+```bash
+memgw pricing add kimi/kimi-new-model \
+  --billing-provider kimi \
+  --cache-hit 1.0 \
+  --cache-miss 5.0 \
+  --output 20.0 \
+  --source https://platform.kimi.com/official-pricing \
+  --as-of 2026-08-02
+```
+
+也可以让 `pricing.research` 路由中的模型读取用户指定的官方 HTTPS 页面并生成候选：
+
+```bash
+memgw pricing research kimi/kimi-new-model \
+  --source https://platform.kimi.com/official-pricing
+
+# 对照官方页面确认候选后才写入
+memgw pricing research kimi/kimi-new-model \
+  --source https://platform.kimi.com/official-pricing \
+  --apply
+```
+
+研究模型只能生成候选，不能替代官方来源和人工确认。完整格式与扩展流程见 `docs/model_catalog.md`。
 
 ## FLIT / OpenAI Chat Completions 接入
 
@@ -446,17 +601,17 @@ curl \
 | 召回解释 | 查看一次上下文组装中的核心记忆、搜索命中、候选池、排除原因和分数拆解。 |
 | 评测闭环 | 机制诊断、召回快照、人工标注、关键词/embedding 指标。 |
 | 对话上下文 | 查看 `/v1` 自动分支树、滚动摘要、最近原文和结构状态；可搜索、控制加载数量、软删除整棵后续分支，并在“已清理”视图恢复。另保留按动态 conversation ID 保存的近期摘要视图。 |
-| 用量与费用 | 汇总 `/v1` 聊天、记忆提取/整理/体检、会话压缩、知识代理和 embedding 调用；按故障切换后实际命中的 provider/model、上游 usage 与事件价格快照计算公开 API 原价。 |
+| 用量与费用 | 汇总 `/v1` 聊天、后台任务和 embedding 的实际 provider/model 与 Token；direct-provider 模式保留本地价格快照，独立 Model Gateway 模式的渠道价格以 `modelgw usage summary` 为权威。 |
 | 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
 | 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录；空候选会显示受控的模型原因码，同时继续隐藏自由文本理由。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
 | 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
 
 ### 模型用量与费用
 
-服务会为升级后的每个成功模型响应保存一条独立计量事件，覆盖 `/v1` 的普通回复与工具轮次、全部后台 LLM 任务、记忆/知识搜索 embedding 和知识索引 embedding。`LLM_PROVIDER_PRIORITY` 只决定尝试顺序；账单使用故障切换后真正成功的 provider 与模型，不会默认按优先级第一项估算。
+服务会为升级后的每个成功模型响应保存一条独立计量事件，覆盖 `/v1` 的普通回复与工具轮次、全部后台 LLM 任务、记忆/知识搜索 embedding 和知识索引 embedding。无论哪种路由模式，都只记录实际成功的 provider/model。
 
 - Token 只采用上游响应的 `usage`，兼容 OpenAI 的 cached token 明细和 DeepSeek 的 cache hit/miss 字段；上游未返回 `usage` 时保留调用记录并显示“缺少 usage”，不猜 Token。
-- 金额按事件发生时保存的人民币价格快照计算；当前映射及官方来源在 Web 控制台“用量与费用 → 当前价格表”中展示。套餐、赠金、限时折扣和账户级优惠不参与估算。
+- direct-provider 兼容模式继续按事件发生时的本地人民币价格快照计算。独立 Model Gateway 模式不复用这份旧价格表：My_Memory 只显示 Token，实际渠道、币种、分档和价格快照由 `modelgw usage summary` 统一管理，避免官方、硅基流动、阿里云等同名模型被错误套价。
 - 自定义模型或尚未找到明确公开单价的模型仍统计调用和 Token，但金额显示“待定价”，不会用相似模型价格替代，也不会显示成 0 元。
 - 计量从本版本启用后的新调用开始，不读取 provider 账单，也不对旧日志反向估算。
 - 事件只保存 user id、用途、provider/model、Token、价格快照、请求 ID 和时间，不保存提示词、回复或知识正文；查询继续按 `X-User-Id` 隔离。
@@ -573,6 +728,7 @@ curl \
 - `origin=user_asserted|agent_derived` 区分用户事实和模型派生内容；agent-derived 默认不进入普通召回和核心整理。
 - `valid_from`、`temporal_subject`、`temporal_predicate` 用于可替换的当前状态事实，例如当前城市、当前雇主、首选称呼。普通 MCP 客户端不要自行填写这些字段。
 - `topics`、`entities`、`space_ids` 是轻量组织结构，不代表系统自动判断事实真伪。
+- `embedding_space_id` 标识记忆向量所属的精确向量空间。只有查询和记忆都声明同一个非空空间时才会计算向量相似度；Model Gateway 模式会同时核对空间 Header、维度 Header 与实际向量长度，direct-provider 模式采用 endpoint、模型名和维度派生的稳定本地空间。升级前的旧向量保持未知空间，不会按当前模型猜测，需通过 re-embed 进入当前空间。
 - `conversation_branch_nodes` 是 `/v1` 的本地运行上下文：保存不可逆历史指纹、滚动摘要和最近原始轮次，按用户隔离并限制为最近 5000 个节点；它不是长期记忆，也不进入核心记忆或衰减。
 - `surface_score`、`life_score`、`review_signals` 是运行时解释信号，默认不持久化为权威事实。
 - 知识文档有标题、版本、来源、敏感度、标签、结构化元数据和索引状态，但没有 memory type、importance、usage、生命周期或衰减字段。

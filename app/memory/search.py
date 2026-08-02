@@ -12,6 +12,11 @@ import time
 import anyio
 import httpx
 
+from app.llm.model_gateway import (
+    ModelGatewayProtocolError,
+    parse_model_gateway_metadata,
+    validate_model_gateway_metadata,
+)
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.redaction import detect_text_sensitivity
@@ -30,11 +35,11 @@ from app.usage.recorder import UsageRecorder
 # 模块级缓存（跨请求存活）
 # ---------------------------------------------------------------------------
 _EMBEDDING_CACHE: dict[tuple, tuple[float, list[float]]] = {}
-"""L1: (user_id, normalized_query) -> (expires_at, embedding_vector)"""
+"""L1: (user_id, embedding_space_id, normalized_query) -> cached query vector."""
 _EMBEDDING_CACHE_LOCK = threading.Lock()
 
 SEARCH_CACHE: dict[tuple, tuple[float, str, int, list[dict[str, object]]]] = {}
-"""L2: (user_id, normalized_query, limit) -> (expires_at, max_updated_at, active_count, hit payloads)"""
+"""L2 keys include embedding_space_id so results never cross vector spaces."""
 _SEARCH_CACHE_LOCK = threading.Lock()
 
 _EMBEDDING_CACHE_MAX = 512
@@ -291,6 +296,10 @@ class MemorySurfaceHit:
 
 
 class EmbeddingClient(ABC):
+    # Empty means the vector space is unknown and therefore unsafe for memory
+    # vector comparison. Non-memory consumers may still use the raw vectors.
+    embedding_space_id: str = ""
+
     @abstractmethod
     async def embed(self, text: str) -> list[float] | None:
         raise NotImplementedError
@@ -315,6 +324,8 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         api_key: str,
         model: str,
         dimensions: int = 1024,
+        expected_space_id: str = "",
+        model_gateway_mode: bool = False,
         timeout_seconds: float = 60.0,
         allow_sensitive_egress: bool = False,
         usage_recorder: UsageRecorder | None = None,
@@ -323,6 +334,9 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self.api_key = api_key
         self.model = model
         self.dimensions = dimensions
+        self.expected_space_id = " ".join(expected_space_id.strip().split())
+        self.embedding_space_id = self.expected_space_id
+        self.model_gateway_mode = bool(model_gateway_mode)
         self.timeout_seconds = timeout_seconds
         self.allow_sensitive_egress = allow_sensitive_egress
         self.usage_recorder = usage_recorder
@@ -371,6 +385,22 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
+                metadata = parse_model_gateway_metadata(response.headers)
+                if self.model_gateway_mode:
+                    try:
+                        validate_model_gateway_metadata(
+                            metadata,
+                            expected_route=self.model,
+                            expected_embedding_space=self.expected_space_id,
+                            expected_embedding_dimensions=self.dimensions,
+                        )
+                    except ModelGatewayProtocolError:
+                        return []
+                elif (
+                    self.expected_space_id
+                    and metadata.embedding_space_id != self.expected_space_id
+                ):
+                    return []
                 data = response.json()
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return []
@@ -380,9 +410,17 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
                 partial(
                     self.usage_recorder.record_response,
                     payload=data,
-                    model=self.model,
+                    model=(
+                        metadata.upstream_model
+                        if self.model_gateway_mode
+                        else self.model
+                    ),
                     kind="embedding",
                     base_url=self.base_url,
+                    provider_override=(
+                        metadata.channel_operator if self.model_gateway_mode else ""
+                    ),
+                    use_local_pricing=not self.model_gateway_mode,
                 )
             )
         try:
@@ -396,12 +434,20 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
                 response_index = item.get("index", fallback_index)
                 if isinstance(response_index, bool) or not isinstance(response_index, int):
                     continue
-                by_index[response_index] = [
-                    float(value) for value in item["embedding"]
-                ]
+                vector = [float(value) for value in item["embedding"]]
+                if len(vector) != self.dimensions or any(
+                    not math.isfinite(value) for value in vector
+                ):
+                    continue
+                by_index[response_index] = vector
             return [by_index.get(index) for index in range(expected_count)]
         except (IndexError, TypeError, ValueError):
             return []
+
+
+def embedding_space_id_for(client: object) -> str:
+    value = getattr(client, "embedding_space_id", "")
+    return " ".join(str(value).strip().split()) if value else ""
 
 
 class MemorySearchService:
@@ -458,8 +504,15 @@ class MemorySearchService:
             return []
         capped_limit = max(1, min(limit, 20))
         now = _now()
+        embedding_space_id = embedding_space_id_for(self.embedding_client)
 
-        l2_key = (user_id, normalized, capped_limit, bool(include_sensitive))
+        l2_key = (
+            user_id,
+            normalized,
+            capped_limit,
+            bool(include_sensitive),
+            embedding_space_id,
+        )
         if self.enable_cache:
             cached_hits = await anyio.to_thread.run_sync(
                 partial(
@@ -495,6 +548,7 @@ class MemorySearchService:
                 user_id=user_id,
                 query=query,
                 query_embedding=query_embedding,
+                embedding_space_id=embedding_space_id,
                 limit=candidate_limit,
                 include_sensitive=include_sensitive,
             )
@@ -542,6 +596,7 @@ class MemorySearchService:
         user_id: str,
         query: str,
         query_embedding: list[float] | None,
+        embedding_space_id: str,
         limit: int,
         include_sensitive: bool,
     ) -> list[MemorySearchHit]:
@@ -558,6 +613,7 @@ class MemorySearchService:
             memories=memories,
             query=query,
             query_embedding=query_embedding,
+            embedding_space_id=embedding_space_id,
             limit=limit,
         )
 
@@ -622,7 +678,15 @@ class MemorySearchService:
         user_id: str,
         now: float,
     ) -> list[float] | None:
-        l1_key = (user_id, normalized_query)
+        embedding_space_id = embedding_space_id_for(self.embedding_client)
+        if not embedding_space_id:
+            self.last_embedding_cache_status = (
+                "disabled"
+                if isinstance(self.embedding_client, NullEmbeddingClient)
+                else "space-unavailable"
+            )
+            return None
+        l1_key = (user_id, embedding_space_id, normalized_query)
         cached_embedding: tuple[float, list[float]] | None = None
         if self.enable_cache:
             with _EMBEDDING_CACHE_LOCK:
@@ -658,6 +722,7 @@ class MemorySearchService:
         memories: list[MemoryRecord],
         query: str,
         query_embedding: list[float] | None,
+        embedding_space_id: str,
         limit: int,
     ) -> list[MemorySearchHit]:
         now = datetime.now(UTC)
@@ -677,7 +742,11 @@ class MemorySearchService:
         ]
 
         if query_embedding:
-            for topic_score, memory in self._score_by_embedding(memories, query_embedding)[:_RECALL_LIMIT]:
+            for topic_score, memory in self._score_by_embedding(
+                memories,
+                query_embedding,
+                embedding_space_id=embedding_space_id,
+            )[:_RECALL_LIMIT]:
                 _upsert_hit(combined, memory, topic_score, "embedding", now=now)
 
         for topic_score, memory in self._score_by_keywords(memories, query)[:_RECALL_LIMIT]:
@@ -739,12 +808,27 @@ class MemorySearchService:
                 continue
             decay = score_memory(memory)
             channels = payload.get("channels")
+            cached_channels = (
+                [str(channel) for channel in channels]
+                if isinstance(channels, list)
+                else ["cache"]
+            )
+            cached_space_id = str(key[4]) if len(key) > 4 else ""
+            if (
+                "embedding" in cached_channels
+                and (
+                    not cached_space_id
+                    or memory.embedding_space_id != cached_space_id
+                )
+            ):
+                _discard_search_cache_entry(key, cached_entry)
+                return None
             score_breakdown = payload.get("score_breakdown")
             hits.append(
                 MemorySearchHit(
                     memory=memory,
                     relevance=_float_payload(payload.get("relevance")),
-                    channels=[str(channel) for channel in channels] if isinstance(channels, list) else ["cache"],
+                    channels=cached_channels,
                     topic_score=_float_payload(payload.get("topic_score")),
                     total_score=_float_payload(payload.get("total_score")),
                     final_score=decay.final_score,
@@ -828,10 +912,17 @@ class MemorySearchService:
         self,
         memories: list[MemoryRecord],
         query_embedding: list[float],
+        *,
+        embedding_space_id: str,
     ) -> list[tuple[float, MemoryRecord]]:
+        if not embedding_space_id:
+            return []
         scored: list[tuple[float, MemoryRecord]] = []
         for memory in memories:
-            memory_embedding = _memory_embedding_vector(memory)
+            memory_embedding = _memory_embedding_vector(
+                memory,
+                expected_space_id=embedding_space_id,
+            )
             if memory_embedding is None:
                 continue
             cosine = cosine_similarity(query_embedding, memory_embedding)

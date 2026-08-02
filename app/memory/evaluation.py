@@ -337,6 +337,7 @@ def build_recall_workbench(
 class _TrackingEmbeddingClient(EmbeddingClient):
     def __init__(self, delegate: EmbeddingClient):
         self.delegate = delegate
+        self.embedding_space_id = getattr(delegate, "embedding_space_id", "")
         self.available = False
 
     def reset(self) -> None:

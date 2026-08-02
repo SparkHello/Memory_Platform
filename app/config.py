@@ -1,9 +1,11 @@
 from functools import lru_cache
 import json
 import math
-from typing import Literal
+import re
+from typing import Literal, Self
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.llm.routing import normalize_provider_priority
@@ -91,6 +93,50 @@ class Settings(BaseSettings):
     )
     upstream_api_key: str = Field(default="", validation_alias="UPSTREAM_API_KEY")
     upstream_model: str = Field(default="glm-5.1", validation_alias="UPSTREAM_MODEL")
+    model_gateway_base_url: str = Field(
+        default="",
+        validation_alias="MODEL_GATEWAY_BASE_URL",
+    )
+    model_gateway_api_key: str = Field(
+        default="",
+        validation_alias="MODEL_GATEWAY_API_KEY",
+    )
+    model_gateway_chat_model: str = Field(
+        default="memory.chat",
+        validation_alias="MODEL_GATEWAY_CHAT_MODEL",
+    )
+    model_gateway_memory_extract_model: str = Field(
+        default="memory.extract",
+        validation_alias="MODEL_GATEWAY_MEMORY_EXTRACT_MODEL",
+    )
+    model_gateway_memory_compact_model: str = Field(
+        default="memory.compact",
+        validation_alias="MODEL_GATEWAY_MEMORY_COMPACT_MODEL",
+    )
+    model_gateway_memory_core_model: str = Field(
+        default="memory.core",
+        validation_alias="MODEL_GATEWAY_MEMORY_CORE_MODEL",
+    )
+    model_gateway_memory_review_model: str = Field(
+        default="memory.review",
+        validation_alias="MODEL_GATEWAY_MEMORY_REVIEW_MODEL",
+    )
+    model_gateway_knowledge_fast_model: str = Field(
+        default="knowledge.fast",
+        validation_alias="MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL",
+    )
+    model_gateway_knowledge_pro_model: str = Field(
+        default="knowledge.pro",
+        validation_alias="MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL",
+    )
+    model_gateway_embedding_model: str = Field(
+        default="memory.embedding",
+        validation_alias="MODEL_GATEWAY_EMBEDDING_MODEL",
+    )
+    model_gateway_embedding_space_id: str = Field(
+        default="",
+        validation_alias="MODEL_GATEWAY_EMBEDDING_SPACE_ID",
+    )
     embedding_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         validation_alias="EMBEDDING_BASE_URL",
@@ -164,6 +210,18 @@ class Settings(BaseSettings):
             "LLM_PROVIDER_PRIORITY",
             "KNOWLEDGE_AGENT_PROVIDER_PRIORITY",
         ),
+    )
+    model_catalog_path: str = Field(
+        default="",
+        validation_alias="MODEL_CATALOG_PATH",
+    )
+    model_routes_path: str = Field(
+        default="",
+        validation_alias="MODEL_ROUTES_PATH",
+    )
+    pricing_catalog_path: str = Field(
+        default="",
+        validation_alias="PRICING_CATALOG_PATH",
     )
     llm_mimo_base_url: str = Field(
         default="https://api.xiaomimimo.com/v1",
@@ -241,6 +299,80 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_llm_provider_priority(cls, value: str) -> str:
         return normalize_provider_priority(value)
+
+    @field_validator("model_gateway_base_url")
+    @classmethod
+    def _validate_model_gateway_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return ""
+        parsed = urlsplit(normalized)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("MODEL_GATEWAY_BASE_URL 不是安全的服务 URL")
+        loopback = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+            raise ValueError(
+                "MODEL_GATEWAY_BASE_URL 仅允许 HTTPS，或本机回环地址上的 HTTP"
+            )
+        return normalized
+
+    @field_validator(
+        "model_gateway_chat_model",
+        "model_gateway_memory_extract_model",
+        "model_gateway_memory_compact_model",
+        "model_gateway_memory_core_model",
+        "model_gateway_memory_review_model",
+        "model_gateway_knowledge_fast_model",
+        "model_gateway_knowledge_pro_model",
+        "model_gateway_embedding_model",
+    )
+    @classmethod
+    def _validate_model_gateway_route_alias(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", normalized):
+            raise ValueError("Model Gateway route 必须是安全的稳定 ID")
+        return normalized
+
+    @field_validator("model_gateway_embedding_space_id")
+    @classmethod
+    def _validate_model_gateway_embedding_space_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) > 300 or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in normalized
+        ):
+            raise ValueError("MODEL_GATEWAY_EMBEDDING_SPACE_ID 格式无效")
+        return normalized
+
+    @field_validator("model_gateway_api_key")
+    @classmethod
+    def _validate_model_gateway_api_key(cls, value: str) -> str:
+        if len(value) > 4096 or any(character in value for character in "\r\n\x00"):
+            raise ValueError("MODEL_GATEWAY_API_KEY 格式无效")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_model_gateway_credentials(self) -> Self:
+        has_base_url = bool(self.model_gateway_base_url.strip())
+        has_api_key = bool(self.model_gateway_api_key.strip())
+        if has_base_url != has_api_key:
+            raise ValueError(
+                "MODEL_GATEWAY_BASE_URL 和 MODEL_GATEWAY_API_KEY 必须同时配置"
+            )
+        return self
+
+    @property
+    def model_gateway_enabled(self) -> bool:
+        return bool(
+            self.model_gateway_base_url.strip()
+            and self.model_gateway_api_key.strip()
+        )
 
     # 衰减引擎 (Ebbinghaus)
     decay_lambda_default: float = Field(

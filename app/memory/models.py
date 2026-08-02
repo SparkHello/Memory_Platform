@@ -210,6 +210,7 @@ class MemoryRecord(BaseModel):
     source_conversation_id: str | None = None
     origin: MemoryOrigin = "user_asserted"
     embedding_json: str | None = None
+    embedding_space_id: str | None = Field(default=None, max_length=300)
     last_used_at: str | None = None
     usage_count: float = Field(default=0.0, ge=0.0)
     stability: MemoryStability = "stable"
@@ -243,6 +244,11 @@ class MemoryRecord(BaseModel):
     def _normalize_type(cls, value: object) -> object:
         return normalize_memory_type(value)
 
+    @field_validator("embedding_space_id", mode="before")
+    @classmethod
+    def _normalize_embedding_space_id(cls, value: object) -> object:
+        return normalize_optional_text(value)
+
     @field_validator("temporal_subject", "temporal_predicate", mode="before")
     @classmethod
     def _normalize_temporal_key(cls, value: object) -> object:
@@ -255,6 +261,8 @@ class MemoryRecord(BaseModel):
 
     @model_validator(mode="after")
     def _validate_temporal_metadata(self) -> "MemoryRecord":
+        if self.embedding_json is None and self.embedding_space_id is not None:
+            raise ValueError("embedding_space_id requires embedding_json")
         _validate_temporal_metadata(
             temporal_subject=self.temporal_subject,
             temporal_predicate=self.temporal_predicate,

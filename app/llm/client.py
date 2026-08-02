@@ -8,14 +8,20 @@ from fastapi import HTTPException, status
 import httpx
 
 from app.config import Settings
+from app.llm.model_gateway import (
+    ModelGatewayProtocolError,
+    model_gateway_model_for_operation,
+    parse_model_gateway_metadata,
+    validate_model_gateway_metadata,
+)
 from app.llm.routing import (
     GLOBAL_PROVIDER_COOLDOWNS,
     LLMProvider,
     ProviderCooldowns,
     ProviderCoolingDown,
-    ordered_configured_providers,
     retry_after_seconds,
 )
+from app.model_catalog import legacy_provider_map, providers_for_operation
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.recorder import UsageRecorder
 
@@ -46,10 +52,15 @@ class OpenAICompatibleClient:
         thinking: Literal["enabled", "disabled"] = "enabled",
         structured_tool: dict[str, Any] | None = None,
     ) -> dict:
-        providers = ordered_configured_providers(
-            self.settings.llm_provider_priority,
-            self._providers(),
-        )
+        if self.settings.model_gateway_enabled:
+            return await self._create_via_model_gateway(
+                request=request,
+                messages=messages,
+                thinking=thinking,
+                structured_tool=structured_tool,
+            )
+
+        providers = providers_for_operation(self.settings, request.model)
         if not providers:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -131,6 +142,145 @@ class OpenAICompatibleClient:
                 operation=request.model,
             )
         return data
+
+    async def _create_via_model_gateway(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        messages: list[dict[str, str]],
+        thinking: Literal["enabled", "disabled"],
+        structured_tool: dict[str, Any] | None,
+    ) -> dict:
+        try:
+            model = model_gateway_model_for_operation(self.settings, request.model)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
+            ) from exc
+
+        # The central gateway owns provider selection and vendor-specific
+        # thinking/structured-output adaptations. Keep this request generic.
+        payload = request.model_dump(
+            exclude_none=True,
+            exclude={"conversation_id"},
+        )
+        payload["model"] = model
+        payload["messages"] = messages
+        payload["stream"] = False
+        payload.setdefault(
+            "reasoning_effort",
+            "high" if thinking == "enabled" else "none",
+        )
+        if structured_tool is not None:
+            payload.pop("response_format", None)
+            payload["tools"] = [{"type": "function", "function": structured_tool}]
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": structured_tool["name"]},
+            }
+
+        started_at = time.monotonic()
+        try:
+            async with asyncio.timeout(self.settings.request_timeout_seconds):
+                response = await self._post_model_gateway(payload=payload)
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            logger.warning(
+                "中央模型网关调用达到总超时。elapsed_seconds=%.2f",
+                time.monotonic() - started_at,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=(
+                    "调用中央模型网关超时"
+                    f"（{self.settings.request_timeout_seconds:g} 秒），请稍后重试"
+                ),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            detail = _safe_error_detail(exc.response)
+            logger.warning(
+                "中央模型网关返回错误。status_code=%s elapsed_seconds=%.2f",
+                exc.response.status_code,
+                time.monotonic() - started_at,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"中央模型网关返回错误：{detail}",
+            ) from exc
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "中央模型网关网络调用失败。error_type=%s elapsed_seconds=%.2f",
+                type(exc).__name__,
+                time.monotonic() - started_at,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"调用中央模型网关失败：{exc}",
+            ) from exc
+
+        metadata = parse_model_gateway_metadata(response.headers)
+        try:
+            validate_model_gateway_metadata(metadata, expected_route=model)
+        except ModelGatewayProtocolError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        logger.info(
+            "中央模型网关调用完成。route=%s deployment=%s connection=%s "
+            "vendor=%s model=%s elapsed_seconds=%.2f",
+            metadata.route or request.model,
+            metadata.deployment_id or "unknown",
+            metadata.connection_id or "unknown",
+            metadata.channel_operator or "unknown",
+            metadata.upstream_model or model,
+            time.monotonic() - started_at,
+        )
+        try:
+            data = _json_from_utf8_bytes(response)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="中央模型网关返回了无法解析的 JSON",
+            ) from exc
+
+        if self.usage_recorder is not None:
+            actual_model = metadata.upstream_model
+            usage_payload = {**data, "model": actual_model}
+            await asyncio.to_thread(
+                self.usage_recorder.record_response,
+                payload=usage_payload,
+                model=actual_model,
+                kind="chat",
+                base_url=self.settings.model_gateway_base_url,
+                provider_override=metadata.channel_operator,
+                use_local_pricing=False,
+                operation=request.model,
+            )
+        return data
+
+    async def _post_model_gateway(
+        self,
+        *,
+        payload: dict[str, Any],
+    ) -> httpx.Response:
+        url = (
+            f"{self.settings.model_gateway_base_url.rstrip('/')}"
+            "/chat/completions"
+        )
+        headers = {
+            "Authorization": f"Bearer {self.settings.model_gateway_api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_seconds,
+        }
+        if self.transport is not None:
+            client_kwargs["transport"] = self.transport
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response
 
     async def _request_with_failover(
         self,
@@ -241,34 +391,7 @@ def configured_llm_providers(
     settings: Settings,
 ) -> dict[Literal["M", "K", "D"], LLMProvider]:
     """Build the provider map shared by internal tasks and the chat gateway."""
-    deepseek = LLMProvider(
-        code="D",
-        base_url=settings.llm_deepseek_base_url,
-        api_key=settings.llm_deepseek_api_key,
-        model=settings.llm_deepseek_flash_model,
-    )
-    if not deepseek.configured:
-        deepseek = LLMProvider(
-            code="D",
-            base_url=settings.upstream_base_url,
-            api_key=settings.upstream_api_key,
-            model=settings.upstream_model,
-        )
-    return {
-        "M": LLMProvider(
-            code="M",
-            base_url=settings.llm_mimo_base_url,
-            api_key=settings.llm_mimo_api_key,
-            model=settings.llm_mimo_model,
-        ),
-        "K": LLMProvider(
-            code="K",
-            base_url=settings.llm_kimi_base_url,
-            api_key=settings.llm_kimi_api_key,
-            model=settings.llm_kimi_model,
-        ),
-        "D": deepseek,
-    }
+    return legacy_provider_map(settings)  # type: ignore[return-value]
 
 
 def _provider_payload(

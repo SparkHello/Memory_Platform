@@ -10,6 +10,15 @@ from app.knowledge.agent import (
     KnowledgeSearchAgent,
     OpenAICompatibleKnowledgeAgentClient,
 )
+from app.llm.model_gateway import (
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+    MODEL_GATEWAY_VENDOR_HEADER,
+)
 
 
 DOCUMENT_REF = "knowledge://document/doc-a"
@@ -782,3 +791,243 @@ async def test_m_only_priority_uses_deepseek_as_implicit_429_fallback() -> None:
 
     assert calls == ["mimo-v2.5-pro-ultraspeed", "deepseek-v4-flash"]
     assert response["model"] == "deepseek-v4-flash"
+
+
+def _model_gateway_response_headers(
+    *,
+    route: str,
+    deployment: str,
+    upstream_model: str,
+) -> dict[str, str]:
+    return {
+        MODEL_GATEWAY_ROUTE_HEADER: route,
+        MODEL_GATEWAY_DEPLOYMENT_HEADER: deployment,
+        MODEL_GATEWAY_CONNECTION_HEADER: f"connection-{deployment}",
+        MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER: "moonshot",
+        MODEL_GATEWAY_MODEL_AUTHOR_HEADER: "moonshot",
+        MODEL_GATEWAY_VENDOR_HEADER: "kimi",
+        MODEL_GATEWAY_UPSTREAM_MODEL_HEADER: upstream_model,
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_knowledge_client_does_not_retry_local_mkd_or_cooldown(
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode("utf-8"))["model"])
+        return httpx.Response(429, json={"error": {"message": "route limited"}})
+
+    cooldowns = KnowledgeProviderCooldowns()
+    config = _config(
+        model_gateway_enabled=True,
+        base_url="http://127.0.0.1:2030/v1",
+        api_key="central-key",
+        flash_model="knowledge.fast",
+        pro_model="knowledge.pro",
+        provider_priority="MKD",
+        mimo_api_key="must-not-be-used",
+        kimi_api_key="must-not-be-used",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+        cooldowns=cooldowns,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.create_chat_completion(
+            model="knowledge.fast",
+            messages=[],
+            tools=[],
+            timeout_seconds=25,
+        )
+
+    assert exc_info.value.response.status_code == 429
+    assert calls == ["knowledge.fast"]
+    assert cooldowns.remaining(client._provider("M")) == 0
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_knowledge_phase_requires_first_deployment_on_later_rounds(
+) -> None:
+    store = FakeStore([_hit()])
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append({"headers": dict(request.headers), "payload": payload})
+        if len(calls) == 1:
+            response = _tool_response(
+                "search_index",
+                {"query": "补充检索", "limit": 5, "document_refs": []},
+                reasoning_content="需要先补充检索。",
+            )
+        else:
+            response = _tool_response(
+                "select_references",
+                {"chunk_refs": [CHUNK_REF], "needs_pro": False},
+            )
+        return httpx.Response(
+            200,
+            headers=_model_gateway_response_headers(
+                route="knowledge.fast",
+                deployment="fast-primary",
+                upstream_model="kimi-k2.7-code",
+            ),
+            json=response,
+        )
+
+    config = _config(
+        model_gateway_enabled=True,
+        base_url="http://127.0.0.1:2030/v1",
+        api_key="central-key",
+        flash_model="knowledge.fast",
+        pro_model="knowledge.pro",
+        provider_priority="MKD",
+        mimo_api_key="must-not-be-used",
+        kimi_api_key="must-not-be-used",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+    )
+    agent = KnowledgeSearchAgent(store, config, client=client)
+
+    result = await agent.search("查找资料", "alice")
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert len(calls) == 2
+    assert calls[0]["payload"]["model"] == "knowledge.fast"
+    assert "thinking" not in calls[0]["payload"]
+    assert "x-model-gateway-require-deployment" not in calls[0]["headers"]
+    assert calls[1]["headers"]["x-model-gateway-require-deployment"] == (
+        "fast-primary"
+    )
+    assert calls[1]["headers"][
+        "x-model-gateway-reasoning-origin-deployment"
+    ] == "fast-primary"
+    assistant_messages = [
+        message
+        for message in calls[1]["payload"]["messages"]
+        if message["role"] == "assistant"
+    ]
+    assert assistant_messages[0]["reasoning_content"] == "需要先补充检索。"
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_affinity_409_falls_back_without_cross_deployment_replay(
+) -> None:
+    store = FakeStore([_hit()])
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append({"headers": dict(request.headers), "payload": payload})
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                headers=_model_gateway_response_headers(
+                    route="knowledge.fast",
+                    deployment="fast-primary",
+                    upstream_model="kimi-k2.7-code",
+                ),
+                json=_tool_response(
+                    "search_index",
+                    {"query": "补充检索", "limit": 5, "document_refs": []},
+                    reasoning_content="私有推理状态。",
+                ),
+            )
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "message": "required deployment unavailable",
+                    "type": "model_gateway_affinity_unavailable",
+                    "code": "model_gateway_affinity_unavailable",
+                }
+            },
+        )
+
+    config = _config(
+        model_gateway_enabled=True,
+        base_url="http://127.0.0.1:2030/v1",
+        api_key="central-key",
+        flash_model="knowledge.fast",
+        pro_model="knowledge.pro",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+    )
+    agent = KnowledgeSearchAgent(store, config, client=client)
+
+    result = await agent.search("仍应返回本地结果", "alice", quality="deep")
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert result.metadata.agent_used is False
+    assert result.metadata.fallback_reason == "agent_affinity_unavailable"
+    assert len(calls) == 2
+    assert calls[1]["headers"]["x-model-gateway-require-deployment"] == (
+        "fast-primary"
+    )
+    assert any(
+        message.get("reasoning_content") == "私有推理状态。"
+        for message in calls[1]["payload"]["messages"]
+        if message.get("role") == "assistant"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_flash_and_pro_phases_choose_independent_deployments(
+) -> None:
+    store = FakeStore([_hit()])
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append({"headers": dict(request.headers), "payload": payload})
+        route = payload["model"]
+        deployment = "fast-primary" if route == "knowledge.fast" else "pro-primary"
+        return httpx.Response(
+            200,
+            headers=_model_gateway_response_headers(
+                route=route,
+                deployment=deployment,
+                upstream_model=(
+                    "kimi-k2.7-code"
+                    if route == "knowledge.fast"
+                    else "deepseek-v4-pro"
+                ),
+            ),
+            json=_tool_response(
+                "select_references",
+                {"chunk_refs": [CHUNK_REF], "needs_pro": False},
+            ),
+        )
+
+    config = _config(
+        model_gateway_enabled=True,
+        base_url="http://127.0.0.1:2030/v1",
+        api_key="central-key",
+        flash_model="knowledge.fast",
+        pro_model="knowledge.pro",
+    )
+    client = OpenAICompatibleKnowledgeAgentClient(
+        config,
+        transport=httpx.MockTransport(handler),
+    )
+    agent = KnowledgeSearchAgent(store, config, client=client)
+
+    result = await agent.search("深度核对", "alice", quality="deep")
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert [call["payload"]["model"] for call in calls] == [
+        "knowledge.fast",
+        "knowledge.pro",
+    ]
+    assert all(
+        "x-model-gateway-require-deployment" not in call["headers"]
+        for call in calls
+    )

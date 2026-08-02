@@ -5,7 +5,12 @@ from app.memory.models import MemoryRecord
 from app.memory.redaction import redact_memory_payload
 from app.memory.search import cosine_similarity
 from app.memory.store import MemoryStore
-from app.memory.utils import _char_overlap, _memory_embedding_vector, _term_jaccard
+from app.memory.utils import (
+    _char_overlap,
+    _memory_embedding_vector,
+    _memory_embeddings_share_space,
+    _term_jaccard,
+)
 
 
 CORE_SECTION_TITLES = {
@@ -268,7 +273,8 @@ def memory_similarity(
         left_vector = vectors.get(left.id)
         right_vector = vectors.get(right.id)
     if (
-        left_vector is not None
+        _memory_embeddings_share_space(left, right)
+        and left_vector is not None
         and right_vector is not None
         and len(left_vector) == len(right_vector)
         and bool(left_vector)

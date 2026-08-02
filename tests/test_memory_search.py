@@ -16,6 +16,7 @@ from app.memory.temporal import (
 class StaticEmbeddingClient:
     def __init__(self, vector: list[float] | None):
         self.vector = vector
+        self.embedding_space_id = "test-space"
         self.call_count = 0
         self.texts: list[str] = []
 
@@ -308,6 +309,7 @@ async def test_search_hits_merges_embedding_and_keyword_channels_once(
         type="emotional",
         importance=8,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     service = MemorySearchService(
         store=memory_store,
@@ -342,6 +344,7 @@ async def test_search_hits_combines_embedding_only_and_keyword_only_memories(
         type="semantic",
         importance=5,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     keyword = memory_store.create_memory(
         user_id="default",
@@ -378,6 +381,7 @@ async def test_search_hit_breakdown_survives_search_cache(
         type="emotional",
         importance=8,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     embedding_client = StaticEmbeddingClient([1.0, 0.0])
     service = MemorySearchService(
@@ -403,6 +407,70 @@ async def test_search_hit_breakdown_survives_search_cache(
     assert cached_hits[0].score_breakdown["semantic_score"] > 0
     assert cached_hits[0].score_breakdown["keyword_score"] > 0
     assert cached_hits[0].score_breakdown["final_score"] == cached_hits[0].relevance
+
+
+@pytest.mark.asyncio
+async def test_embedding_search_never_compares_different_spaces(
+    memory_store: MemoryStore,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户正在准备一次越野跑。",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="space-a",
+    )
+    embedding_client = StaticEmbeddingClient([1.0, 0.0])
+    embedding_client.embedding_space_id = "space-b"
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=embedding_client,
+    )
+
+    hits = await service.search_hits(
+        query="咖啡",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert hits == []
+    assert embedding_client.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_l1_and_l2_caches_are_isolated_by_embedding_space(
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户正在准备一次越野跑。",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="space-a",
+    )
+    client_a = StaticEmbeddingClient([1.0, 0.0])
+    client_a.embedding_space_id = "space-a"
+    service_a = MemorySearchService(store=memory_store, embedding_client=client_a)
+
+    first = await service_a.search_hits(
+        query="咖啡",
+        user_id="default",
+        record_usage=False,
+    )
+    assert [hit.memory.id for hit in first] == [memory.id]
+
+    client_b = StaticEmbeddingClient([1.0, 0.0])
+    client_b.embedding_space_id = "space-b"
+    service_b = MemorySearchService(store=memory_store, embedding_client=client_b)
+    second = await service_b.search_hits(
+        query="咖啡",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert second == []
+    assert client_a.call_count == 1
+    assert client_b.call_count == 1
+    assert any(key[-1] == "space-a" for key in SEARCH_CACHE)
+    assert not any(key[-1] == "space-b" for key in SEARCH_CACHE)
 
 
 def test_surface_memories_empty_store(memory_store: MemoryStore) -> None:
@@ -1060,6 +1128,7 @@ async def test_embedding_uses_normalized_query_and_rejects_weak_cosine(
         user_id="default",
         content="用户喜欢黑咖啡。",
         embedding_json=json.dumps([0.5, 0.8660254]),
+        embedding_space_id="test-space",
     )
     embedding_client = StaticEmbeddingClient([1.0, 0.0])
     service = MemorySearchService(
@@ -1085,6 +1154,7 @@ async def test_high_confidence_embedding_can_bridge_synonyms(
         user_id="default",
         content="用户养了两只猫。",
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     service = MemorySearchService(
         store=memory_store,
@@ -1108,6 +1178,7 @@ async def test_user_subject_query_rejects_pet_subject_embedding(
         user_id="default",
         content="十一特别爱吃西瓜。",
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     service = MemorySearchService(
         store=memory_store,

@@ -10,6 +10,7 @@ from app.memory.store import MemoryStore
 class StaticEmbeddingClient:
     def __init__(self, vector: list[float] | None):
         self.vector = vector
+        self.embedding_space_id = "test-space"
 
     async def embed(self, text: str) -> list[float] | None:
         return self.vector
@@ -76,6 +77,7 @@ async def test_resolver_ignores_broader_paraphrase_covered_by_old_memory(
         topics=["硬件配置", "设备", "工具"],
         entities=["华硕枪神9 Plus", "RTX 5060", "枪神9plus"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -127,6 +129,7 @@ async def test_semantic_cover_does_not_suppress_different_relation(
         topics=["经历"],
         entities=["Acme" if "Acme" in old_content else "Paris"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -161,6 +164,7 @@ async def test_semantic_cover_still_suppresses_same_relation_in_english(
         topics=["employment"],
         entities=["Acme"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -194,6 +198,7 @@ async def test_resolver_does_not_hide_new_plan_with_same_device_entity(
         topics=["硬件配置", "设备"],
         entities=["华硕枪神9 Plus", "枪神9plus"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -228,6 +233,7 @@ async def test_resolver_does_not_hide_candidate_with_uncovered_entity(
         topics=["硬件配置", "设备"],
         entities=["华硕枪神9 Plus", "枪神9plus"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -262,6 +268,7 @@ async def test_resolver_does_not_hide_new_structured_device_detail(
         topics=["设备", "游戏"],
         entities=["枪神"],
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -294,6 +301,7 @@ async def test_resolver_creates_related_memory_without_overwriting_old_timeline(
         type="semantic",
         importance=7,
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -327,6 +335,7 @@ async def test_resolver_creates_high_similarity_non_contained_memory(
         type="emotional",
         importance=7,
         embedding_json=json.dumps([0.0, 1.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,
@@ -357,6 +366,7 @@ async def test_resolver_temporal_candidate_closes_old_fact(
         temporal_subject="user",
         temporal_predicate="current_employer",
         embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
     )
     resolver = MemoryResolver(
         store=memory_store,

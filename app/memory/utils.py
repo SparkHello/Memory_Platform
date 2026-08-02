@@ -6,11 +6,11 @@ import re
 import threading
 
 
-# 进程内有界缓存：(memory_id, updated_at) -> 解析后的 embedding 向量。
-# key 里带 updated_at，记忆更新后旧 key 自然失效；记忆删除后条目最多占一个坑位，
-# 由 LRU 上限挤出，不会读到旧向量。
+# 进程内有界缓存：(memory_id, updated_at, embedding_space_id) -> 向量。
+# key 里同时带更新时间和空间，记忆更新/重新向量化后旧 key 自然失效；
+# 记忆删除后条目最多占一个坑位，由 LRU 上限挤出。
 _EMBEDDING_VECTOR_CACHE_MAX = 2048
-_embedding_vector_cache: OrderedDict[tuple[str, str], list[float] | None] = OrderedDict()
+_embedding_vector_cache: OrderedDict[tuple[str, str, str], list[float] | None] = OrderedDict()
 _embedding_vector_cache_lock = threading.Lock()
 
 
@@ -40,8 +40,9 @@ def _cached_embedding_vector(
     memory_id: str,
     updated_at: str | None,
     embedding_json: str | None,
+    embedding_space_id: str | None,
 ) -> list[float] | None:
-    key = (memory_id, updated_at or "")
+    key = (memory_id, updated_at or "", embedding_space_id or "")
     with _embedding_vector_cache_lock:
         if key in _embedding_vector_cache:
             _embedding_vector_cache.move_to_end(key)
@@ -53,13 +54,33 @@ def _cached_embedding_vector(
         return vector
 
 
-def _memory_embedding_vector(memory) -> list[float] | None:
-    """按 (id, updated_at) 缓存解析记忆的 embedding，避免每次查询重复 json.loads。"""
+def _memory_embedding_vector(
+    memory,
+    *,
+    expected_space_id: str | None = None,
+) -> list[float] | None:
+    """解析记忆向量；指定空间时，未知或不同空间一律不可用。"""
+    memory_space_id = _memory_embedding_space_id(memory)
+    if expected_space_id is not None and (
+        not expected_space_id or memory_space_id != expected_space_id
+    ):
+        return None
     return _cached_embedding_vector(
         memory_id=str(memory.id),
         updated_at=memory.updated_at,
         embedding_json=memory.embedding_json,
+        embedding_space_id=memory_space_id,
     )
+
+
+def _memory_embedding_space_id(memory) -> str:
+    value = getattr(memory, "embedding_space_id", None)
+    return str(value).strip() if value else ""
+
+
+def _memory_embeddings_share_space(left, right) -> bool:
+    left_space = _memory_embedding_space_id(left)
+    return bool(left_space and left_space == _memory_embedding_space_id(right))
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:

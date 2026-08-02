@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, get_settings
 from app.api.deps import (
+    embedding_runtime_enabled,
     get_embedding_client,
     get_llm_client,
     get_memory_search_service,
@@ -81,6 +82,7 @@ from app.memory.search import (
     EmbeddingClient,
     MemorySearchService,
     NullEmbeddingClient,
+    embedding_space_id_for,
     search_cache_stats,
 )
 from app.memory.store import MemoryStore
@@ -819,7 +821,7 @@ def memory_database_health(
     checker = MemoryHealthChecker(
         store=store,
         expected_embedding_dimensions=settings.embedding_dimensions,
-        embedding_enabled=bool(settings.embedding_api_key),
+        embedding_enabled=embedding_runtime_enabled(settings),
     )
     return checker.check(user_id=user_id).model_dump()
 
@@ -938,6 +940,13 @@ async def re_embed_memories(
             detail="未配置 embedding 服务，无法重新生成 embedding",
         )
 
+    embedding_space_id = embedding_space_id_for(embedding_client)
+    if not embedding_space_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="embedding 服务未声明可验证的向量空间，拒绝写入记忆向量",
+        )
+
     memory_ids: list[str] = []
     if body.memory_ids:
         memory_ids = list(dict.fromkeys(body.memory_ids))  # 去重保序
@@ -951,6 +960,7 @@ async def re_embed_memories(
             store=store,
             user_id=user_id,
             expected_dimensions=settings.embedding_dimensions,
+            expected_space_id=embedding_space_id,
         )
     else:
         raise HTTPException(
@@ -981,6 +991,7 @@ async def re_embed_memories(
             memory_id=memory_id,
             user_id=user_id,
             embedding_json=embedding_json,
+            embedding_space_id=embedding_space_id,
         ):
             succeeded.append(memory_id)
         else:
@@ -2097,13 +2108,14 @@ def _find_memories_needing_embedding(
     store: MemoryStore,
     user_id: str,
     expected_dimensions: int,
+    expected_space_id: str,
 ) -> list[str]:
-    """扫描活跃记忆中缺失、无效或维度不匹配 embedding 的记忆 ID。"""
+    """扫描缺失、损坏、维度错误或不属于当前空间的记忆向量。"""
     memory_ids: list[str] = []
     with store._connect() as connection:
         rows = connection.execute(
             """
-            SELECT id, embedding_json
+            SELECT id, embedding_json, embedding_space_id
             FROM memories
             WHERE user_id = ? AND archived = 0
             ORDER BY updated_at DESC
@@ -2112,7 +2124,7 @@ def _find_memories_needing_embedding(
         ).fetchall()
     for row in rows:
         raw = row["embedding_json"]
-        if not raw:
+        if not raw or row["embedding_space_id"] != expected_space_id:
             memory_ids.append(row["id"])
             continue
         vector = parse_embedding_vector(raw)

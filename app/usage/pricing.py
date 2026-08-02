@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import json
+import os
+from pathlib import Path
+from typing import Any
 
 
-PRICING_AS_OF = "2026-07-31"
+BUILTIN_PRICING_PATH = Path(__file__).parents[1] / "catalog" / "pricing.json"
+_configured_pricing_path = ""
+
+
+class PricingCatalogError(ValueError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,7 +31,7 @@ class ModelPrice:
     input_token_min: int = 0
     input_token_max: int | None = None
     input_range_label: str = ""
-    as_of: str = PRICING_AS_OF
+    as_of: str = ""
 
     def public_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -33,146 +42,6 @@ class ModelPrice:
         ):
             data[field] = str(data[field])
         return data
-
-
-_PRICES = (
-    ModelPrice(
-        key="mimo:mimo-v2.5-pro-ultraspeed",
-        provider="mimo",
-        provider_label="MiMo",
-        model="mimo-v2.5-pro-ultraspeed",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.075"),
-        input_cache_miss_per_million=Decimal("9"),
-        output_per_million=Decimal("18"),
-        source_url="https://mimo.mi.com/models/en-US/mimo-v2.5-pro-ultraspeed",
-    ),
-    ModelPrice(
-        key="kimi:kimi-k2.7-code",
-        provider="kimi",
-        provider_label="Kimi",
-        model="kimi-k2.7-code",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("1.30"),
-        input_cache_miss_per_million=Decimal("6.50"),
-        output_per_million=Decimal("27"),
-        source_url="https://platform.kimi.com/docs/pricing/chat-k27-code",
-    ),
-    ModelPrice(
-        key="kimi:kimi-k2.7-code-highspeed",
-        provider="kimi",
-        provider_label="Kimi",
-        model="kimi-k2.7-code-highspeed",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("2.60"),
-        input_cache_miss_per_million=Decimal("13.00"),
-        output_per_million=Decimal("54.00"),
-        source_url="https://platform.kimi.com/docs/pricing/chat-k27-code",
-    ),
-    ModelPrice(
-        key="deepseek:deepseek-v4-flash",
-        provider="deepseek",
-        provider_label="DeepSeek",
-        model="deepseek-v4-flash",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.02"),
-        input_cache_miss_per_million=Decimal("1"),
-        output_per_million=Decimal("2"),
-        source_url="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
-    ),
-    ModelPrice(
-        key="deepseek:deepseek-v4-pro",
-        provider="deepseek",
-        provider_label="DeepSeek",
-        model="deepseek-v4-pro",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.025"),
-        input_cache_miss_per_million=Decimal("3"),
-        output_per_million=Decimal("6"),
-        source_url="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
-    ),
-    ModelPrice(
-        key="zhipu:glm-5.1:input-lt-32k",
-        provider="zhipu",
-        provider_label="智谱",
-        model="glm-5.1",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("1.3"),
-        input_cache_miss_per_million=Decimal("6"),
-        output_per_million=Decimal("24"),
-        source_url="https://bigmodel.cn/pricing",
-        input_token_max=32_000,
-        input_range_label="输入 < 32K Token",
-    ),
-    ModelPrice(
-        key="zhipu:glm-5.1:input-gte-32k",
-        provider="zhipu",
-        provider_label="智谱",
-        model="glm-5.1",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("2"),
-        input_cache_miss_per_million=Decimal("8"),
-        output_per_million=Decimal("28"),
-        source_url="https://bigmodel.cn/pricing",
-        input_token_min=32_000,
-        input_range_label="输入 ≥ 32K Token",
-    ),
-    ModelPrice(
-        key="zhipu:glm-5.2",
-        provider="zhipu",
-        provider_label="智谱",
-        model="glm-5.2",
-        kind="chat",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("2"),
-        input_cache_miss_per_million=Decimal("8"),
-        output_per_million=Decimal("28"),
-        source_url="https://bigmodel.cn/pricing",
-    ),
-    ModelPrice(
-        key="alibaba:text-embedding-v4",
-        provider="alibaba",
-        provider_label="阿里云百炼",
-        model="text-embedding-v4",
-        kind="embedding",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.5"),
-        input_cache_miss_per_million=Decimal("0.5"),
-        output_per_million=Decimal("0"),
-        source_url="https://help.aliyun.com/zh/model-studio/text-embedding-v4",
-    ),
-    ModelPrice(
-        key="alibaba:qwen3.7-text-embedding",
-        provider="alibaba",
-        provider_label="阿里云百炼",
-        model="qwen3.7-text-embedding",
-        kind="embedding",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.5"),
-        input_cache_miss_per_million=Decimal("0.5"),
-        output_per_million=Decimal("0"),
-        source_url="https://help.aliyun.com/zh/model-studio/qwen3-7-text-embedding",
-    ),
-    ModelPrice(
-        key="zhipu:embedding-3",
-        provider="zhipu",
-        provider_label="智谱",
-        model="embedding-3",
-        kind="embedding",
-        currency="CNY",
-        input_cache_hit_per_million=Decimal("0.5"),
-        input_cache_miss_per_million=Decimal("0.5"),
-        output_per_million=Decimal("0"),
-        source_url="https://docs.bigmodel.cn/cn/guide/models/embedding/embedding-3",
-    ),
-)
 
 
 def normalize_model_name(model: str) -> str:
@@ -227,9 +96,10 @@ def price_for(
     input_tokens: int | None = None,
 ) -> ModelPrice | None:
     normalized = normalize_model_name(model)
+    prices, _ = load_pricing_catalog()
     candidates = [
         price
-        for price in _PRICES
+        for price in prices
         if (
             price.provider == provider
             and price.model == normalized
@@ -257,13 +127,142 @@ def price_for(
     )
 
 
-def pricing_catalog() -> dict[str, object]:
-    return {
-        "as_of": PRICING_AS_OF,
-        "currency": "CNY",
-        "models": [price.public_dict() for price in _PRICES],
-        "note": (
-            "金额按事件发生时保存的公开 API 原价快照计算，不含套餐、赠金、"
-            "限时折扣或账户级优惠；未匹配到公开单价的模型不会计入金额。"
-        ),
+def load_pricing_catalog(
+    path: str | Path | None = None,
+) -> tuple[tuple[ModelPrice, ...], dict[str, str]]:
+    builtins, builtin_meta = _parse_catalog(_load_json(BUILTIN_PRICING_PATH))
+    selected = str(
+        path or _configured_pricing_path or os.getenv("PRICING_CATALOG_PATH", "")
+    ).strip()
+    if not selected:
+        return tuple(builtins.values()), builtin_meta
+    overlay_path = Path(selected).expanduser()
+    if overlay_path.resolve() == BUILTIN_PRICING_PATH.resolve():
+        return tuple(builtins.values()), builtin_meta
+    overlay, overlay_meta = _parse_catalog(_load_json(overlay_path))
+    merged = {**builtins, **overlay}
+    return tuple(merged.values()), {
+        "as_of": overlay_meta["as_of"],
+        "currency": overlay_meta["currency"],
+        "note": overlay_meta.get("note") or builtin_meta.get("note", ""),
     }
+
+
+def pricing_catalog() -> dict[str, object]:
+    prices, metadata = load_pricing_catalog()
+    return {
+        "as_of": metadata["as_of"],
+        "currency": metadata["currency"],
+        "models": [price.public_dict() for price in prices],
+        "note": metadata["note"],
+    }
+
+
+def configure_pricing_catalog(path: str = "") -> None:
+    global _configured_pricing_path
+    selected = path.strip()
+    if selected:
+        load_pricing_catalog(selected)
+    _configured_pricing_path = selected
+
+
+def _parse_catalog(
+    payload: dict[str, Any],
+) -> tuple[dict[str, ModelPrice], dict[str, str]]:
+    if payload.get("version") != 1:
+        raise PricingCatalogError("价格目录 version 必须为 1")
+    as_of = _required_string(payload.get("as_of"), "as_of")
+    currency = _required_string(payload.get("currency"), "currency").upper()
+    raw_prices = payload.get("models")
+    if not isinstance(raw_prices, list):
+        raise PricingCatalogError("价格目录缺少 models 数组")
+    prices: dict[str, ModelPrice] = {}
+    for raw in raw_prices:
+        if not isinstance(raw, dict):
+            raise PricingCatalogError("models 中的每一项都必须是对象")
+        key = _required_string(raw.get("key"), "price key")
+        if key in prices:
+            raise PricingCatalogError(f"价格 key 重复：{key}")
+        item_currency = str(raw.get("currency") or currency).strip().upper()
+        source_url = _required_string(raw.get("source_url"), "source_url")
+        if not source_url.startswith("https://"):
+            raise PricingCatalogError(f"价格来源必须使用 HTTPS：{key}")
+        token_min = _non_negative_int(raw.get("input_token_min", 0), "input_token_min")
+        raw_max = raw.get("input_token_max")
+        token_max = (
+            None
+            if raw_max is None
+            else _non_negative_int(raw_max, "input_token_max")
+        )
+        if token_max is not None and token_max <= token_min:
+            raise PricingCatalogError(f"价格分档上限必须大于下限：{key}")
+        prices[key] = ModelPrice(
+            key=key,
+            provider=_required_string(raw.get("provider"), "provider").lower(),
+            provider_label=_required_string(raw.get("provider_label"), "provider_label"),
+            model=normalize_model_name(_required_string(raw.get("model"), "model")),
+            kind=_required_string(raw.get("kind"), "kind").lower(),
+            currency=item_currency,
+            input_cache_hit_per_million=_non_negative_decimal(
+                raw.get("input_cache_hit_per_million"),
+                "input_cache_hit_per_million",
+            ),
+            input_cache_miss_per_million=_non_negative_decimal(
+                raw.get("input_cache_miss_per_million"),
+                "input_cache_miss_per_million",
+            ),
+            output_per_million=_non_negative_decimal(
+                raw.get("output_per_million"),
+                "output_per_million",
+            ),
+            source_url=source_url,
+            input_token_min=token_min,
+            input_token_max=token_max,
+            input_range_label=str(raw.get("input_range_label") or "").strip(),
+            as_of=str(raw.get("as_of") or as_of).strip(),
+        )
+    return prices, {
+        "as_of": as_of,
+        "currency": currency,
+        "note": str(payload.get("note") or "").strip(),
+    }
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise PricingCatalogError(f"价格目录不存在：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise PricingCatalogError(f"价格目录不是合法 JSON：{path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PricingCatalogError(f"价格目录顶层必须是对象：{path}")
+    return payload
+
+
+def _required_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PricingCatalogError(f"{label} 必须是非空字符串")
+    return value.strip()
+
+
+def _non_negative_int(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise PricingCatalogError(f"{label} 必须是非负整数")
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise PricingCatalogError(f"{label} 必须是非负整数") from exc
+    if parsed < 0:
+        raise PricingCatalogError(f"{label} 必须是非负整数")
+    return parsed
+
+
+def _non_negative_decimal(value: object, label: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise PricingCatalogError(f"{label} 必须是非负数字") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise PricingCatalogError(f"{label} 必须是非负数字")
+    return parsed

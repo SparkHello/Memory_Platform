@@ -11,6 +11,7 @@ from app.api.chat_gateway import (
     _inject_memory_context,
     _restore_tool_reasoning,
     _turn_fingerprint,
+    _usage_provider_arguments,
     clear_chat_gateway_state,
 )
 from app.llm.prompts import render_memory_context
@@ -21,6 +22,7 @@ from app.openai_compat.gateway_client import GatewayUpstreamHTTPError
 class RecordingEmbeddingClient:
     def __init__(self, vector: list[float]) -> None:
         self.vector = vector
+        self.embedding_space_id = "test-space"
         self.texts: list[str] = []
 
     async def embed(self, text: str) -> list[float] | None:
@@ -253,6 +255,7 @@ def test_gateway_uses_embedding_recall_even_without_keyword_overlap(
         type="preference",
         importance=8,
         embedding_json="[1.0, 0.0]",
+        embedding_space_id="test-space",
     )
 
     response = client.post(
@@ -1395,6 +1398,60 @@ def test_context_budget_reports_only_memories_that_were_actually_injected(
 
     assert rendered == first_only
     assert [memory.id for memory in selected] == [first.id]
+
+
+def test_model_gateway_reasoning_cache_uses_deployment_affinity() -> None:
+    clear_chat_gateway_state()
+    messages = [
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-central", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-central", "content": "done"},
+        {"role": "user", "content": "next"},
+    ]
+    fingerprint = _turn_fingerprint(
+        user_id="default",
+        messages=messages,
+        latest_user_index=0,
+    )
+    provider = SimpleNamespace(
+        code="G",
+        model="deepseek-v3.2",
+        base_url="http://127.0.0.1:2030/v1",
+        deployment_id="siliconflow-deepseek-primary",
+        connection_id="siliconflow-cn",
+        vendor="siliconflow",
+    )
+    _cache_tool_reasoning(
+        user_id="default",
+        conversation_id=None,
+        turn_fingerprint=fingerprint,
+        tool_call_ids=["call-central"],
+        reasoning="deployment-private-state",
+        provider=provider,
+        ttl_seconds=60,
+    )
+
+    preferred = _restore_tool_reasoning(
+        messages,
+        user_id="default",
+        conversation_id=None,
+        strip_unknown=True,
+    )
+
+    assert preferred == "siliconflow-deepseek-primary"
+    assert messages[1]["reasoning_content"] == "deployment-private-state"
+    assert _usage_provider_arguments(provider) == {
+        "model": "deepseek-v3.2",
+        "provider_code": "",
+        "base_url": "http://127.0.0.1:2030/v1",
+        "provider_override": "siliconflow",
+        "use_local_pricing": False,
+    }
+    clear_chat_gateway_state()
 
 
 def test_tool_reasoning_cache_is_turn_scoped_and_provider_isolated() -> None:
