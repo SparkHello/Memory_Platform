@@ -42,6 +42,7 @@ if [ "$INSTALL_UI" -eq 1 ]; then
   (
     cd "$MEMORY_SERVICE/ui"
     npm ci
+    npm run build
   )
 fi
 

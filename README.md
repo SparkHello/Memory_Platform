@@ -16,7 +16,7 @@ scripts/bootstrap.sh
 scripts/memgw stack install --start
 ```
 
-`bootstrap.sh` 会在 `services/memory-gateway/.venv` 创建统一 Python 运行环境，以 editable 模式安装两个服务，并安装 Web Console 依赖。若暂时不需要前端依赖：
+`bootstrap.sh` 会在 `services/memory-gateway/.venv` 创建统一 Python 运行环境，以 editable 模式安装两个服务，并安装依赖、构建 Web Console。若暂时不需要前端：
 
 ```bash
 scripts/bootstrap.sh --skip-ui
