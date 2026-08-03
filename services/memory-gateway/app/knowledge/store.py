@@ -1585,6 +1585,33 @@ class KnowledgeStore:
     # Agent compatibility name.
     search_index = search_chunks
 
+    def egress_override_confirmed(self, user_id: str, version_ref: str) -> bool:
+        """Whether the owner explicitly cleared this version's document for egress.
+
+        Chunk-level sensitivity screening exists to protect documents nobody has
+        reviewed.  Once a flagged document has been overridden back to 'normal'
+        and confirmed, re-screening every chunk would silently overrule that
+        decision and leave the document permanently half-indexed.
+        """
+        user_id = _required_text(user_id, "user_id", 256)
+        version_id = self._version_id(version_ref)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT d.sensitivity, d.sensitivity_override_confirmed
+                FROM knowledge_versions v
+                JOIN knowledge_documents d
+                    ON d.id = v.document_id AND d.user_id = v.user_id
+                WHERE v.id = ? AND v.user_id = ?
+                """,
+                (version_id, user_id),
+            ).fetchone()
+        if row is None:
+            return False
+        return row["sensitivity"] == "normal" and bool(
+            row["sensitivity_override_confirmed"]
+        )
+
     def list_chunks_for_embedding(
         self,
         user_id: str,
@@ -1769,7 +1796,6 @@ class KnowledgeStore:
         user_id: str,
         query_vector: Sequence[float],
         *,
-        model: str,
         embedding_space_id: str,
         query: str = "",
         limit: int = 20,
@@ -1779,16 +1805,19 @@ class KnowledgeStore:
     ) -> list[KnowledgeSearchHit]:
         user_id = _required_text(user_id, "user_id", 256)
         vector = _validated_vector(query_vector)
-        model = _required_text(model, "embedding model", 300)
         embedding_space_id = _required_embedding_space_id(embedding_space_id)
         query = _optional_text(query, "query", 8000)
         limit = _bounded_int(limit, "limit", minimum=1, maximum=_SEARCH_MAX_RESULTS)
         document_ids = self._document_ids(document_refs or [])
         if len(document_ids) > 50:
             raise KnowledgeValidationError("document_refs must not contain more than 50 items")
+        # embedding_space_id is the only vector-space contract.  The stored
+        # `model` column is attribution metadata whose meaning differs between
+        # runtimes -- an upstream model id in direct mode, a route alias behind
+        # the Model Gateway -- so filtering on it would hide vectors that the
+        # space id already proves are comparable.
         conditions = [
             "e.user_id = ?",
-            "e.model = ?",
             "e.embedding_space_id = ?",
             "e.dimensions = ?",
             "d.status = 'active'",
@@ -1799,7 +1828,6 @@ class KnowledgeStore:
         ]
         params: list[Any] = [
             user_id,
-            model,
             embedding_space_id,
             len(vector),
             embedding_space_id,

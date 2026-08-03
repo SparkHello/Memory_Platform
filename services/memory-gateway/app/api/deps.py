@@ -15,7 +15,7 @@ from app.knowledge.retrieval import (
 )
 from app.knowledge.store import KnowledgeStore
 from app.llm.client import OpenAICompatibleClient
-from app.model_catalog import providers_for_route
+from app.providers.catalog import providers_for_route
 from app.memory.search import (
     EmbeddingClient,
     MemorySearchService,
@@ -54,8 +54,6 @@ def direct_embedding_space_id(settings: Settings) -> str:
 def embedding_runtime_enabled(settings: Settings) -> bool:
     """Whether the active runtime has a trustworthy embedding space."""
 
-    if settings.model_gateway_enabled:
-        return bool(settings.model_gateway_embedding_space_id.strip())
     return bool(
         settings.embedding_api_key.strip() and settings.embedding_model.strip()
     )
@@ -100,23 +98,6 @@ def get_knowledge_store(
 def get_embedding_client(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> EmbeddingClient:
-    if settings.model_gateway_enabled:
-        # Vector reuse is only safe when the application knows the gateway's
-        # immutable embedding space. An unset space deliberately falls back to
-        # local keyword/FTS retrieval instead of guessing from model names.
-        if not settings.model_gateway_embedding_space_id.strip():
-            return NullEmbeddingClient()
-        return OpenAICompatibleEmbeddingClient(
-            base_url=settings.model_gateway_base_url,
-            api_key=settings.model_gateway_api_key,
-            model=settings.model_gateway_embedding_model,
-            dimensions=settings.embedding_dimensions,
-            expected_space_id=settings.model_gateway_embedding_space_id,
-            model_gateway_mode=True,
-            timeout_seconds=settings.request_timeout_seconds,
-            allow_sensitive_egress=settings.allow_sensitive_egress,
-            usage_recorder=UsageRecorder(settings.database_path),
-        )
     if settings.embedding_api_key and settings.embedding_model:
         client = OpenAICompatibleEmbeddingClient(
             base_url=settings.embedding_base_url,
@@ -167,60 +148,16 @@ def get_knowledge_search_agent(
     ],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> KnowledgeSearchAgent:
-    if settings.model_gateway_enabled:
-        config = KnowledgeAgentConfig(
-            model_gateway_enabled=True,
-            base_url=settings.model_gateway_base_url,
-            api_key=settings.model_gateway_api_key,
-            flash_model=settings.model_gateway_knowledge_fast_model,
-            pro_model=settings.model_gateway_knowledge_pro_model,
-            implicit_deepseek_fallback=False,
-            egress_policy=settings.knowledge_agent_egress_policy,
-            allow_sensitive_egress=settings.allow_sensitive_egress,
-            timeout_seconds=settings.knowledge_agent_timeout_seconds,
-        )
-    else:
-        fast_providers = providers_for_route(settings, "knowledge.fast")
-        fast_by_code = {
-            provider.code: provider for provider in reversed(fast_providers)
-        }
-        fast_priority = "".join(
-            dict.fromkeys(provider.code for provider in fast_providers)
-        )
-        pro_providers = providers_for_route(settings, "knowledge.pro")
-        pro_provider = next(
-            (provider for provider in pro_providers if provider.code == "D"),
-            None,
-        )
-        mimo = fast_by_code.get("M")
-        kimi = fast_by_code.get("K")
-        deepseek = fast_by_code.get("D")
-        config = KnowledgeAgentConfig(
-            base_url=(deepseek or pro_provider).base_url
-            if (deepseek or pro_provider)
-            else settings.llm_deepseek_base_url,
-            api_key=(deepseek or pro_provider).api_key
-            if (deepseek or pro_provider)
-            else settings.llm_deepseek_api_key,
-            flash_model=(
-                deepseek.model if deepseek else settings.llm_deepseek_flash_model
-            ),
-            pro_model=(
-                pro_provider.model if pro_provider else settings.llm_deepseek_pro_model
-            ),
-            provider_priority=fast_priority or settings.llm_provider_priority,
-            implicit_deepseek_fallback=not bool(settings.model_routes_path),
-            mimo_base_url=mimo.base_url if mimo else settings.llm_mimo_base_url,
-            mimo_api_key=mimo.api_key if mimo else settings.llm_mimo_api_key,
-            mimo_model=mimo.model if mimo else settings.llm_mimo_model,
-            kimi_base_url=kimi.base_url if kimi else settings.llm_kimi_base_url,
-            kimi_api_key=kimi.api_key if kimi else settings.llm_kimi_api_key,
-            kimi_model=kimi.model if kimi else settings.llm_kimi_model,
-            rate_limit_cooldown_seconds=settings.llm_rate_limit_cooldown_seconds,
-            egress_policy=settings.knowledge_agent_egress_policy,
-            allow_sensitive_egress=settings.allow_sensitive_egress,
-            timeout_seconds=settings.knowledge_agent_timeout_seconds,
-        )
+    fast_providers = providers_for_route(settings, "knowledge.fast")
+    pro_providers = providers_for_route(settings, "knowledge.pro")
+    config = KnowledgeAgentConfig(
+        fast_providers=fast_providers,
+        pro_provider=pro_providers[0] if pro_providers else None,
+        rate_limit_cooldown_seconds=settings.llm_rate_limit_cooldown_seconds,
+        egress_policy=settings.knowledge_agent_egress_policy,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
+        timeout_seconds=settings.knowledge_agent_timeout_seconds,
+    )
     return KnowledgeSearchAgent(
         store=retrieval,
         config=config,

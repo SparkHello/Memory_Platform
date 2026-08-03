@@ -81,36 +81,6 @@ def test_shared_llm_provider_configuration_keeps_legacy_upstream_fallback(
     assert settings.knowledge_agent_egress_policy == "all"
 
 
-def test_knowledge_agent_uses_only_central_gateway_configuration_when_enabled(
-) -> None:
-    settings = Settings(
-        _env_file=None,
-        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
-        MODEL_GATEWAY_API_KEY="central-key",
-        MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL="route.knowledge.fast",
-        MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL="route.knowledge.pro",
-        LLM_PROVIDER_PRIORITY="MKD",
-        LLM_MIMO_API_KEY="must-not-be-used",
-        LLM_KIMI_API_KEY="must-not-be-used",
-        LLM_DEEPSEEK_API_KEY="must-not-be-used",
-        KNOWLEDGE_AGENT_EGRESS_POLICY="normal",
-        ALLOW_SENSITIVE_EGRESS=True,
-    )
-
-    agent = get_knowledge_search_agent(object(), settings)  # type: ignore[arg-type]
-
-    assert agent.config.model_gateway_enabled is True
-    assert agent.config.base_url == "http://127.0.0.1:2030/v1"
-    assert agent.config.api_key == "central-key"
-    assert agent.config.flash_model == "route.knowledge.fast"
-    assert agent.config.pro_model == "route.knowledge.pro"
-    assert agent.config.mimo_api_key == ""
-    assert agent.config.kimi_api_key == ""
-    assert agent.config.implicit_deepseek_fallback is False
-    assert agent.config.egress_policy == "normal"
-    assert agent.config.allow_sensitive_egress is True
-
-
 def test_memory_and_knowledge_database_paths_must_be_distinct(monkeypatch, tmp_path) -> None:
     from app.main import create_app
 

@@ -343,6 +343,8 @@ def client(
     monkeypatch.setenv("LLM_MIMO_API_KEY", "")
     monkeypatch.setenv("LLM_KIMI_API_KEY", "")
     monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "none")
+    # Egress-blocking assertions must not depend on the developer's local .env.
+    monkeypatch.setenv("ALLOW_SENSITIVE_EGRESS", "false")
     monkeypatch.setenv("EVAL_DIR", str(Path(memory_store.database_path).with_name("eval")))
     monkeypatch.setenv("UPSTREAM_API_KEY", "")
     monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")

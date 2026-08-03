@@ -148,50 +148,6 @@ def test_memory_health_embedding_missing_severity_follows_embedding_config(
     assert enabled_result.issues[0].severity == "warning"
 
 
-def test_memory_health_uses_central_embedding_space_instead_of_legacy_key(
-    client,
-    auth_headers,
-    memory_store: MemoryStore,
-) -> None:
-    memory = memory_store.create_memory(
-        user_id="default",
-        content="User has a memory awaiting a trustworthy embedding space.",
-    )
-
-    def check(space_id: str) -> dict:
-        settings = Settings(
-            _env_file=None,
-            GATEWAY_API_KEY="test-gateway-key",
-            MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
-            MODEL_GATEWAY_API_KEY="central-key",
-            MODEL_GATEWAY_EMBEDDING_SPACE_ID=space_id,
-            EMBEDDING_API_KEY="legacy-key-must-not-enable-central-embedding",
-        )
-        client.app.dependency_overrides[get_settings] = lambda: settings
-        try:
-            response = client.get("/memories/health", headers=auth_headers)
-        finally:
-            client.app.dependency_overrides.pop(get_settings, None)
-        assert response.status_code == 200, response.text
-        return response.json()
-
-    without_space = check("")
-    configured_space = check("memory-embedding-1024-v1")
-    without_issue = next(
-        issue
-        for issue in without_space["issues"]
-        if issue["related_id"] == memory.id and issue["type"] == "embedding_missing"
-    )
-    configured_issue = next(
-        issue
-        for issue in configured_space["issues"]
-        if issue["related_id"] == memory.id and issue["type"] == "embedding_missing"
-    )
-
-    assert without_issue["severity"] == "info"
-    assert configured_issue["severity"] == "warning"
-
-
 def test_memory_health_reports_invalid_and_mismatched_embeddings(
     memory_store: MemoryStore,
 ):

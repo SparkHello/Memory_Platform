@@ -109,6 +109,13 @@ class KnowledgeEmbeddingIndexer:
                 embedding_space_id=embedding_space_id,
             )
         )
+        override_confirmed = await anyio.to_thread.run_sync(
+            partial(
+                self.store.egress_override_confirmed,
+                user_id=user_id,
+                version_ref=version_ref,
+            )
+        )
         vectors: dict[str, list[float]] = {}
         try:
             for start in range(0, len(chunks), self.batch_size):
@@ -118,7 +125,8 @@ class KnowledgeEmbeddingIndexer:
                     operation="knowledge_index",
                 ):
                     embedded = await self.embedding_client.embed_many(
-                        [chunk.content for chunk in batch]
+                        [chunk.content for chunk in batch],
+                        screen_sensitivity=not override_confirmed,
                     )
                 for chunk, vector in zip(batch, embedded, strict=False):
                     if vector:
@@ -199,15 +207,13 @@ class KnowledgeRetrievalService:
             except Exception:
                 query_vector = None
         keyword_hits = await keyword_task
-        model = str(getattr(self.embedding_client, "model", "") or "")
         vector_hits: list[KnowledgeSearchHit] = []
-        if query_vector and model:
+        if query_vector:
             vector_hits = await anyio.to_thread.run_sync(
                 partial(
                     self.store.search_chunks_by_embedding,
                     user_id=user_id,
                     query_vector=query_vector,
-                    model=model,
                     embedding_space_id=embedding_space_id,
                     query=query,
                     limit=candidate_limit,

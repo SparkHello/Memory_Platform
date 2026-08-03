@@ -19,6 +19,7 @@ import { RecentContextPage } from "./pages/memory/RecentContextPage";
 import { ReportsPage } from "./pages/memory/ReportsPage";
 import { ReviewPage } from "./pages/memory/ReviewPage";
 import { DeveloperPage } from "./pages/system/DeveloperPage";
+import { ProvidersPage } from "./pages/system/ProvidersPage";
 import { SettingsPage } from "./pages/system/SettingsPage";
 import { UsagePage } from "./pages/system/UsagePage";
 import { loadSettings, loadTheme, saveSettings, saveTheme, type ThemeMode } from "./storage";
@@ -280,6 +281,7 @@ export function App() {
         )}
         {activePage === "logs" && <DecisionLogsPage api={api} />}
         {activePage === "usage" && <UsagePage api={api} />}
+        {activePage === "providers" && <ProvidersPage api={api} />}
         {activePage === "settings" && (
           <SettingsPage settings={settings} onSave={applySettings} notify={notify} />
         )}

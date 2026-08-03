@@ -143,7 +143,7 @@ class Settings(BaseSettings):
     )
     embedding_api_key: str = Field(default="", validation_alias="EMBEDDING_API_KEY")
     embedding_model: str = Field(
-        default="text-embedding-v4",
+        default="qwen3.7-text-embedding",
         validation_alias="EMBEDDING_MODEL",
     )
     embedding_dimensions: int = Field(default=1024, validation_alias="EMBEDDING_DIMENSIONS")
@@ -218,6 +218,15 @@ class Settings(BaseSettings):
     model_routes_path: str = Field(
         default="",
         validation_alias="MODEL_ROUTES_PATH",
+    )
+    # New two-level provider configuration; consumers are still being migrated.
+    providers_path: str = Field(
+        default="",
+        validation_alias="PROVIDERS_PATH",
+    )
+    routes_path: str = Field(
+        default="",
+        validation_alias="ROUTES_PATH",
     )
     pricing_catalog_path: str = Field(
         default="",

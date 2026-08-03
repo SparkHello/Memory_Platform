@@ -68,19 +68,69 @@ docs/               客户端接入和产品路线文档
 
 ## 快速启动
 
-推荐把两个职责分开：独立项目 `Model_Gateway` 管供应商账号、模型 deployment、功能路由、健康检查和价格；本项目的 `memgw` 只负责 My_Memory 的本地配置与进程生命周期。My_Memory 只持有一个本地 client key，不再保存每家供应商密钥。
+推荐把两个职责分开：同一单仓库中的 `services/model-gateway` 管供应商账号、模型 deployment、功能路由、健康检查和价格；本服务的 `memgw` 只负责 Memory Gateway 的本地配置与进程生命周期。Memory Gateway 只持有一个本地 client key，不再保存每家供应商密钥。
+
+### 日常使用：一个终端入口
+
+安装完成后直接运行：
+
+```bash
+memgw
+```
+
+“本地记忆助手”菜单只提供用户日常需要的入口：启动或停止记忆服务、设置模型服务、检查系统、设置本机访问密钥、查看日志，以及打开现有记忆管理页面。
+
+选择“设置模型渠道、模型和用途”会打开相邻独立项目的 Model Gateway 终端菜单。渠道密钥、模型、用途顺序和官方价格仍由 Model Gateway 独立保存。Web 控制台的“模型与路由”页可以在不复制密钥到 My_Memory 的前提下，替换已有渠道密钥、执行只读连接检查并调整已有用途路由；写入时还需单独的 Model Gateway admin 客户端密钥。
+
+推荐使用统一运行栈。首次在源码工作区安装时，`memgw` 会把相邻 Model Gateway 复制安装到 My_Memory 的虚拟环境，之后日常运行不再依赖两个源码目录同时存在：
+
+```bash
+memgw stack install --model-gateway-source ../model-gateway --start
+memgw stack status
+```
+
+如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建标准 backend/admin client，并轮换一枚只在两端仓库外保存的 backend key；不会显示密钥或修改项目 `.env`。以后只使用：
+
+```bash
+memgw stack start
+memgw stack restart
+memgw stack doctor
+memgw stack stop
+```
+
+跨设备迁移使用不含 API Key 的便携包：
+
+```bash
+memgw stack backup --output memory-stack.zip
+# 在新设备克隆 Memory_Platform 并安装依赖后：
+memgw stack restore memory-stack.zip \
+  --model-gateway-source ../model-gateway \
+  --yes --start
+```
+
+便携包包含记忆库、知识库、Model Gateway 配置与用量库、模型/路由/价格目录和可移植的非密钥设置。SQLite 在服务运行时通过一致性快照导出；恢复前会校验全部哈希、SQLite 和 JSON，停止两个服务，并把被替换的本机文件保存到 `restore-backups/`。供应商密钥、admin key、backend key 与 `GATEWAY_API_KEY` 均不会进入备份；新设备缺失时需重新输入。虽然没有密钥，备份仍包含完整记忆和知识正文，必须按敏感文件保管。
+
+第一次使用可按这个顺序完成：
+
+1. 在 `memgw` 菜单选择“设置模型渠道、模型和用途”；
+2. 添加实际购买 API 的渠道和模型；
+3. 让一个聊天模型先承担全部文字工作，之后再按需拆分；
+4. 在模型菜单选择“连接到记忆服务”；
+5. 返回 `memgw`，确认记忆服务与模型服务都显示为运行中。
+
+下面的安装和完整命令主要用于第一次部署、自动化和排障，日常使用不需要记忆。
 
 先安装并配置独立模型网关：
 
 ```bash
-cd ../Model_Gateway
+cd ../model-gateway
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/modelgw init
 .venv/bin/modelgw install-path
 ```
 
-按 [Model Gateway README](../Model_Gateway/README.md) 添加 connection、deployment 和八条 `memory.*` / `knowledge.*` route，然后创建只允许这些 route 的 backend client，并启动服务：
+按 [Model Gateway README](../model-gateway/README.md) 添加 connection、deployment 和八条 `memory.*` / `knowledge.*` route，然后创建只允许这些 route 的 backend client，并启动服务：
 
 ```bash
 modelgw client add memory-gateway \
@@ -97,7 +147,7 @@ modelgw start
 再初始化 My_Memory 控制台：
 
 ```bash
-cd /Users/spark/My_Memory
+cd /path/to/Memory_Platform/services/memory-gateway
 scripts/memgw init --no-import-env
 scripts/memgw install-path
 ```
@@ -132,7 +182,7 @@ macOS 的 My_Memory 用户配置默认位于 `~/Library/Application Support/memo
 下面是仍然支持的手工安装与启动方式：
 
 ```bash
-cd /Users/spark/My_Memory
+cd /path/to/Memory_Platform/services/memory-gateway
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -602,6 +652,7 @@ curl \
 | 评测闭环 | 机制诊断、召回快照、人工标注、关键词/embedding 指标。 |
 | 对话上下文 | 查看 `/v1` 自动分支树、滚动摘要、最近原文和结构状态；可搜索、控制加载数量、软删除整棵后续分支，并在“已清理”视图恢复。另保留按动态 conversation ID 保存的近期摘要视图。 |
 | 用量与费用 | 汇总 `/v1` 聊天、后台任务和 embedding 的实际 provider/model 与 Token；direct-provider 模式保留本地价格快照，独立 Model Gateway 模式的渠道价格以 `modelgw usage summary` 为权威。 |
+| 模型与路由 | 查看实际 Model Gateway 渠道、deployment 和用途顺序；输入仅在当前页面内存保留的 admin 客户端密钥后，可单向替换已有渠道密钥、免费检查 `/models`，并通过“草稿 → 校验 → 应用”调整已有路由。direct-provider 兼容模式继续只读。 |
 | 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
 | 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录；空候选会显示受控的模型原因码，同时继续隐藏自由文本理由。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
 | 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
@@ -834,6 +885,7 @@ Windows 服务辅助脚本：
 - 知识文档的“按用户选择导入”确认只决定该文档保存后的敏感标签，不会修改全局 `ALLOW_SENSITIVE_EGRESS`；保存为 private/sensitive 时，默认仍禁止远程 embedding/代理出站。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
 - `GATEWAY_API_KEY` 是本地共享令牌；`X-User-Id` 适合可信本地或私有网络部署，不等同完整多租户权限系统。
+- `GATEWAY_API_KEY` 只能读取模型配置状态，不能写 Model Gateway。`/providers/*` 配置写入还要求 `X-Model-Gateway-Admin-Key`；Web 页面不把该 admin 密钥写入 `localStorage`，My_Memory 也不保存或回显它，只将其转发到配置好的固定 Model Gateway 地址。管理写入仅允许 HTTPS，或本机 `localhost`/回环 HTTP；上游渠道密钥仍只单向写入 Model Gateway 的 `secrets.env`。
 - Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。
 
 ## 当前边界与后续方向

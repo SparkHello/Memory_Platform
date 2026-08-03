@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -49,6 +50,11 @@ from app.model_catalog import (
 )
 from app.model_probe import PROBE_PROVIDERS, ModelProbeResult, check_model_catalog
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.stack_backup import (
+    create_stack_backup,
+    default_model_gateway_home,
+    restore_stack_backup,
+)
 from app.usage.pricing import (
     PricingCatalogError,
     load_pricing_catalog,
@@ -162,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     menu_parser = subparsers.add_parser("menu", help="打开交互式控制台")
     menu_parser.set_defaults(handler=_cmd_menu)
 
+    _add_stack_commands(subparsers)
     _add_config_commands(subparsers)
     _add_secret_commands(subparsers)
     _add_model_commands(subparsers)
@@ -174,6 +181,67 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--reload", action="store_true")
+
+
+def _add_stack_commands(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "stack",
+        help="用一个入口安装、运行和迁移记忆服务与 Model Gateway",
+    )
+    commands = parser.add_subparsers(dest="stack_command", required=True)
+
+    install = commands.add_parser("install", help="安装并连接双服务运行栈")
+    install.add_argument(
+        "--model-gateway-source",
+        default="",
+        help="Model Gateway 源码或发行包路径；默认发现相邻项目或已安装命令",
+    )
+    install.add_argument("--model-gateway-home", default="")
+    install.add_argument(
+        "--keep-backend-key",
+        action="store_true",
+        help="保留现有 backend key；默认安全轮换并同步两端",
+    )
+    install.add_argument("--start", action="store_true", help="安装完成后启动整个栈")
+    install.set_defaults(handler=_cmd_stack_install)
+
+    start = commands.add_parser("start", help="按 Model Gateway → My_Memory 顺序启动")
+    _add_run_options(start)
+    start.add_argument("--model-gateway-home", default="")
+    start.set_defaults(handler=_cmd_stack_start)
+
+    stop = commands.add_parser("stop", help="按 My_Memory → Model Gateway 顺序停止")
+    stop.add_argument("--model-gateway-home", default="")
+    stop.add_argument("--force", action="store_true")
+    stop.set_defaults(handler=_cmd_stack_stop)
+
+    restart = commands.add_parser("restart", help="重启整个栈")
+    _add_run_options(restart)
+    restart.add_argument("--model-gateway-home", default="")
+    restart.add_argument("--force", action="store_true")
+    restart.set_defaults(handler=_cmd_stack_restart)
+
+    status = commands.add_parser("status", help="同时查看两个服务")
+    status.add_argument("--model-gateway-home", default="")
+    status.set_defaults(handler=_cmd_stack_status)
+
+    doctor = commands.add_parser("doctor", help="同时检查两个服务和接线")
+    doctor.add_argument("--model-gateway-home", default="")
+    doctor.set_defaults(handler=_cmd_stack_doctor)
+
+    backup = commands.add_parser("backup", help="创建不含明文密钥的便携备份")
+    backup.add_argument("--output", default="")
+    backup.add_argument("--model-gateway-home", default="")
+    backup.add_argument("--force", action="store_true")
+    backup.set_defaults(handler=_cmd_stack_backup)
+
+    restore = commands.add_parser("restore", help="校验并恢复便携备份")
+    restore.add_argument("archive")
+    restore.add_argument("--model-gateway-source", default="")
+    restore.add_argument("--model-gateway-home", default="")
+    restore.add_argument("--start", action="store_true")
+    restore.add_argument("--yes", action="store_true", help="确认停止服务并替换当前数据")
+    restore.set_defaults(handler=_cmd_stack_restore)
 
 
 def _add_config_commands(subparsers: Any) -> None:
@@ -306,6 +374,286 @@ def _cmd_init(args: Any, paths: CliPaths, project_root: Path) -> int:
     if result["imported"]:
         print(f"已从项目 .env 导入 {len(result['imported'])} 项非占位配置。")
     print("项目中的 .env 未被修改。接下来可运行 `memgw secret set gateway`。")
+    return 0
+
+
+def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
+    ensure_initialized(paths, project_root)
+    modelgw = _ensure_model_gateway_runtime(args, project_root)
+    model_home = _stack_model_gateway_home(args)
+    if _run_modelgw(modelgw, model_home, ["init"]):
+        return 1
+
+    clients = _modelgw_json(modelgw, model_home, ["client", "list"])
+    client_by_id = {
+        str(item.get("id") or ""): item
+        for item in clients
+        if isinstance(item, dict) and item.get("id")
+    }
+    backend = client_by_id.get("memory-gateway")
+    backend_routes = (
+        set(str(item) for item in backend.get("allowed_routes") or [])
+        if isinstance(backend, dict)
+        else set()
+    )
+    if (
+        not isinstance(backend, dict)
+        or backend.get("kind") != "backend"
+        or not backend.get("enabled", True)
+        or not {"memory.*", "knowledge.*"}.issubset(backend_routes)
+    ):
+        result = _run_modelgw(
+            modelgw,
+            model_home,
+            [
+                "client",
+                "add",
+                "memory-gateway",
+                "--kind",
+                "backend",
+                "--route",
+                "memory.*",
+                "--route",
+                "knowledge.*",
+                "--replace",
+            ],
+        )
+        if result:
+            return result
+
+    admin = client_by_id.get("memory-console-admin")
+    admin_needs_secret = not isinstance(admin, dict) or not admin.get("secret_configured")
+    if (
+        not isinstance(admin, dict)
+        or admin.get("kind") != "admin"
+        or not admin.get("enabled", True)
+    ):
+        result = _run_modelgw(
+            modelgw,
+            model_home,
+            [
+                "client",
+                "add",
+                "memory-console-admin",
+                "--kind",
+                "admin",
+                "--route",
+                "*",
+                "--replace",
+            ],
+        )
+        if result:
+            return result
+        admin_needs_secret = True
+
+    environment = effective_environment(paths, project_root)
+    backend_key = environment.get("MODEL_GATEWAY_API_KEY", "").strip()
+    if not args.keep_backend_key or not backend_key or is_placeholder_value(backend_key):
+        backend_key = secrets.token_urlsafe(48)
+    result = _run_modelgw(
+        modelgw,
+        model_home,
+        ["secret", "set", "memory-gateway", "--stdin", "--no-check"],
+        input_text=backend_key + "\n",
+        quiet=True,
+    )
+    if result:
+        return result
+
+    config = _read_model_gateway_config(model_home)
+    server = config.get("server") if isinstance(config.get("server"), dict) else {}
+    port = int(server.get("port") or 2030)
+    update_env_value(paths.settings_env, "MODEL_GATEWAY_BASE_URL", f"http://127.0.0.1:{port}/v1")
+    update_env_value(paths.settings_env, "MODEL_GATEWAY_API_KEY", backend_key)
+    embedding_space = _model_gateway_embedding_space(config)
+    if embedding_space:
+        update_env_value(
+            paths.settings_env,
+            "MODEL_GATEWAY_EMBEDDING_SPACE_ID",
+            embedding_space,
+        )
+
+    print("双服务运行栈已经安装并安全接线。")
+    print(f"Model Gateway 配置：{model_home}")
+    print("backend key 已在两端同步，值未显示，也未写入项目 .env。")
+    if admin_needs_secret:
+        print("启用 Web 配置写入前，请运行：modelgw secret set memory-console-admin")
+    if args.start:
+        return _cmd_stack_restart(
+            argparse.Namespace(
+                host="0.0.0.0",
+                port=None,
+                reload=False,
+                model_gateway_home=str(model_home),
+                force=False,
+            ),
+            paths,
+            project_root,
+        )
+    print("下一步：memgw stack restart")
+    return 0
+
+
+def _cmd_stack_start(args: Any, paths: CliPaths, project_root: Path) -> int:
+    ensure_initialized(paths, project_root)
+    environment = effective_environment(paths, project_root)
+    settings = Settings(_env_file=None, **environment)
+    if not settings.model_gateway_enabled:
+        raise ValueError("尚未连接独立 Model Gateway；请先运行 `memgw stack install`")
+    modelgw = _require_modelgw(project_root)
+    model_result = _run_modelgw(
+        modelgw,
+        _stack_model_gateway_home(args),
+        ["start"],
+    )
+    if model_result:
+        return model_result
+    memory_result = _cmd_start(args, paths, project_root)
+    if not memory_result:
+        print("Memory Stack 已启动。")
+    return memory_result
+
+
+def _cmd_stack_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
+    memory_result = _cmd_stop(
+        argparse.Namespace(force=bool(args.force)),
+        paths,
+        project_root,
+    )
+    modelgw = _find_modelgw(project_root)
+    if modelgw is None:
+        print("没有找到 modelgw；My_Memory 已按当前状态处理。", file=sys.stderr)
+        return memory_result or 1
+    model_result = _run_modelgw(
+        modelgw,
+        _stack_model_gateway_home(args),
+        ["stop", *(["--force"] if args.force else [])],
+    )
+    if not memory_result and not model_result:
+        print("Memory Stack 已停止。")
+    return memory_result or model_result
+
+
+def _cmd_stack_restart(args: Any, paths: CliPaths, project_root: Path) -> int:
+    stop_result = _cmd_stack_stop(args, paths, project_root)
+    if stop_result:
+        return stop_result
+    return _cmd_stack_start(args, paths, project_root)
+
+
+def _cmd_stack_status(args: Any, paths: CliPaths, project_root: Path) -> int:
+    modelgw = _find_modelgw(project_root)
+    print("Model Gateway", flush=True)
+    print("-" * 36, flush=True)
+    model_result = (
+        _run_modelgw(modelgw, _stack_model_gateway_home(args), ["status"])
+        if modelgw is not None
+        else 1
+    )
+    if modelgw is None:
+        print("未安装或未找到 modelgw。")
+    print("\nMy_Memory")
+    print("-" * 36)
+    memory_result = _cmd_status(args, paths, project_root)
+    return model_result or memory_result
+
+
+def _cmd_stack_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
+    modelgw = _require_modelgw(project_root)
+    print("Model Gateway 检查", flush=True)
+    print("-" * 36, flush=True)
+    model_result = _run_modelgw(
+        modelgw,
+        _stack_model_gateway_home(args),
+        ["doctor"],
+    )
+    print("\nMy_Memory 检查")
+    print("-" * 36)
+    memory_result = _cmd_doctor(args, paths, project_root)
+    return model_result or memory_result
+
+
+def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
+    ensure_initialized(paths, project_root)
+    settings = Settings(_env_file=None, **effective_environment(paths, project_root))
+    memory_database = _resolve_runtime_path(project_root, settings.database_path)
+    knowledge_database = _resolve_runtime_path(project_root, settings.knowledge_database_path)
+    default_name = "memory-stack-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".zip"
+    destination = Path(args.output).expanduser() if args.output else Path.cwd() / default_name
+    result = create_stack_backup(
+        destination=destination,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=_stack_model_gateway_home(args),
+        force=bool(args.force),
+    )
+    print(f"便携备份已创建：{result['archive']}")
+    print(f"包含 {len(result['files'])} 个组件；API Key 未包含。")
+    print("注意：记忆和知识正文为明文敏感数据，请妥善保存备份文件。")
+    return 0
+
+
+def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
+    if not args.yes:
+        raise ValueError("恢复会替换当前数据库和配置；确认后请加 --yes")
+    ensure_initialized(paths, project_root)
+    modelgw = _find_modelgw(project_root)
+    memory_stop = _cmd_stop(argparse.Namespace(force=False), paths, project_root)
+    if memory_stop:
+        return memory_stop
+    if modelgw is not None:
+        model_stop = _run_modelgw(
+            modelgw,
+            _stack_model_gateway_home(args),
+            ["stop"],
+        )
+        if model_stop:
+            return model_stop
+    project_config = read_json(paths.project_file)
+    memory_port = int(project_config.get("port") or 2026)
+    if _health_ok(memory_port):
+        raise ValueError(
+            f"端口 {memory_port} 上仍有 My_Memory 服务运行；请先停止非 memgw 管理的进程"
+        )
+    if _model_gateway_health_ok(_stack_model_gateway_home(args)):
+        raise ValueError("Model Gateway 仍在运行；拒绝替换其配置和用量数据库")
+
+    settings = Settings(_env_file=None, **effective_environment(paths, project_root))
+    result = restore_stack_backup(
+        archive_path=Path(args.archive),
+        paths=paths,
+        memory_database=_resolve_runtime_path(project_root, settings.database_path),
+        knowledge_database=_resolve_runtime_path(project_root, settings.knowledge_database_path),
+        model_gateway_home=_stack_model_gateway_home(args),
+    )
+    print(f"已恢复 {len(result['restored'])} 个组件。")
+    print(f"原文件回滚副本：{result['rollback']}")
+
+    install_result = _cmd_stack_install(
+        argparse.Namespace(
+            model_gateway_source=args.model_gateway_source,
+            model_gateway_home=args.model_gateway_home,
+            keep_backend_key=False,
+            start=False,
+        ),
+        paths,
+        project_root,
+    )
+    if install_result:
+        return install_result
+    print("供应商 API Key 和本机 GATEWAY_API_KEY 不在备份中；缺失时请重新输入。")
+    if args.start:
+        return _cmd_stack_start(
+            argparse.Namespace(
+                host="0.0.0.0",
+                port=None,
+                reload=False,
+                model_gateway_home=args.model_gateway_home,
+            ),
+            paths,
+            project_root,
+        )
     return 0
 
 
@@ -1055,53 +1403,258 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
     while True:
         state = _read_state(paths) or {}
         running = _pid_running(int(state.get("pid", 0)))
-        print("\nmemory-gateway 控制台")
-        print(f"状态：{'运行中' if running else '已停止'}")
-        print("1. 启动  2. 停止  3. 状态  4. 打开 Web  5. 设置 API Key")
-        print("6. 查看模型  7. 设置功能路由  8. 环境检查  9. 查看日志")
-        print("10. 检查所有模型  0. 退出")
-        choice = input("选择：").strip()
+        print("\n本地记忆助手")
+        print("=" * 36)
+        print(f"记忆服务：{'运行中' if running else '已停止'}")
+        print(f"模型服务：{_model_service_status(paths, project_root)}")
+        print()
+        print("1. 启动或停止记忆服务")
+        print("2. 设置模型渠道、模型和用途")
+        print("3. 检查整个系统是否可用")
+        print("4. 设置本机访问密钥")
+        print("5. 查看最近日志")
+        print("6. 打开记忆管理页面")
+        print("7. 重启记忆服务")
+        print("0. 退出")
+        try:
+            choice = input("请选择：").strip()
+        except EOFError:
+            print()
+            return 0
         if choice == "0":
             return 0
         if choice == "1":
-            _cmd_start(argparse.Namespace(host="0.0.0.0", port=None, reload=False), paths, project_root)
-        elif choice == "2":
-            _cmd_stop(argparse.Namespace(force=False), paths, project_root)
-        elif choice == "3":
-            _cmd_status(None, paths, project_root)
-        elif choice == "4":
-            _cmd_open(None, paths, project_root)
-        elif choice == "5":
-            alias = input(
-                "名称 gateway/model-gateway/mimo/kimi/deepseek/upstream/embedding："
-            ).strip().lower()
-            if alias not in _SECRET_ALIASES:
-                print("名称无效。")
+            if running:
+                if _confirm("停止记忆服务？"):
+                    _cmd_stop(argparse.Namespace(force=False), paths, project_root)
             else:
-                _cmd_secret_set(
-                    argparse.Namespace(name=alias, stdin=False, no_check=False),
+                _cmd_start(
+                    argparse.Namespace(host="0.0.0.0", port=None, reload=False),
                     paths,
                     project_root,
                 )
-        elif choice == "6":
-            _cmd_model_list(None, paths, project_root)
-        elif choice == "7":
-            _cmd_route_guide(None, paths, project_root)
-            route = input("功能路由名称：").strip()
-            models = input("模型（MKD、编号或完整 ID；直接回车进入选择）：").split()
-            _cmd_route_set(argparse.Namespace(route=route, models=models), paths, project_root)
-        elif choice == "8":
+        elif choice == "2":
+            modelgw = _find_modelgw(project_root)
+            if modelgw is None:
+                print("没有找到模型服务菜单。请确认相邻的 Model_Gateway 项目已经安装。")
+            else:
+                subprocess.run([str(modelgw)], check=False)
+        elif choice == "3":
+            modelgw = _find_modelgw(project_root)
+            if modelgw is not None:
+                subprocess.run([str(modelgw), "doctor"], check=False)
+            else:
+                print("[注意] 没有找到独立模型服务。")
             _cmd_doctor(None, paths, project_root)
-        elif choice == "9":
+        elif choice == "4":
+            _cmd_secret_set(
+                argparse.Namespace(name="gateway", stdin=False, no_check=True),
+                paths,
+                project_root,
+            )
+        elif choice == "5":
             _cmd_logs(argparse.Namespace(lines=40, follow=False), paths, project_root)
-        elif choice == "10":
-            _cmd_model_check(
-                argparse.Namespace(provider="", timeout=10.0, live=False, yes=False),
+        elif choice == "6":
+            _cmd_open(None, paths, project_root)
+        elif choice == "7":
+            _cmd_restart(
+                argparse.Namespace(
+                    host="0.0.0.0",
+                    port=None,
+                    reload=False,
+                    force=False,
+                ),
                 paths,
                 project_root,
             )
         else:
-            print("无效选择。")
+            print("没有这个选项，请输入菜单里的数字。")
+
+
+def _find_modelgw(project_root: Path) -> Path | None:
+    managed = (
+        project_root / ".venv" / "Scripts" / "modelgw.exe"
+        if os.name == "nt"
+        else project_root / ".venv" / "bin" / "modelgw"
+    )
+    if managed.is_file():
+        return managed
+    installed = shutil.which("modelgw")
+    if installed:
+        return Path(installed)
+    siblings = (
+        project_root.parent / "Model_Gateway",
+        project_root.parent / "model-gateway",
+    )
+    candidates = tuple(
+        candidate
+        for sibling in siblings
+        for candidate in (
+            sibling / ".venv" / "bin" / "modelgw",
+            sibling / ".venv" / "Scripts" / "modelgw.exe",
+            sibling / "scripts" / "modelgw",
+        )
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _require_modelgw(project_root: Path) -> Path:
+    modelgw = _find_modelgw(project_root)
+    if modelgw is None:
+        raise ValueError(
+            "没有找到 Model Gateway 运行时；请运行 `memgw stack install "
+            "--model-gateway-source /path/to/model-gateway`"
+        )
+    return modelgw
+
+
+def _ensure_model_gateway_runtime(args: Any, project_root: Path) -> Path:
+    managed = (
+        project_root / ".venv" / "Scripts" / "modelgw.exe"
+        if os.name == "nt"
+        else project_root / ".venv" / "bin" / "modelgw"
+    )
+    if managed.is_file():
+        return managed
+
+    explicit_source = str(getattr(args, "model_gateway_source", "") or "").strip()
+    sibling_candidates = (
+        project_root.parent / "Model_Gateway",
+        project_root.parent / "model-gateway",
+    )
+    sibling = next(
+        (
+            candidate
+            for candidate in sibling_candidates
+            if (candidate / "pyproject.toml").is_file()
+        ),
+        sibling_candidates[0],
+    )
+    source = Path(explicit_source).expanduser() if explicit_source else sibling
+    installable_source = source.is_file() or (
+        source.is_dir() and (source / "pyproject.toml").is_file()
+    )
+    if installable_source:
+        python = _project_python(project_root)
+        if not python.is_file():
+            raise ValueError(f"项目虚拟环境不存在：{python}")
+        print(f"正在把 Model Gateway 安装到统一运行环境：{python.parent.parent}")
+        result = subprocess.run(
+            [str(python), "-m", "pip", "install", "--no-deps", str(source.resolve())],
+            check=False,
+        )
+        if result.returncode:
+            raise ValueError("Model Gateway 运行时安装失败")
+        if not managed.is_file():
+            raise ValueError("安装完成但没有找到 modelgw 启动器")
+        return managed
+
+    installed = shutil.which("modelgw")
+    if installed:
+        return Path(installed)
+    raise ValueError(
+        "没有找到 Model Gateway 源码或已安装命令；请使用 "
+        "`--model-gateway-source /path/to/model-gateway`"
+    )
+
+
+def _stack_model_gateway_home(args: Any) -> Path:
+    value = str(getattr(args, "model_gateway_home", "") or "").strip()
+    return Path(value).expanduser().resolve() if value else default_model_gateway_home()
+
+
+def _modelgw_base_command(modelgw: Path, home: Path) -> list[str]:
+    return [str(modelgw), "--home", str(home)]
+
+
+def _run_modelgw(
+    modelgw: Path,
+    home: Path,
+    arguments: list[str],
+    *,
+    input_text: str | None = None,
+    quiet: bool = False,
+) -> int:
+    result = subprocess.run(
+        [*_modelgw_base_command(modelgw, home), *arguments],
+        input=input_text,
+        text=True,
+        capture_output=quiet,
+        check=False,
+    )
+    if quiet and result.returncode:
+        message = (result.stderr or result.stdout or "Model Gateway 命令失败").strip()
+        print(message, file=sys.stderr)
+    return int(result.returncode)
+
+
+def _modelgw_json(modelgw: Path, home: Path, arguments: list[str]) -> list[Any]:
+    result = subprocess.run(
+        [*_modelgw_base_command(modelgw, home), "--json", *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout or "Model Gateway 命令失败").strip())
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Model Gateway 返回了无效 JSON") from exc
+    if not isinstance(payload, list):
+        raise ValueError("Model Gateway JSON 响应格式无效")
+    return payload
+
+
+def _read_model_gateway_config(home: Path) -> dict[str, Any]:
+    config_path = home / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Model Gateway 配置不存在：{config_path}")
+    return read_json(config_path)
+
+
+def _model_gateway_embedding_space(config: dict[str, Any]) -> str:
+    routes = config.get("routes")
+    deployments = config.get("deployments")
+    if not isinstance(routes, dict) or not isinstance(deployments, dict):
+        return ""
+    route = routes.get("memory.embedding")
+    if not isinstance(route, dict):
+        return ""
+    targets = route.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return ""
+    deployment = deployments.get(str(targets[0]))
+    return str(deployment.get("embedding_space") or "") if isinstance(deployment, dict) else ""
+
+
+def _model_gateway_health_ok(home: Path) -> bool:
+    try:
+        config = _read_model_gateway_config(home)
+        server = config.get("server")
+        port = int(server.get("port") or 2030) if isinstance(server, dict) else 2030
+    except (OSError, ValueError):
+        return False
+    return _health_ok(port)
+
+
+def _model_service_status(paths: CliPaths, project_root: Path) -> str:
+    environment = effective_environment(paths, project_root)
+    base_url = environment.get("MODEL_GATEWAY_BASE_URL", "").strip()
+    if not base_url:
+        return "尚未连接"
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        return "地址设置有误"
+    root_path = parsed.path.rstrip("/")
+    if root_path.endswith("/v1"):
+        root_path = root_path[:-3]
+    health_url = parsed._replace(path=root_path + "/health", query="", fragment="").geturl()
+    try:
+        response = httpx.get(health_url, timeout=0.8)
+    except httpx.HTTPError:
+        return "已经连接，但当前未运行"
+    return "已连接并运行" if response.status_code == 200 else "已经连接，但当前不可用"
 
 
 def _server_command(args: Any, paths: CliPaths, project_root: Path) -> tuple[list[str], dict[str, str], int]:

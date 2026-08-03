@@ -16,19 +16,15 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.knowledge.store import detect_knowledge_text_sensitivity
-from app.llm.model_gateway import (
-    ModelGatewayProtocolError,
-    parse_model_gateway_metadata,
-    validate_model_gateway_metadata,
-)
 from app.llm.routing import (
     GLOBAL_PROVIDER_COOLDOWNS as _GLOBAL_PROVIDER_COOLDOWNS,
+    LLMProvider,
     LLMProvider as _KnowledgeProvider,
     ProviderCooldowns as KnowledgeProviderCooldowns,
     ProviderCoolingDown as KnowledgeProviderCoolingDown,
-    effective_provider_priority as _effective_provider_priority,
     retry_after_seconds as _retry_after_seconds,
 )
+from app.llm.protocol import auto_tool_choice_allowed, thinking_payload
 from app.usage.context import model_usage_scope
 from app.usage.recorder import UsageRecorder
 
@@ -41,13 +37,6 @@ _VERSION_REF_RE = re.compile(r"^knowledge://version/[A-Za-z0-9][A-Za-z0-9_-]{0,1
 _CHUNK_REF_RE = re.compile(r"^knowledge://chunk/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_TOOL_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,200}$")
 _SENSITIVE_LEVELS = {"private", "sensitive"}
-_MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER = (
-    "X-Model-Gateway-Require-Deployment"
-)
-_MODEL_GATEWAY_REASONING_ORIGIN_HEADER = (
-    "X-Model-Gateway-Reasoning-Origin-Deployment"
-)
-_MODEL_GATEWAY_DEPLOYMENT_RESPONSE_KEY = "__model_gateway_deployment"
 logger = logging.getLogger(__name__)
 
 
@@ -60,37 +49,22 @@ class KnowledgeAgentConfig(BaseModel):
     model.
     """
 
-    base_url: str = "https://api.deepseek.com"
-    api_key: str = ""
-    flash_model: str = "deepseek-v4-flash"
-    pro_model: str = "deepseek-v4-pro"
-    model_gateway_enabled: bool = False
-    provider_priority: str = "D"
-    implicit_deepseek_fallback: bool = True
-    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
-    mimo_api_key: str = ""
-    mimo_model: str = "mimo-v2.5-pro-ultraspeed"
-    kimi_base_url: str = "https://api.moonshot.cn/v1"
-    kimi_api_key: str = ""
-    kimi_model: str = "kimi-k2.7-code"
+    fast_providers: list[LLMProvider] = Field(default_factory=list)
+    pro_provider: LLMProvider | None = None
     rate_limit_cooldown_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
     egress_policy: KnowledgeAgentEgressPolicy = "none"
     allow_sensitive_egress: bool = False
     timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    @field_validator("provider_priority")
-    @classmethod
-    def _valid_provider_priority(cls, value: str) -> str:
-        normalized = "".join(value.upper().split())
-        if not normalized:
-            return "D"
-        if set(normalized) - {"M", "K", "D"}:
-            raise ValueError("provider_priority only accepts M, K, and D")
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("provider_priority cannot contain duplicates")
-        return normalized
+    @property
+    def flash_model(self) -> str:
+        return self.fast_providers[0].model if self.fast_providers else ""
+
+    @property
+    def pro_model(self) -> str:
+        return self.pro_provider.model if self.pro_provider else ""
 
 
 class KnowledgeAgentToolStep(BaseModel):
@@ -141,7 +115,6 @@ class KnowledgeCompletionClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         timeout_seconds: float,
-        required_deployment: str = "",
     ) -> dict[str, Any]: ...
 
 
@@ -170,27 +143,17 @@ class OpenAICompatibleKnowledgeAgentClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         timeout_seconds: float,
-        required_deployment: str = "",
     ) -> dict[str, Any]:
-        if self.config.model_gateway_enabled:
-            return await self._post_model_gateway(
-                model=model,
-                messages=messages,
-                tools=tools,
-                timeout_seconds=timeout_seconds,
-                required_deployment=required_deployment,
-            )
-
-        if model == self.config.flash_model:
+        if self.config.fast_providers and model == self.config.flash_model:
             return await self._create_flash_completion(
                 messages=messages,
                 tools=tools,
                 timeout_seconds=timeout_seconds,
             )
 
-        provider = self._provider("D", model=model)
-        if not provider.configured:
-            raise RuntimeError("LLM_DEEPSEEK_API_KEY is not configured")
+        provider = self.config.pro_provider
+        if provider is None or not provider.configured:
+            raise RuntimeError("no configured knowledge.pro provider is available")
         remaining = self.cooldowns.remaining(provider)
         if remaining > 0:
             raise KnowledgeProviderCoolingDown(
@@ -215,13 +178,9 @@ class OpenAICompatibleKnowledgeAgentClient:
         tools: list[dict[str, Any]],
         timeout_seconds: float,
     ) -> dict[str, Any]:
-        priority = (
-            _effective_provider_priority(self.config.provider_priority)
-            if self.config.implicit_deepseek_fallback
-            else list(self.config.provider_priority)
-        )
-        providers = [self._provider(code) for code in priority]
-        providers = [provider for provider in providers if provider.configured]
+        providers = [
+            provider for provider in self.config.fast_providers if provider.configured
+        ]
         if not providers:
             raise RuntimeError("no configured knowledge-agent provider is available")
 
@@ -271,11 +230,11 @@ class OpenAICompatibleKnowledgeAgentClient:
             "model": provider.model,
             "messages": messages,
             "tools": tools,
-            "temperature": _knowledge_temperature(provider),
+            "temperature": 1 if provider.quirks.forces_temperature_one else 0,
             "stream": False,
         }
-        payload.update(_knowledge_thinking_payload(provider))
-        if provider.code != "D":
+        payload.update(thinking_payload(provider.quirks, thinking="enabled"))
+        if auto_tool_choice_allowed(provider.quirks):
             payload["tool_choice"] = "auto"
         timeout = min(timeout_seconds, self.config.timeout_seconds)
         async with httpx.AsyncClient(
@@ -301,98 +260,6 @@ class OpenAICompatibleKnowledgeAgentClient:
             )
         return data
 
-    async def _post_model_gateway(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        timeout_seconds: float,
-        required_deployment: str,
-    ) -> dict[str, Any]:
-        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        if required_deployment:
-            headers[_MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER] = required_deployment
-            headers[_MODEL_GATEWAY_REASONING_ORIGIN_HEADER] = required_deployment
-        payload = {
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "temperature": 0,
-            "stream": False,
-        }
-        timeout = min(timeout_seconds, self.config.timeout_seconds)
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            transport=self.transport,
-        ) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError("knowledge agent response must be a JSON object")
-
-        metadata = parse_model_gateway_metadata(response.headers)
-        try:
-            validate_model_gateway_metadata(metadata, expected_route=model)
-        except ModelGatewayProtocolError as exc:
-            raise _KnowledgeAgentAffinityUnavailable(str(exc)) from exc
-        if required_deployment and metadata.deployment_id != required_deployment:
-            raise _KnowledgeAgentAffinityUnavailable(
-                "central model gateway changed deployment within a phase"
-            )
-        actual_model = metadata.upstream_model
-        data.setdefault("model", actual_model)
-        data[_MODEL_GATEWAY_DEPLOYMENT_RESPONSE_KEY] = metadata.deployment_id
-        if self.usage_recorder is not None:
-            usage_payload = {**data}
-            if metadata.upstream_model:
-                usage_payload["model"] = metadata.upstream_model
-            usage_payload.pop(_MODEL_GATEWAY_DEPLOYMENT_RESPONSE_KEY, None)
-            await anyio.to_thread.run_sync(
-                partial(
-                    self.usage_recorder.record_response,
-                    payload=usage_payload,
-                    model=actual_model,
-                    kind="chat",
-                    base_url=self.config.base_url,
-                    provider_override=metadata.channel_operator,
-                    use_local_pricing=False,
-                )
-            )
-        return data
-
-    def _provider(
-        self,
-        code: Literal["M", "K", "D"],
-        *,
-        model: str | None = None,
-    ) -> _KnowledgeProvider:
-        if code == "M":
-            return _KnowledgeProvider(
-                code="M",
-                base_url=self.config.mimo_base_url,
-                api_key=self.config.mimo_api_key,
-                model=self.config.mimo_model,
-            )
-        if code == "K":
-            return _KnowledgeProvider(
-                code="K",
-                base_url=self.config.kimi_base_url,
-                api_key=self.config.kimi_api_key,
-                model=self.config.kimi_model,
-            )
-        return _KnowledgeProvider(
-            code="D",
-            base_url=self.config.base_url,
-            api_key=self.config.api_key,
-            model=model or self.config.flash_model,
-        )
-
     def _defer_after_429(
         self,
         provider: _KnowledgeProvider,
@@ -409,15 +276,6 @@ class OpenAICompatibleKnowledgeAgentClient:
             provider.code,
             seconds,
         )
-
-
-def _knowledge_temperature(provider: _KnowledgeProvider) -> int:
-    if provider.code != "K":
-        return 0
-    model = provider.model.lower()
-    if model.startswith("kimi-k2.7") or model.startswith("kimi-for-coding"):
-        return 1
-    return 0
 
 
 class _SearchIndexArgs(BaseModel):
@@ -524,10 +382,6 @@ class _ToolRejected(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-class _KnowledgeAgentAffinityUnavailable(RuntimeError):
-    pass
 
 
 class KnowledgeSearchAgent:
@@ -662,10 +516,6 @@ class KnowledgeSearchAgent:
             # be lexical matches that do not actually answer the request.
             metadata.agent_used = True
             return self._finish([], metadata, started, baseline_values)
-        if flash.failure_reason == "agent_affinity_unavailable":
-            metadata.fallback_reason = flash.failure_reason
-            return self._finish(baseline_refs, metadata, started, baseline_values)
-
         should_escalate = quality != "fast" and (
             quality == "deep" or flash.needs_pro or flash.may_escalate
         )
@@ -745,7 +595,6 @@ class KnowledgeSearchAgent:
         invalid_streak = 0
         last_failure = ""
         used_model = model
-        phase_deployment = ""
 
         for round_number in range(1, max_rounds + 1):
             try:
@@ -755,24 +604,7 @@ class KnowledgeSearchAgent:
                     deadline=deadline,
                     user_id=user_id,
                     operation=f"knowledge_agent_{phase}",
-                    required_deployment=phase_deployment,
                 )
-                if self.config.model_gateway_enabled:
-                    response_deployment = str(
-                        raw.get(_MODEL_GATEWAY_DEPLOYMENT_RESPONSE_KEY) or ""
-                    ).strip()
-                    if not response_deployment:
-                        raise _KnowledgeAgentAffinityUnavailable(
-                            "central model gateway omitted deployment metadata"
-                        )
-                    if (
-                        phase_deployment
-                        and response_deployment != phase_deployment
-                    ):
-                        raise _KnowledgeAgentAffinityUnavailable(
-                            "central model gateway changed deployment within a phase"
-                        )
-                    phase_deployment = response_deployment
                 used_model = _response_model(raw, fallback=model)
                 calls = _extract_tool_calls(raw)
             except Exception as exc:
@@ -1046,22 +878,16 @@ class KnowledgeSearchAgent:
         deadline: float,
         user_id: str,
         operation: str,
-        required_deployment: str,
     ) -> dict[str, Any]:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
         with model_usage_scope(user_id=user_id, operation=operation):
-            completion_kwargs: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "tools": _AGENT_TOOLS,
-                "timeout_seconds": remaining,
-            }
-            if self.config.model_gateway_enabled:
-                completion_kwargs["required_deployment"] = required_deployment
             value = self.client.create_chat_completion(
-                **completion_kwargs,
+                model=model,
+                messages=messages,
+                tools=_AGENT_TOOLS,
+                timeout_seconds=remaining,
             )
             result = await _await_with_timeout(value, remaining)
         if not isinstance(result, dict):
@@ -1383,29 +1209,11 @@ async def _await_with_timeout(value: Any, timeout: float) -> Any:
 
 
 def _configured_provider_codes(config: KnowledgeAgentConfig) -> list[str]:
-    if config.model_gateway_enabled:
-        return (
-            ["G"]
-            if all(
-                value.strip()
-                for value in (
-                    config.base_url,
-                    config.api_key,
-                    config.flash_model,
-                    config.pro_model,
-                )
-            )
-            else []
-        )
-    configured = {
-        "M": bool(config.mimo_base_url and config.mimo_api_key and config.mimo_model),
-        "K": bool(config.kimi_base_url and config.kimi_api_key and config.kimi_model),
-        "D": bool(config.base_url and config.api_key and config.flash_model),
-    }
+    """Ordered ids of the fast-route providers that actually have a key."""
     return [
-        code
-        for code in _effective_provider_priority(config.provider_priority)
-        if configured[code]
+        provider.code
+        for provider in config.fast_providers
+        if provider.configured
     ]
 
 
@@ -1414,15 +1222,6 @@ def _response_model(response: Mapping[str, Any], *, fallback: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()[:200]
     return fallback
-
-
-def _knowledge_thinking_payload(provider: _KnowledgeProvider) -> dict[str, Any]:
-    model = provider.model.lower()
-    if provider.code == "K":
-        if model.startswith("kimi-k3"):
-            return {"reasoning_effort": "max"}
-        return {"thinking": {"type": "enabled", "keep": "all"}}
-    return {"thinking": {"type": "enabled"}}
 
 
 def _response_message_text(response: Mapping[str, Any], field: str) -> str:
@@ -1436,14 +1235,10 @@ def _response_message_text(response: Mapping[str, Any], field: str) -> str:
 def _agent_failure_reason(exc: Exception) -> str:
     if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
         return "agent_timeout"
-    if isinstance(exc, _KnowledgeAgentAffinityUnavailable):
-        return "agent_affinity_unavailable"
     if isinstance(exc, KnowledgeProviderCoolingDown):
         return "agent_rate_limited"
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
-        if status_code == 409 and _is_affinity_unavailable_response(exc.response):
-            return "agent_affinity_unavailable"
         if status_code == 429:
             return "agent_rate_limited"
         if status_code >= 500:
@@ -1452,17 +1247,6 @@ def _agent_failure_reason(exc: Exception) -> str:
     if isinstance(exc, (json.JSONDecodeError, ValidationError, TypeError, ValueError)):
         return "invalid_agent_response"
     return "agent_upstream_error"
-
-
-def _is_affinity_unavailable_response(response: httpx.Response) -> bool:
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        return False
-    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
-        return False
-    error = payload["error"]
-    return error.get("code") == "model_gateway_affinity_unavailable"
 
 
 def _is_sensitive(value: str) -> bool:

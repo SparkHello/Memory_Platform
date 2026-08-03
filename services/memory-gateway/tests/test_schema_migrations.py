@@ -410,7 +410,6 @@ class TestKnowledgeSchemaMigrations:
         assert store.search_chunks_by_embedding(
             "alice",
             [1.0, 0.0],
-            model="legacy-model",
             embedding_space_id="current-space",
         ) == []
 

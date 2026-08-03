@@ -8,6 +8,10 @@ import type {
   DecisionLog,
   MemoryExport,
   ModelUsageSummary,
+  ModelGatewayConnectionCheck,
+  ModelGatewayRouteChangeResult,
+  ModelGatewayRouteDraft,
+  ProvidersStatus,
   DatabaseHealthResult,
   MechanismDiagnosisResult,
   MemoryContextExplainResult,
@@ -73,6 +77,7 @@ type RequestOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
   timeoutMessage?: string;
+  headers?: Record<string, string>;
 };
 
 type RedactionOptions = {
@@ -135,6 +140,72 @@ export class MemoryApi {
 
   async knowledgeStatus(signal?: AbortSignal): Promise<KnowledgeStatus> {
     return this.request("/knowledge/status", { signal });
+  }
+
+  async providersStatus(signal?: AbortSignal): Promise<ProvidersStatus> {
+    return this.request("/providers/status", { signal });
+  }
+
+  async validateProviderRoutes(
+    revision: string,
+    routes: ModelGatewayRouteDraft[],
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayRouteChangeResult> {
+    return this.request("/providers/routes/validate", {
+      method: "POST",
+      body: { revision, routes },
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async applyProviderRoutes(
+    revision: string,
+    routes: ModelGatewayRouteDraft[],
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayRouteChangeResult> {
+    return this.request("/providers/routes", {
+      method: "PUT",
+      body: { revision, routes },
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async updateProviderSecret(
+    connectionId: string,
+    value: string,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<{ connection_id: string; configured: boolean }> {
+    return this.request(
+      `/providers/connections/${encodeURIComponent(connectionId)}/secret`,
+      {
+        method: "PUT",
+        body: { value },
+        headers: { "X-Model-Gateway-Admin-Key": adminKey },
+        signal
+      }
+    );
+  }
+
+  async checkProviderConnection(
+    connectionId: string,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayConnectionCheck> {
+    return this.request(
+      `/providers/connections/${encodeURIComponent(connectionId)}/check`,
+      {
+        method: "POST",
+        headers: { "X-Model-Gateway-Admin-Key": adminKey },
+        signal,
+        timeoutMs: 30000,
+        timeoutMessage: "渠道检查超时，请确认 Model Gateway 和供应商服务可访问"
+      }
+    );
   }
 
   async listKnowledgeDocuments(
@@ -914,6 +985,9 @@ export class MemoryApi {
     }
     if (auth) {
       headers.set("X-User-Id", this.settings.userId || "default");
+    }
+    for (const [name, value] of Object.entries(options.headers || {})) {
+      headers.set(name, value);
     }
 
     // 手动 AbortController + setTimeout 实现超时兜底，同时串联调用方传入的 signal。

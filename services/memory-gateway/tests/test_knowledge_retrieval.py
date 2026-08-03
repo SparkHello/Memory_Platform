@@ -24,9 +24,6 @@ class FakeEmbeddingClient(EmbeddingClient):
             return [1.0, 0.0]
         return [0.0, 1.0]
 
-    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
-        return [await self.embed(text) for text in texts]
-
 
 class FailingQueryEmbeddingClient(FakeEmbeddingClient):
     async def embed(self, text: str) -> list[float] | None:

@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+from copy import deepcopy
+
+from model_gateway.adapters import apply_connection_adapter
+from model_gateway.models import ConnectionConfig, DeploymentConfig
+from model_gateway.proxy import prepare_payload
+from model_gateway.routing import Router
+
+
+def connection(adapter: str) -> ConnectionConfig:
+    return ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor",
+            "adapter": adapter,
+            "base_url": "https://vendor.example/v1",
+            "auth": {"secret_ref": "UPSTREAM"},
+        }
+    )
+
+
+def deployment(model: str, *, reasoning_default: str = "enabled") -> DeploymentConfig:
+    return DeploymentConfig.model_validate(
+        {
+            "connection": "vendor",
+            "upstream_model": model,
+            "model_author": "author",
+            "reasoning_default": reasoning_default,
+        }
+    )
+
+
+def test_kimi_k27_adapter_sets_keep_and_temperature() -> None:
+    payload = {"messages": [], "reasoning_effort": "high"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("kimi"),
+        deployment=deployment("kimi-k2.7-code"),
+    )
+    assert payload["temperature"] == 1.0
+    assert payload["thinking"] == {"type": "enabled", "keep": "all"}
+    assert "reasoning_effort" not in payload
+
+
+def test_kimi_k3_keeps_native_reasoning_effort() -> None:
+    payload = {"messages": []}
+    apply_connection_adapter(
+        payload,
+        connection=connection("kimi"),
+        deployment=deployment("kimi-k3-thinking"),
+    )
+    assert payload["reasoning_effort"] == "max"
+    assert "thinking" not in payload
+
+
+def test_deepseek_adapter_maps_effort_and_removes_incompatible_tool_choice() -> None:
+    payload = {
+        "messages": [],
+        "reasoning_effort": "max",
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+    }
+    apply_connection_adapter(
+        payload,
+        connection=connection("deepseek"),
+        deployment=deployment("deepseek-reasoner"),
+    )
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+    assert "tool_choice" not in payload
+
+
+def test_mimo_adapter_adds_empty_reasoning_field_to_tool_history() -> None:
+    payload = {
+        "messages": [
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        ]
+    }
+    apply_connection_adapter(
+        payload,
+        connection=connection("mimo"),
+        deployment=deployment("mimo-v2.5-pro-ultraspeed"),
+    )
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["messages"][0]["reasoning_content"] == ""
+
+
+def test_fallback_strips_reasoning_from_a_different_origin(
+    gateway_config, backend_client
+) -> None:
+    router = Router()
+    target = router.resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+        preferred_deployment="chat-reseller",
+    ).targets[0]
+    payload = {
+        "model": "memory.chat",
+        "messages": [
+            {
+                "role": "assistant",
+                "reasoning_content": "official-private-state",
+                "content": "visible",
+            }
+        ],
+    }
+    forwarded = prepare_payload(
+        payload,
+        target,
+        reasoning_origin_deployment="chat-official",
+    )
+    assert forwarded["messages"][0] == {"role": "assistant", "content": "visible"}
+    assert payload["messages"][0]["reasoning_content"] == "official-private-state"

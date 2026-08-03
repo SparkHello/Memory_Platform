@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 import hashlib
 import threading
@@ -10,13 +10,65 @@ from typing import Any, Literal, Mapping
 
 ProviderCode = Literal["M", "K", "D"]
 
+ThinkingStyle = Literal[
+    "none",
+    "type_object",
+    "type_object_keep_all",
+    "native_effort",
+]
+StructuredOutput = Literal["json_schema", "json_object", "tool_call_only"]
+# How much of `tool_choice` a provider tolerates while reasoning is enabled.
+#   any       -- no restriction
+#   auto_only -- rejects a named function, accepts "auto" (Kimi)
+#   none      -- rejects the field entirely (DeepSeek)
+ToolChoicePolicy = Literal["any", "auto_only", "none"]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderQuirks:
+    """Declarative provider behaviour, replacing base_url substring sniffing.
+
+    Every field here used to be a hard-coded `"moonshot" in base_url` style
+    test spread across the chat and gateway clients.  Declaring them keeps the
+    knowledge with the provider definition, where it can be corrected without a
+    code change.
+    """
+
+    thinking_style: ThinkingStyle = "none"
+    reasoning_effort_max: str = "high"
+    # DeepSeek accepts `reasoning_effort` alongside `thinking`; most providers
+    # reject the pair and need the generic field dropped after translation.
+    keeps_reasoning_effort: bool = False
+    # Providers with no reasoning support at all (e.g. Mistral) must not even
+    # receive the generic fields; leaving them in place is an upstream 400.
+    strips_reasoning_fields: bool = False
+    tool_choice_with_thinking: ToolChoicePolicy = "any"
+    structured_output: StructuredOutput = "json_object"
+    forces_temperature_one: bool = False
+    rejects_stream_options: bool = False
+    requires_reasoning_replay: bool = False
+
+    def merged(self, overrides: dict[str, Any]) -> ProviderQuirks:
+        if not overrides:
+            return self
+        known = {f for f in ProviderQuirks.__slots__}
+        unknown = set(overrides) - known
+        if unknown:
+            raise ValueError(f"未知的 quirks 字段：{', '.join(sorted(unknown))}")
+        return ProviderQuirks(
+            **{**{name: getattr(self, name) for name in known}, **overrides}
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class LLMProvider:
-    code: ProviderCode
+    """A resolved `provider_id/model_id` route target ready to be called."""
+
+    code: str
     base_url: str
     api_key: str
     model: str
+    quirks: ProviderQuirks = field(default_factory=ProviderQuirks)
 
     @property
     def configured(self) -> bool:

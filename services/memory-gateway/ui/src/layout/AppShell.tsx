@@ -12,6 +12,7 @@ import {
   Menu,
   Moon,
   ReceiptText,
+  Route as RouteIcon,
   Search,
   ScanSearch,
   Settings as SettingsIcon,
@@ -38,6 +39,7 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   reports: FileText,
   logs: Activity,
   usage: ReceiptText,
+  providers: RouteIcon,
   settings: SettingsIcon,
   developer: Wrench
 };

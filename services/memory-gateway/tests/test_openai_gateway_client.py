@@ -1,4 +1,7 @@
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from fastapi import HTTPException
 import httpx
@@ -12,46 +15,92 @@ from app.openai_compat.gateway_client import (
 )
 
 
-def _settings(**overrides) -> Settings:
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+DEEPSEEK_QUIRKS = {
+    "thinking_style": "type_object",
+    "reasoning_effort_max": "max",
+    "keeps_reasoning_effort": True,
+    "tool_choice_with_thinking": "none",
+    "requires_reasoning_replay": True,
+}
+MIMO_QUIRKS = {"thinking_style": "type_object", "requires_reasoning_replay": True}
+KIMI_QUIRKS = {
+    "thinking_style": "type_object_keep_all",
+    "tool_choice_with_thinking": "auto_only",
+    "forces_temperature_one": True,
+    "requires_reasoning_replay": True,
+}
+
+
+def _provider_settings(
+    providers: dict[str, dict],
+    chat_targets: list[str],
+    **overrides,
+) -> Settings:
+    """Settings whose `chat` route resolves to the given ad-hoc providers.
+
+    Behaviour that used to be inferred from the hostname is now declared per
+    provider, so a private proxy with no vendor marker in its URL is expressed
+    the same way as an official endpoint.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="gateway-client-"))
+    presets = {}
+    for provider_id, spec in providers.items():
+        presets[provider_id] = {
+            "name": provider_id,
+            "protocol": "openai",
+            "api_host": spec["api_host"],
+            "quirks": spec.get("quirks", {}),
+            "models": [{"id": model, "kind": "chat"} for model in spec["models"]],
+        }
+        os.environ[f"PROVIDER_{provider_id.upper()}_API_KEY"] = spec.get("api_key", "test-key")
+    (directory / "providers.json").write_text(
+        json.dumps({"version": 1, "presets": presets}), encoding="utf-8"
+    )
+    (directory / "routes.json").write_text(
+        json.dumps({"version": 1, "routes": {"chat": chat_targets}}), encoding="utf-8"
+    )
     values = {
         "GATEWAY_API_KEY": "gateway-key",
-        "LLM_PROVIDER_PRIORITY": "MD",
-        "LLM_MIMO_BASE_URL": "https://mimo.invalid/v1",
-        "LLM_MIMO_API_KEY": "mimo-key",
-        "LLM_MIMO_MODEL": "mimo-test",
-        "LLM_DEEPSEEK_BASE_URL": "https://deepseek.invalid/v1",
-        "LLM_DEEPSEEK_API_KEY": "deepseek-key",
-        "LLM_DEEPSEEK_FLASH_MODEL": "deepseek-test",
-        "UPSTREAM_API_KEY": "",
+        "PROVIDERS_PATH": str(directory / "providers.json"),
+        "ROUTES_PATH": str(directory / "routes.json"),
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
 
 
-def _model_gateway_settings(**overrides) -> Settings:
-    return _settings(
-        MODEL_GATEWAY_BASE_URL="https://model-gateway.invalid/v1",
-        MODEL_GATEWAY_API_KEY="central-key",
-        MODEL_GATEWAY_CHAT_MODEL="memory.chat",
+def _settings(**overrides) -> Settings:
+    """The default two-provider chain: MiMo first, DeepSeek as the fallback."""
+    return _provider_settings(
+        {
+            "mimo": {
+                "api_host": "https://mimo.invalid/v1",
+                "api_key": "mimo-key",
+                "models": ["mimo-test"],
+                "quirks": MIMO_QUIRKS,
+            },
+            "deepseek": {
+                "api_host": "https://deepseek.invalid/v1",
+                "api_key": "deepseek-key",
+                "models": ["deepseek-test"],
+                "quirks": DEEPSEEK_QUIRKS,
+            },
+        },
+        ["mimo/mimo-test", "deepseek/deepseek-test"],
         **overrides,
     )
-
-
-def _model_gateway_response_headers(
-    *,
-    deployment: str = "deploy-kimi-primary",
-    route: str = "memory.chat",
-) -> dict[str, str]:
-    return {
-        "Content-Type": "application/json; charset=utf-8",
-        "X-Model-Gateway-Route": route,
-        "X-Model-Gateway-Deployment": deployment,
-        "X-Model-Gateway-Connection": "moonshot-official",
-        "X-Model-Gateway-Channel-Operator": "moonshot",
-        "X-Model-Gateway-Model-Author": "moonshot",
-        "X-Model-Gateway-Vendor": "kimi",
-        "X-Model-Gateway-Upstream-Model": "kimi-k2.7-code",
-    }
 
 
 @pytest.mark.asyncio
@@ -131,219 +180,6 @@ async def test_gateway_client_preserves_payload_and_fails_over() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_gateway_central_route_preserves_body_and_parses_origin() -> None:
-    seen: list[tuple[httpx.Request, dict]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((request, json.loads(request.content)))
-        return httpx.Response(
-            200,
-            json={
-                "model": "kimi-k2.7-code",
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "ok",
-                            "reasoning_content": "kept",
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-            },
-            headers=_model_gateway_response_headers(),
-        )
-
-    client = OpenAIChatGatewayClient(
-        _model_gateway_settings(),
-        transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
-    )
-    result = await client.complete(
-        {
-            "model": "memory-auto",
-            "messages": [{"role": "user", "content": "hello"}],
-            "vendor_extension": {"preserve": True},
-            "conversation_id": "local-only",
-        }
-    )
-
-    assert len(seen) == 1
-    request, forwarded = seen[0]
-    assert request.url == httpx.URL(
-        "https://model-gateway.invalid/v1/chat/completions"
-    )
-    assert request.headers["authorization"] == "Bearer central-key"
-    assert forwarded["model"] == "memory.chat"
-    assert forwarded["vendor_extension"] == {"preserve": True}
-    assert forwarded["stream"] is False
-    assert "conversation_id" not in forwarded
-    assert result.provider.deployment_id == "deploy-kimi-primary"
-    assert result.provider.connection_id == "moonshot-official"
-    assert result.provider.vendor == "moonshot"
-    assert result.provider.model_author == "moonshot"
-    assert result.provider.model == "kimi-k2.7-code"
-    assert "x-model-gateway-deployment" not in result.headers
-    assert client.list_models() == ["memory-auto", "memory.chat"]
-
-
-@pytest.mark.asyncio
-async def test_model_gateway_public_chat_rejects_internal_routes_and_old_aliases() -> None:
-    calls: list[httpx.Request] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        raise AssertionError("rejected model must not reach Model Gateway")
-
-    client = OpenAIChatGatewayClient(
-        _model_gateway_settings(),
-        transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
-    )
-
-    configured = client._model_gateway_payload(
-        {
-            "model": "memory.chat",
-            "messages": [{"role": "user", "content": "hello"}],
-        },
-        stream=False,
-    )
-    assert configured["model"] == "memory.chat"
-
-    for requested_model in (
-        "memory.extract",
-        "knowledge.pro",
-        "memory.embedding",
-        "memory-gateway",
-        "auto",
-        "default",
-    ):
-        with pytest.raises(HTTPException) as caught:
-            await client.complete(
-                {
-                    "model": requested_model,
-                    "messages": [{"role": "user", "content": "hello"}],
-                }
-            )
-        assert caught.value.status_code == 404
-
-    with pytest.raises(HTTPException) as stream_error:
-        await client.open_stream(
-            {
-                "model": "memory.review",
-                "messages": [{"role": "user", "content": "hello"}],
-            }
-        )
-    assert stream_error.value.status_code == 404
-    assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_model_gateway_affinity_409_retries_once_without_private_reasoning() -> None:
-    seen: list[tuple[httpx.Request, dict]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        forwarded = json.loads(request.content)
-        seen.append((request, forwarded))
-        if len(seen) == 1:
-            return httpx.Response(
-                409,
-                json={
-                    "error": {
-                        "code": "model_gateway_affinity_unavailable",
-                        "message": "deployment is unavailable",
-                    }
-                },
-            )
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "ok"}}]},
-            headers=_model_gateway_response_headers(deployment="deploy-deepseek-backup"),
-        )
-
-    client = OpenAIChatGatewayClient(
-        _model_gateway_settings(),
-        transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
-    )
-    result = await client.complete(
-        {
-            "model": "memory-auto",
-            "messages": [
-                {"role": "user", "content": "first"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "reasoning_content": "deployment-private-state",
-                    "tool_calls": [{"id": "call_1", "type": "function"}],
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
-            ],
-        },
-        preferred_provider_code="deploy-kimi-primary",
-    )
-
-    assert len(seen) == 2
-    first_request, first_payload = seen[0]
-    second_request, second_payload = seen[1]
-    assert first_request.headers["x-model-gateway-require-deployment"] == (
-        "deploy-kimi-primary"
-    )
-    assert first_request.headers[
-        "x-model-gateway-reasoning-origin-deployment"
-    ] == "deploy-kimi-primary"
-    assert first_payload["messages"][1]["reasoning_content"] == (
-        "deployment-private-state"
-    )
-    assert "x-model-gateway-require-deployment" not in second_request.headers
-    assert "reasoning_content" not in second_payload["messages"][1]
-    assert result.provider.deployment_id == "deploy-deepseek-backup"
-
-
-@pytest.mark.asyncio
-async def test_model_gateway_rejects_mismatched_affinity_response() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "unsafe"}}]},
-            headers=_model_gateway_response_headers(deployment="wrong-deployment"),
-        )
-
-    client = OpenAIChatGatewayClient(
-        _model_gateway_settings(),
-        transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
-    )
-
-    with pytest.raises(GatewayUpstreamHTTPError) as caught:
-        await client.complete(
-            {
-                "model": "memory-auto",
-                "messages": [{"role": "user", "content": "hello"}],
-            },
-            preferred_provider_code="deploy-kimi-primary",
-        )
-
-    assert caught.value.status_code == 502
-    assert json.loads(caught.value.content)["error"]["code"] == (
-        "model_gateway_affinity_protocol_error"
-    )
-
-
-class _ChunkStream(httpx.AsyncByteStream):
-    def __init__(self, chunks: list[bytes]) -> None:
-        self.chunks = chunks
-        self.closed = False
-
-    async def __aiter__(self):
-        for chunk in self.chunks:
-            yield chunk
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-@pytest.mark.asyncio
 async def test_gateway_client_opens_and_closes_stream_without_buffering() -> None:
     chunks = [
         b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
@@ -361,7 +197,11 @@ async def test_gateway_client_opens_and_closes_stream_without_buffering() -> Non
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(LLM_PROVIDER_PRIORITY="D"),
+        _provider_settings(
+            {"deepseek": {"api_host": "https://deepseek.invalid/v1",
+                          "models": ["deepseek-test"], "quirks": DEEPSEEK_QUIRKS}},
+            ["deepseek/deepseek-test"],
+        ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
     )
@@ -387,63 +227,13 @@ async def test_gateway_client_opens_and_closes_stream_without_buffering() -> Non
     assert source.closed is True
 
 
-@pytest.mark.asyncio
-async def test_model_gateway_stream_preserves_sse_and_affinity_metadata() -> None:
-    chunks = [
-        b'data: {"choices":[{"delta":{"reasoning_content":"r"}}]}\n\n',
-        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
-        b"data: [DONE]\n\n",
-    ]
-    source = _ChunkStream(chunks)
-    captured: dict = {}
-    headers: dict[str, str] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured.update(json.loads(request.content))
-        headers.update(request.headers)
-        return httpx.Response(
-            200,
-            headers={
-                **_model_gateway_response_headers(),
-                "Content-Type": "text/event-stream",
-            },
-            stream=source,
-        )
-
-    client = OpenAIChatGatewayClient(
-        _model_gateway_settings(),
-        transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
-    )
-    stream = await client.open_stream(
-        {
-            "model": "memory-auto",
-            "messages": [{"role": "user", "content": "hello"}],
-        },
-        preferred_provider_code="deploy-kimi-primary",
-    )
-    forwarded = [chunk async for chunk in stream.aiter_bytes()]
-    await stream.aclose()
-
-    assert forwarded == chunks
-    assert captured["model"] == "memory.chat"
-    assert captured["stream"] is True
-    assert headers["x-model-gateway-require-deployment"] == (
-        "deploy-kimi-primary"
-    )
-    assert stream.provider.deployment_id == "deploy-kimi-primary"
-    assert stream.metadata.vendor == "moonshot"
-    assert source.closed is True
-
-
 def test_gateway_client_model_list_uses_only_configured_upstreams() -> None:
     configured = OpenAIChatGatewayClient(_settings())
     empty = OpenAIChatGatewayClient(
-        _settings(
-            LLM_PROVIDER_PRIORITY="D",
-            LLM_MIMO_API_KEY="",
-            LLM_DEEPSEEK_API_KEY="",
-            UPSTREAM_API_KEY="",
+        _provider_settings(
+            {"nokey": {"api_host": "https://nokey.invalid/v1",
+                       "api_key": "", "models": ["nokey-test"]}},
+            ["nokey/nokey-test"],
         )
     )
 
@@ -474,7 +264,11 @@ async def test_gateway_client_translates_flit_reasoning_without_conflicts() -> N
     tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
     cases = [
         (
-            _settings(LLM_PROVIDER_PRIORITY="D"),
+            _provider_settings(
+            {"deepseek": {"api_host": "https://deepseek.invalid/v1",
+                          "models": ["deepseek-test"], "quirks": DEEPSEEK_QUIRKS}},
+            ["deepseek/deepseek-test"],
+        ),
             "deepseek-test",
             {
                 "thinking": {"type": "enabled"},
@@ -484,7 +278,11 @@ async def test_gateway_client_translates_flit_reasoning_without_conflicts() -> N
             },
         ),
         (
-            _settings(LLM_PROVIDER_PRIORITY="M"),
+            _provider_settings(
+                {"mimo": {"api_host": "https://mimo.invalid/v1",
+                          "models": ["mimo-test"], "quirks": MIMO_QUIRKS}},
+                ["mimo/mimo-test"],
+            ),
             "mimo-test",
             {
                 "thinking": {"type": "enabled"},
@@ -494,11 +292,10 @@ async def test_gateway_client_translates_flit_reasoning_without_conflicts() -> N
             },
         ),
         (
-            _settings(
-                LLM_PROVIDER_PRIORITY="K",
-                LLM_KIMI_BASE_URL="https://kimi-proxy.invalid/v1",
-                LLM_KIMI_API_KEY="kimi-key",
-                LLM_KIMI_MODEL="kimi-k2.7-code",
+            _provider_settings(
+                {"kimi": {"api_host": "https://kimi-proxy.invalid/v1",
+                          "models": ["kimi-k2.7-code"], "quirks": KIMI_QUIRKS}},
+                ["kimi/kimi-k2.7-code"],
             ),
             "kimi-k2.7-code",
             {
@@ -509,11 +306,12 @@ async def test_gateway_client_translates_flit_reasoning_without_conflicts() -> N
             },
         ),
         (
-            _settings(
-                LLM_PROVIDER_PRIORITY="K",
-                LLM_KIMI_BASE_URL="https://kimi-proxy.invalid/v1",
-                LLM_KIMI_API_KEY="kimi-key",
-                LLM_KIMI_MODEL="kimi-k3-test",
+            _provider_settings(
+                {"kimi": {"api_host": "https://kimi-proxy.invalid/v1",
+                          "models": ["kimi-k3-test"],
+                          "quirks": {"thinking_style": "native_effort",
+                                     "reasoning_effort_max": "max"}}},
+                ["kimi/kimi-k3-test"],
             ),
             "kimi-k3-test",
             {
@@ -582,7 +380,11 @@ async def test_deepseek_preserves_flit_max_reasoning_strength() -> None:
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(LLM_PROVIDER_PRIORITY="D"),
+        _provider_settings(
+            {"deepseek": {"api_host": "https://deepseek.invalid/v1",
+                          "models": ["deepseek-test"], "quirks": DEEPSEEK_QUIRKS}},
+            ["deepseek/deepseek-test"],
+        ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
     )
@@ -610,7 +412,11 @@ async def test_streaming_rejects_successful_json_before_sending_sse_headers() ->
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(LLM_PROVIDER_PRIORITY="D"),
+        _provider_settings(
+            {"deepseek": {"api_host": "https://deepseek.invalid/v1",
+                          "models": ["deepseek-test"], "quirks": DEEPSEEK_QUIRKS}},
+            ["deepseek/deepseek-test"],
+        ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
     )
@@ -654,14 +460,10 @@ async def test_gateway_strips_flit_stream_options_for_incompatible_upstreams(
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(
-            LLM_PROVIDER_PRIORITY="D",
-            LLM_DEEPSEEK_BASE_URL="",
-            LLM_DEEPSEEK_API_KEY="",
-            LLM_DEEPSEEK_FLASH_MODEL="",
-            UPSTREAM_BASE_URL=base_url,
-            UPSTREAM_API_KEY="upstream-key",
-            UPSTREAM_MODEL=model,
+        _provider_settings(
+            {"upstream": {"api_host": base_url, "models": [model],
+                          "quirks": {"rejects_stream_options": True}}},
+            [f"upstream/{model}"],
         ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
@@ -699,14 +501,11 @@ async def test_gateway_strips_flit_reasoning_controls_for_mistral() -> None:
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(
-            LLM_PROVIDER_PRIORITY="D",
-            LLM_DEEPSEEK_BASE_URL="",
-            LLM_DEEPSEEK_API_KEY="",
-            LLM_DEEPSEEK_FLASH_MODEL="",
-            UPSTREAM_BASE_URL="https://private-proxy.invalid/v1",
-            UPSTREAM_API_KEY="upstream-key",
-            UPSTREAM_MODEL="vendor/codestral-latest",
+        _provider_settings(
+            {"upstream": {"api_host": "https://private-proxy.invalid/v1",
+                          "models": ["vendor/codestral-latest"],
+                          "quirks": {"strips_reasoning_fields": True}}},
+            ["upstream/vendor/codestral-latest"],
         ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
@@ -752,11 +551,11 @@ async def test_private_proxy_models_still_receive_native_auto_thinking(
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(
-            LLM_PROVIDER_PRIORITY="D",
-            LLM_DEEPSEEK_BASE_URL="https://private-proxy.invalid/v1",
-            LLM_DEEPSEEK_API_KEY="private-key",
-            LLM_DEEPSEEK_FLASH_MODEL=model,
+        _provider_settings(
+            {"private": {"api_host": "https://private-proxy.invalid/v1",
+                         "models": [model],
+                         "quirks": {"thinking_style": "type_object"}}},
+            [f"private/{model}"],
         ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
@@ -790,11 +589,10 @@ async def test_memory_auto_enables_native_thinking_and_respects_explicit_off() -
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(
-            LLM_PROVIDER_PRIORITY="K",
-            LLM_KIMI_BASE_URL="https://kimi-proxy.invalid/v1",
-            LLM_KIMI_API_KEY="kimi-key",
-            LLM_KIMI_MODEL="kimi-k2.7-code",
+        _provider_settings(
+            {"kimi": {"api_host": "https://kimi-proxy.invalid/v1",
+                      "models": ["kimi-k2.7-code"], "quirks": KIMI_QUIRKS}},
+            ["kimi/kimi-k2.7-code"],
         ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
@@ -846,7 +644,11 @@ async def test_gateway_completes_reasoning_content_for_alias_tool_history() -> N
         )
 
     client = OpenAIChatGatewayClient(
-        _settings(LLM_PROVIDER_PRIORITY="D"),
+        _provider_settings(
+            {"deepseek": {"api_host": "https://deepseek.invalid/v1",
+                          "models": ["deepseek-test"], "quirks": DEEPSEEK_QUIRKS}},
+            ["deepseek/deepseek-test"],
+        ),
         transport=httpx.MockTransport(handler),
         cooldowns=ProviderCooldowns(),
     )
@@ -912,7 +714,7 @@ async def test_memory_auto_prefers_cached_tool_provider_before_normal_priority()
             "model": "memory-auto",
             "messages": [{"role": "user", "content": "hello"}],
         },
-        preferred_provider_code="D",
+        preferred_provider_code="deepseek",
     )
 
     assert hosts == ["deepseek.invalid"]
@@ -956,7 +758,7 @@ async def test_failover_does_not_replay_one_providers_reasoning_to_another() -> 
                 },
             ],
         },
-        preferred_provider_code="D",
+        preferred_provider_code="deepseek",
     )
 
     assert (
@@ -998,7 +800,7 @@ async def test_stream_failover_also_strips_the_previous_providers_reasoning() ->
                 },
             ],
         },
-        preferred_provider_code="D",
+        preferred_provider_code="deepseek",
     )
     await stream.aclose()
 

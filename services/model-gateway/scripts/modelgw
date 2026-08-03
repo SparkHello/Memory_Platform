@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_source="${BASH_SOURCE[0]}"
+while [[ -L "$script_source" ]]; do
+  script_dir="$(cd -P "$(dirname "$script_source")" >/dev/null 2>&1 && pwd)"
+  link_target="$(readlink "$script_source")"
+  if [[ "$link_target" == /* ]]; then
+    script_source="$link_target"
+  else
+    script_source="$script_dir/$link_target"
+  fi
+done
+
+project_root="$(cd -P "$(dirname "$script_source")/.." >/dev/null 2>&1 && pwd)"
+if [[ -x "$project_root/.venv/bin/python" ]]; then
+  python_bin="$project_root/.venv/bin/python"
+elif [[ -n "${MODEL_GATEWAY_PYTHON:-}" ]]; then
+  python_bin="$MODEL_GATEWAY_PYTHON"
+else
+  python_bin="python3"
+fi
+
+exec "$python_bin" -m model_gateway.cli "$@"

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 from app.cli import main
-from app.cli_config import cli_paths, read_env_file, read_json
+from app.cli_config import cli_paths, read_env_file, read_json, update_env_value
 from app.model_probe import ModelProbeResult
 
 
@@ -113,6 +115,142 @@ def test_cli_connects_memory_service_to_independent_model_gateway(
     assert checks == [
         (tmp_path / "memgw-home", PROJECT_ROOT, 10.0),
     ]
+
+
+def test_user_menu_uses_service_language_and_can_exit(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    answers = iter(["0"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    assert main([*args, "menu"]) == 0
+
+    output = capsys.readouterr().out
+    assert "本地记忆助手" in output
+    assert "记忆服务" in output
+    assert "模型服务" in output
+    assert "connection" not in output
+    assert "deployment" not in output
+
+
+def test_user_menu_opens_independent_model_service_menu(
+    tmp_path, monkeypatch
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    answers = iter(["2", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(
+        "app.cli._find_modelgw",
+        lambda project_root: Path("/fake/modelgw"),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "app.cli.subprocess.run",
+        lambda command, **kwargs: calls.append(command) or SimpleNamespace(returncode=0),
+    )
+
+    assert main([*args, "menu"]) == 0
+    assert calls == [["/fake/modelgw"]]
+
+
+def test_stack_lifecycle_starts_model_first_and_stops_memory_first(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    settings_path = cli_paths(tmp_path / "memgw-home").settings_env
+    update_env_value(settings_path, "MODEL_GATEWAY_BASE_URL", "http://127.0.0.1:2030/v1")
+    update_env_value(settings_path, "MODEL_GATEWAY_API_KEY", "backend-key")
+    calls: list[str] = []
+    monkeypatch.setattr("app.cli._find_modelgw", lambda project_root: Path("/fake/modelgw"))
+    monkeypatch.setattr(
+        "app.cli._run_modelgw",
+        lambda modelgw, home, arguments, **kwargs: calls.append("model:" + arguments[0]) or 0,
+    )
+    monkeypatch.setattr(
+        "app.cli._cmd_start",
+        lambda args, paths, project_root: calls.append("memory:start") or 0,
+    )
+    monkeypatch.setattr(
+        "app.cli._cmd_stop",
+        lambda args, paths, project_root: calls.append("memory:stop") or 0,
+    )
+
+    assert main([*args, "stack", "start"]) == 0
+    assert calls == ["model:start", "memory:start"]
+    calls.clear()
+    assert main([*args, "stack", "stop"]) == 0
+    assert calls == ["memory:stop", "model:stop"]
+
+
+def test_stack_install_rotates_and_syncs_backend_key_without_echo(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    model_home = tmp_path / "model-home"
+    model_home.mkdir()
+    (model_home / "config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "server": {"port": 2030},
+                "routes": {"memory.embedding": {"targets": ["embedding"]}},
+                "deployments": {
+                    "embedding": {"embedding_space": "portable-space"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    secret_inputs: list[str] = []
+    monkeypatch.setattr(
+        "app.cli._ensure_model_gateway_runtime",
+        lambda args, project_root: Path("/fake/modelgw"),
+    )
+    monkeypatch.setattr(
+        "app.cli._modelgw_json",
+        lambda modelgw, home, arguments: [
+            {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
+            {"id": "memory-console-admin", "kind": "admin", "secret_configured": True},
+        ],
+    )
+
+    def fake_modelgw(modelgw, home, arguments, **kwargs):
+        if kwargs.get("input_text"):
+            secret_inputs.append(kwargs["input_text"].strip())
+        return 0
+
+    monkeypatch.setattr("app.cli._run_modelgw", fake_modelgw)
+
+    assert (
+        main(
+            [
+                *args,
+                "stack",
+                "install",
+                "--model-gateway-home",
+                str(model_home),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    values = read_env_file(cli_paths(tmp_path / "memgw-home").settings_env)
+    assert len(secret_inputs) == 1
+    assert values["MODEL_GATEWAY_API_KEY"] == secret_inputs[0]
+    assert values["MODEL_GATEWAY_BASE_URL"] == "http://127.0.0.1:2030/v1"
+    assert values["MODEL_GATEWAY_EMBEDDING_SPACE_ID"] == "portable-space"
+    assert secret_inputs[0] not in output
 
 
 def test_cli_adds_model_and_assigns_feature_route(tmp_path) -> None:

@@ -35,37 +35,6 @@ def test_embedding_client_falls_back_without_embedding_api_key(monkeypatch) -> N
     assert isinstance(client, NullEmbeddingClient)
 
 
-def test_model_gateway_embedding_requires_explicit_immutable_space() -> None:
-    without_space = get_embedding_client(
-        Settings(
-            _env_file=None,
-            MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
-            MODEL_GATEWAY_API_KEY="central-key",
-            EMBEDDING_API_KEY="legacy-key-must-not-be-used",
-        )
-    )
-    configured = get_embedding_client(
-        Settings(
-            _env_file=None,
-            MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
-            MODEL_GATEWAY_API_KEY="central-key",
-            MODEL_GATEWAY_EMBEDDING_MODEL="memory.embedding",
-            MODEL_GATEWAY_EMBEDDING_SPACE_ID="qwen3.7/1024/v1",
-            EMBEDDING_DIMENSIONS=1024,
-            EMBEDDING_API_KEY="legacy-key-must-not-be-used",
-        )
-    )
-
-    assert isinstance(without_space, NullEmbeddingClient)
-    assert isinstance(configured, OpenAICompatibleEmbeddingClient)
-    assert configured.base_url == "http://127.0.0.1:2030/v1"
-    assert configured.api_key == "central-key"
-    assert configured.model == "memory.embedding"
-    assert configured.expected_space_id == "qwen3.7/1024/v1"
-    assert configured.embedding_space_id == "qwen3.7/1024/v1"
-    assert configured.model_gateway_mode is True
-
-
 def test_direct_embedding_uses_stable_local_space_without_key_material(tmp_path) -> None:
     common = {
         "MODEL_GATEWAY_BASE_URL": "",
@@ -310,6 +279,7 @@ async def test_sensitive_embedding_is_blocked_before_http(monkeypatch) -> None:
 
 def test_sensitive_egress_is_disabled_by_default(monkeypatch) -> None:
     monkeypatch.delenv("ALLOW_SENSITIVE_EGRESS", raising=False)
-    get_settings.cache_clear()
 
-    assert get_settings().allow_sensitive_egress is False
+    # This asserts the built-in default, so it must ignore the project .env
+    # a developer may have switched on locally.
+    assert Settings(_env_file=None).allow_sensitive_egress is False

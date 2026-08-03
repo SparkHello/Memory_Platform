@@ -27,7 +27,7 @@
 安装开发依赖：
 
 ```bash
-cd /Users/spark/My_Memory
+cd /path/to/Memory_Platform/services/memory-gateway
 python3 -m venv .venv
 source .venv/bin/activate
 .venv/bin/pip install -e ".[dev]"
@@ -144,7 +144,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 
 ## 开发工作流
 
-- 项目根目录是 `/Users/spark/My_Memory`，不要误把外层目录当作仓库根。
+- 服务目录是 `services/memory-gateway`，Git 仓库根目录在其上两级；所有提交都从 Memory_Platform 根目录统一处理。
 - 修改前先跑 `git status --short`。如果只看到 Git 读取用户级 ignore 的权限警告，但没有文件列表，通常表示工作区干净。
 - 搜索优先用 `rg` / `rg --files`，再按任务读取相关模块；不要只凭 README 推断实现。
 - 文档改动通常不需要跑完整测试；代码、接口、schema 或保存规则变更需要跑相关定向测试，风险较大时再跑完整 `pytest`。
@@ -191,11 +191,13 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/main.py`：应用工厂。创建 FastAPI app，初始化 SQLite，启动 MCP session manager，先挂载 `/ui` 静态目录，再兜底挂载 MCP 子应用。
 - `app/config.py`：配置入口。读取 `.env`，包含上游 chat、embedding、数据库和超时配置。
 - `app/cli.py`、`app/cli_config.py`：`memgw` 控制台、后台进程管理、仓库外原子配置/密钥写入、独立 Model Gateway client 接线和 PATH 安装；项目内模型/价格功能只作 direct-provider 兼容。
+- `app/stack_backup.py`：统一 Memory Stack 便携备份/恢复。使用 SQLite backup API 在线快照记忆、知识与用量库，导出 Model Gateway 脱敏配置和非密钥设置；恢复前校验清单哈希及所有 SQLite/JSON，并为被替换文件保留仓库外回滚副本。不得把任何 API Key 加入便携包。
 - `app/model_catalog.py`、`app/catalog/`：数据化模型目录、八类功能路由、公开价格目录和 JSON Schema；未设置外部路径时继续兼容旧 `MKD`。
 - `app/model_probe.py`：CLI 的 provider/model 连通性检查；默认只请求 `/models`，`--live` 才发送最小真实调用，测试必须使用 `httpx.MockTransport`。
 - `app/api/deps.py`：REST 鉴权、`X-User-Id`、MemoryStore、LLM client 和 embedding client 依赖。
 - `app/api/chat_gateway.py`：`/v1/models` 与 `/v1/chat/completions`；组装安全上下文、FLIT 工具轮次召回/推理状态缓存、SSE 透明转发、最终回答幂等激活/提取。
 - `app/api/usage.py`：`/usage/summary`；按 user id 返回时间范围汇总、模型/用途/日期拆分、最近事件和当前价格目录。
+- `app/api/providers.py`：`/providers/status` 与受控配置代理。只读状态使用 My_Memory 的 Model Gateway backend key；路由校验/应用、渠道密钥单向写入和 discovery 检查必须额外提供 Model Gateway admin client key。代理目标固定为配置中的 Model Gateway，不能接收任意 URL。
 - `app/api/memories.py`：记忆管理 REST API，包括列表、搜索、删除、恢复、导出、报告、合并、核心记忆、对话分支查看/清理和决策日志。
 - `app/openai_compat/schemas.py`：内部与外部 OpenAI-compatible schema；外部消息允许多模态 content 和额外字段。
 - `app/openai_compat/gateway_client.py`：透明聊天上游；中央模式保留请求/SSE 并执行 deployment reasoning affinity，兼容模式继续处理 `memory-auto` provider 路由。
@@ -229,6 +231,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `scripts/eval_recall.py`：微型召回评测。`--init` 按 user id 建立物理隔离快照，`--run` 以 `record_usage=False` 输出排序、无答案误召、拒答和实际 fallback 指标。真实库全程只读，`eval/` 已被 gitignore。
 - `docs/client_integration.md`：Kelivo/iOS 接入说明。维护 MCP 原文提交原则、temporal key 填写边界，以及对外把 `usage_count` 解释为 `activation_count` 的文案。
 - `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`；“对话上下文”页同时展示 `/v1` 自动分支树和按 conversation ID 保存的近期摘要；“用量与费用”页展示实际模型、Token、可计费金额、完整度和价格来源。
+- `ui/src/pages/system/ProvidersPage.tsx`：Model Gateway 配置页。普通访问密钥只读；admin key 只保存在 React 内存中，刷新即清除。渠道密钥字段只允许替换、不回填、不删除；路由必须先校验当前 revision，再原子应用。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
 - `scripts/`：Python 辅助工具、macOS/Linux 一键启动脚本 `dev.sh`，以及仅适用于 Windows 的 PowerShell 服务脚本。
 
@@ -237,6 +240,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | 变更范围 | 优先测试 |
 | --- | --- |
 | REST 鉴权、路由、响应字段 | `pytest tests/test_memory_management.py tests/test_response_charset.py tests/test_chat_gateway.py` |
+| Model Gateway 配置状态、admin 代理与密钥边界 | `pytest tests/test_provider_management.py tests/test_response_charset.py`；同时在相邻 Model Gateway 跑 `pytest tests/test_service.py` |
+| `memgw stack` 生命周期、便携备份与恢复 | `pytest tests/test_cli.py tests/test_stack_backup.py`；同时在相邻 Model Gateway 跑 `pytest tests/test_cli.py` |
 | `/v1` 透明代理、FLIT tools/多模态、流式、幂等、故障切换 | `pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test_chat_streaming.py` |
 | MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
 | 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
@@ -298,5 +303,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改 MCP 工具、REST 端点、记忆字段、保存门槛或当前限制时，同步更新 README 和本文件，避免下一位 agent 读到旧契约。
 - 修改 `/v1` 代理时同步检查 FLIT 的 SSE、multimodal、tools/reasoning 原样保留，同一 user turn 指纹复用、最终回答判定、敏感自动注入边界和后台副作用幂等；运行三组 chat gateway 定向测试。
 - 新 provider/渠道/套餐/模型优先在独立 `Model_Gateway` 的 connection/deployment/route/pricing 配置中新增，不应再把供应商特例嵌入本项目。只有维护 direct-provider 兼容模式时才更新 `app/catalog/models.json` / `pricing.json` 及对应测试。价格必须来自该实际渠道的官方来源，不能用相似模型或第三方聚合价；中央响应的 vendor/upstream-model Header 是本项目归账权威，缺失时不得猜价。
+- 修改“模型与路由”写入能力时，必须保持三层边界：普通 `GATEWAY_API_KEY` 不可写、Model Gateway backend key 不可写、只有请求期提供的 admin client key 可写；不得记录、回显或持久化 admin key/渠道 key，也不得允许浏览器指定代理目标 URL。admin key 只可转发到 HTTPS 或本机 `localhost`/回环 HTTP 的 Model Gateway。路由应用继续依赖 Model Gateway 的完整 schema 校验、revision 冲突检测、原子替换和热加载。
+- 修改 `memgw stack` 或便携备份时，保持两个服务的逻辑/权限隔离但只暴露一个用户入口；启动顺序为 Model Gateway → My_Memory，停止顺序相反。备份只能包含 SQLite 一致性快照、脱敏配置和非密钥设置，恢复必须先验证全部内容、确认服务已停止并保留回滚副本。测试不得读取或修改真实数据库和真实用户配置目录。
 - 测试应继续使用 fake LLM，不要引入真实网络调用。
 - 当前仓库可能存在用户未提交改动。修改前先看 `git status --short`，不要回滚用户改动。

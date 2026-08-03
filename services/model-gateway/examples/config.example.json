@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 2030,
+    "body_limit_bytes": 16777216
+  },
+  "clients": {
+    "memory-gateway": {
+      "kind": "backend",
+      "secret_ref": "CLIENT_MEMORY_GATEWAY",
+      "allowed_routes": [
+        "memory.*",
+        "knowledge.*"
+      ],
+      "allow_direct_deployments": false,
+      "enabled": true
+    }
+  },
+  "connections": {
+    "vendor-official": {
+      "channel_operator": "vendor",
+      "protocol": "openai_compatible",
+      "adapter": "generic",
+      "base_url": "https://api.vendor.example/v1",
+      "auth": {
+        "type": "bearer",
+        "secret_ref": "UPSTREAM_VENDOR_OFFICIAL"
+      },
+      "billing_plan": {
+        "type": "payg",
+        "name": "default"
+      },
+      "usage_scope": "backend_allowed",
+      "models_endpoint": "/models",
+      "chat_endpoint": "/chat/completions",
+      "embeddings_endpoint": "/embeddings",
+      "enabled": true
+    }
+  },
+  "deployments": {
+    "chat-primary": {
+      "connection": "vendor-official",
+      "upstream_model": "vendor/model-id",
+      "model_author": "model-author",
+      "model_family": "model-family",
+      "kind": "chat",
+      "capabilities": {
+        "streaming": true,
+        "tools": true,
+        "parallel_tools": true,
+        "reasoning": true,
+        "multimodal_input": false,
+        "json_object": true,
+        "json_schema": true
+      },
+      "pricing": "vendor-model-2026-08",
+      "enabled": true
+    }
+  },
+  "routes": {
+    "memory.chat": {
+      "kind": "chat",
+      "targets": [
+        "chat-primary"
+      ],
+      "required_capabilities": [
+        "streaming",
+        "tools",
+        "reasoning"
+      ],
+      "max_attempts": 3,
+      "enabled": true
+    }
+  },
+  "pricing": {
+    "vendor-model-2026-08": {
+      "mode": "per_token",
+      "currency": "USD",
+      "unit_tokens": 1000000,
+      "tiers": [
+        {
+          "input": "1.00",
+          "cached_input": "0.10",
+          "output": "2.00"
+        }
+      ],
+      "source_url": "https://api.vendor.example/pricing",
+      "effective_from": "2026-08-01",
+      "checked_at": "2026-08-02",
+      "notes": "Replace this example with the vendor's official price page."
+    }
+  }
+}

@@ -11,23 +11,14 @@ from fastapi import HTTPException, status
 import httpx
 
 from app.config import Settings
-from app.llm.client import (
-    _kimi_requires_temperature_one,
-    _thinking_payload,
-)
-from app.llm.model_gateway import (
-    ModelGatewayMetadata,
-    ModelGatewayProtocolError,
-    parse_model_gateway_metadata,
-    validate_model_gateway_metadata,
-)
+from app.llm.protocol import apply_reasoning_compatibility, should_fail_over
 from app.llm.routing import (
     GLOBAL_PROVIDER_COOLDOWNS,
     LLMProvider,
     ProviderCooldowns,
     retry_after_seconds,
 )
-from app.model_catalog import providers_for_route
+from app.providers.catalog import providers_for_route
 
 
 logger = logging.getLogger(__name__)
@@ -55,19 +46,6 @@ class GatewayHTTPResult:
     status_code: int
     headers: dict[str, str]
     provider: Any
-    metadata: ModelGatewayMetadata = field(default_factory=ModelGatewayMetadata)
-
-
-@dataclass(frozen=True, slots=True)
-class ModelGatewayProvider:
-    code: str
-    base_url: str
-    api_key: str
-    model: str
-    deployment_id: str = ""
-    connection_id: str = ""
-    vendor: str = ""
-    model_author: str = ""
 
 
 class GatewayUpstreamHTTPError(RuntimeError):
@@ -97,12 +75,10 @@ class GatewayUpstreamStream:
         client: httpx.AsyncClient,
         response: httpx.Response,
         provider: Any,
-        metadata: ModelGatewayMetadata | None = None,
     ) -> None:
         self.client = client
         self.response = response
         self.provider = provider
-        self.metadata = metadata or ModelGatewayMetadata()
         self.headers = passthrough_response_headers(response)
         self._closed = False
 
@@ -141,12 +117,6 @@ class OpenAIChatGatewayClient:
         self._wall_clock = wall_clock
 
     def list_models(self) -> list[str]:
-        if self.settings.model_gateway_enabled:
-            return list(
-                dict.fromkeys(
-                    [AUTO_MODEL_ID, self.settings.model_gateway_chat_model]
-                )
-            )
         ordered = providers_for_route(self.settings, "chat")
         if not ordered:
             return []
@@ -159,11 +129,6 @@ class OpenAIChatGatewayClient:
         *,
         preferred_provider_code: str | None = None,
     ) -> GatewayHTTPResult:
-        if self.settings.model_gateway_enabled:
-            return await self._complete_via_model_gateway(
-                payload,
-                required_deployment=preferred_provider_code or "",
-            )
         providers = self._providers_for_model(
             str(payload.get("model") or ""),
             preferred_provider_code=preferred_provider_code,
@@ -227,11 +192,6 @@ class OpenAIChatGatewayClient:
         *,
         preferred_provider_code: str | None = None,
     ) -> GatewayUpstreamStream:
-        if self.settings.model_gateway_enabled:
-            return await self._open_model_gateway_stream(
-                payload,
-                required_deployment=preferred_provider_code or "",
-            )
         providers = self._providers_for_model(
             str(payload.get("model") or ""),
             preferred_provider_code=preferred_provider_code,
@@ -331,193 +291,6 @@ class OpenAIChatGatewayClient:
             ),
         )
 
-    async def _complete_via_model_gateway(
-        self,
-        payload: dict[str, Any],
-        *,
-        required_deployment: str,
-    ) -> GatewayHTTPResult:
-        request_payload = self._model_gateway_payload(payload, stream=False)
-        required = required_deployment.strip()
-        while True:
-            try:
-                async with self._new_client() as client:
-                    response = await client.post(
-                        self._model_gateway_chat_url(),
-                        json=request_payload,
-                        headers=self._model_gateway_headers(required),
-                    )
-            except httpx.HTTPError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"连接中央模型网关失败：{type(exc).__name__}",
-                ) from exc
-            if required and _is_affinity_unavailable(response.status_code, response.content):
-                # The original deployment did not see this request. Remove its
-                # private reasoning before allowing the central route to choose
-                # another deployment, and retry at most once.
-                _strip_assistant_reasoning_content(request_payload)
-                required = ""
-                continue
-            if not response.is_success:
-                raise GatewayUpstreamHTTPError(
-                    status_code=response.status_code,
-                    content=response.content,
-                    headers=passthrough_response_headers(response),
-                )
-            metadata = parse_model_gateway_metadata(response.headers)
-            _require_model_gateway_metadata(
-                metadata,
-                expected_route=str(request_payload.get("model") or ""),
-            )
-            _require_matching_affinity(metadata, required)
-            provider = self._model_gateway_provider(metadata, request_payload)
-            return GatewayHTTPResult(
-                content=response.content,
-                status_code=response.status_code,
-                headers=passthrough_response_headers(response),
-                provider=provider,
-                metadata=metadata,
-            )
-
-    async def _open_model_gateway_stream(
-        self,
-        payload: dict[str, Any],
-        *,
-        required_deployment: str,
-    ) -> GatewayUpstreamStream:
-        request_payload = self._model_gateway_payload(payload, stream=True)
-        required = required_deployment.strip()
-        while True:
-            client = self._new_client(stream=True)
-            try:
-                request = client.build_request(
-                    "POST",
-                    self._model_gateway_chat_url(),
-                    json=request_payload,
-                    headers=self._model_gateway_headers(required),
-                )
-                response = await client.send(request, stream=True)
-            except BaseException as exc:
-                await client.aclose()
-                if not isinstance(exc, httpx.HTTPError):
-                    raise
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"连接中央模型网关流失败：{type(exc).__name__}",
-                ) from exc
-
-            if not response.is_success:
-                try:
-                    content = await response.aread()
-                finally:
-                    await response.aclose()
-                    await client.aclose()
-                if required and _is_affinity_unavailable(
-                    response.status_code, content
-                ):
-                    _strip_assistant_reasoning_content(request_payload)
-                    required = ""
-                    continue
-                raise GatewayUpstreamHTTPError(
-                    status_code=response.status_code,
-                    content=content,
-                    headers=passthrough_response_headers(response),
-                )
-
-            metadata = parse_model_gateway_metadata(response.headers)
-            try:
-                _require_model_gateway_metadata(
-                    metadata,
-                    expected_route=str(request_payload.get("model") or ""),
-                )
-                _require_matching_affinity(metadata, required)
-            except GatewayUpstreamHTTPError:
-                await response.aclose()
-                await client.aclose()
-                raise
-            content_type = response.headers.get("Content-Type", "").lower()
-            if content_type and not content_type.startswith(
-                ("text/event-stream", "text/plain")
-            ):
-                await response.aclose()
-                await client.aclose()
-                raise GatewayUpstreamHTTPError(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    content=openai_error_payload(
-                        message=(
-                            "中央模型网关在 stream=true 时没有返回 SSE；"
-                            f"收到 Content-Type {content_type}"
-                        ),
-                        code="upstream_stream_protocol_error",
-                    ),
-                    headers={"content-type": "application/json; charset=utf-8"},
-                )
-            return GatewayUpstreamStream(
-                client=client,
-                response=response,
-                provider=self._model_gateway_provider(metadata, request_payload),
-                metadata=metadata,
-            )
-
-    def _model_gateway_payload(
-        self, payload: dict[str, Any], *, stream: bool
-    ) -> dict[str, Any]:
-        forwarded = deepcopy(payload)
-        forwarded.pop("conversation_id", None)
-        requested = str(forwarded.get("model") or "").strip()
-        if not requested:
-            raise HTTPException(status_code=422, detail="model 不能为空")
-        chat_route = self.settings.model_gateway_chat_model
-        if requested == AUTO_MODEL_ID:
-            forwarded["model"] = chat_route
-        elif requested != chat_route:
-            # The My_Memory client key may legitimately access internal Model
-            # Gateway routes for background jobs.  Never let the public /v1
-            # proxy turn that backend credential into a generic route tunnel.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"聊天网关未配置模型：{requested}",
-            )
-        forwarded["stream"] = stream
-        return forwarded
-
-    def _model_gateway_headers(self, required_deployment: str) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self.settings.model_gateway_api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json, text/event-stream",
-        }
-        if required_deployment:
-            headers["X-Model-Gateway-Require-Deployment"] = required_deployment
-            headers["X-Model-Gateway-Reasoning-Origin-Deployment"] = (
-                required_deployment
-            )
-        return headers
-
-    def _model_gateway_chat_url(self) -> str:
-        return (
-            f"{self.settings.model_gateway_base_url.rstrip('/')}"
-            "/chat/completions"
-        )
-
-    def _model_gateway_provider(
-        self,
-        metadata: ModelGatewayMetadata,
-        payload: dict[str, Any],
-    ) -> ModelGatewayProvider:
-        model = metadata.upstream_model or str(payload.get("model") or "")
-        return ModelGatewayProvider(
-            code="G",
-            base_url=self.settings.model_gateway_base_url,
-            api_key="",
-            model=model,
-            deployment_id=metadata.deployment_id,
-            connection_id=metadata.connection_id,
-            vendor=metadata.channel_operator,
-            model_author=metadata.model_author,
-        )
-
     def _providers_for_model(
         self,
         requested_model: str,
@@ -588,7 +361,7 @@ class OpenAIChatGatewayClient:
             and provider.code != reasoning_provider_code
         ):
             _strip_assistant_reasoning_content(forwarded)
-        if _provider_rejects_stream_options(provider):
+        if provider.quirks.rejects_stream_options:
             # FLIT decides whether to send this field from the gateway host.
             # The gateway must instead apply the rule to the selected upstream.
             forwarded.pop("stream_options", None)
@@ -600,22 +373,11 @@ class OpenAIChatGatewayClient:
                 **stream_options,
                 "include_usage": True,
             }
-        if _provider_is_mistral(provider):
-            # FLIT deliberately sends no reasoning control when connected
-            # directly to Mistral. Its gateway-host fallback would otherwise
-            # add unsupported OpenAI-style fields.
-            for field in (
-                "reasoning_effort",
-                "thinking",
-                "enable_thinking",
-                "thinking_mode",
-            ):
-                forwarded.pop(field, None)
-        if _kimi_requires_temperature_one(provider):
+        if provider.quirks.forces_temperature_one:
             forwarded["temperature"] = 1.0
-        _apply_reasoning_compatibility(
+        apply_reasoning_compatibility(
             forwarded,
-            provider=provider,
+            quirks=provider.quirks,
             default_thinking=True,
         )
         _ensure_reasoning_content_for_tool_turns(
@@ -662,21 +424,7 @@ class OpenAIChatGatewayClient:
 
     @staticmethod
     def _should_fail_over(status_code: int, content: bytes) -> bool:
-        if status_code in {401, 402, 404, 408, 429} or status_code >= 500:
-            return True
-        if status_code != 400:
-            return False
-        detail = content.decode("utf-8", errors="replace").lower()
-        return any(
-            marker in detail
-            for marker in (
-                "invalid model",
-                "invalid temperature",
-                "model not found",
-                "not supported model",
-                "unsupported model",
-            )
-        )
+        return should_fail_over(status_code, content)
 
     def _record_rate_limit(
         self,
@@ -701,191 +449,6 @@ def passthrough_response_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
-def _is_affinity_unavailable(status_code: int, content: bytes) -> bool:
-    if status_code != status.HTTP_409_CONFLICT:
-        return False
-    try:
-        payload = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-    return str(error.get("code") or "").strip() == (
-        "model_gateway_affinity_unavailable"
-    )
-
-
-def _require_matching_affinity(
-    metadata: ModelGatewayMetadata,
-    required_deployment: str,
-) -> None:
-    required = required_deployment.strip()
-    if not required or metadata.deployment_id == required:
-        return
-    raise GatewayUpstreamHTTPError(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        content=openai_error_payload(
-            message=(
-                "中央模型网关未确认所要求的 deployment affinity；"
-                "已拒绝重放 provider 私有推理状态"
-            ),
-            code="model_gateway_affinity_protocol_error",
-        ),
-        headers={"content-type": "application/json; charset=utf-8"},
-    )
-
-
-def _require_model_gateway_metadata(
-    metadata: ModelGatewayMetadata,
-    *,
-    expected_route: str,
-) -> None:
-    try:
-        validate_model_gateway_metadata(
-            metadata,
-            expected_route=expected_route,
-        )
-    except ModelGatewayProtocolError as exc:
-        detail = str(exc)
-    else:
-        return
-    raise GatewayUpstreamHTTPError(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        content=openai_error_payload(
-            message=f"中央模型网关响应归因元数据无效：{detail}",
-            code="model_gateway_metadata_protocol_error",
-        ),
-        headers={"content-type": "application/json; charset=utf-8"},
-    )
-
-
-def _apply_reasoning_compatibility(
-    payload: dict[str, Any],
-    *,
-    provider: LLMProvider,
-    default_thinking: bool = False,
-) -> None:
-    """Translate FLIT's generic effort only when a provider needs `thinking`.
-
-    Explicit provider-native `thinking` is authoritative. Kimi K3 uses
-    `reasoning_effort` natively, so its client value must not be overwritten.
-    """
-    provider_text = f"{provider.base_url} {provider.model}".lower()
-    is_deepseek = "deepseek" in provider_text
-    native_enabled = _provider_thinking_payload(provider, thinking="enabled")
-    if (
-        default_thinking
-        and "thinking" not in payload
-        and "reasoning_effort" not in payload
-    ):
-        # FLIT's AUTO reasoning level sends no generic field for an unknown
-        # custom model such as memory-auto. Resolve AUTO after routing so Kimi
-        # gets keep=all, K3 keeps its native effort, and other known providers
-        # receive their own thinking switch.
-        payload.update(native_enabled)
-
-    if (
-        "thinking" in payload
-        and "reasoning_effort" in payload
-        and "thinking" in native_enabled
-    ):
-        effort = str(payload.get("reasoning_effort") or "").strip().lower()
-        thinking_options = payload.get("thinking")
-        thinking_type = (
-            str(thinking_options.get("type") or "").lower()
-            if isinstance(thinking_options, dict)
-            else ""
-        )
-        if (
-            is_deepseek
-            and thinking_type != "disabled"
-            and effort not in {"none", "disabled", "off"}
-        ):
-            payload["reasoning_effort"] = _deepseek_reasoning_effort(effort)
-        else:
-            payload.pop("reasoning_effort", None)
-
-    if "thinking" not in payload and "reasoning_effort" in payload:
-        effort = str(payload.get("reasoning_effort") or "").strip().lower()
-        thinking_mode: Literal["enabled", "disabled"] = (
-            "disabled"
-            if effort in {"none", "disabled", "off"}
-            else "enabled"
-        )
-        translated = _provider_thinking_payload(provider, thinking=thinking_mode)
-        if "thinking" in translated:
-            payload.update(translated)
-            if is_deepseek and thinking_mode == "enabled":
-                payload["reasoning_effort"] = _deepseek_reasoning_effort(effort)
-            else:
-                payload.pop("reasoning_effort", None)
-
-    thinking_options = payload.get("thinking")
-    thinking_enabled = (
-        isinstance(thinking_options, dict)
-        and str(thinking_options.get("type") or "").lower() == "enabled"
-    )
-    if (
-        "deepseek" in provider_text
-        and thinking_enabled
-        and payload.get("tools")
-    ):
-        # DeepSeek thinking mode rejects tool_choice even when tools themselves
-        # are accepted. FLIT normally omits it, but custom bodies may add it.
-        payload.pop("tool_choice", None)
-
-
-def _deepseek_reasoning_effort(effort: str) -> str:
-    return "max" if effort in {"xhigh", "max"} else "high"
-
-
-def _provider_rejects_stream_options(provider: LLMProvider) -> bool:
-    base_url = provider.base_url.lower()
-    model = _provider_model_leaf(provider)
-    return model.startswith("glm-") or _provider_is_mistral(provider) or any(
-        marker in base_url
-        for marker in (
-            "open.bigmodel.cn",
-            "bigmodel",
-            "z.ai",
-            "zhipu",
-        )
-    )
-
-
-def _provider_is_mistral(provider: LLMProvider) -> bool:
-    model = _provider_model_leaf(provider)
-    return (
-        "api.mistral.ai" in provider.base_url.lower()
-        or model.startswith(
-            (
-                "mistral-",
-                "open-mistral-",
-                "ministral-",
-                "codestral-",
-                "pixtral-",
-                "magistral-",
-                "devstral-",
-            )
-        )
-    )
-
-
-def _provider_model_leaf(provider: LLMProvider) -> str:
-    return provider.model.lower().rsplit("/", 1)[-1]
-
-
-def _provider_requires_reasoning_replay(provider: LLMProvider) -> bool:
-    provider_text = f"{provider.base_url} {provider.model}".lower()
-    return (
-        provider.code in {"M", "K"}
-        or any(marker in provider_text for marker in ("deepseek", "kimi", "mimo"))
-    )
-
-
 def _ensure_reasoning_content_for_tool_turns(
     payload: dict[str, Any],
     *,
@@ -897,7 +460,7 @@ def _ensure_reasoning_content_for_tool_turns(
     ``memory-auto`` it cannot know that DeepSeek/Kimi/MiMo also require an
     explicit empty ``reasoning_content`` on assistant tool-call history.
     """
-    if not _provider_requires_reasoning_replay(provider):
+    if not provider.quirks.requires_reasoning_replay:
         return
     messages = payload.get("messages")
     if not isinstance(messages, list):
@@ -948,35 +511,6 @@ def _strip_assistant_reasoning_content(payload: dict[str, Any]) -> None:
             continue
         message.pop("reasoning_content", None)
         message.pop("reasoning", None)
-
-
-def _provider_thinking_payload(
-    provider: LLMProvider,
-    *,
-    thinking: Literal["enabled", "disabled"],
-) -> dict[str, Any]:
-    # Provider codes remain authoritative even when users put Kimi/MiMo behind
-    # a private OpenAI-compatible reverse proxy whose hostname has no marker.
-    base_url = provider.base_url
-    if provider.code == "K":
-        base_url = f"{base_url} kimi"
-    elif provider.code == "M":
-        base_url = f"{base_url} xiaomimimo"
-    else:
-        model = _provider_model_leaf(provider)
-        if model.startswith("deepseek-"):
-            base_url = f"{base_url} deepseek"
-        elif model.startswith("glm-"):
-            base_url = f"{base_url} zhipu"
-        elif model.startswith("kimi-"):
-            base_url = f"{base_url} kimi"
-        elif "mimo" in model:
-            base_url = f"{base_url} xiaomimimo"
-    return _thinking_payload(
-        base_url=base_url,
-        model=_provider_model_leaf(provider),
-        thinking=thinking,
-    )
 
 
 def openai_error_payload(*, message: str, code: str) -> bytes:

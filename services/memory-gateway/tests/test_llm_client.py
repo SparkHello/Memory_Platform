@@ -6,6 +6,7 @@ import httpx
 from fastapi import HTTPException
 
 from app.config import Settings
+from app.llm.routing import LLMProvider
 from app.knowledge.agent import (
     KnowledgeAgentConfig,
     OpenAICompatibleKnowledgeAgentClient,
@@ -696,10 +697,14 @@ def test_memory_and_knowledge_clients_share_process_cooldown_registry() -> None:
     memory_client = OpenAICompatibleClient(settings=settings)
     knowledge_client = OpenAICompatibleKnowledgeAgentClient(
         KnowledgeAgentConfig(
-            provider_priority=settings.llm_provider_priority,
-            mimo_base_url=settings.llm_mimo_base_url,
-            mimo_api_key=settings.llm_mimo_api_key,
-            mimo_model=settings.llm_mimo_model,
+            fast_providers=[
+                LLMProvider(
+                    code="mimo",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5-pro-ultraspeed",
+                )
+            ]
         )
     )
 

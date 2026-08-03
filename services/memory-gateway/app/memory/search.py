@@ -304,7 +304,15 @@ class EmbeddingClient(ABC):
     async def embed(self, text: str) -> list[float] | None:
         raise NotImplementedError
 
-    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+    async def embed_many(
+        self,
+        texts: list[str],
+        *,
+        screen_sensitivity: bool = True,
+    ) -> list[list[float] | None]:
+        # This fallback always screens through embed().  Only subclasses that
+        # own the provider call may honour screen_sensitivity, so the generic
+        # path can never become the permissive one by accident.
         return [await self.embed(text) for text in texts]
 
 
@@ -312,7 +320,12 @@ class NullEmbeddingClient(EmbeddingClient):
     async def embed(self, text: str) -> list[float] | None:
         return None
 
-    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+    async def embed_many(
+        self,
+        texts: list[str],
+        *,
+        screen_sensitivity: bool = True,
+    ) -> list[list[float] | None]:
         return [None for _ in texts]
 
 
@@ -347,7 +360,12 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         vectors = await self._request_embeddings(text)
         return vectors[0] if vectors else None
 
-    async def embed_many(self, texts: list[str]) -> list[list[float] | None]:
+    async def embed_many(
+        self,
+        texts: list[str],
+        *,
+        screen_sensitivity: bool = True,
+    ) -> list[list[float] | None]:
         if not texts:
             return []
         allowed_indices: list[int] = []
@@ -356,6 +374,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         for index, text in enumerate(texts):
             if (
                 self.allow_sensitive_egress
+                or not screen_sensitivity
                 or detect_text_sensitivity(text) == "normal"
             ):
                 allowed_indices.append(index)

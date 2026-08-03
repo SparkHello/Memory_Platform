@@ -11,6 +11,7 @@ import "./styles/accessibility.css";
 import "./styles/knowledge.css";
 import "./styles/conversation.css";
 import "./styles/usage.css";
+import "./styles/providers.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

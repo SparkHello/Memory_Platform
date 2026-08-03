@@ -11,6 +11,7 @@ export type PageKey =
   | "reports"
   | "logs"
   | "usage"
+  | "providers"
   | "settings"
   | "developer";
 
@@ -990,4 +991,137 @@ export interface KnowledgeRestoreResult {
   chunks_rebuilt?: boolean;
   fts_rebuilt?: boolean;
   [key: string]: unknown;
+}
+
+
+export interface ProviderModelInfo {
+  id: string;
+  kind: "chat" | "embedding";
+}
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  protocol: string;
+  api_host: string;
+  api_key_env: string;
+  legacy_api_key_envs: string[];
+  configured: boolean;
+  models: ProviderModelInfo[];
+  urls: { website?: string; api_key?: string; docs?: string };
+}
+
+export interface RouteTargetInfo {
+  target: string;
+  provider_id?: string;
+  provider_name?: string;
+  model?: string;
+  valid: boolean;
+  configured: boolean;
+}
+
+export interface RouteInfo {
+  id: string;
+  description: string;
+  targets: RouteTargetInfo[];
+  usable: boolean;
+  migrated: boolean;
+}
+
+export interface ModelGatewayConnectionInfo {
+  id: string;
+  channel_operator: string;
+  base_url: string;
+  adapter: string;
+  usage_scope: string;
+  enabled: boolean;
+  configured: boolean;
+}
+
+export interface ModelGatewayCapabilities {
+  streaming?: boolean;
+  tools?: boolean;
+  parallel_tools?: boolean;
+  reasoning?: boolean;
+  multimodal_input?: boolean;
+  json_object?: boolean;
+  json_schema?: boolean;
+}
+
+export interface ModelGatewayDeploymentInfo {
+  id: string;
+  connection: string;
+  upstream_model: string;
+  model_author: string;
+  model_family: string;
+  kind: "chat" | "embedding";
+  capabilities: ModelGatewayCapabilities;
+  dimensions: number | null;
+  embedding_space: string;
+  enabled: boolean;
+}
+
+export interface ModelGatewayRouteInfo {
+  id: string;
+  kind: "chat" | "embedding";
+  targets: string[];
+  required_capabilities: string[];
+  max_attempts: number;
+  enabled: boolean;
+}
+
+export interface ModelGatewayControlSnapshot {
+  revision: string;
+  admin_required: boolean;
+  connections: ModelGatewayConnectionInfo[];
+  deployments: ModelGatewayDeploymentInfo[];
+  routes: ModelGatewayRouteInfo[];
+}
+
+export interface ModelGatewayRouteDraft {
+  id: string;
+  targets: string[];
+  enabled: boolean;
+}
+
+export interface ModelGatewayRouteChangeResult {
+  valid?: boolean;
+  applied?: boolean;
+  revision: string;
+  changed_routes: string[];
+  warnings: string[];
+  restart_required?: boolean;
+}
+
+export interface ModelGatewayConnectionCheck {
+  mode: "discovery" | "live";
+  summary: Record<string, number>;
+  connections: Array<{
+    connection_id: string;
+    status: string;
+    level: "ok" | "warning" | "error" | "skipped";
+    detail: string;
+    http_status?: number | null;
+  }>;
+}
+
+export interface ProvidersStatus {
+  runtime: {
+    model_gateway_enabled: boolean;
+    model_gateway_base_url: string;
+    chat_source: "model_gateway" | "legacy_direct";
+    knowledge_source: string;
+    providers_path: string;
+    routes_path: string;
+  };
+  embedding: {
+    model: string;
+    base_url: string;
+    dimensions: number;
+    configured: boolean;
+  };
+  providers: ProviderInfo[];
+  routes: RouteInfo[];
+  control: ModelGatewayControlSnapshot | null;
+  config_error: string;
 }
