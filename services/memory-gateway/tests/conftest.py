@@ -330,6 +330,8 @@ def client(
     fake_gateway: FakeChatGatewayClient,
 ) -> Iterator[TestClient]:
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
+    # Multi-user fixtures explicitly exercise the legacy migration mode.
+    monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "true")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
     monkeypatch.setenv(
         "KNOWLEDGE_DATABASE_PATH",

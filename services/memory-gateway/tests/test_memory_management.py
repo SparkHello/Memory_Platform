@@ -1372,24 +1372,74 @@ def test_patch_memory_updates_content_and_clears_embedding(
         importance=7,
         confidence=0.9,
         embedding_json="[0.1, 0.2]",
+        topics=["Solarized"],
+        entities=["Solarized Dark"],
     )
 
     response = client.patch(
         f"/memories/{memory.id}",
         headers=auth_headers,
-        json={"content": "User likes espresso."},
+        json={"content": "User prefers the Nord theme."},
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["updated"] is True
-    assert payload["memory"]["content"] == "User likes espresso."
+    assert payload["memory"]["content"] == "User prefers the Nord theme."
     assert "embedding_json" not in payload["memory"]
 
     stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
     assert stored is not None
-    assert stored.content == "User likes espresso."
+    assert stored.content == "User prefers the Nord theme."
     assert stored.embedding_json is None
+    assert "Solarized" not in stored.topics
+    assert "Solarized Dark" not in stored.entities
+    assert "Nord" in stored.entities
+
+
+def test_patch_memory_can_explicitly_preserve_derived_metadata(
+    client, auth_headers, memory_store: MemoryStore,
+):
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="User prefers Solarized Dark.",
+        type="emotional",
+        topics=["theme"],
+        entities=["Solarized Dark"],
+    )
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"content": "User prefers Nord.", "preserve_metadata": True},
+    )
+
+    assert response.status_code == 200
+    stored = memory_store.get_memory(memory_id=memory.id, user_id="default")
+    assert stored is not None
+    assert stored.entities == ["Solarized Dark"]
+    assert stored.embedding_json is None
+
+
+def test_gateway_key_is_bound_to_configured_user_by_default(
+    client, auth_headers, monkeypatch,
+):
+    from app.config import get_settings
+
+    monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "false")
+    monkeypatch.setenv("GATEWAY_USER_ID", "alice")
+    get_settings.cache_clear()
+    try:
+        allowed = client.get("/memories", headers={**auth_headers, "X-User-Id": "alice"})
+        rejected = client.get("/memories", headers={**auth_headers, "X-User-Id": "bob"})
+        implicit = client.get("/memories", headers=auth_headers)
+        assert allowed.status_code == 200
+        assert implicit.status_code == 200
+        assert rejected.status_code == 403
+    finally:
+        monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "true")
+        monkeypatch.delenv("GATEWAY_USER_ID", raising=False)
+        get_settings.cache_clear()
 
 
 def test_patch_memory_partial_update_preserves_other_fields_and_embedding(

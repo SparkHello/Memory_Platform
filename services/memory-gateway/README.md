@@ -20,7 +20,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - OpenAI-compatible `/v1/chat/completions` 透明记忆代理：服务端自动混合检索、注入安全核心/长期记忆、流式转发，并只在最终文本回答后执行幂等激活与记忆提取。
 - REST 管理接口 `/memories/*`，覆盖记忆列表、搜索、保存、编辑、软删除、恢复、永久删除、合并、报告、导出、恢复导入、网络图、时间线、体检和评估。
 - Web 控制台 `/ui`，用于日常查看、治理、评估、备份、接入配置，以及按实际 provider/model 汇总 Token 与公开 API 原价。
-- SQLite 本地存储，按 `X-User-Id` 做用户隔离，默认用户为 `default`。
+- SQLite 本地存储；Bearer 凭证默认绑定 `GATEWAY_USER_ID`（默认 `default`），不能由调用者用 `X-User-Id` 改写。
 - 五类记忆扇区：`episodic`、`semantic`、`procedural`、`emotional`、`reflective`。
 - 生命周期状态：`dynamic`、`resolved`、`archived`、`pinned`，并带有遗忘曲线、消化标记和活跃度统计。
 - 记忆自动组织层：新 ingest 的记忆会自动获得 `topics`、`entities`，并保守绑定到少量 `memory_spaces`。
@@ -296,7 +296,7 @@ tailscale ip -4
 
 服务需要以 `--host 0.0.0.0` 启动。Windows 上需允许 Windows 防火墙在可信私有网络中访问端口 `2026`（仅 Windows）；macOS 若开启应用防火墙，首次启动时允许 Python/uvicorn 接受传入连接即可。不要把该端口无鉴权暴露到公网；远程请求仍必须携带 `GATEWAY_API_KEY`。
 
-除 `/health` 外，受保护接口都需要 Bearer token。`X-User-Id` 可选，省略时使用 `default`：
+除 `/health` 外，受保护接口都需要 Bearer token。凭证默认绑定 `GATEWAY_USER_ID`；`X-User-Id` 只能与绑定值相同：
 
 ```http
 Authorization: Bearer <GATEWAY_API_KEY>
@@ -322,6 +322,8 @@ curl \
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_API_KEY` | 空 | `/v1`、MCP、REST 和 Web 控制台共用访问令牌。未配置时受保护接口返回 500。 |
+| `GATEWAY_USER_ID` | `default` | 将该访问令牌绑定到固定记忆用户命名空间。 |
+| `GATEWAY_ALLOW_USER_ID_HEADER` | `false` | 旧版共享 key 迁移开关；开启后调用者可用 `X-User-Id` 选择命名空间，不建议用于不可信网络。 |
 | `CHAT_GATEWAY_ENABLED` | `true` | 是否启用 `/v1/models` 和 `/v1/chat/completions`。 |
 | `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | `read-write` | 默认记忆模式：`off` 仅透明代理，`read` 只召回/注入，`read-write` 还会在完整最终回答后自动提取新记忆。可由请求头 `X-Memory-Mode` 覆盖。 |
 | `CHAT_GATEWAY_SEARCH_LIMIT` | `8` | 每轮自动召回的长期记忆上限，范围 1–20。 |
@@ -884,7 +886,7 @@ Windows 服务辅助脚本：
 - `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、体检和知识代理的默认安全边界；它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。
 - 知识文档的“按用户选择导入”确认只决定该文档保存后的敏感标签，不会修改全局 `ALLOW_SENSITIVE_EGRESS`；保存为 private/sensitive 时，默认仍禁止远程 embedding/代理出站。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
-- `GATEWAY_API_KEY` 是本地共享令牌；`X-User-Id` 适合可信本地或私有网络部署，不等同完整多租户权限系统。
+- `GATEWAY_API_KEY` 默认与 `GATEWAY_USER_ID` 固定绑定。旧客户端迁移期可短暂设置 `GATEWAY_ALLOW_USER_ID_HEADER=true`，但这会恢复共享 key 可伪造命名空间的旧行为；多租户部署应为每个入口使用独立凭证/实例。
 - `GATEWAY_API_KEY` 只能读取模型配置状态，不能写 Model Gateway。`/providers/*` 配置写入还要求 `X-Model-Gateway-Admin-Key`；Web 页面不把该 admin 密钥写入 `localStorage`，My_Memory 也不保存或回显它，只将其转发到配置好的固定 Model Gateway 地址。管理写入仅允许 HTTPS，或本机 `localhost`/回环 HTTP；上游渠道密钥仍只单向写入 Model Gateway 的 `secrets.env`。
 - Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。
 

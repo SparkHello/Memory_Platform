@@ -25,6 +25,7 @@ from app.llm.prompts import (
     render_memory_context,
     render_recent_context_summary_context,
 )
+from app.memory.classification import classify_memory
 from app.memory.core import CoreMemoryConsolidator, safe_core_memory_sections
 from app.memory.evaluation import (
     EvaluationError,
@@ -214,6 +215,7 @@ class MemoryUpdateRequest(BaseModel):
     temporal_subject: str | None = None
     temporal_predicate: str | None = None
     status: MemoryStatus | None = None
+    preserve_metadata: bool = False
 
 
 class MemorySpacesUpdateRequest(BaseModel):
@@ -1657,8 +1659,31 @@ def update_memory(
         updates["temporal_predicate"] = normalize_optional_text(body.temporal_predicate)
 
     content = updates.get("content", existing.content)
-    embedding_json = None if content != existing.content else existing.embedding_json
+    content_changed = content != existing.content
+    embedding_json = None if content_changed else existing.embedding_json
     before = _classification_payload(existing)
+
+    derived_classification = None
+    if content_changed and not body.preserve_metadata:
+        candidate = CandidateMemory(
+            action="update",
+            memory=content,
+            type=updates.get("type", existing.type),
+            importance=updates.get("importance", existing.importance),
+            confidence=updates.get("confidence", existing.confidence),
+            valence=updates.get("valence", existing.valence),
+            arousal=updates.get("arousal", existing.arousal),
+            stability=updates.get("stability", existing.stability),
+            sensitivity=updates.get("sensitivity", existing.sensitivity),
+            temporal_subject=updates.get("temporal_subject", existing.temporal_subject),
+            temporal_predicate=updates.get("temporal_predicate", existing.temporal_predicate),
+            source_quote=content,
+        )
+        derived_classification = classify_memory(candidate, source_text=content)
+        if "topics" not in body.model_fields_set:
+            updates["topics"] = derived_classification.topics
+        if "entities" not in body.model_fields_set:
+            updates["entities"] = derived_classification.entities
 
     # 校验 status 值
     if "status" in body.model_fields_set and body.status not in {"dynamic", "resolved", "archived", "pinned"}:
@@ -1712,6 +1737,13 @@ def update_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="记忆不存在或已删除",
         )
+    if derived_classification is not None:
+        memory = store.replace_memory_spaces(
+            memory_id=memory_id,
+            user_id=user_id,
+            space_ids=[],
+            create_space_names=derived_classification.space_names,
+        ) or memory
     after = _classification_payload(memory)
     if before != after:
         _write_classification_log(

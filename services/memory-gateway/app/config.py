@@ -13,6 +13,11 @@ from app.llm.routing import normalize_provider_priority
 
 class Settings(BaseSettings):
     gateway_api_key: str = Field(default="", validation_alias="GATEWAY_API_KEY")
+    gateway_user_id: str = Field(default="default", validation_alias="GATEWAY_USER_ID")
+    gateway_allow_user_id_header: bool = Field(
+        default=False,
+        validation_alias="GATEWAY_ALLOW_USER_ID_HEADER",
+    )
     chat_gateway_enabled: bool = Field(
         default=True,
         validation_alias="CHAT_GATEWAY_ENABLED",

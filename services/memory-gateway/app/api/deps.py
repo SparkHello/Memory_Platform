@@ -76,8 +76,25 @@ def require_api_key(
         )
 
 
-def get_user_id(x_user_id: Annotated[str | None, Header()] = None) -> str:
-    return x_user_id or "default"
+def get_user_id(
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_user_id: Annotated[str | None, Header()] = None,
+) -> str:
+    """Resolve the namespace bound to the authenticated gateway credential.
+
+    The legacy shared-key header behaviour is available only through an
+    explicit migration switch.
+    """
+    bound_user_id = settings.gateway_user_id.strip() or "default"
+    requested_user_id = (x_user_id or "").strip()
+    if not requested_user_id or requested_user_id == bound_user_id:
+        return bound_user_id
+    if settings.gateway_allow_user_id_header:
+        return requested_user_id
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="X-User-Id 与当前凭证绑定的用户不匹配",
+    )
 
 
 def get_memory_store(settings: Annotated[Settings, Depends(get_settings)]) -> MemoryStore:
