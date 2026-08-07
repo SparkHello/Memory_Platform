@@ -17,6 +17,7 @@ from app.knowledge.store import KnowledgeValidationError
 _SUPPORTED_EXTENSIONS: Final = {".txt", ".md", ".markdown", ".pdf", ".docx", ".epub"}
 _MAX_ARCHIVE_FILES: Final = 10_000
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES: Final = 100 * 1024 * 1024
+_MAX_TABLE_CELLS: Final = 200_000
 _WORD_NS: Final = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _CONTAINER_NS: Final = "urn:oasis:names:tc:opendocument:xmlns:container"
 _OPF_NS: Final = "http://www.idpf.org/2007/opf"
@@ -214,6 +215,8 @@ def _docx_table(element: ET.Element) -> str:
     if not rows:
         return ""
     width = max(len(row) for row in rows)
+    if len(rows) * width > _MAX_TABLE_CELLS:
+        raise KnowledgeValidationError("DOCX table exceeds the supported cell count")
     normalized = [row + [""] * (width - len(row)) for row in rows]
     lines = ["| " + " | ".join(row) + " |" for row in normalized]
     lines.insert(1, "| " + " | ".join("---" for _ in range(width)) + " |")

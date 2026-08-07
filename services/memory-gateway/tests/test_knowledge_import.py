@@ -112,6 +112,22 @@ def test_text_parser_rejects_non_utf8_and_archives_reject_unsafe_paths() -> None
         )
 
 
+def test_docx_table_cell_count_limit_rejects_amplification() -> None:
+    row = "<w:tr>" + "<w:tc/>" * 450 + "</w:tr>"
+    table = "<w:tbl>" + row * 450 + "</w:tbl>"
+    document = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{table}</w:body>"
+        "</w:document>"
+    )
+    with pytest.raises(KnowledgeValidationError, match="cell count"):
+        parse_knowledge_file(
+            _zip_bytes({"word/document.xml": document}),
+            filename="huge-table.docx",
+        )
+
+
 def test_epub_binary_import_is_searchable_and_keeps_metadata(
     client,
     auth_headers,
