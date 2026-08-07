@@ -105,6 +105,80 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = commands.add_parser("init", help="初始化用户配置目录")
     init_parser.set_defaults(handler=_cmd_init)
 
+    quickstart_parser = commands.add_parser(
+        "quickstart",
+        help="一步配置一个渠道、聊天模型和全部用途，并连接记忆服务",
+    )
+    quickstart_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="不提问；用下面的参数配置，API Key 从标准输入读取一行",
+    )
+    # --json is also a global flag; accepting it here too lets automation append
+    # it after the subcommand (the natural form) without an argparse error.
+    # SUPPRESS keeps the global value intact when this positional copy is absent.
+    quickstart_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="以 JSON 输出结果（也可放在 quickstart 之前作为全局参数）",
+    )
+    quickstart_parser.add_argument("--channel", default="", help="渠道英文简称，例如 deepseek")
+    quickstart_parser.add_argument("--base-url", default="", help="官方 OpenAI 兼容 API 地址（HTTPS）")
+    quickstart_parser.add_argument("--chat-model", default="", help="供应商页面显示的精确聊天模型 ID")
+    quickstart_parser.add_argument(
+        "--adapter", default="generic", choices=["generic", "kimi", "deepseek", "mimo"]
+    )
+    quickstart_parser.add_argument(
+        "--plan",
+        default="payg",
+        choices=[
+            "payg",
+            "subscription",
+            "free_tier",
+            "token_plan",
+            "coding_plan",
+            "direct_tool_only",
+            "custom",
+        ],
+    )
+    quickstart_parser.add_argument("--chat-author", default="", help="聊天模型作者简称，默认用渠道名")
+    quickstart_parser.add_argument(
+        "--chat-capability",
+        action="append",
+        default=[],
+        choices=[
+            "tools",
+            "parallel_tools",
+            "reasoning",
+            "multimodal_input",
+            "json_object",
+            "json_schema",
+        ],
+        help="聊天模型能力；可重复",
+    )
+    quickstart_parser.add_argument(
+        "--reasoning-default",
+        default="inherit",
+        choices=["inherit", "enabled", "disabled"],
+    )
+    quickstart_parser.add_argument("--embedding-model", default="", help="可选：向量模型 ID")
+    quickstart_parser.add_argument("--embedding-dimensions", type=int, help="向量维度")
+    quickstart_parser.add_argument("--embedding-space", default="", help="向量空间名称")
+    quickstart_parser.add_argument("--embedding-author", default="", help="向量模型作者简称")
+    quickstart_parser.add_argument(
+        "--no-connect-memory",
+        action="store_true",
+        help="只配置模型服务，不自动连接记忆服务",
+    )
+    quickstart_parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="配置完成后不自动启动模型服务",
+    )
+    quickstart_parser.add_argument("--memgw", default="", help="记忆服务 memgw 启动器路径")
+    quickstart_parser.set_defaults(handler=_cmd_quickstart)
+
     serve_parser = commands.add_parser(
         "serve",
         aliases=["run"],
@@ -566,6 +640,164 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"配置文件：{paths.config}")
         print(f"密钥文件：{paths.secrets}（不会写入项目目录）")
     return 0
+
+
+def _cmd_quickstart(args: argparse.Namespace) -> int:
+    from model_gateway.quickstart import QuickstartError, QuickstartSpec, apply_quickstart
+    from model_gateway.user_console import _find_memgw, _run_memgw
+
+    paths = _paths(args)
+    initialize(paths)
+
+    if args.non_interactive:
+        api_key = sys.stdin.readline().rstrip("\r\n")
+        spec = QuickstartSpec(
+            channel_operator=args.channel,
+            base_url=args.base_url,
+            chat_model=args.chat_model,
+            api_key=api_key,
+            adapter=args.adapter,
+            plan=args.plan,
+            chat_author=args.chat_author,
+            chat_capabilities=tuple(dict.fromkeys(args.chat_capability)),
+            reasoning_default=args.reasoning_default,
+            embedding_model=args.embedding_model,
+            embedding_dimensions=args.embedding_dimensions,
+            embedding_space=args.embedding_space,
+            embedding_author=args.embedding_author,
+            connect_memory=not args.no_connect_memory,
+        )
+    else:
+        if args.json:
+            raise CLIError("交互式 quickstart 不能与 --json 一起使用；自动化请加 --non-interactive")
+        spec = _quickstart_prompt(args)
+
+    try:
+        result = apply_quickstart(paths, spec)
+    except QuickstartError as exc:
+        raise CLIError(str(exc)) from exc
+
+    # Wire the memory service unless the caller opted out. The generated client
+    # key is what memgw must present as MODEL_GATEWAY_API_KEY; both sides keep
+    # independent secret files and the value is never echoed.
+    memgw_wired = False
+    if spec.connect_memory:
+        memgw = Path(args.memgw).expanduser() if args.memgw else _find_memgw()
+        if memgw is None or not Path(memgw).is_file():
+            result.warnings.append(
+                "没有找到记忆服务 memgw；模型服务已配置，可稍后用 memgw stack install 连接。"
+            )
+        else:
+            base_url = _server_url(load_config(paths.config).server) + "/v1"
+            if _run_memgw(memgw, ["config", "set", "MODEL_GATEWAY_BASE_URL", base_url]) != 0:
+                result.warnings.append("记忆服务没有接受模型服务地址。")
+            elif _run_memgw(
+                memgw,
+                ["secret", "set", "model-gateway", "--stdin", "--no-check"],
+                input_text=result.memory_client_key + "\n",
+            ) != 0:
+                result.warnings.append("记忆服务没有保存 backend key；可稍后重试。")
+            else:
+                memgw_wired = True
+                if result.embedding_deployment_id:
+                    _run_memgw(
+                        memgw,
+                        ["config", "set", "MODEL_GATEWAY_EMBEDDING_SPACE_ID", result.embedding_space],
+                    )
+                    _run_memgw(
+                        memgw,
+                        ["config", "set", "EMBEDDING_DIMENSIONS", str(result.embedding_dimensions)],
+                    )
+
+    started = False
+    if not args.no_start:
+        start_args = argparse.Namespace(
+            home=getattr(args, "home", ""),
+            json=False,
+            host=None,
+            port=None,
+            log_level="info",
+            access_log=False,
+        )
+        if _cmd_start(start_args) == 0:
+            started = True
+        if memgw_wired:
+            _run_memgw(
+                Path(args.memgw).expanduser() if args.memgw else _find_memgw(),
+                ["restart"],
+            )
+
+    payload = {
+        "connection_id": result.connection_id,
+        "chat_deployment_id": result.chat_deployment_id,
+        "chat_routes": list(result.chat_routes),
+        "embedding_deployment_id": result.embedding_deployment_id,
+        "memgw_wired": memgw_wired,
+        "started": started,
+        "warnings": result.warnings,
+    }
+    if args.json:
+        _json(payload)
+    else:
+        print("")
+        print("模型服务已配置")
+        print("-" * 36)
+        print(f"渠道：{spec.channel_operator}  ·  聊天模型：{spec.chat_model}")
+        print(f"已安排全部 {len(result.chat_routes)} 项文字用途使用该模型。")
+        if result.embedding_deployment_id:
+            print(f"向量模型：{spec.embedding_model}（{result.embedding_dimensions} 维）")
+        if memgw_wired:
+            print("已连接记忆服务；两端使用独立密钥文件，密钥未显示。")
+        elif spec.connect_memory:
+            print("模型服务已就绪，但尚未连接记忆服务（见下方提示）。")
+        for warning in result.warnings:
+            print(f"注意：{warning}")
+        if started:
+            print("模型服务已启动。")
+    return 0
+
+
+def _quickstart_prompt(args: argparse.Namespace) -> Any:
+    from model_gateway.quickstart import QuickstartSpec
+
+    print("一步完成首次配置：一个渠道、一个聊天模型、全部文字用途。")
+    channel = (args.channel or input("渠道英文简称（例如 deepseek）：").strip()).strip()
+    base_url = (args.base_url or input("官方 OpenAI 兼容 API 地址（HTTPS）：").strip()).strip()
+    chat_model = (
+        args.chat_model or input("供应商页面显示的精确聊天模型 ID：").strip()
+    ).strip()
+    api_key = getpass.getpass("该渠道的 API Key（输入时不会显示）：").strip()
+    embedding_model = args.embedding_model
+    embedding_dimensions = args.embedding_dimensions
+    embedding_space = args.embedding_space
+    if not embedding_model and input("要现在配置向量（语义搜索）模型吗？[y/N] ").strip().lower() in {
+        "y",
+        "yes",
+        "是",
+    }:
+        embedding_model = input("向量模型 ID：").strip()
+        if embedding_model:
+            raw_dimensions = input("向量维度（例如 1024）：").strip()
+            if not raw_dimensions.isdecimal() or int(raw_dimensions) < 1:
+                raise CLIError("向量维度必须是正整数")
+            embedding_dimensions = int(raw_dimensions)
+            embedding_space = input("向量空间名称（换模型或维度时必须换名）：").strip()
+    return QuickstartSpec(
+        channel_operator=channel,
+        base_url=base_url,
+        chat_model=chat_model,
+        api_key=api_key,
+        adapter=args.adapter,
+        plan=args.plan,
+        chat_author=args.chat_author,
+        chat_capabilities=tuple(dict.fromkeys(args.chat_capability)),
+        reasoning_default=args.reasoning_default,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        embedding_space=embedding_space,
+        embedding_author=args.embedding_author,
+        connect_memory=not args.no_connect_memory,
+    )
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:

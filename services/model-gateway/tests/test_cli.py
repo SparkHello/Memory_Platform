@@ -214,6 +214,95 @@ def test_cli_accepts_ordered_multi_tier_pricing(tmp_path: Path) -> None:
     assert str(pricing.tiers[1].output) == "4"
 
 
+def test_quickstart_non_interactive_builds_config_and_reads_key_from_stdin(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import io
+    import sys
+
+    home = tmp_path / "gateway-home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("upstream-sensitive-token\n"))
+
+    assert (
+        main(
+            [
+                "--home",
+                str(home),
+                "quickstart",
+                "--non-interactive",
+                "--channel",
+                "deepseek",
+                "--base-url",
+                "https://api.deepseek.example/v1",
+                "--chat-model",
+                "deepseek-chat",
+                "--no-connect-memory",
+                "--no-start",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "upstream-sensitive-token" not in output
+
+    paths = gateway_paths(home)
+    config = load_config(paths.config)
+    # One connection, one chat deployment, every chat route pointed at it, and
+    # the memory-gateway backend client materialized for a standalone run.
+    assert len(config.connections) == 1
+    chat_deployments = [d for d in config.deployments.values() if d.kind == "chat"]
+    assert len(chat_deployments) == 1
+    assert config.routes["memory.chat"].targets == config.routes["knowledge.pro"].targets
+    assert "memory-gateway" in config.clients
+
+    secrets = read_secrets(paths.secrets)
+    connection = next(iter(config.connections.values()))
+    assert secrets[connection.auth.secret_ref] == "upstream-sensitive-token"
+    # The generated backend client key is stored and non-empty, never printed.
+    assert secrets[config.clients["memory-gateway"].secret_ref]
+
+
+def test_quickstart_accepts_json_flag_after_subcommand(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # `--json` is a global flag, but automation (and the ai-install doc) naturally
+    # appends it after the subcommand. The subparser mirrors it with SUPPRESS so
+    # both `modelgw --json quickstart ...` and `modelgw quickstart ... --json`
+    # emit parseable JSON. This locks the trailing position against regression.
+    import io
+    import sys
+
+    home = tmp_path / "gateway-home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("upstream-sensitive-token\n"))
+
+    assert (
+        main(
+            [
+                "--home",
+                str(home),
+                "quickstart",
+                "--non-interactive",
+                "--channel",
+                "deepseek",
+                "--base-url",
+                "https://api.deepseek.example/v1",
+                "--chat-model",
+                "deepseek-chat",
+                "--no-connect-memory",
+                "--no-start",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["connection_id"]
+    assert len(payload["chat_routes"]) == 7
+    assert "upstream-sensitive-token" not in json.dumps(payload)
+
+
 def test_windows_managed_process_requires_command_identity(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -253,6 +253,80 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
     assert secret_inputs[0] not in output
 
 
+def _install_stack_mocks(tmp_path, monkeypatch) -> Path:
+    model_home = tmp_path / "model-home"
+    model_home.mkdir()
+    (model_home / "config.json").write_text(
+        json.dumps({"schema_version": 1, "server": {"port": 2030}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "app.cli._ensure_model_gateway_runtime",
+        lambda args, project_root: Path("/fake/modelgw"),
+    )
+    monkeypatch.setattr(
+        "app.cli._modelgw_json",
+        lambda modelgw, home, arguments: [
+            {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
+            {"id": "memory-console-admin", "kind": "admin", "secret_configured": True},
+        ],
+    )
+    monkeypatch.setattr(
+        "app.cli._run_modelgw",
+        lambda modelgw, home, arguments, **kwargs: 0,
+    )
+    return model_home
+
+
+def test_stack_install_auto_generates_gateway_key_when_absent(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    model_home = _install_stack_mocks(tmp_path, monkeypatch)
+
+    assert (
+        main([*args, "stack", "install", "--model-gateway-home", str(model_home)])
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    values = read_env_file(cli_paths(tmp_path / "memgw-home").settings_env)
+    gateway_key = values["GATEWAY_API_KEY"]
+    # A real generated key, not a placeholder, and long enough to be secure.
+    assert gateway_key and gateway_key != "change-me"
+    assert len(gateway_key) >= 32
+    # The client needs it, so it is shown exactly once on first generation.
+    assert gateway_key in output
+
+
+def test_stack_install_keeps_existing_gateway_key(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    settings_path = cli_paths(tmp_path / "memgw-home").settings_env
+    update_env_value(settings_path, "GATEWAY_API_KEY", "already-configured-key")
+    capsys.readouterr()
+    model_home = _install_stack_mocks(tmp_path, monkeypatch)
+
+    assert (
+        main([*args, "stack", "install", "--model-gateway-home", str(model_home)])
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    values = read_env_file(settings_path)
+    # An existing client key is never rotated or echoed by install.
+    assert values["GATEWAY_API_KEY"] == "already-configured-key"
+    assert "already-configured-key" not in output
+
+
 def test_cli_adds_model_and_assigns_feature_route(tmp_path) -> None:
     args = _base_args(tmp_path)
     assert main([*args, "init", "--no-import-env"]) == 0
