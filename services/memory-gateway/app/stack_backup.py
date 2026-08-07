@@ -25,6 +25,7 @@ from app.cli_config import (
 STACK_BACKUP_VERSION = 1
 _MAX_ARCHIVE_FILES = 16
 _MAX_TOTAL_BYTES = 100 * 1024 * 1024 * 1024
+_STREAM_CHUNK_BYTES = 1024 * 1024
 _DEVICE_LOCAL_SETTINGS = {
     "DATABASE_PATH",
     "KNOWLEDGE_DATABASE_PATH",
@@ -168,58 +169,61 @@ def restore_stack_backup(
     if not archive_path.is_file():
         raise ValueError(f"找不到备份文件：{archive_path}")
 
-    with zipfile.ZipFile(archive_path) as archive:
-        manifest = _validated_manifest(archive)
-        extracted = _verified_payloads(archive, manifest)
+    with tempfile.TemporaryDirectory(prefix="memgw-stack-restore-") as staging_name:
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = _validated_manifest(archive)
+            extracted = _verified_payloads(archive, manifest, Path(staging_name))
 
-    targets: dict[str, tuple[Path, Callable[[Path], None] | None]] = {
-        "memory/memory.db": (memory_database, _validate_sqlite),
-        "memory/knowledge.db": (knowledge_database, _validate_sqlite),
-        "memory/models.json": (paths.models, _validate_json_object),
-        "memory/routes.json": (paths.routes, _validate_json_object),
-        "memory/pricing.json": (paths.pricing, _validate_json_object),
-        "model-gateway/config.json": (
-            model_gateway_home / "config.json",
-            _validate_json_object,
-        ),
-        "model-gateway/usage.db": (
-            model_gateway_home / "usage.db",
-            _validate_sqlite,
-        ),
-    }
-    _validate_restore_payloads(extracted, targets)
-    rollback_parent = paths.home / "restore-backups"
-    rollback_parent.mkdir(parents=True, exist_ok=True)
-    rollback_root = Path(
-        tempfile.mkdtemp(
-            prefix=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-"),
-            dir=rollback_parent,
+        targets: dict[str, tuple[Path, Callable[[Path], None] | None]] = {
+            "memory/memory.db": (memory_database, _validate_sqlite),
+            "memory/knowledge.db": (knowledge_database, _validate_sqlite),
+            "memory/models.json": (paths.models, _validate_json_object),
+            "memory/routes.json": (paths.routes, _validate_json_object),
+            "memory/pricing.json": (paths.pricing, _validate_json_object),
+            "model-gateway/config.json": (
+                model_gateway_home / "config.json",
+                _validate_json_object,
+            ),
+            "model-gateway/usage.db": (
+                model_gateway_home / "usage.db",
+                _validate_sqlite,
+            ),
+        }
+        _validate_restore_payloads(extracted, targets)
+        rollback_parent = paths.home / "restore-backups"
+        rollback_parent.mkdir(parents=True, exist_ok=True)
+        rollback_root = Path(
+            tempfile.mkdtemp(
+                prefix=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-"),
+                dir=rollback_parent,
+            )
         )
-    )
-    os.chmod(rollback_root, 0o700)
-    restored: list[str] = []
-    for archive_name, (target, validator) in targets.items():
-        payload = extracted.get(archive_name)
-        if payload is None:
-            continue
-        _save_rollback(target, rollback_root, archive_name)
-        _atomic_restore(target, payload, validator=validator)
-        restored.append(archive_name)
-
-    settings_payload = extracted.get("memory/settings.json")
-    if settings_payload is not None:
-        safe_settings = _json_object(settings_payload, "memory/settings.json")
-        current_settings = read_env_file(paths.settings_env)
-        for raw_name, raw_value in safe_settings.items():
-            name = str(raw_name).strip().upper()
-            if is_secret_name(name) or name in _DEVICE_LOCAL_SETTINGS:
+        os.chmod(rollback_root, 0o700)
+        restored: list[str] = []
+        for archive_name, (target, validator) in targets.items():
+            payload = extracted.get(archive_name)
+            if payload is None:
                 continue
-            if not isinstance(raw_value, str):
-                raise ValueError(f"便携配置 {name} 必须是字符串")
-            current_settings[name] = raw_value
-        _save_rollback(paths.settings_env, rollback_root, "memory/settings.env")
-        write_env_atomic(paths.settings_env, current_settings)
-        restored.append("memory/settings.json")
+            _save_rollback(target, rollback_root, archive_name)
+            _atomic_restore(target, payload, validator=validator)
+            restored.append(archive_name)
+
+        settings_payload = extracted.get("memory/settings.json")
+        if settings_payload is not None:
+            safe_settings = _json_object(
+                settings_payload.read_bytes(), "memory/settings.json"
+            )
+            current_settings = read_env_file(paths.settings_env)
+            for raw_name, raw_value in safe_settings.items():
+                name = str(raw_name).strip().upper()
+                if is_secret_name(name) or name in _DEVICE_LOCAL_SETTINGS:
+                    continue
+                if not isinstance(raw_value, str):
+                    raise ValueError(f"便携配置 {name} 必须是字符串")
+                current_settings[name] = raw_value
+            _save_rollback(paths.settings_env, rollback_root, "memory/settings.env")
+            write_env_atomic(paths.settings_env, current_settings)
+            restored.append("memory/settings.json")
 
     return {
         "archive": str(archive_path),
@@ -230,22 +234,17 @@ def restore_stack_backup(
 
 
 def _validate_restore_payloads(
-    extracted: dict[str, bytes],
+    extracted: dict[str, Path],
     targets: dict[str, tuple[Path, Callable[[Path], None] | None]],
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="memgw-stack-restore-validate-") as name:
-        temporary = Path(name)
-        for archive_name, (_, validator) in targets.items():
-            payload = extracted.get(archive_name)
-            if payload is None or validator is None:
-                continue
-            candidate = temporary / archive_name
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            candidate.write_bytes(payload)
-            validator(candidate)
-        settings_payload = extracted.get("memory/settings.json")
-        if settings_payload is not None:
-            _json_object(settings_payload, "memory/settings.json")
+    for archive_name, (_, validator) in targets.items():
+        payload = extracted.get(archive_name)
+        if payload is None or validator is None:
+            continue
+        validator(payload)
+    settings_payload = extracted.get("memory/settings.json")
+    if settings_payload is not None:
+        _json_object(settings_payload.read_bytes(), "memory/settings.json")
 
 
 def _stage_file(source: Path, staged: dict[str, Path], archive_name: str) -> None:
@@ -305,18 +304,42 @@ def _validated_manifest(archive: zipfile.ZipFile) -> dict[str, Any]:
 def _verified_payloads(
     archive: zipfile.ZipFile,
     manifest: dict[str, Any],
-) -> dict[str, bytes]:
-    payloads: dict[str, bytes] = {}
+    staging: Path,
+) -> dict[str, Path]:
+    payloads: dict[str, Path] = {}
     files = manifest["files"]
+    total_bytes = 0
     for archive_name, metadata in files.items():
         if archive_name not in _PORTABLE_FILES or not isinstance(metadata, dict):
             raise ValueError("备份 manifest 包含无效文件记录")
-        payload = archive.read(archive_name)
         expected_size = metadata.get("size")
         expected_hash = metadata.get("sha256")
-        if expected_size != len(payload) or expected_hash != sha256(payload).hexdigest():
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 0
+            or not isinstance(expected_hash, str)
+        ):
             raise ValueError(f"备份文件校验失败：{archive_name}")
-        payloads[archive_name] = payload
+        staged = staging / archive_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        digest = sha256()
+        actual_size = 0
+        with archive.open(archive_name, "r") as source, staged.open("wb") as target:
+            while True:
+                chunk = source.read(_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                actual_size += len(chunk)
+                total_bytes += len(chunk)
+                if actual_size > expected_size or total_bytes > _MAX_TOTAL_BYTES:
+                    raise ValueError(f"备份文件校验失败：{archive_name}")
+                digest.update(chunk)
+                target.write(chunk)
+        os.chmod(staged, 0o600)
+        if actual_size != expected_size or digest.hexdigest() != expected_hash:
+            raise ValueError(f"备份文件校验失败：{archive_name}")
+        payloads[archive_name] = staged
     return payloads
 
 
@@ -331,7 +354,7 @@ def _save_rollback(target: Path, root: Path, archive_name: str) -> None:
 
 def _atomic_restore(
     target: Path,
-    payload: bytes,
+    payload: Path,
     *,
     validator: Callable[[Path], None] | None,
 ) -> None:
@@ -339,8 +362,8 @@ def _atomic_restore(
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
+        with os.fdopen(descriptor, "wb") as handle, payload.open("rb") as source:
+            shutil.copyfileobj(source, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)

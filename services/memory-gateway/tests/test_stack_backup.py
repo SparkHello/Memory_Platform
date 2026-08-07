@@ -156,3 +156,34 @@ def test_stack_restore_rejects_tampering_before_writing(tmp_path: Path) -> None:
 
     assert _database_value(memory_database) == "memory-before"
     assert not (paths.home / "restore-backups").exists()
+
+
+def test_stack_restore_rejects_oversized_entry_before_writing(tmp_path: Path) -> None:
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "portable.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+    oversized = tmp_path / "oversized.zip"
+    with zipfile.ZipFile(archive_path) as source, zipfile.ZipFile(oversized, "w") as target:
+        for name in source.namelist():
+            payload = source.read(name)
+            if name == "memory/memory.db":
+                payload = payload + b" " * (8 * 1024 * 1024)
+            target.writestr(name, payload)
+
+    with pytest.raises(ValueError, match="校验失败"):
+        restore_stack_backup(
+            archive_path=oversized,
+            paths=paths,
+            memory_database=memory_database,
+            knowledge_database=knowledge_database,
+            model_gateway_home=model_home,
+        )
+
+    assert _database_value(memory_database) == "memory-before"
+    assert not (paths.home / "restore-backups").exists()
