@@ -29,103 +29,72 @@ jobs:
         working-directory: services/memory-gateway
         run: python -m pytest -ra
 
-      # TEMPORARY DIAGNOSTIC. test_cli_background_start_status_and_stop fails on
-      # Linux CI while passing locally on macOS: `start` reports the gateway
-      # healthy, then `status` immediately returns 1. This reproduces that exact
-      # sequence and dumps every input to _state_process_matches so the failing
-      # condition is identified from the runner itself. Remove once diagnosed.
-      - name: Diagnose background status mismatch
+      # TEMPORARY DIAGNOSTIC round 2. Round 1 showed the plain sequence PASSES
+      # on Linux (status rc=0), so the symlink asymmetry is not the CI cause.
+      # Remaining suspect: _state_process_matches needs the full home path inside
+      # `ps -o command=` output, and pytest's tmp_path is ~40 chars longer than
+      # round 1's path. procps ps truncates by width. Test that directly, and
+      # run the failing test alone to separate pollution from environment.
+      - name: Diagnose ps truncation and test isolation
         working-directory: services/model-gateway
         continue-on-error: true
         run: |
           python - <<'DIAG'
-          import json, os, socket, subprocess, sys, tempfile, time
+          import os, socket, subprocess, sys, tempfile
           from pathlib import Path
-
           from model_gateway import cli as c
           from model_gateway.config_store import gateway_paths
 
-          def show(label, value):
-              print(f"{label:38} {value}")
+          def show(k, v): print(f"{k:34} {v}")
 
-          print("=== runner environment ===")
-          show("platform", sys.platform)
-          show("python", sys.version.split()[0])
-          show("/tmp is symlink", Path("/tmp").is_symlink())
-          show("/tmp resolves to", Path("/tmp").resolve())
-          show("TMPDIR", os.environ.get("TMPDIR", "(unset)"))
-          try:
-              ps_version = subprocess.run(
-                  ["ps", "--version"], capture_output=True, text=True, timeout=5
-              ).stdout.strip()
-          except Exception as exc:
-              ps_version = f"unavailable: {exc!r}"
-          show("ps implementation", ps_version)
-          show("COLUMNS", os.environ.get("COLUMNS", "(unset)"))
+          # Recreate pytest's tmp_path shape and length exactly.
+          base = Path("/tmp/pytest-of-runner/pytest-99/test_cli_background_start_stat0")
+          base.mkdir(parents=True, exist_ok=True)
+          home = base / "gateway-home"
+          show("home", home)
+          show("len(str(home))", len(str(home)))
 
-          # Mirror the test: a tmp home plus a port discovered by bind-then-release.
-          root = Path(tempfile.mkdtemp(prefix="diag-"))
-          home = root / "gateway-home"
-          with socket.socket() as listener:
-              listener.bind(("127.0.0.1", 0))
-              port = listener.getsockname()[1]
+          with socket.socket() as s:
+              s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
 
-          print("\n=== init + start ===")
-          show("home (raw)", home)
-          show("home.resolve()", home.resolve())
-          show("raw == resolved", str(home) == str(home.resolve()))
-          show("init rc", c.main(["--home", str(home), "init"]))
-          show("start rc", c.main(["--home", str(home), "start", "--port", str(port)]))
+          c.main(["--home", str(home), "init"])
+          rc = c.main(["--home", str(home), "start", "--port", str(port)])
+          show("start rc", rc)
 
           paths = gateway_paths(home)
-          state = {}
-          if paths.state.exists():
-              state = json.loads(paths.state.read_text(encoding="utf-8"))
-          print("\n=== state file ===")
-          show("exists", paths.state.exists())
-          show("pid", state.get("pid"))
-          show("state['home']", state.get("home"))
-          show("expected_home", str(paths.home.resolve()))
-          show("home fields equal", str(state.get("home") or "") == str(paths.home.resolve()))
-
+          import json
+          state = json.loads(paths.state.read_text()) if paths.state.exists() else {}
           pid = int(state.get("pid") or 0)
-          print("\n=== process identity ===")
-          show("_pid_alive", c._pid_alive(pid) if pid else "no pid")
-          for flag in ("stat=", "command="):
-              try:
-                  out = subprocess.run(
-                      ["ps", "-p", str(pid), "-o", flag],
-                      capture_output=True, text=True, timeout=5,
-                  )
-                  show(f"ps -o {flag} rc", out.returncode)
-                  show(f"ps -o {flag} value", repr(out.stdout.strip()))
-              except Exception as exc:
-                  show(f"ps -o {flag}", f"error {exc!r}")
 
-          command = c._process_command(pid) or ""
-          print("\n=== the three command checks ===")
-          show("_process_command len", len(command))
-          show("command", repr(command))
-          show("'model_gateway.cli' in cmd", "model_gateway.cli" in command)
-          show("'serve' in cmd", "serve" in command)
-          show("expected_home in cmd", str(paths.home.resolve()) in command)
+          print("\n=== ps truncation probe ===")
+          for env_desc, env in (("inherited", None), ("COLUMNS=80", {**os.environ, "COLUMNS": "80"})):
+              out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                   capture_output=True, text=True, env=env)
+              val = out.stdout.strip()
+              show(f"len ({env_desc})", len(val))
+              show(f"home in it ({env_desc})", str(paths.home.resolve()) in val)
+          wide = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="],
+                                capture_output=True, text=True).stdout.strip()
+          show("len (ps -ww)", len(wide))
+          show("home in ps -ww", str(paths.home.resolve()) in wide)
 
-          print("\n=== verdict ===")
-          show("_state_process_matches", c._state_process_matches(state, paths) if state else "no state")
-          url = str(state.get("url") or "")
-          show("url", url)
-          show("_gateway_responding", c._gateway_responding(url) if url else "no url")
+          print("\n=== verdict with long path ===")
+          cmd = c._process_command(pid) or ""
+          show("_process_command len", len(cmd))
+          show("expected_home in cmd", str(paths.home.resolve()) in cmd)
+          show("_state_process_matches", c._state_process_matches(state, paths))
+          show("_gateway_responding", c._gateway_responding(str(state.get("url") or "")))
           show("status rc (expect 0)", c.main(["--home", str(home), "status"]))
-
-          # Re-check after a pause to separate a race from a hard mismatch.
-          time.sleep(2)
-          print("\n=== after 2s ===")
-          show("_pid_alive", c._pid_alive(pid) if pid else "no pid")
-          show("_gateway_responding", c._gateway_responding(url) if url else "no url")
-          show("status rc", c.main(["--home", str(home), "status"]))
-
           c.main(["--home", str(home), "stop", "--timeout", "5", "--force"])
           DIAG
+
+      - name: Run the failing test alone
+        working-directory: services/model-gateway
+        continue-on-error: true
+        run: |
+          python -m pytest -ra -vv \
+            tests/test_cli.py::test_cli_background_start_status_and_stop
+          echo "alone exit=$?"
 
       - name: Test Model Gateway
         working-directory: services/model-gateway
