@@ -38,7 +38,7 @@ from app.cli_config import (
     update_env_value,
     write_json_atomic,
 )
-from app.config import Settings
+from app.config import Settings, describe_settings_error
 from app.llm.client import OpenAICompatibleClient
 from app.model_catalog import (
     CatalogError,
@@ -108,7 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n已取消。", file=sys.stderr)
         return 130
     except (CatalogError, PricingCatalogError, ValueError) as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        print(f"错误：{describe_settings_error(exc)}", file=sys.stderr)
         return 2
 
 
@@ -1330,7 +1330,7 @@ def _cmd_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
     try:
         settings = Settings(_env_file=None, **environment)
     except Exception as exc:
-        problems.append(f"运行配置无效：{exc}")
+        problems.append(f"运行配置无效：{describe_settings_error(exc)}")
         settings = None
     if settings is not None:
         memory_path = _resolve_runtime_path(project_root, settings.database_path)

@@ -292,7 +292,7 @@ def _is_placeholder(value: str) -> bool:
 
 def _is_secret_name(name: str) -> bool:
     upper = name.upper()
-    return upper.endswith(("_API_KEY", "_TOKEN", "_SECRET")) or upper == "GATEWAY_API_KEY"
+    return upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_CREDENTIALS"))
 
 
 def _chmod_private_directory(path: Path) -> None:

@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
@@ -68,7 +69,9 @@ def require_api_key(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="GATEWAY_API_KEY 未配置",
         )
-    if credentials is None or credentials.credentials != settings.gateway_api_key:
+    if credentials is None or not hmac.compare_digest(
+        credentials.credentials, settings.gateway_api_key
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization Bearer token 无效",

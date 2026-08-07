@@ -433,3 +433,30 @@ def test_cli_adds_pricing_to_external_catalog(tmp_path) -> None:
     assert price["input_cache_miss_per_million"] == "2"
     assert price["output_per_million"] == "3"
     assert payload["as_of"] == "2026-08-02"
+
+
+def test_settings_error_redaction_and_secret_name_suffixes() -> None:
+    from app.cli_config import _is_secret_name
+    from app.config import Settings, describe_settings_error
+
+    try:
+        Settings(
+            _env_file=None,
+            **{
+                "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030",
+                "GATEWAY_API_KEY": "gw-secret-value-1234567890",
+                "EMBEDDING_API_KEY": "emb-secret-value-abcdefghij",
+            },
+        )
+    except Exception as exc:
+        text = describe_settings_error(exc)
+    else:
+        raise AssertionError("Settings validation should have failed")
+    assert "gw-secret-value-1234567890" not in text
+    assert "emb-secret-value-abcdefghij" not in text
+    assert "必须同时配置" in text
+
+    assert _is_secret_name("OPENAI_KEY")
+    assert _is_secret_name("DASHSCOPE_PASSWORD")
+    assert _is_secret_name("GATEWAY_API_KEY")
+    assert not _is_secret_name("LOG_LEVEL")

@@ -1,3 +1,4 @@
+import hmac
 import json
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -30,7 +31,9 @@ class MCPAuthMiddleware:
         if not settings.gateway_api_key:
             await _send_json(send, 500, {"detail": "GATEWAY_API_KEY 未配置"})
             return
-        if headers.get("authorization") != f"Bearer {settings.gateway_api_key}":
+        if not hmac.compare_digest(
+            headers.get("authorization") or "", f"Bearer {settings.gateway_api_key}"
+        ):
             await _send_json(
                 send,
                 401,
