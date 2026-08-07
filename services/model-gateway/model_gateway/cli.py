@@ -860,7 +860,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         "-m",
         "model_gateway.cli",
         "--home",
-        str(paths.home),
+        str(paths.home.resolve()),
         "serve",
         "--host",
         server.host,
@@ -2177,7 +2177,7 @@ def _process_command(pid: int) -> str | None:
         return None
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             check=False,
             capture_output=True,
             text=True,

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 
 import httpx
+import pytest
 
 from model_gateway import cli as cli_module
 from model_gateway.cli import main
@@ -149,6 +153,44 @@ def test_cli_background_start_status_and_stop(tmp_path: Path, capsys) -> None:
     output = capsys.readouterr().out
     assert "后台启动" in output
     assert "已停止" in output
+
+
+def test_process_command_is_not_truncated_by_narrow_terminal(monkeypatch) -> None:
+    monkeypatch.setenv("COLUMNS", "80")
+    marker = "x" * 150
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", marker]
+    )
+    try:
+        command = cli_module._process_command(process.pid)
+    finally:
+        process.kill()
+        process.wait()
+    assert command is not None
+    assert marker in command
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+def test_cli_background_start_tracks_symlinked_home(tmp_path: Path, capsys) -> None:
+    real_home = tmp_path / "real-gateway-home"
+    real_home.mkdir()
+    home = tmp_path / "gateway-home-link"
+    home.symlink_to(real_home, target_is_directory=True)
+    assert run_cli(home, "init") == 0
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    try:
+        assert run_cli(home, "start", "--port", str(port)) == 0
+        assert run_cli(home, "status") == 0
+        response = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2)
+        assert response.status_code == 200
+    finally:
+        run_cli(home, "stop", "--timeout", "5", "--force")
+
+    assert run_cli(home, "status") == 1
+    assert gateway_paths(home).state.exists() is False
 
 
 def test_schema_command_outputs_json(capsys) -> None:
