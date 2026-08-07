@@ -1691,6 +1691,20 @@ def update_memory(
             status_code=422,
             detail=f"无效的 status 值: {body.status}，仅支持 dynamic/resolved/archived/pinned",
         )
+    if updates.get("status") == "archived":
+        # 归档必须走完整语义（置 archived 标志并脱离时间链）；只写 status 列
+        # 会让记忆从列表消失却进不了回收站，也无法恢复或清除。
+        if len(updates) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="归档记忆时请仅提交 status 字段",
+            )
+        if not store.archive_memory(memory_id=memory_id, user_id=user_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="记忆不存在或已删除",
+            )
+        return {"updated": True, "archived": True, "memory_id": memory_id}
 
     temporal_updates = {
         field_name: updates[field_name]

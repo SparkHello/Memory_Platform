@@ -1629,3 +1629,54 @@ def test_patch_memory_requires_authorization(client, memory_store: MemoryStore):
     )
 
     assert response.status_code == 401
+
+
+def test_patch_status_archived_uses_full_archive_semantics(client, auth_headers, memory_store: MemoryStore):
+    memory = memory_store.create_memory(user_id="default", content="稍后归档的一条记忆。")
+
+    response = client.patch(
+        f"/memories/{memory.id}",
+        headers=auth_headers,
+        json={"status": "archived"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["archived"] is True
+    deleted = client.get("/memories/deleted", headers=auth_headers)
+    assert deleted.status_code == 200
+    assert memory.id in {item["id"] for item in deleted.json()["data"]}
+
+    other = memory_store.create_memory(user_id="default", content="另一条记忆。")
+    rejected = client.patch(
+        f"/memories/{other.id}",
+        headers=auth_headers,
+        json={"status": "archived", "importance": 9},
+    )
+    assert rejected.status_code == 422
+
+
+def test_manual_resolved_status_survives_temporal_chain_rebuild(client, auth_headers, memory_store: MemoryStore):
+    older = memory_store.create_memory(
+        user_id="default",
+        content="用户的旧编辑器是 Vim。",
+        temporal_subject="用户",
+        temporal_predicate="编辑器",
+    )
+    current = memory_store.create_memory(
+        user_id="default",
+        content="用户的编辑器是 Neovim。",
+        temporal_subject="用户",
+        temporal_predicate="编辑器",
+    )
+    response = client.patch(
+        f"/memories/{current.id}",
+        headers=auth_headers,
+        json={"status": "resolved"},
+    )
+    assert response.status_code == 200
+
+    assert memory_store.archive_memory(memory_id=older.id, user_id="default")
+
+    after = memory_store.get_memory(memory_id=current.id, user_id="default")
+    assert after is not None
+    assert after.status == "resolved"

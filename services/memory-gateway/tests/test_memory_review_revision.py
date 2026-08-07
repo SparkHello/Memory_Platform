@@ -1099,3 +1099,58 @@ def test_birth_year_age_statement_is_not_rewritten(
     [memory] = memory_store.list_memories(user_id="default")
     assert memory.content == "用户出生于 2008 年。"
     assert memory.review_after is None
+
+
+def test_apply_revision_redacts_sensitive_content_in_decision_log(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢深烘咖啡。",
+    )
+    fake_llm.review_revision_content = json.dumps(
+        {
+            "operations": [
+                {
+                    "operation": "update",
+                    "memory_ids": [memory.id],
+                    "target_memory_id": memory.id,
+                    "content": "用户的邮箱密码是 TopSecret-12345。",
+                    "type": "semantic",
+                    "reason": "用户补充了账号信息。",
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    preview_response = client.post(
+        "/memories/review/revise/preview",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id], "user_note": "补充账号信息"},
+    )
+    assert preview_response.status_code == 200
+    preview = preview_response.json()
+
+    apply_response = client.post(
+        "/memories/review/revise/apply",
+        headers=auth_headers,
+        json={
+            "memory_ids": [memory.id],
+            "operations": preview["operations"],
+            "preview_token": preview["preview_token"],
+        },
+    )
+    assert apply_response.status_code == 200
+
+    logs = memory_store.list_decision_logs(user_id="default")
+    review_logs = [
+        log for log in logs if '"source": "review_modify"' in log.candidate_json
+    ]
+    assert review_logs
+    for log in review_logs:
+        assert "TopSecret-12345" not in log.candidate_json
+        assert '"redacted": true' in log.candidate_json
