@@ -9,6 +9,10 @@ import type {
   MemoryExport,
   ModelUsageSummary,
   ModelGatewayConnectionCheck,
+  ModelGatewayConnectionCreateBody,
+  ModelGatewayConnectionCreateResult,
+  ModelGatewayDeploymentApplyBody,
+  ModelGatewayDeploymentApplyResult,
   ModelGatewayRouteChangeResult,
   ModelGatewayRouteDraft,
   ProvidersStatus,
@@ -206,6 +210,32 @@ export class MemoryApi {
         timeoutMessage: "渠道检查超时，请确认 Model Gateway 和供应商服务可访问"
       }
     );
+  }
+
+  async createProviderConnection(
+    body: ModelGatewayConnectionCreateBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayConnectionCreateResult> {
+    return this.request("/providers/connections", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async applyProviderDeployments(
+    body: ModelGatewayDeploymentApplyBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayDeploymentApplyResult> {
+    return this.request("/providers/deployments", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
   }
 
   async listKnowledgeDocuments(

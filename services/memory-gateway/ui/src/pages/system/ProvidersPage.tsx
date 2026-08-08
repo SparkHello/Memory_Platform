@@ -6,6 +6,7 @@ import {
   EyeOff,
   KeyRound,
   LockKeyhole,
+  Plus,
   PlugZap,
   RefreshCcw,
   Save,
@@ -31,21 +32,10 @@ import type {
   RouteInfo
 } from "../../types";
 import { errorMessage } from "../../utils/format";
+import { NewChannelWizard, ROUTE_LABELS } from "./NewChannelWizard";
 
 type Feedback = { tone: "success" | "warning" | "error"; message: string };
 type ConnectionCheckState = "checking" | ModelGatewayConnectionCheck;
-
-const ROUTE_LABELS: Record<string, string> = {
-  "memory.chat": "日常聊天",
-  "memory.extract": "提取长期记忆",
-  "memory.compact": "压缩对话上下文",
-  "memory.core": "整理核心记忆",
-  "memory.review": "记忆体检",
-  "knowledge.fast": "快速知识检索",
-  "knowledge.pro": "深度知识检索",
-  "memory.embedding": "语义搜索",
-  "pricing.research": "价格信息研究"
-};
 
 // 未保存修改保护：dirty 时拦截刷新/关闭和站内导航点击，确认后才放行。
 // 站内导航由 App 先改 state 再改 hash，hashchange 触发时本页已卸载，
@@ -111,6 +101,7 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
   const [busyAction, setBusyAction] = useState("");
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [validatedSignature, setValidatedSignature] = useState("");
+  const [wizardOpen, setWizardOpen] = useState(false);
   const { confirm, confirmState, resolveConfirm } = useConfirm();
 
   const load = useCallback(
@@ -356,7 +347,17 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
                 }
                 onSaveSecret={(connection) => void saveSecret(connection)}
                 onCheck={(connection) => void checkConnection(connection)}
+                onCreateChannel={() => setWizardOpen(true)}
               />
+              {wizardOpen && (
+                <NewChannelWizard
+                  api={api}
+                  adminKey={adminKey}
+                  control={status.control}
+                  onClose={() => setWizardOpen(false)}
+                  onCompleted={() => load(undefined, false)}
+                />
+              )}
               <RoutesEditor
                 control={status.control}
                 drafts={drafts}
@@ -440,7 +441,8 @@ function ConnectionsEditor({
   onSecretChange,
   onToggleSecret,
   onSaveSecret,
-  onCheck
+  onCheck,
+  onCreateChannel
 }: {
   control: ModelGatewayControlSnapshot;
   adminReady: boolean;
@@ -452,6 +454,7 @@ function ConnectionsEditor({
   onToggleSecret: (id: string) => void;
   onSaveSecret: (connection: ModelGatewayConnectionInfo) => void;
   onCheck: (connection: ModelGatewayConnectionInfo) => void;
+  onCreateChannel: () => void;
 }) {
   const deploymentsByConnection = useMemo(() => {
     const grouped: Record<string, ModelGatewayDeploymentInfo[]> = {};
@@ -468,8 +471,26 @@ function ConnectionsEditor({
           <h2 id="provider-connections-title">模型渠道</h2>
           <p>替换已有渠道密钥并执行免费的模型列表检查；不会发起推理。</p>
         </div>
-        <span className="provider-count">{control.connections.length} 个渠道</span>
+        <div className="provider-section-actions">
+          <span className="provider-count">{control.connections.length} 个渠道</span>
+          <button type="button" className="secondary-button" onClick={onCreateChannel}>
+            <Plus size={16} aria-hidden />
+            新建渠道
+          </button>
+        </div>
       </div>
+      {control.connections.length === 0 && (
+        <div className="provider-empty-cta">
+          <p>
+            还没有任何模型渠道。新建第一个渠道后，即可选择聊天模型并把
+            memory.* / knowledge.* 用途路由指向它，无需回到终端。
+          </p>
+          <button type="button" className="primary-button" onClick={onCreateChannel}>
+            <Plus size={16} aria-hidden />
+            新建第一个渠道
+          </button>
+        </div>
+      )}
       <div className="provider-connection-list">
         {control.connections.map((connection) => {
           const value = secretValues[connection.id] || "";

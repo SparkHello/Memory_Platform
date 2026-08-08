@@ -409,3 +409,222 @@ def test_unauthenticated_health_never_echoes_invalid_config_values(gateway_home)
         "configuration_reload_failed_using_last_known_good"
     )
     assert marker not in response.text
+
+
+def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "newvendor/chat-1"}, {"id": "newvendor/embed-1"}]},
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        snapshot = client.get(
+            "/admin/configuration",
+            headers={"authorization": "Bearer admin-token"},
+        ).json()
+        body = {
+            "revision": snapshot["revision"],
+            "channel_operator": "NewVendor",
+            "adapter": "generic",
+            "base_url": "https://newvendor.example/v1",
+        }
+
+        denied = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer local-client-token"},
+            json=body,
+        )
+        assert denied.status_code == 403
+
+        preview = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer admin-token"},
+            json={**body, "dry_run": True},
+        )
+        assert preview.status_code == 200
+        assert preview.json() == {
+            "valid": True,
+            "applied": False,
+            "connection_id": "newvendor-account",
+            "revision": snapshot["revision"],
+        }
+        assert "newvendor-account" not in load_config(gateway_home.config).connections
+
+        created = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer admin-token"},
+            json=body,
+        )
+        assert created.status_code == 200
+        assert created.json()["applied"] is True
+
+        stale = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer admin-token"},
+            json=body,
+        )
+        assert stale.status_code == 409
+
+        invalid = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": created.json()["revision"],
+                "channel_operator": "insecure",
+                "base_url": "http://insecure.example/v1",
+            },
+        )
+        assert invalid.status_code == 400
+        assert "HTTPS" in invalid.json()["error"]["message"]
+
+        restricted = client.post(
+            "/admin/connections",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": created.json()["revision"],
+                "channel_operator": "plan-vendor",
+                "base_url": "https://plan.example/v1",
+                "plan": "token_plan",
+            },
+        )
+        assert restricted.status_code == 400
+
+        updated = client.put(
+            "/admin/connections/newvendor-account/secret",
+            headers={"authorization": "Bearer admin-token"},
+            json={"value": "channel-secret"},
+        )
+        assert updated.status_code == 200
+
+        checked = client.post(
+            "/admin/connections/newvendor-account/check",
+            headers={"authorization": "Bearer admin-token"},
+        )
+        assert checked.status_code == 200
+        info = checked.json()["connections"][0]
+        assert info["discovered_models"] == ["newvendor/chat-1", "newvendor/embed-1"]
+        assert "channel-secret" not in checked.text
+
+    config = load_config(gateway_home.config)
+    connection = config.connections["newvendor-account"]
+    assert connection.channel_operator == "newvendor"
+    assert connection.auth.secret_ref == "CONNECTION_NEWVENDOR_ACCOUNT_API_KEY"
+    assert read_secrets(gateway_home.secrets)[
+        "CONNECTION_NEWVENDOR_ACCOUNT_API_KEY"
+    ] == "channel-secret"
+
+
+def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    with TestClient(app) as client:
+        snapshot = client.get(
+            "/admin/configuration",
+            headers={"authorization": "Bearer admin-token"},
+        ).json()
+        body = {
+            "revision": snapshot["revision"],
+            "connection": "official",
+            "deployments": [
+                {
+                    "upstream_model": "author/chat-v2",
+                    "capabilities": {"tools": True, "reasoning": True},
+                }
+            ],
+            "routes": [
+                {"id": "memory.chat", "kind": "chat", "targets": ["$0"]},
+                {"id": "knowledge.fast", "kind": "chat", "targets": ["$0"]},
+            ],
+        }
+
+        denied = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer local-client-token"},
+            json=body,
+        )
+        assert denied.status_code == 403
+
+        preview = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json={**body, "dry_run": True},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["applied"] is False
+        assert preview.json()["deployments"] == [
+            {"id": "official-author-chat-v2", "upstream_model": "author/chat-v2", "kind": "chat"}
+        ]
+        assert "knowledge.fast" not in load_config(gateway_home.config).routes
+
+        applied = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json=body,
+        )
+        assert applied.status_code == 200
+        assert applied.json()["changed_routes"] == ["memory.chat", "knowledge.fast"]
+
+        missing_capability = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": applied.json()["revision"],
+                "connection": "official",
+                "deployments": [{"upstream_model": "author/chat-plain"}],
+                "routes": [{"id": "memory.chat", "kind": "chat", "targets": ["$0"]}],
+            },
+        )
+        assert missing_capability.status_code == 400
+        assert "tools" in missing_capability.json()["error"]["message"]
+
+        bad_embedding = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": applied.json()["revision"],
+                "connection": "official",
+                "deployments": [{"upstream_model": "author/embed-x", "kind": "embedding"}],
+            },
+        )
+        assert bad_embedding.status_code == 400
+        assert "embedding" in bad_embedding.json()["error"]["message"]
+
+        unknown_connection = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": applied.json()["revision"],
+                "connection": "ghost",
+                "deployments": [{"upstream_model": "author/chat-v2"}],
+            },
+        )
+        assert unknown_connection.status_code == 400
+
+        bad_kind = client.post(
+            "/admin/deployments",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": applied.json()["revision"],
+                "connection": "official",
+                "deployments": [
+                    {
+                        "upstream_model": "author/embed-2",
+                        "kind": "embedding",
+                        "dimensions": 4,
+                        "embedding_space": "author.embed-2:4",
+                    }
+                ],
+                "routes": [{"id": "memory.chat", "kind": "embedding", "targets": ["$0"]}],
+            },
+        )
+        assert bad_kind.status_code == 400
+
+    config = load_config(gateway_home.config)
+    deployment = config.deployments["official-author-chat-v2"]
+    assert deployment.model_author == "official-vendor"
+    assert config.routes["memory.chat"].targets == ["official-author-chat-v2"]
+    assert config.routes["knowledge.fast"].max_attempts == 1

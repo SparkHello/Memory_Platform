@@ -95,6 +95,42 @@ async def apply_provider_routes(
     )
 
 
+@router.post("/connections")
+async def create_provider_connection(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/connections",
+        payload=payload,
+    )
+
+
+@router.post("/deployments")
+async def apply_provider_deployments(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/deployments",
+        payload=payload,
+    )
+
+
 @router.put("/connections/{connection_id}/secret")
 async def update_provider_secret(
     connection_id: str,

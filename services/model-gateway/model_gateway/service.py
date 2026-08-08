@@ -13,9 +13,13 @@ import httpx
 from pydantic import ValidationError
 
 from model_gateway.admin import (
+    ConnectionCreateRequest,
+    DeploymentApplyRequest,
     RouteUpdateRequest,
     SecretUpdateRequest,
     configuration_revision,
+    connection_candidate,
+    deployment_candidate,
     public_configuration,
     route_candidate,
 )
@@ -197,6 +201,115 @@ def create_app(
                     "changed_routes": changed,
                     "warnings": warnings,
                     "restart_required": False,
+                }
+            )
+
+    @app.post("/admin/connections")
+    async def create_admin_connection(request: Request) -> Response:
+        async with admin_write_lock:
+            try:
+                config, secrets = manager.snapshot()
+                client = _authenticate(request, config=config, secrets=secrets)
+            except ConfigError:
+                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
+            except AuthenticationError as exc:
+                return _error(401, str(exc))
+            forbidden = _require_admin(client)
+            if forbidden is not None:
+                return forbidden
+            payload = await _validated_admin_body(
+                request,
+                limit=config.server.body_limit_bytes,
+                model=ConnectionCreateRequest,
+                label="渠道",
+            )
+            if isinstance(payload, Response):
+                return payload
+            current_revision = configuration_revision(paths.config)
+            if payload.revision != current_revision:
+                return _error(
+                    409,
+                    "配置已经被其他操作修改；请刷新页面后重新调整",
+                    error_type="model_gateway_config_stale",
+                )
+            try:
+                candidate, connection_id = connection_candidate(config, payload)
+            except (ValueError, ValidationError) as exc:
+                return _error(
+                    400,
+                    f"渠道草稿未通过完整配置校验：{_safe_validation_message(exc)}",
+                    error_type="model_gateway_config_invalid",
+                )
+            if not payload.dry_run:
+                write_config(paths.config, candidate)
+                manager.force_reload()
+            return JSONResponse(
+                {
+                    "valid": True,
+                    "applied": not payload.dry_run,
+                    "connection_id": connection_id,
+                    "revision": configuration_revision(paths.config),
+                }
+            )
+
+    @app.post("/admin/deployments")
+    async def apply_admin_deployments(request: Request) -> Response:
+        async with admin_write_lock:
+            try:
+                config, secrets = manager.snapshot()
+                client = _authenticate(request, config=config, secrets=secrets)
+            except ConfigError:
+                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
+            except AuthenticationError as exc:
+                return _error(401, str(exc))
+            forbidden = _require_admin(client)
+            if forbidden is not None:
+                return forbidden
+            payload = await _validated_admin_body(
+                request,
+                limit=config.server.body_limit_bytes,
+                model=DeploymentApplyRequest,
+                label="部署",
+            )
+            if isinstance(payload, Response):
+                return payload
+            current_revision = configuration_revision(paths.config)
+            if payload.revision != current_revision:
+                return _error(
+                    409,
+                    "配置已经被其他操作修改；请刷新页面后重新调整",
+                    error_type="model_gateway_config_stale",
+                )
+            try:
+                candidate, deployment_ids, changed, warnings = deployment_candidate(
+                    config, payload
+                )
+            except (ValueError, ValidationError) as exc:
+                return _error(
+                    400,
+                    f"部署草稿未通过完整配置校验：{_safe_validation_message(exc)}",
+                    error_type="model_gateway_config_invalid",
+                )
+            if not payload.dry_run:
+                write_config(paths.config, candidate)
+                manager.force_reload()
+            return JSONResponse(
+                {
+                    "valid": True,
+                    "applied": not payload.dry_run,
+                    "deployments": [
+                        {
+                            "id": deployment_id,
+                            "upstream_model": draft.upstream_model,
+                            "kind": draft.kind,
+                        }
+                        for deployment_id, draft in zip(
+                            deployment_ids, payload.deployments
+                        )
+                    ],
+                    "changed_routes": changed,
+                    "warnings": warnings,
+                    "revision": configuration_revision(paths.config),
                 }
             )
 

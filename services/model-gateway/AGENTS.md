@@ -14,7 +14,7 @@
 - 价格研究的模型调用要记录 metadata-only `pricing.research` 用量和研究 deployment 的价格快照，但不得把页面、提示词、证据或回复写入 `usage.db`。
 - 测试只能使用 `httpx.MockTransport` 和临时目录，不调用真实 provider。
 - 密钥只存在用户配置目录的 `secrets.env`，不得写入 `config.json`、日志、测试或版本库。
-- `/admin/configuration` 的只读视图必须按 client route 权限过滤且不返回 `secret_ref`；配置写入、渠道密钥替换和 discovery 检查只允许 `kind=admin`。所有写入继续使用 revision 冲突检测、完整 `GatewayConfig` 校验和原子替换；请求体校验错误不得回显密钥值。管理接口默认只绑定回环地址；跨主机暴露时必须使用 HTTPS，My_Memory 不得把 admin key 转发到非回环明文 HTTP。
+- `/admin/configuration` 的只读视图必须按 client route 权限过滤且不返回 `secret_ref`；配置写入（含 `POST /admin/connections` 新建渠道、`POST /admin/deployments` 新建部署并指派路由）、渠道密钥替换和 discovery 检查只允许 `kind=admin`。所有写入继续使用 revision 冲突检测、完整 `GatewayConfig` 校验和原子替换，新建实体由服务端合并进现有配置后整图校验一次；请求体校验错误不得回显密钥值。管理接口默认只绑定回环地址；跨主机暴露时必须使用 HTTPS，My_Memory 不得把 admin key 转发到非回环明文 HTTP。
 - 每个已配置 client 必须使用不同密钥；身份冲突会让鉴权拒绝请求，`modelgw doctor` 必须在不输出密钥值的情况下提前报告冲突 client ID。My_Memory 的 `memgw stack install` 可以安全轮换并同步 backend key，但不得覆盖或导出 admin/upstream key。
 
 ## 常用命令

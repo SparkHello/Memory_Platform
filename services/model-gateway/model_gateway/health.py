@@ -57,6 +57,7 @@ class ConnectionHealth:
     deployments: tuple[DeploymentHealth, ...]
     http_status: int | None = None
     discovered_model_count: int | None = None
+    discovered_models: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -71,6 +72,8 @@ class ConnectionHealth:
             result["http_status"] = self.http_status
         if self.discovered_model_count is not None:
             result["discovered_model_count"] = self.discovered_model_count
+        if self.discovered_models:
+            result["discovered_models"] = list(self.discovered_models)
         return result
 
 
@@ -348,6 +351,7 @@ async def _check_discovery(
         deployments=tuple(deployment_results),
         http_status=response.status_code,
         discovered_model_count=len(model_ids),
+        discovered_models=tuple(sorted(model_ids)[:500]),
     )
 
 

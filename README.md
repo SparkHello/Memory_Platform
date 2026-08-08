@@ -174,7 +174,7 @@ services/memory-gateway/.venv/bin/modelgw quickstart
 
 它只询问渠道、API Key，以及是否配置语义搜索；预设渠道会自动读取当前 key 可见的精确模型 ID 供选择。先让一个模型承担全部文字用途，最后自动连接并重启记忆服务。想用交互式主菜单精细配置，仍可运行 `scripts/memgw` 选择“设置模型渠道、模型和用途”。
 
-日常调整可以完全在浏览器里完成：`stack install`（含 `scripts/setup.sh` 和 Docker 首启）会自动生成并**打印一次** Model Gateway admin key；打开 `http://127.0.0.1:2026/ui/` 的「模型与路由」页，粘贴该 key 解锁后即可替换渠道密钥、检查连接和调整用途路由。admin key 丢失时用 `modelgw secret set memory-console-admin` 重新设置。首次添加渠道目前仍需上面的 CLI quickstart（Docker 部署用 `docker compose -f docker-compose.user.yml exec memory-platform modelgw quickstart`）。
+不习惯命令行的用户也可以完全在浏览器里完成首次配置：`stack install`（含 `scripts/setup.sh` 和 Docker 首启）会自动生成并**打印一次** Model Gateway admin key；打开 `http://127.0.0.1:2026/ui/` 的「模型与路由」页，粘贴该 key 解锁后点「新建渠道」，按向导选预设、填渠道 key、从自动发现的列表选模型即可，无需任何 CLI 操作。admin key 丢失时用 `modelgw secret set memory-console-admin` 重新设置。
 
 quickstart 内置 DeepSeek、Kimi 中国区、MiMo 和 DashScope 北京区地址预设；选择预设并隐藏输入 API Key 后，会只读请求一次 `/models`，让你按实际可用列表选择，不发送推理。自定义渠道仍可手工填写官方 Base URL。已有环境只想重新配置时使用 `scripts/setup.sh --configure-only --config <文件> --json`，不会重复安装依赖或运行 `stack install`。
 
