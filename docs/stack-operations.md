@@ -50,6 +50,16 @@ docker compose -f docker-compose.user.yml logs memory-platform
 docker compose -f docker-compose.user.yml logs -f memory-platform
 ```
 
+## 端口 2026 被占用
+
+一键脚本 `deploy/install.sh` 会自动避开占用的端口。手工部署时，在 `docker-compose.user.yml` 同目录创建 `.env`，写入一行：
+
+```bash
+MEMORY_PORT=3026
+```
+
+然后 `docker compose -f docker-compose.user.yml up -d` 重启生效。之后本仓库文档中的所有 `2026` 都换成 `3026`（Web Console、Base URL、MCP 地址等）。容器内部端口保持 2026 不变，只改宿主机映射。
+
 ## 密钥和身份
 
 系统中的密钥用途不同，不应复用：

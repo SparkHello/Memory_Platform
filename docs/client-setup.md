@@ -101,6 +101,7 @@ http://127.0.0.1:2026/mcp
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
 | API Key 找不回了 | 它只在安装时打印一次；运行 `scripts/memgw secret set gateway` 换新，旧 key 立即失效，所有客户端要更新 |
+| 配置模型时要的 admin 密钥找不到了 | admin key 同样只打印一次；运行 `services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin` 重设（Docker 部署把命令前缀换成 `docker compose -f docker-compose.user.yml exec memory-platform modelgw`） |
 | 模型名不知道填什么 | 固定 `memory-auto`；以后换渠道换模型只改服务端，客户端不动 |
 | 聊了但什么都没记住 | 记忆只在**完整**最终回答后写入；中途断开、被截断、内容被过滤都不会写 |
 | 担心渠道 key 被发给客户端 | 不会。供应商 key 只存在服务端仓库外的密钥文件，客户端永远只拿 `GATEWAY_API_KEY` |

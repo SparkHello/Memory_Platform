@@ -67,9 +67,19 @@ Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜�
 
 ## 🚀 快速开始
 
-### 最省事：使用 Docker
+### 最省事：一键脚本（Docker）
 
-需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要先 clone 仓库。
+只需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要 clone 仓库。在 macOS / Linux 终端里运行一行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+```
+
+脚本会自动完成全部步骤：检查 Docker → 下载 Compose 配置 → 自动避开已被占用的端口 → 启动服务并等待就绪 → 打印 `GATEWAY_API_KEY` 和 admin key。首次启动需要 1–2 分钟完成内部安装，请耐心等待；脚本结束后把两枚密钥保存好。以后重复运行该脚本即升级到最新镜像，数据保留在 `memory-platform-data` 卷中，不会丢失。
+
+**Windows 用户**：安装 Docker Desktop 后，在 PowerShell 中使用下面的手工方式（效果相同）。
+
+### 手工方式（Windows，或想自己控制每一步）
 
 ```bash
 curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
@@ -78,13 +88,13 @@ docker compose -f docker-compose.user.yml up -d
 
 Compose 会匿名拉取公开的 amd64/arm64 镜像 `ghcr.io/sparkhello/memory-platform:latest`；也可以先在 [GHCR 包页面](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform)核对版本与摘要。
 
-首次启动会在容器日志里各打印一次 `GATEWAY_API_KEY` 和 Model Gateway admin key：
+首次启动需要 1–2 分钟完成内部安装，期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后容器日志会各打印一次 `GATEWAY_API_KEY` 和 Model Gateway admin key：
 
 ```bash
 docker compose -f docker-compose.user.yml logs memory-platform
 ```
 
-请妥善保存它们：`GATEWAY_API_KEY` 用于登录 Web Console 和连接客户端；admin key 只用于在浏览器里修改模型渠道与路由。
+如果日志里还没出现 key，稍等片刻再跑一次。请妥善保存它们：`GATEWAY_API_KEY` 用于登录 Web Console 和连接客户端；admin key 只用于在浏览器里修改模型渠道与路由。端口 2026 被占用时，在 Compose 文件同目录的 `.env` 写一行 `MEMORY_PORT=3026` 后重启即可（详见[栈运维指南](docs/stack-operations.md#端口-2026-被占用)）。
 
 接下来：
 

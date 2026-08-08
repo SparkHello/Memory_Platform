@@ -67,9 +67,19 @@ This is not a performance ranking. Memory Platform currently targets personal ma
 
 ## 🚀 Quick start
 
-### Easiest path: Docker
+### Easiest path: one-line installer (Docker)
 
-You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone.
+You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone. Run one line in a macOS / Linux terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+```
+
+The script does everything: checks Docker → downloads the Compose file → picks a free port if 2026 is taken → starts the stack and waits until it is ready → prints `GATEWAY_API_KEY` and the Model Gateway admin key. First start takes 1–2 minutes of internal setup; save both keys when the script finishes. Re-running the script upgrades to the latest image; your data stays in the `memory-platform-data` volume.
+
+**Windows**: install Docker Desktop, then use the manual path below in PowerShell (same result).
+
+### Manual path (Windows, or to review each step)
 
 ```bash
 curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
@@ -78,13 +88,13 @@ docker compose -f docker-compose.user.yml up -d
 
 Compose anonymously pulls the public amd64/arm64 image `ghcr.io/sparkhello/memory-platform:latest`. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists its versions and digests.
 
-On first start, the container logs print `GATEWAY_API_KEY` and the Model Gateway admin key once each:
+First start takes 1–2 minutes of internal setup, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Once ready, the container logs print `GATEWAY_API_KEY` and the admin key once each:
 
 ```bash
 docker compose -f docker-compose.user.yml logs memory-platform
 ```
 
-Save both. `GATEWAY_API_KEY` connects the Web Console and clients; the admin key is used only to change model channels and routes in the browser.
+If no key has appeared yet, wait a moment and run the command again. Save both: `GATEWAY_API_KEY` connects the Web Console and clients; the admin key is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
 
 Then:
 

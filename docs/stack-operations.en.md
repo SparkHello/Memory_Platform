@@ -50,6 +50,16 @@ docker compose -f docker-compose.user.yml logs memory-platform
 docker compose -f docker-compose.user.yml logs -f memory-platform
 ```
 
+## Port 2026 already in use
+
+The `deploy/install.sh` one-line installer automatically picks a free port. For manual deployments, create a `.env` file next to `docker-compose.user.yml` with one line:
+
+```bash
+MEMORY_PORT=3026
+```
+
+Then restart with `docker compose -f docker-compose.user.yml up -d`. From then on, replace every `2026` in this repository's docs with `3026` (Web Console, Base URL, MCP address, and so on). The container-internal port stays 2026; only the host mapping changes.
+
 ## Keys and identity
 
 The stack has several keys with separate responsibilities. Do not reuse them:

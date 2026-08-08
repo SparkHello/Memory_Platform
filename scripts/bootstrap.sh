@@ -39,7 +39,11 @@ select_python() {
       return 0
     fi
   done
-  echo "No Python >=3.12 found. Install Python 3.12+ or set PYTHON_BIN to one." >&2
+  echo "No Python >=3.12 found. Install one, then re-run:" >&2
+  echo "  macOS:  brew install python@3.12" >&2
+  echo "  other:  https://www.python.org/downloads/" >&2
+  echo "Or point to an existing interpreter:" >&2
+  echo "  PYTHON_BIN=/path/to/python3.12 scripts/bootstrap.sh" >&2
   return 1
 }
 
@@ -62,8 +66,18 @@ fi
   -e "${MODEL_SERVICE}[dev]"
 
 if [ "$INSTALL_UI" -eq 1 ]; then
+  if ! command -v node >/dev/null 2>&1 \
+    || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' 2>/dev/null; then
+    echo "Node.js 22+ is required for the Web Console (found: $(node --version 2>/dev/null || echo none))." >&2
+    echo "Install it, then re-run:" >&2
+    echo "  macOS:  brew install node@22" >&2
+    echo "  other:  https://nodejs.org/" >&2
+    echo "Or build without the Web Console: scripts/bootstrap.sh --skip-ui" >&2
+    exit 1
+  fi
   if ! command -v npm >/dev/null 2>&1; then
-    echo "npm is required for the Web Console; rerun with --skip-ui to omit it." >&2
+    echo "npm is required for the Web Console; it ships with Node.js 22+ (https://nodejs.org/)." >&2
+    echo "Or rerun with --skip-ui to omit the Web Console." >&2
     exit 1
   fi
   (
