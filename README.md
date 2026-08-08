@@ -2,6 +2,11 @@
 
 中文 · [English](README.en.md)
 
+[![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
+[![Docker](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml)
+[![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 本地优先、可审计、可治理的 AI 长期记忆平台，兼容 MCP 与 OpenAI Chat Completions。
 
 Memory Platform 将原先独立的 `My_Memory` 和 `Model_Gateway` 合并到一个单仓库中，统一版本、测试、安装和迁移体验，同时继续保持两套服务在运行时的配置、密钥、数据和安全职责隔离。

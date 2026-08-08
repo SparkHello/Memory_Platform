@@ -4,6 +4,11 @@ A local-first, auditable, governable long-term memory platform for AI, compatibl
 
 *[中文文档](README.md)*
 
+[![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
+[![Docker](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml)
+[![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 Memory Platform combines what used to be two separate repositories — `My_Memory` and `Model_Gateway` — into a single monorepo with unified versioning, tests, installation, and migration, while keeping the two services' configuration, secrets, data, and security responsibilities isolated at runtime.
 
 It is not just "a vector store plus prompt stuffing": Memory Gateway owns long-term memory and knowledge governance, while Model Gateway owns provider channels, purpose-based routing, failover, attribution, and cost. They communicate over stable route names with independent local client keys.
