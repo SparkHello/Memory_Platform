@@ -1,19 +1,49 @@
-# Memory Platform
+<div align="center">
 
-中文 · [English](README.en.md)
+# 🧠 Memory Platform
+
+**本地优先、可审计、可治理的 AI 长期记忆平台**
+
+让你的 AI 真正记住你 —— 兼容 MCP 与 OpenAI Chat Completions
 
 [![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
 [![Docker](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml)
 [![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/SparkHello/Memory_Platform?style=flat)](https://github.com/SparkHello/Memory_Platform/stargazers)
 
-本地优先、可审计、可治理的 AI 长期记忆平台，兼容 MCP 与 OpenAI Chat Completions。
+**[中文](README.md)** · [English](README.en.md)
+
+[🚀 快速开始](#-快速开始) · [✨ 核心能力](#-核心能力) · [🧱 架构](#-架构与数据流) · [🔌 客户端接入](#-客户端接入) · [📖 深度评测](docs/reviews/JJC-20260805-002-memory-platform-deep-review.md)
+
+</div>
+
+<br>
+
+| 记忆工作室 | 记忆库 | 记忆档案 |
+| :---: | :---: | :---: |
+| [![记忆工作室](docs/images/console-studio.png)](docs/images/console-studio.png) | [![记忆库](docs/images/console-memories.png)](docs/images/console-memories.png) | [![记忆档案](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
 
 Memory Platform 将原先独立的 `My_Memory` 和 `Model_Gateway` 合并到一个单仓库中，统一版本、测试、安装和迁移体验，同时继续保持两套服务在运行时的配置、密钥、数据和安全职责隔离。
 
 它不是单纯的“向量库 + Prompt 拼接”：Memory Gateway 负责长期记忆与知识治理，Model Gateway 负责模型渠道、用途路由、故障切换、归因和费用。两者通过稳定 route 和独立本地 client key 通信。
 
-## 为什么拆成两个网关
+## 📖 目录
+
+- [🧩 为什么拆成两个网关](#-为什么拆成两个网关)
+- [✨ 核心能力](#-核心能力)
+- [🧱 架构与数据流](#-架构与数据流)
+- [🧭 选择接入方式](#-选择接入方式)
+- [🚀 快速开始](#-快速开始)
+- [🔌 客户端接入](#-客户端接入)
+- [🔐 配置与安全边界](#-配置与安全边界)
+- [💾 数据、备份与迁移](#-数据备份与迁移)
+- [📁 仓库结构](#-仓库结构)
+- [🔧 开发与验证](#-开发与验证)
+- [🎯 当前范围](#-当前范围)
+- [📄 开源许可证](#-开源许可证)
+
+## 🧩 为什么拆成两个网关
 
 一个模型可能由不同渠道提供、使用不同账号付费，也可能承担聊天、记忆提取、知识检索或 embedding 等不同用途。把这些供应商细节直接写进记忆服务，会让密钥、价格、故障切换和记忆逻辑互相耦合。
 
@@ -26,7 +56,7 @@ Memory Platform 因此保留两个明确边界：
 
 源码和测试统一提交到本仓库；运行配置、API Key、SQLite 数据、日志和评测快照仍保存在仓库外或被 Git 忽略。合并仓库不等于合并敏感数据边界。
 
-## 核心能力
+## ✨ 核心能力
 
 ### 长期记忆与治理
 
@@ -70,7 +100,7 @@ Memory Platform 因此保留两个明确边界：
 
 ### Web Console
 
-Memory Gateway 在 `/ui/` 提供 React Web Console，用于：
+Memory Gateway 在 `/ui/` 提供 React Web Console（截图见本页顶部），用于：
 
 - 查看、搜索、编辑和治理长期记忆；
 - 查看核心记忆、近期上下文、时间线、网络图与召回解释；
@@ -79,11 +109,7 @@ Memory Gateway 在 `/ui/` 提供 React Web Console，用于：
 - 查看模型连接状态、用途路由和用量概览；
 - 导出、备份和恢复数据。
 
-| 记忆工作室 | 记忆库 | 记忆档案 |
-| --- | --- | --- |
-| [![记忆工作室](docs/images/console-studio.png)](docs/images/console-studio.png) | [![记忆库](docs/images/console-memories.png)](docs/images/console-memories.png) | [![记忆档案](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
-
-## 架构与数据流
+## 🧱 架构与数据流
 
 ```mermaid
 flowchart TB
@@ -123,7 +149,7 @@ flowchart TB
 5. 响应以原始 JSON 或 SSE 字节透明转发给客户端。
 6. 只有收到完整最终文本、没有未完成工具调用且不是截断/内容过滤时，才进行幂等激活、分支保存和后台记忆提取。
 
-## 选择接入方式
+## 🧭 选择接入方式
 
 | 使用目标 | 推荐入口 | 记忆由谁触发 |
 | --- | --- | --- |
@@ -134,7 +160,7 @@ flowchart TB
 
 知识库始终需要显式 MCP、REST 或 Web 操作，不会因为使用聊天代理而自动进入上下文。
 
-## 快速开始
+## 🚀 快速开始
 
 ### 环境要求
 
@@ -243,7 +269,7 @@ scripts/memgw stack stop
 
 装好后接入客户端时常踩的坑（手机上 `localhost`、key 只打印一次、模型名固定 `memory-auto` 等）集中列在 [客户端接入指南的速查表](docs/client-setup.md#常见坑速查表)。
 
-## 客户端接入
+## 🔌 客户端接入
 
 已经在用 Chatbox、RikkaHub 等客户端、只需要知道「Base URL、API Key、模型名怎么填」的用户，直接看 [客户端接入指南](docs/client-setup.md)。下面是完整契约说明。
 
@@ -277,7 +303,7 @@ http://127.0.0.1:2026/mcp
 
 除健康检查外，MCP、REST、Web Console API 和 `/v1` 都使用 Memory Gateway 的 Bearer token。MCP 的具体工具及返回契约见 [MCP 工具说明](services/memory-gateway/README.md#mcp-工具)。
 
-## 配置与安全边界
+## 🔐 配置与安全边界
 
 ### 密钥和身份
 
@@ -310,7 +336,7 @@ http://127.0.0.1:2026/mcp
 
 完整安全说明见 [Memory Gateway 安全边界](services/memory-gateway/README.md#安全边界)和 [Model Gateway 核心边界](services/model-gateway/AGENTS.md#核心边界)。
 
-## 数据、备份与迁移
+## 💾 数据、备份与迁移
 
 ### 数据在哪里
 
@@ -365,7 +391,7 @@ scripts/memgw stack restore /safe/path/memory-stack.zip --yes --start
 - 旧目录可以暂时保留作只读回滚来源，不要让新旧两套服务同时占用相同端口或写同一数据库；
 - 确认新栈、Web Console、记忆数量和知识文档正常后，再自行决定是否归档旧目录。
 
-## 兼容 direct-provider 模式
+## 🔁 兼容 direct-provider 模式
 
 如果暂时不运行独立 Model Gateway，Memory Gateway 仍保留旧的 `UPSTREAM_*`、`LLM_*`、`memgw model`、`memgw route` 和 `memgw pricing` 兼容路径。
 
@@ -373,7 +399,7 @@ scripts/memgw stack restore /safe/path/memory-stack.zip --yes --start
 
 兼容模式的完整环境变量见 [Memory Gateway 配置项](services/memory-gateway/README.md#配置项)。
 
-## 仓库结构
+## 📁 仓库结构
 
 ```text
 Memory_Platform/
@@ -400,7 +426,7 @@ Memory_Platform/
 
 两个服务共享 Git 历史，但继续使用各自的运行配置、进程和数据库。不要在 `services/` 下再次执行 `git init`。
 
-## 开发与验证
+## 🔧 开发与验证
 
 安装开发环境：
 
@@ -439,7 +465,7 @@ npm run build
 
 测试必须使用 fake provider、`httpx.MockTransport` 和临时目录，不得调用真实供应商或修改真实 `memory.db`、`knowledge.db` 和用户配置目录。更详细的开发边界见根 [AGENTS.md](AGENTS.md) 及两个服务自己的 `AGENTS.md`。
 
-## 当前范围
+## 🎯 当前范围
 
 Memory Platform 当前适合：
 
@@ -458,7 +484,7 @@ Memory Platform 当前适合：
 
 架构、真实体验、横向对照和后续路线见 [Memory Platform 深度评测](docs/reviews/JJC-20260805-002-memory-platform-deep-review.md)。
 
-## 进一步阅读
+## 📚 进一步阅读
 
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
@@ -472,7 +498,7 @@ Memory Platform 当前适合：
 - [运行、后台服务与健康检查](services/model-gateway/docs/operations.md)
 - [Memory Platform 深度评测](docs/reviews/JJC-20260805-002-memory-platform-deep-review.md)
 
-## 开源许可证
+## 📄 开源许可证
 
 本项目采用 [Apache License 2.0](LICENSE)。该许可证包含显式的专利授权，同时要求保留版权声明并标注对文件的修改。
 

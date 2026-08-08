@@ -1,19 +1,49 @@
-# Memory Platform
+<div align="center">
 
-A local-first, auditable, governable long-term memory platform for AI, compatible with MCP and OpenAI Chat Completions.
+# 🧠 Memory Platform
 
-*[中文文档](README.md)*
+**A local-first, auditable, governable long-term memory platform for AI**
+
+Let your AI truly remember you — compatible with MCP and OpenAI Chat Completions
 
 [![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
 [![Docker](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/docker.yml)
 [![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/SparkHello/Memory_Platform?style=flat)](https://github.com/SparkHello/Memory_Platform/stargazers)
+
+[中文](README.md) · **[English](README.en.md)**
+
+[🚀 Quick start](#-quick-start) · [✨ Core capabilities](#-core-capabilities) · [🧱 Architecture](#-architecture-and-data-flow) · [🔌 Connecting clients](#-connecting-clients) · [📖 Deep review](docs/reviews/JJC-20260805-002-memory-platform-deep-review.md)
+
+</div>
+
+<br>
+
+| Studio | Memory library | Memory detail |
+| :---: | :---: | :---: |
+| [![Studio](docs/images/console-studio.png)](docs/images/console-studio.png) | [![Memory library](docs/images/console-memories.png)](docs/images/console-memories.png) | [![Memory detail](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
 
 Memory Platform combines what used to be two separate repositories — `My_Memory` and `Model_Gateway` — into a single monorepo with unified versioning, tests, installation, and migration, while keeping the two services' configuration, secrets, data, and security responsibilities isolated at runtime.
 
 It is not just "a vector store plus prompt stuffing": Memory Gateway owns long-term memory and knowledge governance, while Model Gateway owns provider channels, purpose-based routing, failover, attribution, and cost. They communicate over stable route names with independent local client keys.
 
-## Why two gateways
+## 📖 Contents
+
+- [🧩 Why two gateways](#-why-two-gateways)
+- [✨ Core capabilities](#-core-capabilities)
+- [🧱 Architecture and data flow](#-architecture-and-data-flow)
+- [🧭 Choosing an integration path](#-choosing-an-integration-path)
+- [🚀 Quick start](#-quick-start)
+- [🔌 Connecting clients](#-connecting-clients)
+- [🔐 Configuration and security boundaries](#-configuration-and-security-boundaries)
+- [💾 Data, backup, and migration](#-data-backup-and-migration)
+- [📁 Repository layout](#-repository-layout)
+- [🔧 Development and verification](#-development-and-verification)
+- [🎯 Current scope](#-current-scope)
+- [📄 License](#-license)
+
+## 🧩 Why two gateways
 
 One model may be served by different channels, billed to different accounts, and used for chat, memory extraction, knowledge retrieval, or embeddings. Writing those provider details directly into the memory service would couple secrets, pricing, failover, and memory logic together.
 
@@ -26,7 +56,7 @@ So Memory Platform keeps two explicit boundaries:
 
 Source and tests live in this repository. Runtime configuration, API keys, SQLite data, logs, and evaluation snapshots stay outside the repository or are git-ignored. Merging the repositories did not merge the sensitive-data boundaries.
 
-## Core capabilities
+## ✨ Core capabilities
 
 ### Long-term memory and governance
 
@@ -70,7 +100,7 @@ Source and tests live in this repository. Runtime configuration, API keys, SQLit
 
 ### Web Console
 
-Memory Gateway serves a React Web Console at `/ui/` for:
+Memory Gateway serves a React Web Console at `/ui/` (screenshots at the top of this page) for:
 
 - viewing, searching, editing, and governing long-term memory;
 - inspecting core memory, recent context, timeline, network graph, and recall explanations;
@@ -79,11 +109,7 @@ Memory Gateway serves a React Web Console at `/ui/` for:
 - viewing model connection status, purpose routes, and a usage overview;
 - exporting, backing up, and restoring data.
 
-| Studio | Memory library | Memory detail |
-| --- | --- | --- |
-| [![Studio](docs/images/console-studio.png)](docs/images/console-studio.png) | [![Memory library](docs/images/console-memories.png)](docs/images/console-memories.png) | [![Memory detail](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
-
-## Architecture and data flow
+## 🧱 Architecture and data flow
 
 ```mermaid
 flowchart TB
@@ -123,7 +149,7 @@ A `/v1/chat/completions` request roughly goes through:
 5. Forwards the response to the client as raw JSON or SSE bytes.
 6. Only after a complete final text — with no unfinished tool calls, and not truncated or content-filtered — does it perform idempotent activation, branch persistence, and background memory extraction.
 
-## Choosing an integration path
+## 🧭 Choosing an integration path
 
 | Goal | Entry point | Who triggers memory |
 | --- | --- | --- |
@@ -134,7 +160,7 @@ A `/v1/chat/completions` request roughly goes through:
 
 The knowledge base always requires an explicit MCP, REST, or Web action. It never enters context just because the chat proxy is in use.
 
-## Quick start
+## 🚀 Quick start
 
 ### Requirements
 
@@ -218,7 +244,7 @@ scripts/memgw stack restart
 scripts/memgw stack stop
 ```
 
-## Connecting clients
+## 🔌 Connecting clients
 
 ### OpenAI Chat Completions
 
@@ -252,7 +278,7 @@ http://127.0.0.1:2026/mcp
 
 Apart from the health endpoint, MCP, REST, Web Console APIs, and `/v1` all use Memory Gateway's bearer token.
 
-## Configuration and security boundaries
+## 🔐 Configuration and security boundaries
 
 ### Keys and identity
 
@@ -283,7 +309,7 @@ The current default target is a personal machine or a trusted home network:
 - Model Gateway's admin interface listens on loopback only by default, and cross-host exposure must sit behind HTTPS;
 - for strong isolation, use separate credentials and instances per user rather than a shared key with a mutable `X-User-Id`.
 
-## Data, backup, and migration
+## 💾 Data, backup, and migration
 
 ### Where the data lives
 
@@ -312,13 +338,13 @@ scripts/memgw stack restore /path/to/memory-stack.zip --yes --start
 
 Restore verifies manifest hashes, SQLite, and JSON, stops both services, and creates rollback copies outside the repository for any local file it replaces. Afterwards you must re-enter the keys that were excluded from the backup.
 
-## direct-provider compatibility mode
+## 🔁 direct-provider compatibility mode
 
 If you are not running a separate Model Gateway yet, Memory Gateway still supports the older `UPSTREAM_*`, `LLM_*`, `memgw model`, `memgw route`, and `memgw pricing` paths.
 
 New deployments should use Model Gateway. As long as `MODEL_GATEWAY_BASE_URL` and `MODEL_GATEWAY_API_KEY` are configured as a pair, chat, background memory tasks, the knowledge agent, and embeddings only call stable routes, and will not silently fall back to old `.env` provider keys when central routing fails.
 
-## Repository layout
+## 📁 Repository layout
 
 ```text
 Memory_Platform/
@@ -347,7 +373,7 @@ Memory_Platform/
 
 The two services share git history but keep separate runtime configuration, processes, and databases. Do not run `git init` again under `services/`.
 
-## Development and verification
+## 🔧 Development and verification
 
 Install the development environment:
 
@@ -382,7 +408,7 @@ npm run build
 
 Tests must use fake providers, `httpx.MockTransport`, and temporary directories. They must never call real vendors or modify a real `memory.db`, `knowledge.db`, or user config directory. See the root [AGENTS.md](AGENTS.md) and each service's own `AGENTS.md`.
 
-## Current scope
+## 🎯 Current scope
 
 Memory Platform currently suits:
 
@@ -399,7 +425,7 @@ It does not currently target:
 - full entity disambiguation, bitemporal modeling, or deep multi-hop reasoning graphs;
 - a complete proxy for OpenAI Responses, audio, files, or image generation.
 
-## Further reading
+## 📚 Further reading
 
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
@@ -413,6 +439,6 @@ It does not currently target:
 - [Model Gateway client protocol](services/model-gateway/docs/client-protocol.md)
 - [Operations, background services, and health checks](services/model-gateway/docs/operations.md)
 
-## License
+## 📄 License
 
 Licensed under the [Apache License 2.0](LICENSE).
