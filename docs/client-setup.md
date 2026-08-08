@@ -109,3 +109,4 @@ http://127.0.0.1:2026/mcp
 | 私密内容会不会发给提取/embedding 模型 | 默认不会（`ALLOW_SENSITIVE_EGRESS=false`），本地识别为敏感的内容不出站 |
 | 导入的文档没出现在聊天里 | 知识库设计为不自动进入聊天上下文；用 MCP 工具、REST 或 Web Console 显式检索 |
 | 想删除某条记忆 | 客户端没有这个工具；打开 `http://127.0.0.1:2026/ui/` 在 Web Console 里操作 |
+| 关闭终端后还能用吗 | 能，服务以后台进程运行；但**重启电脑后**源码安装要在仓库目录重新运行 `scripts/memgw stack start`，Docker 用户启动 Docker Desktop 即可（设置里勾选「登录时启动」可免手动） |

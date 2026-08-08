@@ -25,6 +25,7 @@
 - Web Console「模型与路由」页的 admin key 引导改为优先指向安装时打印的密钥。
 - `scripts/bootstrap.sh` 的 Python/Node 缺失报错给出具体安装命令，并在构建 Web Console 前校验 Node.js ≥ 22。
 - README 与运维、接入文档补充首启等待预期、Windows 安装路径、admin key 找回和端口冲突处理。
+- Web Console「模型与路由」页横幅把 Model Gateway 地址明确标注为内部接线（不用填进客户端），并新增当前来源的客户端接入地址；「连接设置」页新增服务进程管理说明（启停命令、后台运行与开机自启）。
 
 ### Security
 

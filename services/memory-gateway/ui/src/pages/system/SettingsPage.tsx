@@ -142,6 +142,33 @@ export function SettingsPage({
 
       <section className="panel panel--quiet settings-reference">
         <div className="panel-header">
+          <h2>服务进程管理</h2>
+        </div>
+        <div className="notice">
+          服务必须在运行中才能使用；它以后台进程运行，关闭终端窗口不影响，重启电脑后需要按下面方式恢复。
+        </div>
+        <div className="config-grid">
+          <div className="config-item">
+            <code>scripts/memgw stack status</code>
+            <span>源码安装：在仓库目录查看两个服务的状态；start / stop / restart 控制启停</span>
+          </div>
+          <div className="config-item">
+            <code>docker compose -f docker-compose.user.yml ps</code>
+            <span>Docker 安装：在 compose 文件目录查看状态；start / stop / restart 控制启停</span>
+          </div>
+          <div className="config-item">
+            <code>重启电脑后</code>
+            <span>源码安装重新运行 scripts/memgw stack start；Docker 会随 Docker Desktop 自动启动</span>
+          </div>
+          <div className="config-item">
+            <code>开机自启</code>
+            <span>Docker 用户在 Docker Desktop 设置勾选「登录时启动」即可；源码安装暂不提供开机自启</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel panel--quiet settings-reference">
+        <div className="panel-header">
           <h2>项目配置说明</h2>
         </div>
         <div className="notice">
