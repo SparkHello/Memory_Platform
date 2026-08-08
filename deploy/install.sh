@@ -46,7 +46,10 @@ port_in_use() {
 PORT="${MEMORY_PORT:-2026}"
 if port_in_use "$PORT"; then
   if [ -n "${MEMORY_PORT:-}" ]; then
-    fail "端口 $PORT 已被占用。请换一个空闲端口重试，例如：MEMORY_PORT=3026 sh $0"
+    # 通过 curl | sh 运行时 $0 是 "sh"，不能用它拼重跑命令，否则用户复制到的是
+    # 一条跑不起来的 "sh sh"。这里给出可以直接粘贴的完整命令。
+    fail "端口 $PORT 已被占用。请换一个空闲端口重试，例如：
+  MEMORY_PORT=3026 sh -c \"\$(curl -fsSL $REPO_RAW/deploy/install.sh)\""
   fi
   CANDIDATE=$((PORT + 1))
   while port_in_use "$CANDIDATE"; do
@@ -69,6 +72,13 @@ if [ "$HOST" != "127.0.0.1" ]; then
   say "    已开启局域网访问（MEMORY_HOST=0.0.0.0），请只在可信家庭网络中使用。"
 fi
 export MEMORY_HOST="$HOST" MEMORY_PORT="$PORT"
+
+# 密钥只在首启日志里打印一次。必须在 up -d 之前判断数据卷是否已存在，才能区分
+# “这是重装、密钥沿用旧的” 和 “这是首装、但日志没解析出来”——两者的处置完全不同。
+PREEXISTING=0
+if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -q 'memory-platform-data$'; then
+  PREEXISTING=1
+fi
 
 say "==> 拉取镜像并启动（镜像约数百 MB，首次拉取需要几分钟）"
 docker compose -f "$COMPOSE_NAME" pull
@@ -114,9 +124,19 @@ if [ -n "$ADMIN_KEY" ]; then
   say "  admin key（浏览器里解锁模型渠道配置用，权限更高）："
   say "    $ADMIN_KEY"
 fi
-if [ -z "$GATEWAY_KEY" ]; then
-  say "  检测到已有安装：访问密钥沿用首次启动时生成的那一对，"
-  say "  可运行 cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform 查看首次启动日志。"
+if [ -z "$GATEWAY_KEY" ] || [ -z "$ADMIN_KEY" ]; then
+  if [ "$PREEXISTING" -eq 1 ]; then
+    say "  检测到已有安装：访问密钥沿用首次启动时生成的那一对，本次不会重新打印。"
+    say "  日志还在的话可以查看：cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
+    say "  已经找不回了就重新生成一对（旧 key 立即失效，所有客户端要同步更新）："
+    say "    cd $INSTALL_DIR"
+    say "    docker compose -f $COMPOSE_NAME exec memory-platform memgw secret set gateway"
+    say "    docker compose -f $COMPOSE_NAME exec memory-platform modelgw secret set memory-console-admin"
+  else
+    say "  这是首次安装，但没能从日志里解析出密钥（日志可能还没写完或格式有变）。"
+    say "  请手动查看，日志里会各打印一次 GATEWAY_API_KEY 和 admin key："
+    say "    cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
+  fi
 fi
 say "============================================"
 say ""

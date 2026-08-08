@@ -27,6 +27,12 @@
 - README 与运维、接入文档补充首启等待预期、Windows 安装路径、admin key 找回和端口冲突处理。
 - Web Console「模型与路由」页横幅把 Model Gateway 地址明确标注为内部接线（不用填进客户端），并新增当前来源的客户端接入地址；「连接设置」页新增服务进程管理说明（启停命令、后台运行与开机自启）。
 
+### Fixed
+
+- `scripts/setup.sh` 结束时会打印完整接入信息块（Web Console、客户端 Base URL、模型名），此前只打印管理台地址和模型名，缺少客户端最需要的 `/v1` Base URL；同时端口改为读取 `project.json` 的实际值，不再硬编码 2026（`--json` 输出的 `client.*` 同步修正）。
+- `deploy/install.sh` 端口占用时给出的重试命令不再使用 `$0`。通过 `curl | sh` 运行时 `$0` 为 `sh`，原提示会让用户复制到无法执行的 `sh sh`。
+- `deploy/install.sh` 区分「重复安装」与「首装但日志解析失败」：改为在 `up -d` 之前检测数据卷是否已存在，首装解析失败时提示查看日志，重复安装时补充给出两枚密钥的重新生成命令。
+
 ### Security
 
 - quickstart recipe 拒绝未知字段和密钥字段。

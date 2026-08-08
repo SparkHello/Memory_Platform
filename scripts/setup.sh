@@ -201,24 +201,45 @@ CURRENT_STEP=doctor
 say "==> 检查完整运行栈"
 run_visible "$PLATFORM_ROOT/scripts/memgw" stack doctor
 
+# 端口可以在 stack install 时改（存放在 project.json），接入信息必须跟着它走，
+# 不能假定 2026，否则打印出来的 base URL 会指向一个没有服务的端口。
+MEMORY_PORT=$("$RUNTIME_PYTHON" -c '
+try:
+    from app.cli_config import cli_paths, read_json
+    print(int(read_json(cli_paths().project_file).get("port") or 2026))
+except Exception:
+    print(2026)
+' 2>/dev/null) || MEMORY_PORT=2026
+[ -n "$MEMORY_PORT" ] || MEMORY_PORT=2026
+
 if [ "$MODE" = config ] && [ "$JSON_OUTPUT" -eq 1 ]; then
   CURRENT_STEP=finalize
-  printf '%s\n' "$QUICKSTART_OUTPUT" | "$RUNTIME_PYTHON" -c '
-import json, sys
+  printf '%s\n' "$QUICKSTART_OUTPUT" | MEMORY_PORT="$MEMORY_PORT" "$RUNTIME_PYTHON" -c '
+import json, os, sys
 payload = json.load(sys.stdin)
+port = os.environ.get("MEMORY_PORT", "2026")
 payload["setup_verified"] = True
 payload["client"] = {
-    "base_url": "http://127.0.0.1:2026/v1",
+    "base_url": f"http://127.0.0.1:{port}/v1",
     "model": "memory-auto",
-    "web_console": "http://127.0.0.1:2026/ui/",
-    "mcp": "http://127.0.0.1:2026/mcp",
+    "web_console": f"http://127.0.0.1:{port}/ui/",
+    "mcp": f"http://127.0.0.1:{port}/mcp",
 }
 json.dump(payload, sys.stdout, ensure_ascii=False)
 sys.stdout.write("\n")
 '
 else
   say ""
-  say "Memory Platform 已配置并通过检查。"
-  say "Web Console：http://127.0.0.1:2026/ui/"
-  say "客户端模型：memory-auto"
+  say "============================================"
+  say "Memory Platform 已配置并通过检查"
+  say ""
+  say "  Web Console（管理台）  http://127.0.0.1:$MEMORY_PORT/ui/"
+  say "  客户端 Base URL        http://127.0.0.1:$MEMORY_PORT/v1"
+  say "  客户端模型名           memory-auto"
+  say "============================================"
+  say ""
+  say "127.0.0.1 指运行本服务的这台电脑。客户端里填以 /v1 结尾的 Base URL，"
+  say "不要填 /ui/ 结尾的管理台地址；手机等其他设备改用本机的局域网 IP。"
+  say "API Key 填安装时打印过一次的 GATEWAY_API_KEY；找不回可运行"
+  say "scripts/memgw secret set gateway 重新生成（旧 key 立即失效）。"
 fi
