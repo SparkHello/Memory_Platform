@@ -746,8 +746,16 @@ function RuntimeBanner({
         <span>{runtime.model_gateway_enabled ? "独立 Model Gateway" : "本项目兼容配置"}</span>
       </div>
       <div>
-        <strong>运行地址</strong>
-        <span>{runtime.model_gateway_base_url || "直连各供应商"}</span>
+        <strong>内部接线</strong>
+        <span>
+          {runtime.model_gateway_base_url
+            ? `${runtime.model_gateway_base_url}（仅服务间通信，不用填进客户端）`
+            : "直连各供应商"}
+        </span>
+      </div>
+      <div>
+        <strong>客户端接入</strong>
+        <span>{window.location.origin}/v1 · 模型 memory-auto</span>
       </div>
       <div>
         <strong>向量模型</strong>
