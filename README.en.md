@@ -2,10 +2,12 @@
 
 # 🧠 Memory Platform
 
-**Give your AI memory across conversations.**
+**Add an automatic, local memory gateway to the AI client you already use.**
 
-Memory stays on your own device, where you can inspect, edit, delete, and back it up.<br>
-Works with OpenAI Chat Completions and MCP without locking memory to one model or client.
+For ordinary chat, connect to the OpenAI-compatible `/v1` endpoint: Memory Platform recalls relevant memory, injects context, and extracts durable information after a complete answer.<br>
+**No MCP setup and no extra “remember this” prompt are required.** MCP remains available for explicit memory organization and knowledge retrieval.
+
+Memory stays on your own device, where you can inspect, edit, delete, and back it up. Providers, routes, and failover are managed server-side.
 
 [![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
 [![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
@@ -13,22 +15,23 @@ Works with OpenAI Chat Completions and MCP without locking memory to one model o
 
 [中文](README.md) · **[English](README.en.md)**
 
-[🚀 Get started](#-quick-start) · [🧭 Why Memory Platform](#-why-memory-platform) · [🔌 Connect a client](#-connecting-clients) · [📚 Docs](#-documentation)
+[🔀 How it works](#-two-gateway-layers-automatic-ordinary-chat) · [🧭 Why Memory Platform](#-why-memory-platform) · [🚀 Get started](#-quick-start) · [🔌 Connect a client](#-connecting-clients) · [📚 Docs](#-documentation)
 
 </div>
 
-![Memory Platform brand banner: local-first AI memory with a real view of the local Web Console](docs/images/memory-platform-hero.jpg)
+![Memory Platform automatic memory gateway banner with a real view of the local Web Console](docs/images/memory-platform-hero.jpg)
 
-<p align="center"><sub>Local-first · Auditable · Model-neutral · All product screens use demo data, never real user content</sub></p>
+<p align="center"><sub>Automatic memory gateway · Local-first · Auditable · Model-neutral · All product screens use demo data, never real user content</sub></p>
 
 ## ✨ The one-minute version
 
 | What you may want to know first | Short answer |
 | --- | --- |
-| **What does it do?** | It sits between a chat client and a model, recalls relevant memory when needed, and saves durable information after a complete answer. |
-| **Who is it for?** | People using Chatbox, RikkaHub, FLIT, another OpenAI-compatible client, or MCP who want durable preferences and project context. |
+| **What does it do?** | It is an automatic memory gateway between a chat client and a model: it recalls and injects relevant memory, then extracts durable information after a complete answer. |
+| **Who is it for?** | People using Chatbox, RikkaHub, FLIT, or another OpenAI-compatible client who want durable preferences and project context. |
 | **Where is the data?** | Memory, knowledge documents, and runtime configuration remain local; Docker stores them in the `memory-platform-data` volume. |
-| **Must I change clients?** | No. Keep using the OpenAI-compatible `/v1` endpoint, or add `/mcp` for explicit memory and knowledge tools. |
+| **Must I change clients?** | No. Point your current client's Base URL at Memory Platform's OpenAI-compatible `/v1` endpoint. |
+| **Do I need MCP or a memory prompt?** | Not for ordinary chat. The gateway handles recall and saving automatically; `/mcp` is only for explicit memory organization and knowledge retrieval. |
 | **Does it lock me to a model?** | No. Clients use `memory-auto`; provider and model changes stay on the server. |
 | **What is the fastest path?** | Start Docker → configure a model in the browser → enter a Base URL, API key, and model name in your client. |
 
@@ -37,9 +40,16 @@ Memory Platform is not a new chat client and does not include a model. Embedding
 > [!IMPORTANT]
 > **Local-first does not mean no network traffic.** Memory, knowledge documents, and configuration stay on your device by default. If you choose a cloud model provider, the current message you send and the context permitted for that turn are sent to that provider for inference. The default deployment targets a personal machine or trusted home network; do not expose it unauthenticated to the public internet.
 
+## 🔀 Two gateway layers, automatic ordinary chat
+
+![Two-gateway flow: an existing client connects through the OpenAI-compatible Memory Gateway for automatic recall and saving, then Model Gateway handles model routing and failover; MCP is optional](docs/images/gateway-flow.en.svg)
+
+Clients connect only to Memory Gateway. For ordinary `/v1` requests, the gateway automatically recalls memory, injects context, and extracts durable information after the answer; it does not depend on the model remembering to call a tool. Model Gateway selects providers, models, and fallback order by stable purpose. Add `/mcp` only when the model should explicitly search or organize memory or retrieve knowledge.
+
 ## 🧭 Why Memory Platform
 
-- **Keep your current chat entry point:** OpenAI-compatible requests get automatic recall and saving, while MCP lets a model search and organize explicitly.
+- **Gateway-managed memory instead of waiting for tool calls:** ordinary OpenAI-compatible chat gets automatic recall, injection, and saving; neither MCP nor an extra memory prompt is a prerequisite.
+- **Keep your current chat entry point:** change only the Base URL, API key, and model name, then continue using the client you already know.
 - **Governance before “remember more”:** every memory keeps its source and status, explains why it was recalled, and can be edited, archived, restored, or permanently deleted.
 - **Memory and knowledge stay physically separate:** personal facts and preferences live in `memory.db`; imported long-form documents live in `knowledge.db` and never enter memory decay or automatic chat context.
 - **Model choices stay server-side:** Model Gateway selects providers, models, and fallback order by stable purpose, so clients and memory data do not migrate with a vendor change.
@@ -51,7 +61,7 @@ These projects solve different layers of the problem. Start with the one closest
 | Add a general-purpose memory SDK, server API, or managed platform to an application | [Mem0](https://github.com/mem0ai/mem0) |
 | Build a temporal context graph centered on entities, fact validity, and historical queries | [Zep / Graphiti](https://github.com/getzep/graphiti) |
 | Build a stateful agent runtime in which the agent manages its own memory, state, and tools | [Letta](https://github.com/letta-ai/letta) |
-| Keep an existing OpenAI-compatible client while adding local deployment, auditable governance, isolated knowledge, and unified model routing | **Memory Platform** |
+| Keep an existing OpenAI-compatible client while adding gateway-managed automatic memory, local deployment, auditable governance, isolated knowledge, and unified model routing | **Memory Platform** |
 
 This is not a performance ranking. Memory Platform currently targets personal machines and trusted home networks; it does not try to replace a managed memory platform, a full temporal knowledge graph, or an agent runtime.
 
@@ -111,9 +121,11 @@ Model:    memory-auto
 
 After one complete message, open `http://127.0.0.1:2026/ui/` to check whether a memory was created. When you later change providers or models, only the server configuration changes; the client keeps using `memory-auto`.
 
+Ordinary chat does not require MCP or a system prompt telling the model when to save memory. In the default `read-write` mode, Memory Gateway handles relevant-memory recall, context injection, and post-answer extraction automatically.
+
 On a phone, `localhost` and `127.0.0.1` point to the phone itself. LAN or Tailscale devices must use the address of the computer running Memory Platform. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
 
-### MCP: let the model use memory and knowledge explicitly
+### Optional MCP: let the model use memory and knowledge explicitly
 
 Clients that support Streamable HTTP MCP can connect to:
 
@@ -121,7 +133,7 @@ Clients that support Streamable HTTP MCP can connect to:
 http://127.0.0.1:2026/mcp
 ```
 
-Authenticate with the same `GATEWAY_API_KEY`. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported. For ordinary chat, the OpenAI-compatible endpoint above is enough.
+Authenticate with the same `GATEWAY_API_KEY`. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported. It is an enhancement, not a prerequisite for automatic memory. For ordinary chat, the OpenAI-compatible endpoint above is enough.
 
 | What you want to do | Entry point | Who decides when to use memory |
 | --- | --- | --- |
@@ -146,6 +158,8 @@ The knowledge base never enters chat context automatically. It requires an expli
 
 The system waits for a complete answer, checks the original wording, subject, negation, and sensitivity, and only then decides whether to save. Truncated, filtered, or unfinished tool-call responses do not create memory.
 
+You do not need to append “remember this” to each message. The system conservatively extracts durable information only from content the user actually expressed.
+
 ### Search and govern the whole memory library
 
 ![Memory Platform memory library for searching, filtering, and governing long-term memory](docs/images/console-memories.png)
@@ -154,8 +168,8 @@ The system waits for a complete answer, checks the original wording, subject, ne
 
 ## 🧰 Core capabilities
 
+- **Automatic memory gateway with optional MCP:** ordinary `/v1` chat gets automatic recall, injection, and saving, with streaming, tool-call, multimodal-part, and reasoning-field compatibility plus `off` / `read` / `read-write` modes and conversation branches.
 - **Long-term memory and governance:** verifiable source text, lifecycles, timelines, topic links, recall explanations, edit, merge, soft delete, restore, permanent deletion, and export.
-- **Automatic memory proxy and MCP:** streaming, tool calls, multimodal message parts, reasoning-field compatibility, `off` / `read` / `read-write` modes, and conversation branches.
 - **Isolated knowledge base:** text, Markdown, PDF, DOCX, and EPUB with full-text/vector hybrid retrieval, immutable document versions, and exact passage citations.
 - **Models, failover, and usage:** purpose-based model selection and fallback, with channel, model, token, latency, and price snapshots but no prompts, replies, tool arguments, or knowledge content in usage logs.
 - **Safe fallback:** embedding space or dimension mismatches fall back to keyword retrieval; sensitive content is excluded from remote extraction, embeddings, AI review, and the knowledge agent by default.
