@@ -18,6 +18,10 @@ __pycache__/
 **/.codex/
 .pwshot/
 **/.pwshot/
+.playwright-mcp/
+**/.playwright-mcp/
+.kun-design/
+**/.kun-design/
 data/*.db
 **/data/*.db
 **/data/*.db-*
@@ -30,3 +34,6 @@ ui/node_modules/
 ui/dist/
 **/ui/dist/
 memory-stack*.zip
+# Ad-hoc console screenshots captured at the repo root. Scoped to the root so
+# real image assets under ui/ or docs/ stay committable.
+/*.png

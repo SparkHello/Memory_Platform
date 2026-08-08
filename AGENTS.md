@@ -9,6 +9,7 @@
 - `scripts/bootstrap.sh`：创建统一开发环境并安装两个服务。
 - `scripts/memgw`：根目录统一运行栈入口。
 - `scripts/test.sh`：两个后端测试集和前端构建。
+- `Dockerfile` 与 `deploy/`：单容器一体化镜像、首启接线入口脚本和 compose 文件；`.github/workflows/docker.yml` 在 tag 时推送 GHCR。
 
 ## 开发边界
 
@@ -27,6 +28,15 @@ scripts/bootstrap.sh
 scripts/test.sh
 scripts/memgw stack status
 ```
+
+## 帮用户配置
+
+- 用户要求 AI/Agent 完成首次安装或模型配置时，优先读取 `docs/ai-install.md`，使用根 `scripts/setup.sh --config <json> --json` 完成整套流程，不要让用户分别操作两个服务。
+- `stack install`（含 `scripts/setup.sh` 与容器首启）会自动生成并各打印一次 `GATEWAY_API_KEY` 和 Model Gateway admin key（`memory-console-admin`）；admin key 只在生成时显示，丢失后用 `modelgw secret set memory-console-admin` 重设。
+- AI 生成的配置必须符合 `docs/ai-quickstart.schema.json`，且不得包含 API Key、backend key、admin key 或其他 secret；供应商 API Key 只允许通过标准输入传给安装命令。
+- 渠道 `base_url`、精确模型 ID、能力和 embedding 维度必须来自用户指定渠道的官方资料；不确定时先让用户确认，不猜测。
+- 需要确认当前 key 可用模型时，优先用 `modelgw discover --preset <id> --non-interactive --json` 或显式 `--base-url`；它只允许读取 `/models`，不得自动发起 `--live` 推理。
+- 只需要准备环境、不配置模型时显式使用 `scripts/setup.sh --install-only`。已有高级配置继续使用 `modelgw` 的独立子命令，不要用 quickstart 覆盖用户精细路由。
 
 定向测试：
 

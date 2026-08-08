@@ -197,7 +197,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/api/deps.py`：REST 鉴权、`X-User-Id`、MemoryStore、LLM client 和 embedding client 依赖。
 - `app/api/chat_gateway.py`：`/v1/models` 与 `/v1/chat/completions`；组装安全上下文、FLIT 工具轮次召回/推理状态缓存、SSE 透明转发、最终回答幂等激活/提取。
 - `app/api/usage.py`：`/usage/summary`；按 user id 返回时间范围汇总、模型/用途/日期拆分、最近事件和当前价格目录。
-- `app/api/providers.py`：`/providers/status` 与受控配置代理。只读状态使用 My_Memory 的 Model Gateway backend key；路由校验/应用、渠道密钥单向写入和 discovery 检查必须额外提供 Model Gateway admin client key。代理目标固定为配置中的 Model Gateway，不能接收任意 URL。
+- `app/api/providers.py`：`/providers/status` 与受控配置代理。只读状态使用 My_Memory 的 Model Gateway backend key；新建 connection/deployment、路由校验/应用、渠道密钥单向写入和 discovery 检查必须额外提供 Model Gateway admin client key。代理目标固定为配置中的 Model Gateway，不能接收任意 URL。
 - `app/api/memories.py`：记忆管理 REST API，包括列表、搜索、删除、恢复、导出、报告、合并、核心记忆、对话分支查看/清理和决策日志。
 - `app/openai_compat/schemas.py`：内部与外部 OpenAI-compatible schema；外部消息允许多模态 content 和额外字段。
 - `app/openai_compat/gateway_client.py`：透明聊天上游；中央模式保留请求/SSE 并执行 deployment reasoning affinity，兼容模式继续处理 `memory-auto` provider 路由。
@@ -231,7 +231,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `scripts/eval_recall.py`：微型召回评测。`--init` 按 user id 建立物理隔离快照，`--run` 以 `record_usage=False` 输出排序、无答案误召、拒答和实际 fallback 指标。真实库全程只读，`eval/` 已被 gitignore。
 - `docs/client_integration.md`：Kelivo/iOS 接入说明。维护 MCP 原文提交原则、temporal key 填写边界，以及对外把 `usage_count` 解释为 `activation_count` 的文案。
 - `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`；“对话上下文”页同时展示 `/v1` 自动分支树和按 conversation ID 保存的近期摘要；“用量与费用”页展示实际模型、Token、可计费金额、完整度和价格来源。
-- `ui/src/pages/system/ProvidersPage.tsx`：Model Gateway 配置页。普通访问密钥只读；admin key 只保存在 React 内存中，刷新即清除。渠道密钥字段只允许替换、不回填、不删除；路由必须先校验当前 revision，再原子应用。
+- `ui/src/pages/system/ProvidersPage.tsx`：Model Gateway 配置页。普通访问密钥只读；admin key 只保存在 React 内存中，刷新即清除。渠道密钥字段只允许替换、不回填、不删除；路由必须先校验当前 revision，再原子应用。`NewChannelWizard.tsx` 提供从零新建渠道的分步向导（选预设/自定义渠道 → 单向写入密钥 → discovery 检查拉取模型列表 → 选模型与能力 → 创建 deployment 并把 memory.* / knowledge.* 路由指向它），每阶段都先 dry_run 校验再应用。
 - `tests/`：pytest 测试，覆盖 REST、MCP、存储、搜索、核心记忆、编码和配置。
 - `scripts/`：Python 辅助工具、macOS/Linux 一键启动脚本 `dev.sh`，以及仅适用于 Windows 的 PowerShell 服务脚本。
 

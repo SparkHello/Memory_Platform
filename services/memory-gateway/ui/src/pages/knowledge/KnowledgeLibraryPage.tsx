@@ -17,7 +17,7 @@ import {
   Upload,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
 import { Badge } from "../../components/Badge";
 import { DataTable } from "../../components/DataTable";
@@ -136,6 +136,12 @@ function KnowledgeListPage({
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  // 输入防抖：停顿 300ms 后才真正发搜索请求；Enter 立即触发。
+  useEffect(() => {
+    const handle = setTimeout(() => setSubmittedQuery(query.trim()), 300);
+    return () => clearTimeout(handle);
+  }, [query]);
 
   const runSearch = () => setSubmittedQuery(query.trim());
 
@@ -387,6 +393,7 @@ function KnowledgeDetailPage({
   const [readPages, setReadPages] = useState<KnowledgeReadResponse[]>([]);
   const [readError, setReadError] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [showNewVersion, setShowNewVersion] = useState(false);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -555,6 +562,35 @@ function KnowledgeDetailPage({
     }
   };
 
+  // 服务端单页上限 2 万字符，整版正文需循环翻页拼齐后下载；页数兜底防死循环。
+  const downloadVersionText = async () => {
+    if (!detail || !selectedVersionRef) return;
+    const version = detail.versions.find((entry) => knowledgeVersionRef(entry) === selectedVersionRef);
+    setDownloading(true);
+    try {
+      const chunks: string[] = [];
+      let cursor = "";
+      for (let page = 0; page < 500; page += 1) {
+        const result = await api.readKnowledge({ reference: selectedVersionRef, cursor, maxChars: 20000, includeSensitive: true });
+        chunks.push(readPageText(result));
+        if (result.complete || !result.next_cursor || result.next_cursor === cursor) break;
+        cursor = result.next_cursor;
+      }
+      const safeTitle = (detail.document.title || "knowledge").replace(/[\\/:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "") || "knowledge";
+      downloadFile(
+        `${safeTitle}${version ? `-v${version.version_number}` : ""}.md`,
+        chunks.join(""),
+        "text/markdown;charset=utf-8"
+      );
+      notify("正文已下载", "success");
+    } catch (downloadError) {
+      if (isAbortError(downloadError)) return;
+      notify(errorMessage(downloadError), "error");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   if (loading) return <div className="page-stack"><LoadingBlock label="正在加载知识文档" /></div>;
   if (error || !detail) return <div className="page-stack"><button className="ghost-button knowledge-back-button" type="button" onClick={onBack}><ArrowLeft size={16} />返回知识库</button><ErrorBlock message={error || "文档不存在"} onRetry={() => void load()} /></div>;
 
@@ -572,8 +608,8 @@ function KnowledgeDetailPage({
         <span>{document.title}</span>
       </div>
       <PageHeader
-        title={document.title}
-        subtitle="完整路由页面 · 正文按不可变版本读取，Markdown 以纯文本显示。"
+        title="文档详情"
+        subtitle="正文按不可变版本读取，Markdown 以纯文本显示。"
         action={
           <div className="button-row">
             {document.status === "deleted" ? (
@@ -656,7 +692,14 @@ function KnowledgeDetailPage({
               <h2>{selectedVersion ? `正文 · v${selectedVersion.version_number}` : "正文"}</h2>
               <span className="muted">{selectedVersion && knowledgeVersionSha(selectedVersion) ? `SHA-256 ${knowledgeVersionSha(selectedVersion).slice(0, 12)}…` : document.source_name || "本地知识文档"}</span>
             </div>
-            {selectedVersionRef && <button className="secondary-button compact" type="button" onClick={() => void copyText(selectedVersionRef).then(() => notify("版本引用已复制", "success"))}><Clipboard size={14} />复制引用</button>}
+            <div className="button-row">
+              {selectedVersionRef && <button className="secondary-button compact" type="button" onClick={() => void copyText(selectedVersionRef).then(() => notify("版本引用已复制", "success"))}><Clipboard size={14} />复制引用</button>}
+              {selectedVersionRef && document.status !== "deleted" && (
+                <button className="secondary-button compact" type="button" disabled={downloading} onClick={() => void downloadVersionText()}>
+                  <Download size={14} />{downloading ? "正在下载" : "下载此版本正文"}
+                </button>
+              )}
+            </div>
           </div>
           {document.status === "deleted" && <EmptyBlock label="正文暂不可读" hint="该文档位于回收站；恢复后才能通过 Web 或 MCP 读取正文。" />}
           {document.status !== "deleted" && reading && readPages.length === 0 && <LoadingBlock label="正在读取正文" />}

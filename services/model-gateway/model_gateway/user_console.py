@@ -713,6 +713,7 @@ def _run_memgw(
     arguments: list[str],
     *,
     input_text: str | None = None,
+    quiet: bool = False,
 ) -> int:
     result = subprocess.run(
         [str(command), *arguments],
@@ -721,9 +722,9 @@ def _run_memgw(
         capture_output=True,
         check=False,
     )
-    if result.stdout.strip():
+    if not quiet and result.stdout.strip():
         print(result.stdout.strip())
-    if result.stderr.strip():
+    if not quiet and result.stderr.strip():
         print(result.stderr.strip())
     return result.returncode
 

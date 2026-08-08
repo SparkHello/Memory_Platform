@@ -163,12 +163,20 @@ export function AppShell({
               className={`status-pill status-${serviceStatus.tone}`}
               type="button"
               onClick={onRefreshService}
-              title="重新检查服务和访问密钥"
+              title={
+                !serviceStatus.loading && serviceStatus.tone === "bad"
+                  ? `${serviceStatus.message} · 点击重新检查`
+                  : "重新检查服务和访问密钥"
+              }
               aria-live="polite"
             >
               <span className={`status-dot ${serviceStatus.tone}`} />
               <span className="status-text">
-                {serviceStatus.loading ? "检查中" : serviceStatus.message}
+                {serviceStatus.loading
+                  ? "检查中"
+                  : serviceStatus.tone === "bad"
+                    ? "服务异常"
+                    : serviceStatus.message}
               </span>
             </button>
             <button

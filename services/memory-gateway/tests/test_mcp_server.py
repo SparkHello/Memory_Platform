@@ -823,3 +823,21 @@ def test_rest_endpoints_still_work(client, auth_headers):
 
     response = client.get("/memories", headers=auth_headers)
     assert response.status_code == 200
+
+def test_mcp_gateway_key_rejects_unbound_user_by_default(
+    client, auth_headers, monkeypatch,
+):
+    monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "false")
+    monkeypatch.setenv("GATEWAY_USER_ID", "alice")
+    get_settings.cache_clear()
+    try:
+        response = client.post(
+            "/mcp",
+            headers={**auth_headers, **MCP_HEADERS, "X-User-Id": "bob"},
+            json=_rpc("tools/list"),
+        )
+        assert response.status_code == 403
+    finally:
+        monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "true")
+        monkeypatch.delenv("GATEWAY_USER_ID", raising=False)
+        get_settings.cache_clear()

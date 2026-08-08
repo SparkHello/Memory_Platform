@@ -1,0 +1,53 @@
+name: Bug report
+description: 报告可复现的问题；不要提交密钥或私人数据
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "请使用测试数据并隐藏所有 API Key、私人记忆、知识正文和本机地址。安全漏洞请按 SECURITY.md 私密报告。"
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Setup / CLI
+        - Memory Gateway
+        - Model Gateway
+        - Web Console
+        - MCP / OpenAI compatibility
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: 使用 fake provider、临时目录和脱敏输出。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS/Linux, Python, Node, client
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed API keys, private memory, knowledge content, databases and logs.
+          required: true

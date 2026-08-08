@@ -5,7 +5,6 @@ import {
   GitBranch,
   GitFork,
   History,
-  MessageSquareText,
   RefreshCcw,
   Search,
   Trash2

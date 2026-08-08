@@ -1,0 +1,17 @@
+# 开发/自构建用：从仓库根构建镜像。
+# 用法：docker compose -f deploy/docker-compose.yml up -d --build
+services:
+  memory-platform:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: memory-platform:local
+    ports:
+      # 默认只绑回环；局域网/Tailscale 访问改为 "0.0.0.0:2026:2026"
+      - "127.0.0.1:2026:2026"
+    volumes:
+      - memory-platform-data:/data
+    restart: unless-stopped
+
+volumes:
+  memory-platform-data:

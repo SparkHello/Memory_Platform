@@ -51,6 +51,26 @@ modelgw
 
 已有的完整子命令继续保留，供自动化、精细配置和排障使用。显式运行 `modelgw menu` 也会打开同一菜单。
 
+如果由 AI/Agent 帮忙，可让它生成一份不含密钥、符合仓库根 `docs/ai-quickstart.schema.json` 的 JSON 配置单，然后执行：
+
+```bash
+printf '%s\n' "$USER_PROVIDED_API_KEY" | \
+  modelgw quickstart --config /tmp/memory-platform-quickstart.json --json
+```
+
+配置单会严格拒绝未知字段，因而不能把 `api_key` 或 `secret` 混入文件；供应商 API Key 只从标准输入读取。旧的 `quickstart --non-interactive --channel ...` 参数方式继续支持。
+
+想先确认某个 key 当前能看到哪些模型，可只读发现，不保存渠道也不发送推理：
+
+```bash
+printf '%s\n' "$USER_PROVIDED_API_KEY" | \
+  modelgw discover --preset deepseek --non-interactive --json
+```
+
+可用预设为 `deepseek`、`kimi-cn`、`mimo` 和 `dashscope-cn`；自定义渠道改用 `--base-url https://...`。交互式 `modelgw quickstart` 会自动执行同类 `/models` 读取并显示模型编号，失败时才回退为手工输入精确模型 ID。
+
+quickstart 默认拒绝覆盖已有的 `memory.*` / `knowledge.*` 文字 route。交互模式会显示现有 route 并要求确认；自动化必须在 recipe 中显式设置 `replace_existing_routes=true`，或在参数模式中加 `--replace-existing-routes`。已有多渠道 fallback 时优先使用精细 `modelgw route`，不要用 quickstart 收缩配置。
+
 ## 安装与 PATH
 
 ```bash
@@ -212,12 +232,14 @@ memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<exact-embedding-space>'
 - `PUT /admin/connections/{id}/secret`：仅 admin，单向替换 connection 引用的渠道密钥，响应永不回显；
 - `POST /admin/connections/{id}/check`：仅 admin，只执行 discovery `/models` 检查，不发起推理。
 
-给 My_Memory Web 控制台创建单独的管理身份：
+统一运行栈安装（`memgw stack install`、`scripts/setup.sh`、容器首启）会自动创建 `memory-console-admin` 身份并生成、打印一次 admin key。需要手工重建或重设时：
 
 ```bash
 modelgw client add memory-console-admin \
   --kind admin \
   --set-secret
+# 已存在、只需更换密钥时：
+modelgw secret set memory-console-admin
 ```
 
 该 admin key 只在 Web 页面当前内存中使用，不应与 My_Memory backend client key、`GATEWAY_API_KEY` 或任何上游渠道 key 复用。Model Gateway 应绑定本机回环地址；如果必须跨主机开放管理接口，应放在 HTTPS 之后。My_Memory 会拒绝把 admin key 转发到非回环的明文 HTTP 地址。

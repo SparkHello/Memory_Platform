@@ -66,7 +66,7 @@ class LLMProvider:
 
     code: str
     base_url: str
-    api_key: str
+    api_key: str = field(repr=False)
     model: str
     quirks: ProviderQuirks = field(default_factory=ProviderQuirks)
 

@@ -69,6 +69,7 @@ export function RecallExplainPage({
     data: null
   });
   const [feedbackPending, setFeedbackPending] = useState<string | null>(null);
+  const [feedbackRecorded, setFeedbackRecorded] = useState<Record<string, SearchFeedbackValue>>({});
   const explainRequestRef = useRef<AbortController | null>(null);
 
   // 卸载时取消在途的 explain 请求；重复提交时取消上一次。
@@ -79,6 +80,7 @@ export function RecallExplainPage({
     const controller = new AbortController();
     explainRequestRef.current = controller;
     setState((current) => ({ ...current, loading: true, error: null }));
+    setFeedbackRecorded({});
     try {
       const data = await api.explainContext({
         query,
@@ -104,6 +106,7 @@ export function RecallExplainPage({
         feedback
       });
       notify(`召回反馈已记录：${feedbackLabel(feedback)}`, "success");
+      setFeedbackRecorded((current) => ({ ...current, [memory.id]: feedback }));
     } catch (error) {
       notify(errorMessage(error), "error");
     } finally {
@@ -172,7 +175,7 @@ export function RecallExplainPage({
               近期上下文
             </label>
           </div>
-          <button className="primary-button" type="submit" disabled={state.loading}>
+          <button className="primary-button" type="submit" disabled={state.loading || !query.trim()}>
             <Search size={16} />
             解释召回
           </button>
@@ -263,6 +266,7 @@ export function RecallExplainPage({
                     key={memory.id}
                     memory={memory}
                     feedbackPending={feedbackPending}
+                    feedbackRecorded={feedbackRecorded[memory.id]}
                     onFeedback={submitFeedback}
                     onOpen={openMemory}
                   />
@@ -341,11 +345,13 @@ function ContextBlock({
 function MemoryHitCard({
   memory,
   feedbackPending,
+  feedbackRecorded,
   onFeedback,
   onOpen
 }: {
   memory: MemorySearchRecord;
   feedbackPending: string | null;
+  feedbackRecorded: SearchFeedbackValue | undefined;
   onFeedback: (memory: MemorySearchRecord, feedback: SearchFeedbackValue) => void;
   onOpen: (id: string) => void;
 }) {
@@ -361,7 +367,7 @@ function MemoryHitCard({
         </div>
         <p>{memory.content}</p>
         <div className="recall-hit-meta">
-          <span>通道 {memory.channels.map(displayText).join(", ") || "-"}</span>
+          <span>通道 {memory.channels.map(displayText).join("、") || "-"}</span>
           <span>重要度 {memory.importance}</span>
           <span>最近使用 {dateText(memory.last_used_at)}</span>
         </div>
@@ -371,16 +377,18 @@ function MemoryHitCard({
         {FEEDBACK_OPTIONS.map((option) => {
           const Icon = option.icon;
           const pending = feedbackPending === `${memory.id}:${option.value}`;
+          const recorded = feedbackRecorded !== undefined;
+          const chosen = feedbackRecorded === option.value;
           return (
             <button
               className="ghost-button compact"
               type="button"
               key={option.value}
-              disabled={pending}
+              disabled={pending || recorded}
               onClick={() => onFeedback(memory, option.value)}
             >
               <Icon size={14} />
-              {pending ? "记录中" : option.label}
+              {pending ? "记录中" : chosen ? `${option.label} · 已记录` : option.label}
             </button>
           );
         })}

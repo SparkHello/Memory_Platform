@@ -1,82 +1,9 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Activity,
-  ArchiveRestore,
-  Clipboard,
-  Download,
-  Eye,
-  EyeOff,
-  FileText,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
-  Search,
-  ShieldAlert,
-  Trash2,
-  Upload,
-  Wrench,
-  X
-} from "lucide-react";
-import { MemoryApi } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
-import type {
-  ConnectionSettings,
-  CoreMemoryHistoryItem,
-  CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  MemoryAction,
-  MemoryExport,
-  MemoryRecord,
-  MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult
-} from "../../types";
-import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
+import { Clipboard } from "lucide-react";
+import type { ConnectionSettings } from "../../types";
+import { FieldList } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
-import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
-import type { ConfirmFn } from "../../hooks/useConfirm";
-import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
+import { copyText } from "../../utils/files";
+import { joinUrl } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
 export function DeveloperPage({
@@ -88,6 +15,7 @@ export function DeveloperPage({
 }) {
   const mcpUrl = joinUrl(settings.apiBaseUrl, "/mcp");
   const headers = `Authorization: Bearer ${settings.apiKey}\nX-User-Id: ${settings.userId}`;
+  // 常用端点的手写摘录，可能与后端漂移，以实际 /health 路由为准。
   const endpoints = [
     "GET /health",
     "GET /memories",
@@ -102,9 +30,9 @@ export function DeveloperPage({
     "GET /knowledge/export"
   ];
 
-  const copy = async (text: string) => {
+  const copy = async (text: string, message = "已复制") => {
     await copyText(text);
-    notify("已复制", "success");
+    notify(message, "success");
   };
 
   return (
@@ -113,7 +41,11 @@ export function DeveloperPage({
       <section className="panel access-card">
         <div className="panel-header">
           <h2>MCP</h2>
-          <button className="secondary-button" type="button" onClick={() => copy(`${mcpUrl}\n${headers}`)}>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => copy(`${mcpUrl}\n${headers}`, "已复制，包含你的 API Key，注意保存")}
+          >
             <Clipboard size={16} />
             复制
           </button>
@@ -129,6 +61,7 @@ export function DeveloperPage({
             复制端点
           </button>
         </div>
+        <p className="muted">端点为常用摘录，以实际 /health 路由为准。</p>
         <div className="endpoint-list">
           {endpoints.map((endpoint) => (
             <code key={endpoint}>{endpoint}</code>

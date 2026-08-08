@@ -5,14 +5,30 @@ import re
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.llm.routing import normalize_provider_priority
 
 
+def describe_settings_error(exc: Exception) -> str:
+    """Render a Settings validation error without embedding submitted values."""
+    if isinstance(exc, ValidationError):
+        parts = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", ())) or "Settings"
+            parts.append(f"{location}: {error.get('msg', '配置无效')}")
+        return "；".join(parts) or "配置无效"
+    return str(exc)
+
+
 class Settings(BaseSettings):
     gateway_api_key: str = Field(default="", validation_alias="GATEWAY_API_KEY")
+    gateway_user_id: str = Field(default="default", validation_alias="GATEWAY_USER_ID")
+    gateway_allow_user_id_header: bool = Field(
+        default=False,
+        validation_alias="GATEWAY_ALLOW_USER_ID_HEADER",
+    )
     chat_gateway_enabled: bool = Field(
         default=True,
         validation_alias="CHAT_GATEWAY_ENABLED",

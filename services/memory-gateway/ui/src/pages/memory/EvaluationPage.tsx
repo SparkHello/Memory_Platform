@@ -11,10 +11,12 @@ import {
   SearchX,
   Trash2
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { useConfirm, type ConfirmFn } from "../../hooks/useConfirm";
 import type {
   MechanismDiagnosisResult,
   MechanismVerdict,
@@ -85,6 +87,57 @@ function retrievalModeText(mode: string | undefined): string {
   return labels[mode || ""] || mode || "未知";
 }
 
+// 未保存修改保护：dirty 时拦截刷新/关闭和站内导航点击，确认后才放行。
+// 站内导航由 App 先改 state 再改 hash，hashchange 触发时本页已卸载，
+// 只能在捕获阶段拦截导航控件的点击，确认后重新触发原按钮完成跳转。
+function useUnsavedChangesGuard(dirty: boolean, message: string, confirm: ConfirmFn) {
+  const allowNextClickRef = useRef(false);
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const onClickCapture = (event: MouseEvent) => {
+      if (allowNextClickRef.current) {
+        allowNextClickRef.current = false;
+        return;
+      }
+      if (!dirtyRef.current) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const button = target?.closest<HTMLElement>(
+        ".sidebar .nav-item, .mobile-bottom-nav button:not(:last-child), .mobile-more-grid button, .avatar-chip"
+      );
+      if (!button || button.classList.contains("active") || button.getAttribute("aria-current") === "page") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void confirm({
+        title: "离开当前页面？",
+        message,
+        confirmLabel: "放弃修改并离开",
+        cancelLabel: "继续编辑",
+        tone: "warning"
+      }).then((confirmed) => {
+        if (confirmed) {
+          allowNextClickRef.current = true;
+          button.click();
+        }
+      });
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("click", onClickCapture, true);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("click", onClickCapture, true);
+    };
+  }, [dirty, message, confirm]);
+}
+
 export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify }) {
   const [state, setState] = useState<EvalState>(EMPTY_STATE);
   const [labels, setLabels] = useState<RecallEvalLabel[]>([]);
@@ -92,6 +145,9 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
   const [saving, setSaving] = useState(false);
   const [initializing, setInitializing] = useState(false);
   const [runningMode, setRunningMode] = useState<RunMode | null>(null);
+  // 最近一次载入/保存后的标注快照，用于判断当前标注是否有未保存修改。
+  const [savedSignature, setSavedSignature] = useState("[]");
+  const { confirm, confirmState, resolveConfirm } = useConfirm();
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setState((current) => ({ ...current, loading: true, error: null }));
@@ -109,7 +165,9 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
         })
       ]);
       setState({ loading: false, error: null, diagnosis, diagnosisError, workbench });
-      setLabels(workbench?.labels || []);
+      const nextLabels = workbench?.labels || [];
+      setLabels(nextLabels);
+      setSavedSignature(JSON.stringify(nextLabels));
       setSelectedLabelId((current) => current || workbench?.labels[0]?.id || null);
     } catch (error) {
       // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
@@ -142,6 +200,9 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     }
     return map;
   }, [state.workbench?.validation_issues]);
+
+  const labelsDirty = useMemo(() => JSON.stringify(labels) !== savedSignature, [labels, savedSignature]);
+  useUnsavedChangesGuard(labelsDirty, "当前标注有未保存的修改，离开后这些修改会丢失。确定要离开吗？", confirm);
 
   const gradedCount = labels.filter(isGraded).length;
   const relevantCount = labels.filter(
@@ -206,7 +267,14 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     setSelectedLabelId(id);
   };
 
-  const removeLabel = (id: string) => {
+  const removeLabel = async (id: string) => {
+    const confirmed = await confirm({
+      title: "删除标注",
+      message: `确认删除标注 ${id}？保存前可通过重新载入恢复，保存后将从评测快照中移除。`,
+      tone: "danger",
+      confirmLabel: "删除"
+    });
+    if (!confirmed) return;
     setLabels((current) => current.filter((label) => label.id !== id));
     setSelectedLabelId((current) => (current === id ? labels.find((label) => label.id !== id)?.id || null : current));
   };
@@ -245,9 +313,10 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
         subtitle="用真实 query 标注和机制诊断验证当前记忆系统是否真的被数据驱动。"
         action={
           <div className="button-row end">
+            {labelsDirty && <span className="count-pill">有未保存修改</span>}
             <button className="secondary-button" type="button" onClick={() => void load()}>
               <RefreshCcw size={16} />
-              刷新
+              {labelsDirty ? "放弃并刷新" : "刷新"}
             </button>
             <button
               className="primary-button"
@@ -345,7 +414,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
                   <button
                     className="danger-button compact"
                     type="button"
-                    onClick={() => removeLabel(selectedLabel.id)}
+                    onClick={() => void removeLabel(selectedLabel.id)}
                   >
                     <Trash2 size={15} />
                     删除
@@ -497,6 +566,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
           </div>
         </section>
       )}
+      <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
     </div>
   );
 }

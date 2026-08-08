@@ -38,7 +38,7 @@ from app.cli_config import (
     update_env_value,
     write_json_atomic,
 )
-from app.config import Settings
+from app.config import Settings, describe_settings_error
 from app.llm.client import OpenAICompatibleClient
 from app.model_catalog import (
     CatalogError,
@@ -108,7 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n已取消。", file=sys.stderr)
         return 130
     except (CatalogError, PricingCatalogError, ValueError) as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        print(f"错误：{describe_settings_error(exc)}", file=sys.stderr)
         return 2
 
 
@@ -460,6 +460,21 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     if result:
         return result
 
+    # 同步生成 Web 配置管理密钥（admin key），与 GATEWAY_API_KEY 一样只打印一次，
+    # 让首次安装后可以直接在 Web Console 完成渠道与路由配置，无需再跑 CLI。
+    admin_key = ""
+    if admin_needs_secret:
+        admin_key = secrets.token_urlsafe(48)
+        result = _run_modelgw(
+            modelgw,
+            model_home,
+            ["secret", "set", "memory-console-admin", "--stdin", "--no-check"],
+            input_text=admin_key + "\n",
+            quiet=True,
+        )
+        if result:
+            return result
+
     config = _read_model_gateway_config(model_home)
     server = config.get("server") if isinstance(config.get("server"), dict) else {}
     port = int(server.get("port") or 2030)
@@ -473,11 +488,42 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
             embedding_space,
         )
 
+    # Auto-generate the client-facing gateway key when absent or still a
+    # placeholder, mirroring how the backend key is minted above. This removes
+    # the mandatory manual `secret set gateway` step from first-run setup.
+    gateway_key = environment.get("GATEWAY_API_KEY", "").strip()
+    gateway_key_generated = False
+    if not gateway_key or is_placeholder_value(gateway_key):
+        gateway_key = secrets.token_urlsafe(32)
+        update_env_value(paths.settings_env, "GATEWAY_API_KEY", gateway_key)
+        gateway_key_generated = True
+
+    memory_port = int(read_json(paths.project_file).get("port") or 2026)
     print("双服务运行栈已经安装并安全接线。")
     print(f"Model Gateway 配置：{model_home}")
     print("backend key 已在两端同步，值未显示，也未写入项目 .env。")
-    if admin_needs_secret:
-        print("启用 Web 配置写入前，请运行：modelgw secret set memory-console-admin")
+    print("")
+    print("接入信息")
+    print("-" * 36)
+    print(f"Web Console            http://127.0.0.1:{memory_port}/ui/")
+    print(f"OpenAI 兼容 base URL   http://127.0.0.1:{memory_port}/v1")
+    print(f"MCP                    http://127.0.0.1:{memory_port}/mcp")
+    print(f"Model Gateway base URL http://127.0.0.1:{port}/v1")
+    if gateway_key_generated:
+        print("")
+        print("已为你自动生成客户端访问密钥（GATEWAY_API_KEY）。")
+        print("请妥善保存，它不会再次显示，也不会写入项目 .env：")
+        print(f"  {gateway_key}")
+        print("如需更换，可运行：memgw secret set gateway")
+    else:
+        print("客户端访问密钥（GATEWAY_API_KEY）已存在，未改动。")
+    if admin_key:
+        print("")
+        print("已为你自动生成 Web 配置管理密钥（Model Gateway admin key）。")
+        print("它只显示这一次，用于在 Web Console 解锁渠道与路由配置；")
+        print("权限高于普通访问密钥，请与 GATEWAY_API_KEY 分开妥善保存：")
+        print(f"  {admin_key}")
+        print("如丢失，可运行：modelgw secret set memory-console-admin 重新设置。")
     if args.start:
         return _cmd_stack_restart(
             argparse.Namespace(
@@ -1303,7 +1349,7 @@ def _cmd_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
     try:
         settings = Settings(_env_file=None, **environment)
     except Exception as exc:
-        problems.append(f"运行配置无效：{exc}")
+        problems.append(f"运行配置无效：{describe_settings_error(exc)}")
         settings = None
     if settings is not None:
         memory_path = _resolve_runtime_path(project_root, settings.database_path)

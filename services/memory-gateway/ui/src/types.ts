@@ -1102,7 +1102,63 @@ export interface ModelGatewayConnectionCheck {
     level: "ok" | "warning" | "error" | "skipped";
     detail: string;
     http_status?: number | null;
+    discovered_model_count?: number;
+    discovered_models?: string[];
   }>;
+}
+
+export interface ModelGatewayConnectionCreateResult {
+  valid: boolean;
+  applied: boolean;
+  connection_id: string;
+  revision: string;
+}
+
+export interface ModelGatewayConnectionCreateBody {
+  revision: string;
+  channel_operator: string;
+  adapter: string;
+  base_url: string;
+  dry_run?: boolean;
+}
+
+export interface ModelGatewayDeploymentDraftInput {
+  upstream_model: string;
+  model_author?: string;
+  kind: "chat" | "embedding";
+  reasoning_default?: "inherit" | "enabled" | "disabled";
+  capabilities?: ModelGatewayCapabilities;
+  dimensions?: number | null;
+  embedding_space?: string;
+}
+
+export interface ModelGatewayRouteAssignmentInput {
+  id: string;
+  kind: "chat" | "embedding";
+  targets: string[];
+  max_attempts?: number;
+  enabled?: boolean;
+}
+
+export interface ModelGatewayDeploymentApplyBody {
+  revision: string;
+  connection: string;
+  deployments: ModelGatewayDeploymentDraftInput[];
+  routes: ModelGatewayRouteAssignmentInput[];
+  dry_run?: boolean;
+}
+
+export interface ModelGatewayDeploymentApplyResult {
+  valid: boolean;
+  applied: boolean;
+  deployments: Array<{
+    id: string;
+    upstream_model: string;
+    kind: "chat" | "embedding";
+  }>;
+  changed_routes: string[];
+  warnings: string[];
+  revision: string;
 }
 
 export interface ProvidersStatus {

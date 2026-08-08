@@ -1,84 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Activity,
-  ArchiveRestore,
-  Clipboard,
-  Download,
-  Eye,
-  EyeOff,
-  FileText,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
-  Search,
-  ShieldAlert,
-  Trash2,
-  Upload,
-  Wrench,
-  X
-} from "lucide-react";
+import { ChevronDown, RefreshCcw } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
-import type {
-  ConnectionSettings,
-  CoreMemoryHistoryItem,
-  CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  DecisionLogAction,
-  MemoryExport,
-  MemoryRecord,
-  MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult
-} from "../../types";
+import type { DecisionLog, DecisionLogAction } from "../../types";
 import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
+import { FieldList, FilterSelect } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import { Modal } from "../../components/Modal";
-import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
-import type { Notify } from "../pageTypes";
+import { DECISIONS } from "../../utils/constants";
+import { candidateSummary, dateText, errorMessage, prettyJson } from "../../utils/format";
+
+const PAGE_SIZE = 100;
 
 export function DecisionLogsPage({ api }: { api: MemoryApi }) {
   const [state, setState] = useState<LoadState<DecisionLog[]>>({
@@ -86,6 +19,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
     error: null,
     data: null
   });
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const [decision, setDecision] = useState<"all" | DecisionLogAction>("all");
   const [conversationId, setConversationId] = useState("");
   const [selected, setSelected] = useState<DecisionLog | null>(null);
@@ -93,13 +27,13 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
   const load = useCallback(async (signal?: AbortSignal) => {
     setState({ loading: true, error: null, data: null });
     try {
-      setState({ loading: false, error: null, data: await api.decisionLogs(100, {}, signal) });
+      setState({ loading: false, error: null, data: await api.decisionLogs(limit, {}, signal) });
     } catch (error) {
       // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
       if (isAbortError(error)) return;
       setState({ loading: false, error: errorMessage(error), data: null });
     }
-  }, [api]);
+  }, [api, limit]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -116,6 +50,9 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
       return true;
     });
   }, [conversationId, decision, state.data]);
+
+  // 服务端只支持 limit 截断；拿满 limit 条说明后面可能还有更早的记录。
+  const hasMore = (state.data?.length ?? 0) >= limit;
 
   return (
     <div className="page-stack">
@@ -179,7 +116,17 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
               </thead>
               <tbody>
                 {logs.map((log) => (
-                  <tr key={log.id} onClick={() => setSelected(log)}>
+                  <tr
+                    key={log.id}
+                    tabIndex={0}
+                    onClick={() => setSelected(log)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelected(log);
+                      }
+                    }}
+                  >
                     <td>{badge(log.decision)}</td>
                     <td>{log.reason}</td>
                     <td>{log.conversation_id || "-"}</td>
@@ -191,6 +138,15 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
             </table>
           </div>
         )}
+        {!state.loading && !state.error && hasMore && (
+          <div className="button-row">
+            <button className="secondary-button" type="button" onClick={() => setLimit((current) => current + PAGE_SIZE)}>
+              <ChevronDown size={16} />
+              加载更多
+            </button>
+            <span className="muted">已加载 {state.data?.length ?? 0} 条</span>
+          </div>
+        )}
       </section>
       {selected && (
         <Modal title="日志详情" onClose={() => setSelected(null)}>
@@ -199,7 +155,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
               ["决策", selected.decision],
               ["原因", selected.reason],
               ["对话 ID", selected.conversation_id],
-              ["创建时间", selected.created_at]
+              ["创建时间", dateText(selected.created_at)]
             ]}
           />
           <details className="raw-json-details">

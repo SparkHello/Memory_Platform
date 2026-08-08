@@ -20,6 +20,7 @@ from app.memory.models import (
     MemoryReviewRevisionOperation,
     MemoryReviewRevisionPreview,
 )
+from app.memory.redaction import detect_text_sensitivity
 from app.memory.review_policy import build_review_policy
 from app.memory.search import MemorySearchService
 from app.memory.store import MemoryStore
@@ -342,6 +343,11 @@ def apply_review_revision(
                     operation=operation,
                     risk_tags=risk_tags,
                     severity=severity,
+                    memories=[
+                        memory_map[memory_id]
+                        for memory_id in operation.memory_ids
+                        if memory_id in memory_map
+                    ],
                 ),
                 decision="ignore",
                 reason=operation.reason or "体检修改预览未产生变更",
@@ -365,6 +371,11 @@ def apply_review_revision(
                     operation=operation,
                     risk_tags=risk_tags,
                     severity=severity,
+                    memories=[
+                        memory_map[memory_id]
+                        for memory_id in operation.memory_ids
+                        if memory_id in memory_map
+                    ],
                 ),
                 decision="update",
                 reason=operation.reason or "体检 AI 修改已更新记忆",
@@ -389,6 +400,11 @@ def apply_review_revision(
                     operation=operation,
                     risk_tags=risk_tags,
                     severity=severity,
+                    memories=[
+                        memory_map[memory_id]
+                        for memory_id in operation.memory_ids
+                        if memory_id in memory_map
+                    ],
                 ),
                 decision="update",
                 reason=operation.reason or "体检 AI 修改已合并记忆",
@@ -423,6 +439,11 @@ def apply_review_revision(
                     operation=operation,
                     risk_tags=risk_tags,
                     severity=severity,
+                    memories=[
+                        memory_map[memory_id]
+                        for memory_id in operation.memory_ids
+                        if memory_id in memory_map
+                    ],
                 ),
                 decision="update",
                 reason=operation.reason or "体检 AI 修改已归档记忆",
@@ -1062,6 +1083,7 @@ def _decision_log_json(
     operation: MemoryReviewRevisionOperation,
     risk_tags: list[MemoryReviewRiskTag] | None,
     severity: MemoryReviewSeverity | None,
+    memories: list[MemoryRecord],
 ) -> str:
     return json.dumps(
         {
@@ -1071,7 +1093,30 @@ def _decision_log_json(
             "relation": payload.get("relation"),
             "risk_tags": payload.get("risk_tags") or risk_tags or [],
             "severity": payload.get("severity") or severity,
-            "operation": _operation_payload(operation),
+            "operation": _redacted_operation_payload(operation, memories),
         },
         ensure_ascii=False,
     )
+
+
+def _redacted_operation_payload(
+    operation: MemoryReviewRevisionOperation,
+    memories: list[MemoryRecord],
+) -> dict:
+    data = _operation_payload(operation)
+    if operation.content is None:
+        return data
+    sensitive = (operation.sensitivity or "normal") != "normal" or any(
+        memory.sensitivity != "normal" for memory in memories
+    )
+    if not sensitive:
+        sensitive = detect_text_sensitivity(operation.content) != "normal"
+    if not sensitive:
+        return data
+    data.pop("content", None)
+    data["content_length"] = len(operation.content)
+    data["content_sha256"] = hashlib.sha256(
+        operation.content.encode("utf-8")
+    ).hexdigest()
+    data["redacted"] = True
+    return data

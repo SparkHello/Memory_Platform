@@ -6,6 +6,7 @@ import {
   EyeOff,
   KeyRound,
   LockKeyhole,
+  Plus,
   PlugZap,
   RefreshCcw,
   Save,
@@ -13,10 +14,12 @@ import {
   TriangleAlert,
   XCircle
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { useConfirm, type ConfirmFn } from "../../hooks/useConfirm";
 import type {
   ModelGatewayConnectionCheck,
   ModelGatewayConnectionInfo,
@@ -29,21 +32,61 @@ import type {
   RouteInfo
 } from "../../types";
 import { errorMessage } from "../../utils/format";
+import { NewChannelWizard, ROUTE_LABELS } from "./NewChannelWizard";
 
 type Feedback = { tone: "success" | "warning" | "error"; message: string };
 type ConnectionCheckState = "checking" | ModelGatewayConnectionCheck;
 
-const ROUTE_LABELS: Record<string, string> = {
-  "memory.chat": "日常聊天",
-  "memory.extract": "提取长期记忆",
-  "memory.compact": "压缩对话上下文",
-  "memory.core": "整理核心记忆",
-  "memory.review": "记忆体检",
-  "knowledge.fast": "快速知识检索",
-  "knowledge.pro": "深度知识检索",
-  "memory.embedding": "语义搜索",
-  "pricing.research": "价格信息研究"
-};
+// 未保存修改保护：dirty 时拦截刷新/关闭和站内导航点击，确认后才放行。
+// 站内导航由 App 先改 state 再改 hash，hashchange 触发时本页已卸载，
+// 只能在捕获阶段拦截导航控件的点击，确认后重新触发原按钮完成跳转。
+function useUnsavedChangesGuard(dirty: boolean, message: string, confirm: ConfirmFn) {
+  const allowNextClickRef = useRef(false);
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const onClickCapture = (event: MouseEvent) => {
+      if (allowNextClickRef.current) {
+        allowNextClickRef.current = false;
+        return;
+      }
+      if (!dirtyRef.current) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const button = target?.closest<HTMLElement>(
+        ".sidebar .nav-item, .mobile-bottom-nav button:not(:last-child), .mobile-more-grid button, .avatar-chip"
+      );
+      if (!button || button.classList.contains("active") || button.getAttribute("aria-current") === "page") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void confirm({
+        title: "离开当前页面？",
+        message,
+        confirmLabel: "放弃修改并离开",
+        cancelLabel: "继续编辑",
+        tone: "warning"
+      }).then((confirmed) => {
+        if (confirmed) {
+          allowNextClickRef.current = true;
+          button.click();
+        }
+      });
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("click", onClickCapture, true);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("click", onClickCapture, true);
+    };
+  }, [dirty, message, confirm]);
+}
 
 export function ProvidersPage({ api }: { api: MemoryApi }) {
   const [status, setStatus] = useState<ProvidersStatus | null>(null);
@@ -58,6 +101,8 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
   const [busyAction, setBusyAction] = useState("");
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [validatedSignature, setValidatedSignature] = useState("");
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const { confirm, confirmState, resolveConfirm } = useConfirm();
 
   const load = useCallback(
     async (signal?: AbortSignal, preserveDrafts = false) => {
@@ -94,6 +139,7 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
   const dirty = Boolean(status?.control) && draftSignature !== baselineSignature;
   const hasAdminKey = Boolean(adminKey.trim());
   const validated = dirty && validatedSignature === draftSignature;
+  useUnsavedChangesGuard(dirty, "路由草稿尚未应用，离开后这些修改会丢失。确定要离开吗？", confirm);
 
   const updateDrafts = (updater: (current: ModelGatewayRouteDraft[]) => ModelGatewayRouteDraft[]) => {
     setDrafts((current) => updater(current));
@@ -210,7 +256,7 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
   };
 
   return (
-    <section className="page providers-page">
+    <div className="page-stack providers-page">
       <PageHeader
         title="模型与路由"
         subtitle="管理模型渠道密钥和每项用途的故障切换顺序；密钥只单向写入 Model Gateway。"
@@ -301,7 +347,17 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
                 }
                 onSaveSecret={(connection) => void saveSecret(connection)}
                 onCheck={(connection) => void checkConnection(connection)}
+                onCreateChannel={() => setWizardOpen(true)}
               />
+              {wizardOpen && (
+                <NewChannelWizard
+                  api={api}
+                  adminKey={adminKey}
+                  control={status.control}
+                  onClose={() => setWizardOpen(false)}
+                  onCompleted={() => load(undefined, false)}
+                />
+              )}
               <RoutesEditor
                 control={status.control}
                 drafts={drafts}
@@ -314,7 +370,8 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
           )}
         </>
       )}
-    </section>
+      <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
+    </div>
   );
 }
 
@@ -364,8 +421,11 @@ function AdminAccess({
       </label>
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>
-        <p>在 Model Gateway 终端创建只用于配置管理的客户端：</p>
-        <code>modelgw client add memory-console-admin --kind admin --set-secret</code>
+        <p>
+          首次运行 <code>memgw stack install</code>（含 <code>scripts/setup.sh</code> 和容器首启）时会自动生成并打印一次；请从当时的终端或容器日志中查找。
+        </p>
+        <p>丢失后在 Model Gateway 终端重新设置：</p>
+        <code>modelgw secret set memory-console-admin</code>
       </details>
     </section>
   );
@@ -381,7 +441,8 @@ function ConnectionsEditor({
   onSecretChange,
   onToggleSecret,
   onSaveSecret,
-  onCheck
+  onCheck,
+  onCreateChannel
 }: {
   control: ModelGatewayControlSnapshot;
   adminReady: boolean;
@@ -393,6 +454,7 @@ function ConnectionsEditor({
   onToggleSecret: (id: string) => void;
   onSaveSecret: (connection: ModelGatewayConnectionInfo) => void;
   onCheck: (connection: ModelGatewayConnectionInfo) => void;
+  onCreateChannel: () => void;
 }) {
   const deploymentsByConnection = useMemo(() => {
     const grouped: Record<string, ModelGatewayDeploymentInfo[]> = {};
@@ -409,8 +471,26 @@ function ConnectionsEditor({
           <h2 id="provider-connections-title">模型渠道</h2>
           <p>替换已有渠道密钥并执行免费的模型列表检查；不会发起推理。</p>
         </div>
-        <span className="provider-count">{control.connections.length} 个渠道</span>
+        <div className="provider-section-actions">
+          <span className="provider-count">{control.connections.length} 个渠道</span>
+          <button type="button" className="secondary-button" onClick={onCreateChannel}>
+            <Plus size={16} aria-hidden />
+            新建渠道
+          </button>
+        </div>
       </div>
+      {control.connections.length === 0 && (
+        <div className="provider-empty-cta">
+          <p>
+            还没有任何模型渠道。新建第一个渠道后，即可选择聊天模型并把
+            memory.* / knowledge.* 用途路由指向它，无需回到终端。
+          </p>
+          <button type="button" className="primary-button" onClick={onCreateChannel}>
+            <Plus size={16} aria-hidden />
+            新建第一个渠道
+          </button>
+        </div>
+      )}
       <div className="provider-connection-list">
         {control.connections.map((connection) => {
           const value = secretValues[connection.id] || "";

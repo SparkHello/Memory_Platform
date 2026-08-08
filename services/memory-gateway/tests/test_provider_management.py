@@ -194,3 +194,58 @@ def test_provider_writes_refuse_plain_http_to_a_remote_gateway(
 
     assert response.status_code == 409
     assert "HTTPS" in response.json()["detail"]
+
+
+def test_channel_create_and_deploy_proxy_require_and_forward_admin_key(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_request(**kwargs):
+        calls.append(kwargs)
+        return httpx.Response(
+            200,
+            json={
+                "valid": True,
+                "applied": True,
+                "connection_id": "newvendor-account",
+                "revision": "b" * 64,
+            },
+        )
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+    body = {
+        "revision": "a" * 64,
+        "channel_operator": "newvendor",
+        "base_url": "https://newvendor.example/v1",
+    }
+
+    missing = client.post("/providers/connections", headers=auth_headers, json=body)
+    assert missing.status_code == 401
+    assert calls == []
+
+    accepted = client.post(
+        "/providers/connections",
+        headers={**auth_headers, "X-Model-Gateway-Admin-Key": "admin-key"},
+        json=body,
+    )
+    assert accepted.status_code == 200
+    assert calls[0]["path"] == "/admin/connections"
+    assert calls[0]["api_key"] == "admin-key"
+
+    deployed = client.post(
+        "/providers/deployments",
+        headers={**auth_headers, "X-Model-Gateway-Admin-Key": "admin-key"},
+        json={
+            "revision": "b" * 64,
+            "connection": "newvendor-account",
+            "deployments": [{"upstream_model": "newvendor/chat-1"}],
+            "routes": [{"id": "memory.chat", "kind": "chat", "targets": ["$0"]}],
+        },
+    )
+    assert deployed.status_code == 200
+    assert calls[1]["path"] == "/admin/deployments"
+    assert calls[1]["api_key"] == "admin-key"

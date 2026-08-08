@@ -581,6 +581,10 @@ class MemoryStore:
                 # This boundary was synthesized from the old successor. A moved
                 # row must let its new chain position choose the next boundary.
                 valid_until = None
+                if status is None and existing.status == "resolved":
+                    # The resolved state was derived from that synthesized
+                    # boundary; a moved row re-enters its new key as live.
+                    status = "dynamic"
 
             topics = normalize_classification_names(
                 topics,
@@ -2901,6 +2905,11 @@ class MemoryStore:
                         old_successor_start
                     ):
                         memory.valid_until = None
+                        if memory.status == "resolved":
+                            # The resolved state was derived from that
+                            # synthesized boundary; the moved row re-enters
+                            # its new key as live.
+                            memory.status = "dynamic"
 
             evidence_json = json.dumps(memory.evidence_memory_ids, ensure_ascii=False)
             topics_json = json.dumps(memory.topics, ensure_ascii=False)
@@ -3506,11 +3515,16 @@ class MemoryStore:
                 rebuilt_status = "pinned"
             else:
                 ends_at = _parse_iso_datetime(valid_until)
-                rebuilt_status = (
-                    "resolved"
-                    if ends_at is not None and ends_at <= current_instant
-                    else "dynamic"
-                )
+                if ends_at is None and memory.status == "resolved":
+                    # 链上推导的 resolved 必有有效期；没有有效期说明是
+                    # 用户手动了结的，重建时保留，不静默复活。
+                    rebuilt_status = "resolved"
+                else:
+                    rebuilt_status = (
+                        "resolved"
+                        if ends_at is not None and ends_at <= current_instant
+                        else "dynamic"
+                    )
             supersedes = predecessor.id if predecessor is not None else None
             superseded_by = successor.id if successor is not None else None
             if (
@@ -3640,13 +3654,22 @@ class MemoryStore:
             predecessor_status = str(predecessor["status"] or "dynamic")
             if predecessor_status != "pinned":
                 bridged_end = _parse_iso_datetime(predecessor_end)
-                predecessor_status = (
-                    "resolved"
-                    if bridged_end is not None
-                    and current_instant is not None
-                    and bridged_end <= current_instant
-                    else "dynamic"
-                )
+                if (
+                    bridged_end is None
+                    and predecessor_status == "resolved"
+                    and predecessor["valid_until"] is None
+                ):
+                    # 手动了结的 resolved 原本就没有有效期；桥接没有移除
+                    # 任何边界，保留用户意图，不静默复活。
+                    pass
+                else:
+                    predecessor_status = (
+                        "resolved"
+                        if bridged_end is not None
+                        and current_instant is not None
+                        and bridged_end <= current_instant
+                        else "dynamic"
+                    )
             connection.execute(
                 """
                 UPDATE memories

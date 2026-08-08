@@ -1,83 +1,18 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
-import {
-  Activity,
-  ArchiveRestore,
-  Clipboard,
-  Download,
-  Eye,
-  EyeOff,
-  FileText,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
-  Search,
-  ShieldAlert,
-  Trash2,
-  Upload,
-  Wrench,
-  X
-} from "lucide-react";
+import { RefreshCcw, X } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
 import type {
-  ConnectionSettings,
   CoreMemoryHistoryItem,
   CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  MemoryAction,
-  MemoryExport,
-  MemoryRecord,
-  MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult
+  CoreSectionName
 } from "../../types";
-import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  CORE_SECTION_COLOR_VAR,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
+import { useDialogA11y } from "../../hooks/useDialogA11y";
+import { CORE_SECTIONS, CORE_SECTION_COLOR_VAR } from "../../utils/constants";
+import { dateText, errorMessage, percent, sectionTitle } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
 export function CoreMemoryPage({
@@ -102,6 +37,10 @@ export function CoreMemoryPage({
     data: null
   });
   const [consolidating, setConsolidating] = useState(false);
+  const historyDrawerRef = useDialogA11y<HTMLElement>(
+    () => setTab("current"),
+    tab === "history"
+  );
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setSections({ loading: true, error: null, data: null });
@@ -234,7 +173,14 @@ export function CoreMemoryPage({
         <button className="drawer-scrim detail-drawer-scrim" type="button" aria-label="关闭历史版本" onClick={() => setTab("current")} />
       )}
       {tab === "history" && (
-        <aside className="detail-drawer memory-detail-drawer core-history-drawer" role="dialog" aria-modal="true" aria-label="核心记忆历史版本">
+        <aside
+          ref={historyDrawerRef}
+          className="detail-drawer memory-detail-drawer core-history-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-label="核心记忆历史版本"
+          tabIndex={-1}
+        >
           <div className="drawer-header">
             <div>
               <span className="panel-kicker">版本历史</span>

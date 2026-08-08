@@ -245,7 +245,15 @@ export function App() {
         onRefreshService={() => void pingService()}
       >
         {activePage === "dashboard" && (
-          <DashboardPage api={api} settings={settings} setPage={navigateToPage} openMemory={openMemory} notify={notify} />
+          <DashboardPage
+            api={api}
+            settings={settings}
+            setPage={navigateToPage}
+            openMemory={openMemory}
+            notify={notify}
+            confirm={confirm}
+            refreshKey={memoryRefreshKey}
+          />
         )}
         {activePage === "memories" && (
           <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} />
