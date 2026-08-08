@@ -79,6 +79,10 @@ Memory Gateway 在 `/ui/` 提供 React Web Console，用于：
 - 查看模型连接状态、用途路由和用量概览；
 - 导出、备份和恢复数据。
 
+| 记忆工作室 | 记忆库 | 记忆档案 |
+| --- | --- | --- |
+| [![记忆工作室](docs/images/console-studio.png)](docs/images/console-studio.png) | [![记忆库](docs/images/console-memories.png)](docs/images/console-memories.png) | [![记忆档案](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
+
 ## 架构与数据流
 
 ```mermaid

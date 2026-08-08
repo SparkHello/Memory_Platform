@@ -12,8 +12,8 @@
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #f1ebe2;
-  --muted: #a49b91;
-  --muted-strong: #c6bdb2;
+  --muted: #b0a79c;
+  --muted-strong: #d0c8bd;
   --primary: #d8b078;
   --primary-hover: #e6c48e;
   --primary-soft: rgba(216, 176, 120, 0.12);
@@ -31,7 +31,7 @@
 
   /* ── 玻璃材质：磨砂玻璃 + 顶部受光 + 深投影 ── */
   --sidebar-text: #f1ebe2;
-  --sidebar-muted: #9a9188;
+  --sidebar-muted: #a8a095;
   --sidebar-surface: rgba(255, 255, 255, 0.06);
   --glass-bg: rgba(34, 29, 33, 0.62);
   --glass-border: rgba(255, 255, 255, 0.1);

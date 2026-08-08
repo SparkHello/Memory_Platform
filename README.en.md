@@ -79,6 +79,10 @@ Memory Gateway serves a React Web Console at `/ui/` for:
 - viewing model connection status, purpose routes, and a usage overview;
 - exporting, backing up, and restoring data.
 
+| Studio | Memory library | Memory detail |
+| --- | --- | --- |
+| [![Studio](docs/images/console-studio.png)](docs/images/console-studio.png) | [![Memory library](docs/images/console-memories.png)](docs/images/console-memories.png) | [![Memory detail](docs/images/console-memory-detail.png)](docs/images/console-memory-detail.png) |
+
 ## Architecture and data flow
 
 ```mermaid
