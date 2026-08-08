@@ -221,6 +221,8 @@ API Key:  the GATEWAY_API_KEY printed by stack install (or set via memgw secret 
 Model:    memory-auto
 ```
 
+Chatbox / RikkaHub users who just need the three fields above can follow the step-by-step [客户端接入指南](docs/client-setup.md)（中文）.
+
 On a phone, `localhost` points at the phone itself. Phone or LAN clients should use the LAN/Tailscale address of the machine running Memory Platform, and Memory Gateway must bind to an interface that permits access. **Do not expose the service to the public internet without authentication.**
 
 `X-Memory-Mode` selects:
@@ -397,6 +399,7 @@ It does not currently target:
 - [Model Gateway full documentation](services/model-gateway/README.md)
 - [Installing with an AI assistant](docs/ai-install.md)
 - [Client integration](services/memory-gateway/docs/client_integration.md)
+- [客户端接入指南（Chatbox / RikkaHub 等）](docs/client-setup.md)
 - [Model Gateway configuration standard](services/model-gateway/docs/configuration.md)
 - [Model Gateway client protocol](services/model-gateway/docs/client-protocol.md)
 - [Operations, background services, and health checks](services/model-gateway/docs/operations.md)

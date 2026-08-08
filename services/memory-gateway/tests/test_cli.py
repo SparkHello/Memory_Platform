@@ -328,6 +328,57 @@ def test_stack_install_keeps_existing_gateway_key(
     assert "already-configured-key" not in output
 
 
+def test_stack_install_generates_admin_key_once_when_missing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    model_home = tmp_path / "model-home"
+    model_home.mkdir()
+    (model_home / "config.json").write_text(
+        json.dumps({"schema_version": 1, "server": {"port": 2030}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "app.cli._ensure_model_gateway_runtime",
+        lambda args, project_root: Path("/fake/modelgw"),
+    )
+    monkeypatch.setattr(
+        "app.cli._modelgw_json",
+        lambda modelgw, home, arguments: [
+            {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
+            {"id": "memory-console-admin", "kind": "admin", "secret_configured": False},
+        ],
+    )
+    secret_calls: list[tuple[list[str], str]] = []
+
+    def fake_modelgw(modelgw, home, arguments, **kwargs):
+        if kwargs.get("input_text"):
+            secret_calls.append((list(arguments), kwargs["input_text"].strip()))
+        return 0
+
+    monkeypatch.setattr("app.cli._run_modelgw", fake_modelgw)
+
+    assert (
+        main([*args, "stack", "install", "--model-gateway-home", str(model_home)])
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    admin_calls = [
+        secret for arguments, secret in secret_calls
+        if arguments[:3] == ["secret", "set", "memory-console-admin"]
+    ]
+    assert len(admin_calls) == 1
+    admin_key = admin_calls[0]
+    assert len(admin_key) >= 32
+    # Shown exactly once so the Web Console can be unlocked without the CLI.
+    assert admin_key in output
+
+
 def test_cli_adds_model_and_assigns_feature_route(tmp_path) -> None:
     args = _base_args(tmp_path)
     assert main([*args, "init", "--no-import-env"]) == 0

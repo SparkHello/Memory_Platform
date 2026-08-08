@@ -1,0 +1,18 @@
+# 用户版：直接拉取预构建镜像，不需要 clone 仓库、不需要 Python/Node。
+# 用法：
+#   curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
+#   docker compose -f docker-compose.user.yml up -d
+# 首次启动会在容器日志里打印一次 GATEWAY_API_KEY：
+#   docker compose -f docker-compose.user.yml logs memory-platform
+services:
+  memory-platform:
+    image: ghcr.io/sparkhello/memory-platform:latest
+    ports:
+      # 默认只绑回环；手机/局域网访问改为 "0.0.0.0:2026:2026"
+      - "127.0.0.1:2026:2026"
+    volumes:
+      - memory-platform-data:/data
+    restart: unless-stopped
+
+volumes:
+  memory-platform-data:

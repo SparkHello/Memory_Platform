@@ -93,7 +93,7 @@ memgw stack install --model-gateway-source ../model-gateway --start
 memgw stack status
 ```
 
-如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建标准 backend/admin client，并轮换一枚只在两端仓库外保存的 backend key；不会显示密钥或修改项目 `.env`。以后只使用：
+如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建标准 backend/admin client，轮换一枚只在两端仓库外保存的 backend key，并生成只在此时各打印一次的 `GATEWAY_API_KEY` 和 admin key；除这两次性打印外不显示密钥，也不修改项目 `.env`。以后只使用：
 
 ```bash
 memgw stack start

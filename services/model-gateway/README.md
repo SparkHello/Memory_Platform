@@ -232,12 +232,14 @@ memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<exact-embedding-space>'
 - `PUT /admin/connections/{id}/secret`：仅 admin，单向替换 connection 引用的渠道密钥，响应永不回显；
 - `POST /admin/connections/{id}/check`：仅 admin，只执行 discovery `/models` 检查，不发起推理。
 
-给 My_Memory Web 控制台创建单独的管理身份：
+统一运行栈安装（`memgw stack install`、`scripts/setup.sh`、容器首启）会自动创建 `memory-console-admin` 身份并生成、打印一次 admin key。需要手工重建或重设时：
 
 ```bash
 modelgw client add memory-console-admin \
   --kind admin \
   --set-secret
+# 已存在、只需更换密钥时：
+modelgw secret set memory-console-admin
 ```
 
 该 admin key 只在 Web 页面当前内存中使用，不应与 My_Memory backend client key、`GATEWAY_API_KEY` 或任何上游渠道 key 复用。Model Gateway 应绑定本机回环地址；如果必须跨主机开放管理接口，应放在 HTTPS 之后。My_Memory 会拒绝把 admin key 转发到非回环的明文 HTTP 地址。

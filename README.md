@@ -143,6 +143,23 @@ scripts/setup.sh
 
 在真实终端中，它会连续完成：准备 Python 环境、安装两个服务、构建 Web Console、生成本地身份并安全接线、启动双服务，然后直接进入一次问完的模型配置并运行最终检查。暂时不需要前端时用 `scripts/setup.sh --skip-ui`；只准备运行环境、暂不配置模型时用 `scripts/setup.sh --install-only`。
 
+### 或者用 Docker（不需要 Python/Node）
+
+已安装 Docker Desktop 时，可以不 clone 仓库、不装任何依赖，两条命令跑起来：
+
+```bash
+curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
+docker compose -f docker-compose.user.yml up -d
+```
+
+首次启动会自动完成双服务接线，并在容器日志里**各打印一次** `GATEWAY_API_KEY` 和 Web 配置管理密钥（admin key）：
+
+```bash
+docker compose -f docker-compose.user.yml logs memory-platform
+```
+
+Web Console 在 `http://127.0.0.1:2026/ui/`。所有运行数据（配置、密钥、SQLite、日志）都在 `memory-platform-data` 卷里，升级镜像只需 `docker compose -f docker-compose.user.yml pull && up -d`，数据不受影响。日常管理仍可进容器使用 `memgw` / `modelgw`：`docker compose -f docker-compose.user.yml exec memory-platform memgw --help`。
+
 `stack install` 会初始化仓库外配置，为两个服务创建彼此独立的本地身份，安全生成并同步 backend key，还会**自动生成客户端访问密钥（`GATEWAY_API_KEY`）并在输出中打印一次**——请妥善保存，它不会再次显示，也不会写入仓库 `.env`。这就是客户端访问 `/v1`、MCP、REST 和 Web Console 时使用的密钥，与 backend key、admin key 和供应商 API Key 都不同。需要更换时运行 `scripts/memgw secret set gateway`。
 
 需要分步执行或了解各步细节，见 [Memory Gateway README](services/memory-gateway/README.md)；`bootstrap.sh` 与 `memgw stack install --start` 仍可单独调用。
@@ -156,6 +173,8 @@ services/memory-gateway/.venv/bin/modelgw quickstart
 ```
 
 它只询问渠道、API Key，以及是否配置语义搜索；预设渠道会自动读取当前 key 可见的精确模型 ID 供选择。先让一个模型承担全部文字用途，最后自动连接并重启记忆服务。想用交互式主菜单精细配置，仍可运行 `scripts/memgw` 选择“设置模型渠道、模型和用途”。
+
+日常调整可以完全在浏览器里完成：`stack install`（含 `scripts/setup.sh` 和 Docker 首启）会自动生成并**打印一次** Model Gateway admin key；打开 `http://127.0.0.1:2026/ui/` 的「模型与路由」页，粘贴该 key 解锁后即可替换渠道密钥、检查连接和调整用途路由。admin key 丢失时用 `modelgw secret set memory-console-admin` 重新设置。首次添加渠道目前仍需上面的 CLI quickstart（Docker 部署用 `docker compose -f docker-compose.user.yml exec memory-platform modelgw quickstart`）。
 
 quickstart 内置 DeepSeek、Kimi 中国区、MiMo 和 DashScope 北京区地址预设；选择预设并隐藏输入 API Key 后，会只读请求一次 `/models`，让你按实际可用列表选择，不发送推理。自定义渠道仍可手工填写官方 Base URL。已有环境只想重新配置时使用 `scripts/setup.sh --configure-only --config <文件> --json`，不会重复安装依赖或运行 `stack install`。
 
@@ -213,7 +232,11 @@ scripts/memgw stack restart
 scripts/memgw stack stop
 ```
 
+装好后接入客户端时常踩的坑（手机上 `localhost`、key 只打印一次、模型名固定 `memory-auto` 等）集中列在 [客户端接入指南的速查表](docs/client-setup.md#常见坑速查表)。
+
 ## 客户端接入
+
+已经在用 Chatbox、RikkaHub 等客户端、只需要知道「Base URL、API Key、模型名怎么填」的用户，直接看 [客户端接入指南](docs/client-setup.md)。下面是完整契约说明。
 
 ### OpenAI Chat Completions
 
@@ -359,6 +382,8 @@ Memory_Platform/
 │   ├── bootstrap.sh          创建统一开发环境并构建前端
 │   ├── memgw                 双服务统一入口
 │   └── test.sh               两个后端测试集和前端生产构建
+├── deploy/                   Docker 入口脚本与用户/开发 compose 文件
+├── Dockerfile                单容器双服务一体化镜像（含 UI 构建）
 ├── docs/reviews/             跨服务评测与审计报告
 ├── AGENTS.md                 仓库开发和安全边界
 └── README.md
@@ -429,6 +454,7 @@ Memory Platform 当前适合：
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 - [变更记录](CHANGELOG.md)
+- [客户端接入指南（Chatbox / RikkaHub 等）](docs/client-setup.md)
 - [Memory Gateway 完整说明](services/memory-gateway/README.md)
 - [Model Gateway 完整说明](services/model-gateway/README.md)
 - [客户端接入](services/memory-gateway/docs/client_integration.md)

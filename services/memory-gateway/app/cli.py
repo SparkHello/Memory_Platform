@@ -460,6 +460,21 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     if result:
         return result
 
+    # 同步生成 Web 配置管理密钥（admin key），与 GATEWAY_API_KEY 一样只打印一次，
+    # 让首次安装后可以直接在 Web Console 完成渠道与路由配置，无需再跑 CLI。
+    admin_key = ""
+    if admin_needs_secret:
+        admin_key = secrets.token_urlsafe(48)
+        result = _run_modelgw(
+            modelgw,
+            model_home,
+            ["secret", "set", "memory-console-admin", "--stdin", "--no-check"],
+            input_text=admin_key + "\n",
+            quiet=True,
+        )
+        if result:
+            return result
+
     config = _read_model_gateway_config(model_home)
     server = config.get("server") if isinstance(config.get("server"), dict) else {}
     port = int(server.get("port") or 2030)
@@ -502,9 +517,13 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
         print("如需更换，可运行：memgw secret set gateway")
     else:
         print("客户端访问密钥（GATEWAY_API_KEY）已存在，未改动。")
-    if admin_needs_secret:
+    if admin_key:
         print("")
-        print("启用 Web 配置写入前，请运行：modelgw secret set memory-console-admin")
+        print("已为你自动生成 Web 配置管理密钥（Model Gateway admin key）。")
+        print("它只显示这一次，用于在 Web Console 解锁渠道与路由配置；")
+        print("权限高于普通访问密钥，请与 GATEWAY_API_KEY 分开妥善保存：")
+        print(f"  {admin_key}")
+        print("如丢失，可运行：modelgw secret set memory-console-admin 重新设置。")
     if args.start:
         return _cmd_stack_restart(
             argparse.Namespace(

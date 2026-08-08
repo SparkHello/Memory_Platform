@@ -420,8 +420,11 @@ function AdminAccess({
       </label>
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>
-        <p>在 Model Gateway 终端创建只用于配置管理的客户端：</p>
-        <code>modelgw client add memory-console-admin --kind admin --set-secret</code>
+        <p>
+          首次运行 <code>memgw stack install</code>（含 <code>scripts/setup.sh</code> 和容器首启）时会自动生成并打印一次；请从当时的终端或容器日志中查找。
+        </p>
+        <p>丢失后在 Model Gateway 终端重新设置：</p>
+        <code>modelgw secret set memory-console-admin</code>
       </details>
     </section>
   );
