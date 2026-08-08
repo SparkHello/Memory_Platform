@@ -9,7 +9,7 @@
 - `scripts/bootstrap.sh`：创建统一开发环境并安装两个服务。
 - `scripts/memgw`：根目录统一运行栈入口。
 - `scripts/test.sh`：两个后端测试集和前端构建。
-- `Dockerfile` 与 `deploy/`：单容器一体化镜像、首启接线入口脚本和 compose 文件；`.github/workflows/docker.yml` 在 tag 时推送 GHCR。
+- `Dockerfile` 与 `deploy/`：单容器一体化镜像、首启接线入口脚本、compose 文件和 `deploy/install.sh` Docker 一键安装脚本；`.github/workflows/docker.yml` 在 tag 时推送 GHCR。
 
 ## 开发边界
 

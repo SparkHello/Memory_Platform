@@ -1,18 +1,30 @@
 # 用户版：直接拉取预构建镜像，不需要 clone 仓库、不需要 Python/Node。
-# 用法：
+# 最简单的用法是一键脚本（自动下载本文件、避开占用端口并打印密钥）：
+#   curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+# 手工用法：
 #   curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
 #   docker compose -f docker-compose.user.yml up -d
-# 首次启动会在容器日志里打印一次 GATEWAY_API_KEY：
+# 首次启动需 1–2 分钟完成内部安装，之后容器日志会各打印一次
+# GATEWAY_API_KEY 和 admin key：
 #   docker compose -f docker-compose.user.yml logs memory-platform
+# 端口 2026 被占用时，在本文件同目录的 .env 写入一行 MEMORY_PORT=3026 后重启，
+# 之后所有文档中的 2026 换成 3026。
 services:
   memory-platform:
     image: ghcr.io/sparkhello/memory-platform:latest
     ports:
-      # 默认只绑回环；手机/局域网访问改为 "0.0.0.0:2026:2026"
-      - "127.0.0.1:2026:2026"
+      # 默认只绑回环；手机/局域网访问改为 "0.0.0.0:${MEMORY_PORT:-2026}:2026"
+      - "127.0.0.1:${MEMORY_PORT:-2026}:2026"
     volumes:
       - memory-platform-data:/data
     restart: unless-stopped
+    healthcheck:
+      # 首次启动的接线安装约 1 分钟，start_period 给足余量
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2026/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
 
 volumes:
   memory-platform-data:
