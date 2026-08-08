@@ -29,6 +29,8 @@ API Key:  安装时打印一次的 GATEWAY_API_KEY
 要点：
 
 - **API Key 是安装时打印的那一个**。运行 `scripts/setup.sh` 完成安装时，终端会打印一次 `GATEWAY_API_KEY`，之后不再显示。用 Docker 部署时，它在首次启动的容器日志里：`docker compose -f docker-compose.user.yml logs memory-platform`。它和你填给模型渠道（DeepSeek、Kimi 等）的 key 完全是两回事：客户端只认 Memory Platform 的 key，真实供应商 key 只保存在服务端。
+- **只有这一枚密钥要填进客户端**。安装时会打印两枚：`GATEWAY_API_KEY` 给客户端和 Web Console 登录用；admin key 权限更高，只在电脑的浏览器里解锁模型渠道配置时用，**不需要填进任何客户端，也不需要传到手机上**。所以要想办法传到手机的只有一枚。
+- **嫌随机密钥太长可以自己指定**：首次安装时传入即可（至少 16 个字符），Docker 用 `GATEWAY_API_KEY=你的密钥 sh -c "$(curl -fsSL .../install.sh)"`，源码安装用 `GATEWAY_API_KEY=你的密钥 scripts/setup.sh`。装好之后再改用 `memgw secret set gateway`。注意别用微信、剪贴板同步这类第三方工具传密钥——那等于把它交给了第三方；自己设一个能记住的强密码反而更安全。
 - **找不回 key 就换一个新的**：在仓库目录运行 `scripts/memgw secret set gateway`（Docker 部署用 `docker compose -f docker-compose.user.yml exec memory-platform memgw secret set gateway`），按提示生成新 key，然后更新所有客户端。旧 key 会立即失效。
 - **模型名固定填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」。以后换渠道、换模型只改服务端，客户端不用动。
 - **关闭 Responses API / 使用 Chat Completions**。如果客户端有「API 类型」选项，选 `Chat Completions`（大多数客户端默认就是）。

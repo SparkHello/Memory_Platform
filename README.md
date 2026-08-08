@@ -77,6 +77,12 @@ curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/dep
 
 脚本会自动完成全部步骤：检查 Docker → 下载 Compose 配置 → 自动避开已被占用的端口 → 启动服务并等待就绪 → 打印 `GATEWAY_API_KEY` 和 admin key。首次启动需要 1–2 分钟完成内部安装，请耐心等待；脚本结束后把两枚密钥保存好。以后重复运行该脚本即升级到最新镜像，数据保留在 `memory-platform-data` 卷中，不会丢失。
 
+两枚密钥用途不同：**只有 `GATEWAY_API_KEY` 需要填进客户端**（包括手机），admin key 权限更高，只在这台电脑的浏览器里解锁模型渠道配置时用，不需要传到手机上。不想用自动生成的随机值，可以在首次安装时自己指定（至少 16 个字符）：
+
+```bash
+GATEWAY_API_KEY=你自己的密钥 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
+```
+
 **Windows 用户**：安装 Docker Desktop 后，在 PowerShell 中使用下面的手工方式（效果相同）。
 
 ### 手工方式（Windows，或想自己控制每一步）

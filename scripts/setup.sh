@@ -44,6 +44,12 @@ AI / non-interactive mode:
                   Reuse an installed stack; skip dependency and stack install.
 
 The recipe must never contain API keys or other secrets.
+
+Optional environment variables (first install only, at least 16 characters):
+  GATEWAY_API_KEY           Custom client access key instead of a generated one.
+  MEMORY_CONSOLE_ADMIN_KEY  Custom Web Console admin key. Higher privilege; it
+                            is only used in the browser on this machine and
+                            never needs to be copied to a phone client.
 EOF
 }
 

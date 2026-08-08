@@ -11,12 +11,20 @@
 # 之后所有文档中的 2026 换成 3026。
 # 想在手机/其他设备上访问时，在 .env 加一行 MEMORY_HOST=0.0.0.0 后重启，
 # 然后改用电脑的局域网 IP（仅限可信家庭网络，不要把服务无鉴权暴露到公网）。
+# 想自己指定密钥（至少 16 个字符）而不是用自动生成的，在首次启动前这样跑：
+#   GATEWAY_API_KEY=你的密钥 docker compose -f docker-compose.user.yml up -d
+# 建议不要写进 .env，以免密钥明文留在安装目录里。
 services:
   memory-platform:
     image: ghcr.io/sparkhello/memory-platform:latest
     ports:
       # 默认只绑回环；手机/局域网访问在同目录 .env 加 MEMORY_HOST=0.0.0.0
       - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
+    environment:
+      # 自定义密钥（可选，至少 16 个字符），只在首次启动生成密钥时生效；
+      # 留空则容器自动生成一枚高强度密钥。之后更换请用 memgw / modelgw secret set。
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
+      MEMORY_CONSOLE_ADMIN_KEY: "${MEMORY_CONSOLE_ADMIN_KEY:-}"
     volumes:
       - memory-platform-data:/data
     restart: unless-stopped

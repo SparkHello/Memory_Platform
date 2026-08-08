@@ -377,8 +377,42 @@ def _cmd_init(args: Any, paths: CliPaths, project_root: Path) -> int:
     return 0
 
 
+# 自定义密钥的强度下限。这两枚密钥背后是全部记忆和供应商额度，一旦把服务绑到
+# 0.0.0.0 就直接暴露在网络上，所以用户自己指定的值也要过一道最低门槛。
+MIN_CUSTOM_KEY_LENGTH = 16
+CUSTOM_KEY_VARIABLES = ("GATEWAY_API_KEY", "MEMORY_CONSOLE_ADMIN_KEY")
+
+
+def _describe_weak_key(name: str, value: str) -> str:
+    """返回非空字符串表示该自定义密钥太弱，字符串本身就是给用户的说明。"""
+    if any(character.isspace() for character in value):
+        return f"{name} 不能包含空格、制表符或换行。"
+    if len(value) < MIN_CUSTOM_KEY_LENGTH:
+        return f"{name} 至少需要 {MIN_CUSTOM_KEY_LENGTH} 个字符，当前只有 {len(value)} 个。"
+    if len(set(value)) < 8:
+        return f"{name} 里不同字符太少，请使用更随机的值。"
+    return ""
+
+
+def _check_custom_keys(environment: dict[str, str]) -> int:
+    """在做任何安装动作之前校验用户自带的密钥，避免装到一半才失败。"""
+    for name in CUSTOM_KEY_VARIABLES:
+        value = environment.get(name, "").strip()
+        if not value or is_placeholder_value(value):
+            continue
+        problem = _describe_weak_key(name, value)
+        if problem:
+            print(problem, file=sys.stderr)
+            print("不设置该变量则自动生成一枚高强度密钥。", file=sys.stderr)
+            return 2
+    return 0
+
+
 def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
+    custom_key_problem = _check_custom_keys(effective_environment(paths, project_root))
+    if custom_key_problem:
+        return custom_key_problem
     modelgw = _ensure_model_gateway_runtime(args, project_root)
     model_home = _stack_model_gateway_home(args)
     if _run_modelgw(modelgw, model_home, ["init"]):
@@ -463,8 +497,14 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     # 同步生成 Web 配置管理密钥（admin key），与 GATEWAY_API_KEY 一样只打印一次，
     # 让首次安装后可以直接在 Web Console 完成渠道与路由配置，无需再跑 CLI。
     admin_key = ""
+    admin_key_supplied = False
     if admin_needs_secret:
-        admin_key = secrets.token_urlsafe(48)
+        supplied_admin = environment.get("MEMORY_CONSOLE_ADMIN_KEY", "").strip()
+        if supplied_admin and not is_placeholder_value(supplied_admin):
+            admin_key = supplied_admin
+            admin_key_supplied = True
+        else:
+            admin_key = secrets.token_urlsafe(48)
         result = _run_modelgw(
             modelgw,
             model_home,
@@ -491,12 +531,16 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     # Auto-generate the client-facing gateway key when absent or still a
     # placeholder, mirroring how the backend key is minted above. This removes
     # the mandatory manual `secret set gateway` step from first-run setup.
+    persisted_gateway_key = read_env_file(paths.settings_env).get("GATEWAY_API_KEY", "").strip()
     gateway_key = environment.get("GATEWAY_API_KEY", "").strip()
     gateway_key_generated = False
     if not gateway_key or is_placeholder_value(gateway_key):
         gateway_key = secrets.token_urlsafe(32)
-        update_env_value(paths.settings_env, "GATEWAY_API_KEY", gateway_key)
         gateway_key_generated = True
+    # 自带的密钥同样要落到 settings.env：它可能只存在于本次进程环境里（例如
+    # Docker 首启时传入），不写下来的话服务重启后就没有密钥可用了。
+    update_env_value(paths.settings_env, "GATEWAY_API_KEY", gateway_key)
+    gateway_key_supplied = not gateway_key_generated and gateway_key != persisted_gateway_key
 
     memory_port = int(read_json(paths.project_file).get("port") or 2026)
     print("双服务运行栈已经安装并安全接线。")
@@ -515,13 +559,23 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
         print("请妥善保存，它不会再次显示，也不会写入项目 .env：")
         print(f"  {gateway_key}")
         print("如需更换，可运行：memgw secret set gateway")
+    elif gateway_key_supplied:
+        print("")
+        print("客户端访问密钥（GATEWAY_API_KEY）使用了你提供的值，未重新生成。")
+        print("它不会在这里回显；如需更换，可运行：memgw secret set gateway")
     else:
         print("客户端访问密钥（GATEWAY_API_KEY）已存在，未改动。")
-    if admin_key:
+    if admin_key and admin_key_supplied:
+        print("")
+        print("Web 配置管理密钥（admin key）使用了你提供的值，未重新生成。")
+        print("它权限高于客户端访问密钥，只用于在浏览器里解锁渠道与路由配置，")
+        print("不需要填进任何客户端，也不需要传到手机上。")
+    elif admin_key:
         print("")
         print("已为你自动生成 Web 配置管理密钥（Model Gateway admin key）。")
         print("它只显示这一次，用于在 Web Console 解锁渠道与路由配置；")
-        print("权限高于普通访问密钥，请与 GATEWAY_API_KEY 分开妥善保存：")
+        print("权限高于普通访问密钥，请与 GATEWAY_API_KEY 分开妥善保存。")
+        print("它留在这台电脑上就够了，不需要填进客户端或传到手机：")
         print(f"  {admin_key}")
         print("如丢失，可运行：modelgw secret set memory-console-admin 重新设置。")
     if args.start:

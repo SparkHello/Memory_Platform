@@ -27,6 +27,9 @@
 - README 与运维、接入文档补充首启等待预期、Windows 安装路径、admin key 找回和端口冲突处理。
 - Web Console「模型与路由」页横幅把 Model Gateway 地址明确标注为内部接线（不用填进客户端），并新增当前来源的客户端接入地址；「连接设置」页新增服务进程管理说明（启停命令、后台运行与开机自启）。
 
+- 支持在首次安装时自带密钥：`GATEWAY_API_KEY` 和 `MEMORY_CONSOLE_ADMIN_KEY` 两个环境变量对一键脚本、用户版 compose 和 `scripts/setup.sh` 都生效，留空则维持原来的自动生成。自带值需至少 16 个字符、不含空白、字符不过分重复，一键脚本在拉镜像前先校验一次，容器内 `memgw stack install` 再完整校验；密钥只经进程环境传递，不写入安装目录的 `.env`。
+- 安装输出和接入文档明确区分两枚密钥的去向：只有 `GATEWAY_API_KEY` 需要填进客户端（含手机），admin key 留在本机浏览器使用。
+
 ### Fixed
 
 - `scripts/setup.sh` 结束时会打印完整接入信息块（Web Console、客户端 Base URL、模型名），此前只打印管理台地址和模型名，缺少客户端最需要的 `/v1` Base URL；同时端口改为读取 `project.json` 的实际值，不再硬编码 2026（`--json` 输出的 `client.*` 同步修正）。

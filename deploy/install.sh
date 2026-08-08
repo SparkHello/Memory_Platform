@@ -12,6 +12,11 @@
 #   MEMORY_PORT          对外端口（默认 2026；被占用时自动顺延）
 #   MEMORY_HOST          监听地址（默认 127.0.0.1；手机/局域网设备访问用 0.0.0.0，
 #                        仅限可信家庭网络，不要暴露到公网）
+#   GATEWAY_API_KEY      自定义客户端访问密钥（留空则自动生成；至少 16 个字符）。
+#                        只在首次安装时生效，之后改密钥用 memgw secret set gateway。
+#   MEMORY_CONSOLE_ADMIN_KEY
+#                        自定义 Web 配置管理密钥（同上）。它权限更高，只在浏览器
+#                        里用，不需要填进客户端，也不需要传到手机上。
 set -eu
 
 REPO_RAW="https://raw.githubusercontent.com/SparkHello/Memory_Platform/main"
@@ -20,6 +25,21 @@ INSTALL_DIR="${MEMORY_PLATFORM_DIR:-memory-platform}"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# 自带密钥先在本地过一遍下限，免得拉完几百 MB 镜像才在容器里失败。容器内
+# memgw stack install 会再做一次完整校验。
+check_custom_key() {
+  [ -n "$2" ] || return 0
+  case "$2" in
+    *[[:space:]]*) fail "$1 不能包含空格或换行。" ;;
+  esac
+  [ "${#2}" -ge 16 ] || fail "$1 至少需要 16 个字符，当前只有 ${#2} 个。不设置该变量则自动生成一枚高强度密钥。"
+}
+check_custom_key GATEWAY_API_KEY "${GATEWAY_API_KEY:-}"
+check_custom_key MEMORY_CONSOLE_ADMIN_KEY "${MEMORY_CONSOLE_ADMIN_KEY:-}"
+# 只放进本次 compose 进程的环境，不写入 .env——密钥不落盘在安装目录里。
+export GATEWAY_API_KEY="${GATEWAY_API_KEY:-}"
+export MEMORY_CONSOLE_ADMIN_KEY="${MEMORY_CONSOLE_ADMIN_KEY:-}"
 
 say "==> 检查运行环境"
 command -v curl >/dev/null 2>&1 || fail "未找到 curl，请先安装 curl 后重试。"
@@ -116,15 +136,23 @@ if [ "$HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ]; then
   say "  手机/其他设备地址      http://$LAN_IP:$PORT/v1"
 fi
 say ""
-if [ -n "$GATEWAY_KEY" ]; then
+if [ -n "$GATEWAY_API_KEY" ]; then
+  say "  GATEWAY_API_KEY（客户端和 Web Console 登录用）：使用了你提供的值"
+elif [ -n "$GATEWAY_KEY" ]; then
   say "  GATEWAY_API_KEY（客户端和 Web Console 登录用）："
   say "    $GATEWAY_KEY"
 fi
-if [ -n "$ADMIN_KEY" ]; then
+if [ -n "$MEMORY_CONSOLE_ADMIN_KEY" ]; then
+  say "  admin key（浏览器里解锁模型渠道配置用）：使用了你提供的值"
+elif [ -n "$ADMIN_KEY" ]; then
   say "  admin key（浏览器里解锁模型渠道配置用，权限更高）："
   say "    $ADMIN_KEY"
 fi
-if [ -z "$GATEWAY_KEY" ] || [ -z "$ADMIN_KEY" ]; then
+say ""
+say "  只有 GATEWAY_API_KEY 需要填进客户端（含手机）。admin key 权限更高，"
+say "  只在这台电脑的浏览器里用，不要传到手机上。"
+if { [ -z "$GATEWAY_KEY" ] && [ -z "$GATEWAY_API_KEY" ]; } ||
+   { [ -z "$ADMIN_KEY" ] && [ -z "$MEMORY_CONSOLE_ADMIN_KEY" ]; }; then
   if [ "$PREEXISTING" -eq 1 ]; then
     say "  检测到已有安装：访问密钥沿用首次启动时生成的那一对，本次不会重新打印。"
     say "  日志还在的话可以查看：cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
