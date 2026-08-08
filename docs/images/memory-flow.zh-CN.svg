@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="title desc">
+  <title id="title">一次对话如何成为长期记忆</title>
+  <desc id="desc">正常聊天，核对并保存值得长期记住的内容，在相关时召回，并允许用户随时查看、修改或删除。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151217"/>
+      <stop offset="1" stop-color="#241c1a"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#c79a5a"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="320" rx="28" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <g transform="translate(32 42)">
+      <rect width="268" height="236" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <circle cx="34" cy="34" r="18" fill="#d8ad6a"/>
+      <text x="34" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="#241811">1</text>
+      <text x="28" y="92" font-size="24" font-weight="700" fill="#fffaf4">正常聊天</text>
+      <text x="28" y="136" font-size="17" fill="#d8ced2">“我喝咖啡不加糖，</text>
+      <text x="28" y="165" font-size="17" fill="#d8ced2">以后推荐时记住。”</text>
+    </g>
+    <path d="M310 160 H338" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+    <g transform="translate(348 42)">
+      <rect width="268" height="236" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <circle cx="34" cy="34" r="18" fill="#d8ad6a"/>
+      <text x="34" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="#241811">2</text>
+      <text x="28" y="92" font-size="24" font-weight="700" fill="#fffaf4">核对后保存</text>
+      <text x="28" y="136" font-size="17" fill="#d8ced2">检查原话、主语、否定关系</text>
+      <text x="28" y="165" font-size="17" fill="#d8ced2">和敏感信息，只保留可靠内容</text>
+    </g>
+    <path d="M626 160 H654" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+    <g transform="translate(664 42)">
+      <rect width="268" height="236" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <circle cx="34" cy="34" r="18" fill="#d8ad6a"/>
+      <text x="34" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="#241811">3</text>
+      <text x="28" y="92" font-size="24" font-weight="700" fill="#fffaf4">相关时召回</text>
+      <text x="28" y="136" font-size="17" fill="#d8ced2">以后谈到咖啡时，相关记忆</text>
+      <text x="28" y="165" font-size="17" fill="#d8ced2">会按需提供给当前模型</text>
+    </g>
+    <path d="M942 160 H970" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+    <g transform="translate(980 42)">
+      <rect width="268" height="236" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <circle cx="34" cy="34" r="18" fill="#d8ad6a"/>
+      <text x="34" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="#241811">4</text>
+      <text x="28" y="92" font-size="24" font-weight="700" fill="#fffaf4">始终由你控制</text>
+      <text x="28" y="136" font-size="17" fill="#d8ced2">查看来源和召回原因，随时</text>
+      <text x="28" y="165" font-size="17" fill="#d8ced2">修改、归档、恢复或删除</text>
+    </g>
+  </g>
+</svg>
