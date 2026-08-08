@@ -3,6 +3,7 @@ import {
   ArchiveRestore,
   ArrowUpRight,
   Eye,
+  EyeOff,
   GitBranch,
   Pencil,
   Plus,
@@ -27,7 +28,7 @@ import type {
 import { badge } from "./Badge";
 import { FieldList } from "./FormControls";
 import { Modal } from "./Modal";
-import { ErrorBlock, LoadingBlock } from "./StateBlocks";
+import { EmptyBlock, ErrorBlock, LoadingBlock } from "./StateBlocks";
 import type { ConfirmFn } from "../hooks/useConfirm";
 import { useDialogA11y } from "../hooks/useDialogA11y";
 import {
@@ -80,6 +81,7 @@ export function MemoryDetailDrawer({
   const [spaces, setSpaces] = useState<MemorySpace[]>([]);
   const [why, setWhy] = useState<MemorySourceExplanation | null>(null);
   const [traverse, setTraverse] = useState<TraversalResponse | null>(null);
+  const [traverseError, setTraverseError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState<MemoryEditDraft | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
@@ -100,6 +102,7 @@ export function MemoryDetailDrawer({
       setState({ loading: true, error: null, memory: null, deleted: false });
       setWhy(null);
       setTraverse(null);
+      setTraverseError(null);
       setEditing(false);
       setEditDraft(null);
       setEditError(null);
@@ -157,8 +160,8 @@ export function MemoryDetailDrawer({
           .then((value) => {
             if (alive()) setTraverse(value);
           })
-          .catch(() => {
-            if (alive()) setTraverse(null);
+          .catch((error) => {
+            if (alive()) setTraverseError(errorMessage(error));
           });
         void api
           .reviewMemories(signal)
@@ -191,6 +194,29 @@ export function MemoryDetailDrawer({
       notify("已显示完整内容", "success");
     } catch (error) {
       notify(errorMessage(error), "error");
+    }
+  };
+
+  const maskMemory = async () => {
+    if (!memory) return;
+    try {
+      const redacted = await api.getMemory(memory.id, { redactSensitive: true });
+      setState((current) => ({ ...current, memory: redacted }));
+      notify("已重新遮罩敏感内容", "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
+  const retryTraverse = async () => {
+    if (!memory) return;
+    setTraverse(null);
+    setTraverseError(null);
+    try {
+      const value = await api.traverseMemoryNetwork(memory.id, { redactSensitive: true });
+      setTraverse(value);
+    } catch (error) {
+      setTraverseError(errorMessage(error));
     }
   };
 
@@ -348,6 +374,17 @@ export function MemoryDetailDrawer({
               </div>
             )}
 
+            {!memory.redacted && memory.sensitivity !== "normal" && (
+              <div className="notice">
+                <ShieldAlert size={16} />
+                正在显示完整敏感内容。
+                <button className="link-inline" type="button" onClick={() => void maskMemory()}>
+                  <EyeOff size={14} />
+                  重新遮罩
+                </button>
+              </div>
+            )}
+
             <blockquote className="profile-content">{memory.content}</blockquote>
 
             {(memory.topics?.length || memory.entities?.length || memory.space_ids?.length) ? (
@@ -458,9 +495,12 @@ export function MemoryDetailDrawer({
                   关联记忆
                   {traverse && <small>{related.length ? `按图关系强度排序` : ""}</small>}
                 </h3>
-                {!traverse && <div className="muted profile-related-hint">正在遍历记忆网络…</div>}
+                {!traverse && !traverseError && <LoadingBlock label="正在遍历记忆网络" />}
+                {traverseError && (
+                  <ErrorBlock message={`关联记忆加载失败：${traverseError}`} onRetry={() => void retryTraverse()} />
+                )}
                 {traverse && related.length === 0 && (
-                  <div className="muted profile-related-hint">这条记忆暂时没有足够强的关联。</div>
+                  <EmptyBlock compact label="这条记忆暂时没有足够强的关联。" />
                 )}
                 {related.map((item) => (
                   <button
@@ -701,6 +741,7 @@ export function MemoryDetailDrawer({
                 <span>有效期</span>
                 <input
                   value={editDraft.valid_until}
+                  placeholder="YYYY-MM-DD（ISO 8601）"
                   onChange={(event) => setEditDraft({ ...editDraft, valid_until: event.target.value })}
                 />
               </label>
@@ -708,6 +749,7 @@ export function MemoryDetailDrawer({
                 <span>复核时间</span>
                 <input
                   value={editDraft.review_after}
+                  placeholder="YYYY-MM-DD（ISO 8601）"
                   onChange={(event) => setEditDraft({ ...editDraft, review_after: event.target.value })}
                 />
               </label>
@@ -834,8 +876,8 @@ function TemporalFacts({ memory }: { memory: MemoryRecord }) {
         entries={[
           ["生效时间", memory.valid_from],
           ["有效期至", memory.valid_until],
-          ["temporal subject", memory.temporal_subject],
-          ["temporal predicate", memory.temporal_predicate],
+          ["时间主体", memory.temporal_subject],
+          ["时间谓词", memory.temporal_predicate],
           ["取代的记忆 ID", memory.supersedes],
           ["被取代为记忆 ID", memory.superseded_by]
         ]}

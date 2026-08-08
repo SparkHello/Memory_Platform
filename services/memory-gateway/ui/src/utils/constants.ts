@@ -188,6 +188,7 @@ export const DISPLAY_TEXT: Record<string, string> = {
   no_core_evidence: "不影响核心记忆",
   severity_desc: "严重程度",
   updated_desc: "最近更新",
+  rank_below_limit: "排名靠后未入选",
   none: "无",
   same: "重复",
   supplement: "补充",

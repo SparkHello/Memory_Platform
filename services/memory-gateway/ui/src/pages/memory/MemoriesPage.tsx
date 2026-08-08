@@ -73,6 +73,14 @@ const MEMORY_COLUMNS: Array<{ key: MemoryColumn; label: string }> = [
   { key: "lastUsed", label: "最近使用" }
 ];
 
+// 从 hash 查询参数读初始 tab：#/memories?tab=recycle 落到回收站。
+// 非记忆库 hash（如 #/memories/<id> 档案地址）返回 null，不动当前 tab。
+function tabFromHash(hash: string): "active" | "deleted" | null {
+  const [path, queryText = ""] = hash.split("?");
+  if (path.replace(/\/$/, "") !== "#/memories") return null;
+  return new URLSearchParams(queryText).get("tab") === "recycle" ? "deleted" : "active";
+}
+
 export function MemoriesPage({
   api,
   notify,
@@ -84,7 +92,9 @@ export function MemoriesPage({
   openMemory: (id: string) => void;
   refreshKey: number;
 }) {
-  const [tab, setTab] = useState<"active" | "deleted">("active");
+  const [tab, setTab] = useState<"active" | "deleted">(
+    () => tabFromHash(window.location.hash) || "active"
+  );
   const [state, setState] = useState<LoadState<MemoryRecord[]>>({
     loading: true,
     error: null,
@@ -145,10 +155,22 @@ export function MemoriesPage({
   }, [load, tab]);
 
   // 输入防抖：停顿 300ms 后才真正发搜索请求；Enter / 搜索按钮立即触发。
+  // 回收站是客户端过滤，不发搜索请求。
   useEffect(() => {
+    if (tab === "deleted") return;
     const handle = setTimeout(() => setSubmittedQuery(query.trim()), 300);
     return () => clearTimeout(handle);
-  }, [query]);
+  }, [query, tab]);
+
+  // hash 查询参数变化时同步 tab（例如从工作室跳到 #/memories?tab=recycle）。
+  useEffect(() => {
+    const onHashChange = () => {
+      const next = tabFromHash(window.location.hash);
+      if (next) setTab(next);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
 
   const runSearch = () => {
     const value = query.trim();
@@ -163,7 +185,10 @@ export function MemoriesPage({
   }, [refreshKey]);
 
   const memories = useMemo(() => {
+    // 回收站数据已全量在本地，搜索词走客户端 contains 过滤（大小写不敏感）。
+    const deletedQuery = tab === "deleted" ? query.trim().toLocaleLowerCase() : "";
     return (state.data || []).filter((memory) => {
+      if (deletedQuery && !memory.content.toLocaleLowerCase().includes(deletedQuery)) return false;
       if (filters.type !== "all" && memory.type !== filters.type) return false;
       if (filters.status !== "all" && (memory.status || "dynamic") !== filters.status) return false;
       if (filters.sensitivity !== "all" && memory.sensitivity !== filters.sensitivity) return false;
@@ -177,7 +202,7 @@ export function MemoriesPage({
       if (filters.entityQuery && !hasMatchingTag(memory.entities || [], filters.entityQuery)) return false;
       return true;
     });
-  }, [filters, state.data]);
+  }, [filters, query, state.data, tab]);
 
   const pageSize = 25;
   const pageCount = Math.max(1, Math.ceil(memories.length / pageSize));
@@ -330,7 +355,6 @@ export function MemoriesPage({
       ) {
         return;
       }
-      if (tab === "deleted") return;
       event.preventDefault();
       searchInputRef.current?.focus();
     };
@@ -512,8 +536,7 @@ export function MemoriesPage({
               <input
                 ref={searchInputRef}
                 value={query}
-                disabled={tab === "deleted"}
-                placeholder={tab === "deleted" ? "回收站不支持搜索" : "搜索记忆内容（按 / 聚焦）"}
+                placeholder={tab === "deleted" ? "过滤回收站内容（按 / 聚焦）" : "搜索记忆内容（按 / 聚焦）"}
                 aria-label="搜索记忆"
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => {
@@ -602,6 +625,13 @@ export function MemoriesPage({
               <button className="ghost-button compact" type="button" onClick={() => setSelectedIds(new Set())}>
                 清除选择
               </button>
+            </div>
+          )}
+
+          {tab === "active" && submittedQuery && (state.data || []).length === 20 && (
+            <div className="notice">
+              <Search size={16} />
+              仅显示前 20 条匹配，请细化搜索词。
             </div>
           )}
 
@@ -696,6 +726,7 @@ export function MemoriesPage({
                 </button>
               ))}
             </div>
+            {pageCount > 1 && (
             <div className="table-pagination">
               <span>第 {pageIndex + 1} / {pageCount} 页</span>
               <div className="button-row">
@@ -703,6 +734,7 @@ export function MemoriesPage({
                 <button className="icon-button" type="button" disabled={pageIndex >= pageCount - 1} onClick={() => setPageIndex((current) => Math.min(pageCount - 1, current + 1))} aria-label="下一页"><ChevronRight size={17} /></button>
               </div>
             </div>
+            )}
             </>
           )}
         </section>

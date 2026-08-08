@@ -1,82 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Activity,
-  ArchiveRestore,
-  Clipboard,
-  Download,
-  Eye,
-  EyeOff,
-  FileText,
-  KeyRound,
-  Layers3,
-  ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
-  Search,
-  ShieldAlert,
-  Trash2,
-  Upload,
-  Wrench,
-  X
-} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Clipboard, Download, RefreshCcw, ShieldAlert, Upload } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
 import type {
   ConnectionSettings,
-  CoreMemoryHistoryItem,
-  CoreMemorySection,
-  CoreSectionName,
-  DecisionLog,
-  MemoryAction,
   MemoryExport,
-  MemoryRecord,
   MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
-  ReviewRecommendation,
-  ReviewResult
+  RestoreResult
 } from "../../types";
-import { badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
-import { InfoCard, StatCard } from "../../components/StatCard";
-import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { StatCard } from "../../components/StatCard";
+import { ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
 import { downloadBlob, downloadFile, copyText } from "../../utils/files";
-import {
-  candidateSummary,
-  clampNumber,
-  dateText,
-  displayText,
-  errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
-  sectionTitle,
-  shortId
-} from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
+import { errorMessage, reportSectionTitle } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
 export function ReportsPage({
@@ -174,7 +111,15 @@ export function ReportsPage({
     if (
       !(await confirm({
         title: "恢复导入",
-        message: "执行导入前建议先导出备份。确认继续导入？",
+        message: (
+          <span>
+            执行导入前建议先导出备份。
+            {overwrite
+              ? "已勾选「覆盖已有」，同 ID 的现有记忆将被导入内容更新。"
+              : "未勾选「覆盖已有」，同 ID 的现有记忆将保持不变。"}
+            确认继续导入？
+          </span>
+        ),
         tone: "warning",
         confirmLabel: "继续导入"
       }))

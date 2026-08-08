@@ -115,7 +115,8 @@ export function UsagePage({ api }: { api: MemoryApi }) {
           {summary.totals.calls === 0 ? (
             <section className="panel">
               <EmptyBlock
-                label="还没有可统计的调用。升级后的新调用会自动记录；历史账单不会反向估算。"
+                label="还没有可统计的调用"
+                hint="升级后的新调用会自动记录；历史账单不会反向估算。"
               />
             </section>
           ) : (

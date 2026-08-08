@@ -77,11 +77,6 @@ export function SettingsPage({
         eyebrow={!settings.apiKey ? "欢迎使用 Memory Console" : undefined}
         title={!settings.apiKey ? "连接你的本地记忆服务" : "设置"}
         subtitle={!settings.apiKey ? "信息只保存在当前浏览器，不会被上传。" : "连接信息与本机偏好。"}
-        action={
-          <button className="primary-button" type="button" onClick={() => onSave(form)}>
-            保存设置
-          </button>
-        }
       />
       <section className="panel settings-panel">
         <div className="panel-header">
@@ -135,7 +130,7 @@ export function SettingsPage({
             disabled={testing}
             onClick={testConnection}
           >
-            测试连接
+            测试并保存
           </button>
         </div>
         <div className="connection-checks" aria-live="polite">

@@ -1,51 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Activity,
   ArrowDown,
-  ArchiveRestore,
   CheckCircle,
-  Clipboard,
   Database,
-  Download,
-  Eye,
   EyeOff,
-  FileText,
-  KeyRound,
   Layers3,
   ListChecks,
-  Pencil,
-  RefreshCcw,
-  Save,
   Search,
-  ShieldAlert,
-  Sparkles,
-  Trash2,
-  Upload,
-  Wrench,
-  X
+  Sparkles
 } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import { normalizeBaseUrl } from "../../storage";
 import type {
-  ConnectionSettings,
-  CoreMemoryHistoryItem,
   CoreMemorySection,
-  CoreSectionName,
   DatabaseHealthIssue,
   DatabaseHealthResult,
   DecisionLog,
-  MemoryAction,
-  MemoryExport,
   MemoryRecord,
-  MemoryReport,
-  MemorySourceExplanation,
-  MemoryStability,
-  MemorySensitivity,
-  MemoryType,
-  PageKey,
-  RecentContextSummary,
-  RestoreResult,
-  ReviewAction,
   ReviewRelatedCandidate,
   ReviewRecommendation,
   ReviewRevisionPreview,
@@ -54,42 +24,22 @@ import type {
   ReviewResult
 } from "../../types";
 import { Badge, badge } from "../../components/Badge";
-import { FieldList, FilterSelect, RangeFields } from "../../components/FormControls";
+import { FieldList, FilterSelect } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { InfoCard, StatCard } from "../../components/StatCard";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import { Modal } from "../../components/Modal";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
-import {
-  CONFIG_KEYS,
-  CORE_SECTIONS,
-  DECISIONS,
-  MEMORY_TYPES,
-  REVIEW_ACTIONS,
-  REVIEW_RISK_TAGS,
-  REVIEW_SEVERITIES,
-  SENSITIVITIES,
-  STABILITIES
-} from "../../utils/constants";
-import { downloadFile, copyText } from "../../utils/files";
+import { REVIEW_RISK_TAGS, REVIEW_SEVERITIES } from "../../utils/constants";
 import {
   candidateSummary,
-  clampNumber,
   dateText,
   displayText,
   errorMessage,
-  joinUrl,
-  maskSecret,
-  percent,
-  prettyJson,
-  reportSectionTitle,
-  reviewActionText,
   sectionTitle,
   shortId
 } from "../../utils/format";
-import { editDraftToPayload, memoryToEditDraft } from "../../utils/memory";
-import type { MemoryEditDraft, MemoryFilters } from "../../utils/memory";
 import type { Notify } from "../pageTypes";
 
 export function ReviewPage({
@@ -526,6 +476,16 @@ export function ReviewPage({
   };
 
   const consolidateCoreMemory = async () => {
+    if (
+      !(await confirm({
+        title: "重新整理核心记忆",
+        message: "确认重新整理核心记忆？该操作会调用上游模型，并可能更新核心记忆。",
+        tone: "warning",
+        confirmLabel: "重新整理"
+      }))
+    ) {
+      return;
+    }
     setConsolidatingCore(true);
     try {
       await api.consolidateCoreMemory();
@@ -579,6 +539,12 @@ export function ReviewPage({
             </div>
           )}
           {state.data.review.recommendations.length === 0 && <EmptyBlock label="暂无体检建议" />}
+          <div className="stats-grid">
+            <StatCard label="扫描记忆" value={state.data.review.total} />
+            <StatCard label="建议数量" value={state.data.review.recommendations.length} />
+            <StatCard label="高优先级" value={highPriority.length} />
+            <StatCard label="核心影响" value={coreRecommendationCount} />
+          </div>
           {state.data.review.recommendations.length > 0 && (
             <section className="panel review-toolbar-panel">
               <div className="toolbar review-toolbar">
@@ -649,7 +615,6 @@ export function ReviewPage({
                         <FieldList
                           compact
                           entries={[
-                            ["记忆 ID", recommendation.memory_ids],
                             ["建议内容", recommendation.suggested_content],
                             ["可执行操作", recommendation.next_action_options.map(displayText)]
                           ]}
@@ -700,6 +665,11 @@ export function ReviewPage({
                               className="warning-button"
                               type="button"
                               disabled={applying || recommendation.memory_ids.length !== 1}
+                              title={
+                                recommendation.memory_ids.length !== 1
+                                  ? "降权建议需要只包含一条记忆"
+                                  : undefined
+                              }
                               onClick={() => applyLower(recommendation)}
                             >
                               <ArrowDown size={16} />
@@ -759,12 +729,6 @@ export function ReviewPage({
             })}
           </div>
 
-          <div className="stats-grid">
-            <StatCard label="扫描记忆" value={state.data.review.total} />
-            <StatCard label="建议数量" value={state.data.review.recommendations.length} />
-            <StatCard label="高优先级" value={highPriority.length} />
-            <StatCard label="核心影响" value={coreRecommendationCount} />
-          </div>
           <section className="panel panel--quiet governance-overview">
             <div className="panel-header">
               <h2>治理概览</h2>

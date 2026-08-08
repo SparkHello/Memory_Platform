@@ -4,7 +4,7 @@ import {
   Brain,
   CheckCircle2,
   ChevronDown,
-  FileText,
+  Download,
   GitBranch,
   Layers3,
   RefreshCcw,
@@ -18,6 +18,7 @@ import { MemoryNetwork } from "../components/MemoryNetwork";
 import { MemoryTraverse } from "../components/MemoryTraverse";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../components/StateBlocks";
 import { useCountUp } from "../hooks/useCountUp";
+import type { ConfirmFn } from "../hooks/useConfirm";
 import type {
   ConnectionSettings,
   DecisionLog,
@@ -138,6 +139,8 @@ type StudioAction = {
   value: string;
   hint: string;
   page: PageKey;
+  // 需要精确落地地址（如回收站 tab）时优先走 hash 跳转。
+  hash?: `#/${string}`;
 };
 
 export function DashboardPage({
@@ -145,13 +148,17 @@ export function DashboardPage({
   settings,
   setPage,
   openMemory,
-  notify
+  notify,
+  confirm,
+  refreshKey
 }: {
   api: MemoryApi;
   settings: ConnectionSettings;
   setPage: (page: PageKey) => void;
   openMemory: (id: string) => void;
   notify: Notify;
+  confirm: ConfirmFn;
+  refreshKey: number;
 }) {
   const [state, setState] = useState<LoadState>({ loading: true, error: null, data: null });
   const [surfaceLoading, setSurfaceLoading] = useState(false);
@@ -222,6 +229,15 @@ export function DashboardPage({
     void load("balanced", "overview", DEFAULT_NETWORK_FILTERS, controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  // 全局记忆档案抽屉改动记忆后（refreshKey 递增），按当前的浮现模式与
+  // 网络过滤条件重取工作室数据；挂载当次的初始加载不重复触发。
+  const seenRefreshKeyRef = useRef(refreshKey);
+  useEffect(() => {
+    if (refreshKey === seenRefreshKeyRef.current) return;
+    seenRefreshKeyRef.current = refreshKey;
+    void load(surfaceMode, networkDensity, networkFilters);
+  }, [refreshKey, load, surfaceMode, networkDensity, networkFilters]);
 
   const surfaceRequestRef = useRef<AbortController | null>(null);
   const networkRequestRef = useRef<AbortController | null>(null);
@@ -298,6 +314,28 @@ export function DashboardPage({
     void refreshNetwork(networkDensity, nextFilters);
   };
 
+  // 导出的是完整备份（含私密/敏感正文），与报告页一致先弹确认警告。
+  const exportJson = async () => {
+    const confirmed = await confirm({
+      title: "导出 JSON 备份",
+      message: "导出的 JSON 会包含完整私密/敏感正文，请妥善保管导出文件。",
+      confirmLabel: "导出",
+      tone: "warning"
+    });
+    if (!confirmed) return;
+    try {
+      const exportData = await api.exportMemories("json");
+      downloadFile(
+        `memory-export-${settings.userId}.json`,
+        JSON.stringify(exportData, null, 2),
+        "application/json"
+      );
+      notify("已生成 JSON 备份", "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
   const data = state.data;
   const selectedNode = useMemo(() => {
     if (!data || !selectedNodeId) return null;
@@ -349,6 +387,15 @@ export function DashboardPage({
                   {data.health === "ok" ? "服务在线" : data.health}
                 </span>
                 <button
+                  className="icon-button"
+                  type="button"
+                  onClick={() => void exportJson()}
+                  title="导出 JSON 备份（含完整敏感正文）"
+                  aria-label="导出 JSON 备份"
+                >
+                  <Download size={15} />
+                </button>
+                <button
                   className={`icon-button studio-refresh ${state.loading ? "is-loading" : ""}`}
                   type="button"
                   onClick={() => void load(surfaceMode, networkDensity, networkFilters)}
@@ -378,7 +425,13 @@ export function DashboardPage({
                   key={action.key}
                   type="button"
                   className={`action-card tone-${action.tone}`}
-                  onClick={() => setPage(action.page)}
+                  onClick={() => {
+                    if (action.hash) {
+                      window.location.hash = action.hash.slice(1);
+                    } else {
+                      setPage(action.page);
+                    }
+                  }}
                 >
                   <span className="action-title">{action.title}</span>
                   <strong className="action-value">{action.value}</strong>
@@ -474,7 +527,7 @@ export function DashboardPage({
                   情绪分布
                 </h2>
               </div>
-              {emotion && (
+              {emotion ? (
                 <>
                   <EmotionQuadrant valence={emotion.valence} arousal={emotion.arousal} />
                   <div className="emotion-stats">
@@ -496,6 +549,8 @@ export function DashboardPage({
                     </div>
                   </div>
                 </>
+              ) : (
+                <EmptyBlock label="暂无记忆节点，无法统计情绪分布" compact />
               )}
             </section>
             </div>
@@ -551,19 +606,6 @@ export function DashboardPage({
                 spaces={data.spaces}
                 api={api}
                 onOpenMemory={() => selectedNode && openMemory(selectedNode.id)}
-                onExport={async () => {
-                  try {
-                    const exportData = await api.exportMemories("json");
-                    downloadFile(
-                      `memory-export-${settings.userId}.json`,
-                      JSON.stringify(exportData, null, 2),
-                      "application/json"
-                    );
-                    notify("已生成 JSON 备份", "success");
-                  } catch (error) {
-                    notify(errorMessage(error), "error");
-                  }
-                }}
                 onDeveloper={() => setPage("developer")}
               />
             </div>
@@ -606,15 +648,16 @@ function VitalityTrack({
   const average = memories.length
     ? Math.round(memories.reduce((sum, memory) => sum + lifeWidth(memory.life_score), 0) / memories.length)
     : 0;
+  const empty = !loading && memories.length === 0;
   return (
-    <div className="hero-vitality" aria-label={`浮现记忆平均生命力 ${average}%`}>
+    <div className="hero-vitality" aria-label={empty ? "生命力轨道暂无数据" : `浮现记忆平均生命力 ${average}%`}>
       <span>生命力轨道</span>
       <div className="vitality-rail" aria-hidden="true">
         {memories.slice(0, 6).map((memory) => (
           <i key={memory.id} style={{ width: `${Math.max(5, lifeWidth(memory.life_score))}%` }} />
         ))}
       </div>
-      <strong>{loading ? "刷新中" : `${average}%`}</strong>
+      <strong>{loading ? "刷新中" : memories.length ? `${average}%` : "暂无数据"}</strong>
     </div>
   );
 }
@@ -804,14 +847,12 @@ function NetworkDetail({
   spaces,
   api,
   onOpenMemory,
-  onExport,
   onDeveloper
 }: {
   node: MemoryNetworkNode | null;
   spaces: MemorySpace[];
   api: MemoryApi;
   onOpenMemory: () => void;
-  onExport: () => void;
   onDeveloper: () => void;
 }) {
   const [traverse, setTraverse] = useState<{
@@ -830,10 +871,6 @@ function NetworkDetail({
         <strong>节点档案</strong>
         <p>关系、正文和情绪线索会在这里展开。</p>
         <div className="button-row">
-          <button className="secondary-button compact" type="button" onClick={onExport}>
-            <FileText size={15} />
-            导出
-          </button>
           <button className="secondary-button compact" type="button" onClick={onDeveloper}>
             <Wrench size={15} />
             接入
@@ -937,7 +974,7 @@ function NetworkDetail({
         }}
       >
         <GitBranch size={15} />
-        实验图遍历
+        图遍历
       </button>
       <MemoryTraverse
         traverse={traverse.data}
@@ -1031,7 +1068,8 @@ function buildStudioActions(data: DashboardData): StudioAction[] {
       title: "回收站",
       value: `${data.report.counts.deleted_memories} 条`,
       hint: "待恢复或彻底清理",
-      page: "memories"
+      page: "memories",
+      hash: "#/memories?tab=recycle"
     });
   }
   if (data.report.counts.core_sections === 0) {
@@ -1065,8 +1103,9 @@ function summarizeEvalProgress(
 
 function summarizeEmotion(nodes: MemoryNetworkNode[]) {
   const memories = nodes.filter((node) => node.kind === "memory");
+  // 零节点时返回 null，由上层渲染空态，不编造 50%/30% 的兜底值。
   if (!memories.length) {
-    return { valence: 0.5, arousal: 0.3, positive: 0, highArousal: 0 };
+    return null;
   }
   const valence = average(memories.map((node) => node.valence ?? 0.5));
   const arousal = average(memories.map((node) => node.arousal ?? 0.3));
