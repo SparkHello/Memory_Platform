@@ -1,0 +1,34 @@
+name: Feature request
+description: 建议一个有明确使用场景的改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: 先描述当前用户为什么难以完成任务。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Likely scope
+      options:
+        - Setup / onboarding
+        - Memory and governance
+        - Knowledge base
+        - Model routing / provider
+        - MCP / client integration
+        - Web Console
+        - Documentation / ecosystem
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Security, compatibility, or migration constraints

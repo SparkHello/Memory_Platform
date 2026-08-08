@@ -70,6 +70,10 @@ docs/               客户端接入和产品路线文档
 
 推荐把两个职责分开：同一单仓库中的 `services/model-gateway` 管供应商账号、模型 deployment、功能路由、健康检查和价格；本服务的 `memgw` 只负责 Memory Gateway 的本地配置与进程生命周期。Memory Gateway 只持有一个本地 client key，不再保存每家供应商密钥。
 
+从单仓库首次安装时，最短路径是在仓库根运行 `scripts/setup.sh`：真实终端会自动完成环境、双服务接线、启动、模型 quickstart 和最终 doctor。只安装不配置时加 `--install-only`。AI/Agent 可生成不含密钥的 `docs/ai-quickstart.schema.json` 配置单，再使用 `scripts/setup.sh --config <文件> --json`；API Key 只经 stdin 传入。
+
+已有运行环境只重新配置模型时加 `--configure-only`，避免重复安装依赖和运行栈安装。quickstart 提供常见官方渠道地址预设，并用只读 `/models` 自动列出当前 key 可用的精确模型 ID；该发现步骤不发推理、不写配置。
+
 ### 日常使用：一个终端入口
 
 安装完成后直接运行：

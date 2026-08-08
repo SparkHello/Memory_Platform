@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import sys
 
@@ -460,3 +461,28 @@ def test_settings_error_redaction_and_secret_name_suffixes() -> None:
     assert _is_secret_name("DASHSCOPE_PASSWORD")
     assert _is_secret_name("GATEWAY_API_KEY")
     assert not _is_secret_name("LOG_LEVEL")
+
+
+def test_root_setup_returns_machine_readable_error_before_any_mutation() -> None:
+    platform_root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [
+            str(platform_root / "scripts" / "setup.sh"),
+            "--configure-only",
+            "--config",
+            str(platform_root / "examples" / "quickstart.example.json"),
+            "--json",
+        ],
+        input="",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "setup_verified": False,
+        "error": {"step": "arguments", "exit_code": 2},
+    }
+    assert "provider API key is required" in result.stderr

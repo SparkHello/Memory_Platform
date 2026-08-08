@@ -135,13 +135,13 @@ flowchart TB
 
 ### 一键安装双服务运行栈
 
-在仓库根目录执行：
+在仓库根目录执行这一条命令：
 
 ```bash
 scripts/setup.sh
 ```
 
-它会依次完成：探测合适的 Python 创建统一运行环境、以 editable 模式安装两个服务、构建 Web Console，然后运行 `memgw stack install --start` 安装、接线并启动整个栈。暂时不需要前端时用 `scripts/setup.sh --skip-ui`。
+在真实终端中，它会连续完成：准备 Python 环境、安装两个服务、构建 Web Console、生成本地身份并安全接线、启动双服务，然后直接进入一次问完的模型配置并运行最终检查。暂时不需要前端时用 `scripts/setup.sh --skip-ui`；只准备运行环境、暂不配置模型时用 `scripts/setup.sh --install-only`。
 
 `stack install` 会初始化仓库外配置，为两个服务创建彼此独立的本地身份，安全生成并同步 backend key，还会**自动生成客户端访问密钥（`GATEWAY_API_KEY`）并在输出中打印一次**——请妥善保存，它不会再次显示，也不会写入仓库 `.env`。这就是客户端访问 `/v1`、MCP、REST 和 Web Console 时使用的密钥，与 backend key、admin key 和供应商 API Key 都不同。需要更换时运行 `scripts/memgw secret set gateway`。
 
@@ -149,15 +149,17 @@ scripts/setup.sh
 
 ### 第一次配置模型
 
-最快路径是一条 `quickstart` 命令，问完渠道、聊天模型和用途并自动连接记忆服务：
+直接运行上面的 `scripts/setup.sh` 时，模型 quickstart 已经包含在同一流程中。安装过环境后想单独重新配置，也可以运行：
 
 ```bash
 services/memory-gateway/.venv/bin/modelgw quickstart
 ```
 
-它会引导你添加一个渠道、填入一个聊天模型 ID 和 API Key，把全部文字用途都指向这个模型，可选配置语义搜索向量模型，最后连接并重启记忆服务。想用交互式主菜单精细配置，仍可运行 `scripts/memgw` 选择“设置模型渠道、模型和用途”。
+它只询问渠道、API Key，以及是否配置语义搜索；预设渠道会自动读取当前 key 可见的精确模型 ID 供选择。先让一个模型承担全部文字用途，最后自动连接并重启记忆服务。想用交互式主菜单精细配置，仍可运行 `scripts/memgw` 选择“设置模型渠道、模型和用途”。
 
-想让 AI/Agent 帮你全命令行、零交互安装（含 `quickstart --non-interactive`），见 [让 AI 帮你安装](docs/ai-install.md)。
+quickstart 内置 DeepSeek、Kimi 中国区、MiMo 和 DashScope 北京区地址预设；选择预设并隐藏输入 API Key 后，会只读请求一次 `/models`，让你按实际可用列表选择，不发送推理。自定义渠道仍可手工填写官方 Base URL。已有环境只想重新配置时使用 `scripts/setup.sh --configure-only --config <文件> --json`，不会重复安装依赖或运行 `stack install`。
+
+想让 AI/Agent 帮你配置，可让它生成一份**不含密钥**、符合 [`ai-quickstart.schema.json`](docs/ai-quickstart.schema.json) 的配置单，再用 `scripts/setup.sh --config <文件> --json` 一条命令完成。API Key 只从标准输入传入，配置单会拒绝未知字段和密钥字段。完整流程见 [让 AI 帮你安装](docs/ai-install.md)。
 
 Model Gateway 中的几个用户概念：
 
@@ -424,6 +426,9 @@ Memory Platform 当前适合：
 
 ## 进一步阅读
 
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
+- [变更记录](CHANGELOG.md)
 - [Memory Gateway 完整说明](services/memory-gateway/README.md)
 - [Model Gateway 完整说明](services/model-gateway/README.md)
 - [客户端接入](services/memory-gateway/docs/client_integration.md)

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "preset": "deepseek",
+  "chat_model": "exact-chat-model-id",
+  "plan": "payg",
+  "chat_capabilities": [
+    "tools",
+    "reasoning"
+  ],
+  "reasoning_default": "inherit",
+  "embedding": null
+}

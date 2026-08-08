@@ -25,3 +25,5 @@ python3.12 -m venv .venv
 .venv/bin/pytest
 .venv/bin/modelgw --home /tmp/modelgw-test init
 ```
+
+AI/Agent 首次配置优先使用不含密钥的 quickstart recipe：`modelgw quickstart --config <json> --json`。recipe 契约位于仓库根 `docs/ai-quickstart.schema.json`；供应商 API Key 只能从 stdin 读取，不得加入 JSON、命令参数、日志或测试夹具输出。

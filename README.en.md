@@ -141,21 +141,23 @@ From the repository root:
 scripts/setup.sh
 ```
 
-This detects a suitable Python and creates a unified runtime environment, installs both services in editable mode, builds the Web Console, then runs `memgw stack install --start` to install, wire, and start the whole stack. Use `scripts/setup.sh --skip-ui` to skip the frontend for now.
+In a real terminal this prepares Python, installs both services, builds the Web Console, creates and wires the local identities, starts the stack, continues directly into the guided model quickstart, and runs the final checks. Use `scripts/setup.sh --skip-ui` to skip the frontend, or `scripts/setup.sh --install-only` to prepare the stack without configuring a model.
 
 `stack install` initializes configuration outside the repository, creates independent local identities for the two services, securely generates and syncs the backend key, and **auto-generates a client access key (`GATEWAY_API_KEY`), printing it once**. Save it — it is not shown again and is never written to the repository's `.env`. That key is what clients use for `/v1`, MCP, REST, and the Web Console. It differs from the backend key, the admin key, and vendor API keys. Run `scripts/memgw secret set gateway` to rotate it.
 
 ### Configuring your first model
 
-The fastest path is a single `quickstart` command, which asks for a channel, a chat model, and purposes, then wires the memory service automatically:
+The `scripts/setup.sh` flow above already includes model quickstart. To reconfigure a previously installed environment, run:
 
 ```bash
 services/memory-gateway/.venv/bin/modelgw quickstart
 ```
 
-It walks you through adding one channel, entering one chat model ID and API key, points every text purpose at that model, optionally configures an embedding model for semantic search, and finally connects and restarts the memory service. For finer control, run `scripts/memgw` and choose the model configuration menu.
+It asks only for the channel, API key, and optional semantic-search model. Preset channels read the exact model IDs visible to that key and let you choose one. A single model initially carries every text purpose, then the memory service is wired and restarted automatically. For finer control, run `scripts/memgw` and choose the model configuration menu.
 
-To have an AI/agent install it for you with zero interaction (using `quickstart --non-interactive`), see [Installing with an AI assistant](docs/ai-install.md).
+Quickstart includes endpoint presets for DeepSeek, Kimi China, MiMo, and DashScope Beijing. After a hidden API-key prompt it performs one read-only `/models` request and lets you choose from the models that key can actually access; it sends no inference request. For an installed environment, `scripts/setup.sh --configure-only --config <file> --json` skips dependency and stack installation.
+
+For AI-assisted setup, have the agent create a **non-secret** recipe matching [`ai-quickstart.schema.json`](docs/ai-quickstart.schema.json), then run `scripts/setup.sh --config <file> --json`. The provider key is accepted only on stdin, while unknown and secret fields are rejected. See [Installing with an AI assistant](docs/ai-install.md).
 
 Model Gateway's user-facing concepts:
 
@@ -388,6 +390,9 @@ It does not currently target:
 
 ## Further reading
 
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 - [Memory Gateway full documentation](services/memory-gateway/README.md)
 - [Model Gateway full documentation](services/model-gateway/README.md)
 - [Installing with an AI assistant](docs/ai-install.md)

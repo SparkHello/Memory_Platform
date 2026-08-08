@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
+import json
+from pathlib import Path
 import re
 import secrets
+from typing import Any
+
+import httpx
 
 from model_gateway.config_store import (
     GatewayPaths,
@@ -39,6 +44,48 @@ CHAT_ROUTES: tuple[str, ...] = (
     "knowledge.pro",
 )
 EMBEDDING_ROUTE = "memory.embedding"
+QUICKSTART_FILE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelPreset:
+    id: str
+    label: str
+    channel_operator: str
+    base_url: str
+    adapter: str
+
+
+CHANNEL_PRESETS: dict[str, ChannelPreset] = {
+    "deepseek": ChannelPreset(
+        id="deepseek",
+        label="DeepSeek 官方",
+        channel_operator="deepseek",
+        base_url="https://api.deepseek.com",
+        adapter="deepseek",
+    ),
+    "kimi-cn": ChannelPreset(
+        id="kimi-cn",
+        label="Kimi / Moonshot 中国区",
+        channel_operator="moonshot",
+        base_url="https://api.moonshot.cn/v1",
+        adapter="kimi",
+    ),
+    "mimo": ChannelPreset(
+        id="mimo",
+        label="小米 MiMo 官方",
+        channel_operator="xiaomi",
+        base_url="https://api.xiaomimimo.com/v1",
+        adapter="mimo",
+    ),
+    "dashscope-cn": ChannelPreset(
+        id="dashscope-cn",
+        label="阿里云百炼 / DashScope 北京区",
+        channel_operator="dashscope",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        adapter="generic",
+    ),
+}
 
 _ADAPTERS = ("generic", "kimi", "deepseek", "mimo")
 _PLANS = (
@@ -64,6 +111,190 @@ class QuickstartError(ValueError):
     pass
 
 
+def get_channel_preset(preset_id: str) -> ChannelPreset:
+    try:
+        return CHANNEL_PRESETS[preset_id]
+    except KeyError as exc:
+        raise QuickstartError(f"未知渠道预设：{preset_id}") from exc
+
+
+def discover_model_ids(
+    *,
+    base_url: str,
+    api_key: str,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[str, ...]:
+    """Read an OpenAI-compatible model list without inference or redirects."""
+
+    if not base_url.strip():
+        raise QuickstartError("模型发现需要 base_url")
+    if not api_key.strip():
+        raise QuickstartError("模型发现需要 API Key")
+    try:
+        with httpx.Client(
+            transport=transport,
+            follow_redirects=False,
+            timeout=httpx.Timeout(10.0),
+        ) as client:
+            response = client.get(
+                f"{base_url.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key.strip()}"},
+            )
+    except httpx.HTTPError as exc:
+        raise QuickstartError(f"读取 /models 失败：{type(exc).__name__}") from exc
+    if 300 <= response.status_code < 400:
+        raise QuickstartError("渠道 /models 返回重定向；为避免凭证泄露已拒绝跟随")
+    if response.status_code in {401, 403}:
+        raise QuickstartError(f"渠道鉴权失败（HTTP {response.status_code}）")
+    if response.status_code != 200:
+        raise QuickstartError(f"渠道 /models 返回 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise QuickstartError("渠道 /models 没有返回有效 JSON") from exc
+    if isinstance(payload, dict):
+        items = payload.get("data", payload.get("models", []))
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+    if not isinstance(items, list):
+        items = []
+    model_ids: set[str] = set()
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            model_ids.add(item.strip())
+        elif isinstance(item, dict):
+            value = item.get("id") or item.get("model")
+            if isinstance(value, str) and value.strip():
+                model_ids.add(value.strip())
+    if not model_ids:
+        raise QuickstartError("渠道 /models 可访问，但没有解析到模型 ID")
+    return tuple(sorted(model_ids))
+
+
+def load_quickstart_file(
+    path: Path,
+    *,
+    api_key: str,
+    connect_memory: bool = True,
+) -> QuickstartSpec:
+    """Load a reviewable, non-secret quickstart recipe.
+
+    The provider key is deliberately a separate argument so a recipe created
+    by an AI assistant remains safe to inspect, share, and commit as an
+    example. Unknown fields are rejected instead of silently accepting a
+    misspelling or a secret-like field such as ``api_key``.
+    """
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise QuickstartError(f"无法读取 quickstart 配置：{path}") from exc
+    except json.JSONDecodeError as exc:
+        raise QuickstartError(
+            f"quickstart 配置不是有效 JSON：第 {exc.lineno} 行第 {exc.colno} 列"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise QuickstartError("quickstart 配置根节点必须是 JSON 对象")
+
+    allowed = {
+        "schema_version",
+        "preset",
+        "channel",
+        "base_url",
+        "chat_model",
+        "adapter",
+        "plan",
+        "chat_author",
+        "chat_capabilities",
+        "reasoning_default",
+        "embedding",
+        "replace_existing_routes",
+    }
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise QuickstartError(
+            "quickstart 配置含未知字段（配置文件不得保存 API Key 或 secret）："
+            + ", ".join(unknown)
+        )
+    schema_version = raw.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != QUICKSTART_FILE_SCHEMA_VERSION:
+        raise QuickstartError(
+            f"quickstart schema_version 必须是 {QUICKSTART_FILE_SCHEMA_VERSION}"
+        )
+
+    def string_value(container: dict[str, Any], name: str, default: str = "") -> str:
+        value = container.get(name, default)
+        if not isinstance(value, str):
+            raise QuickstartError(f"quickstart 字段 {name} 必须是字符串")
+        return value
+
+    raw_capabilities = raw.get("chat_capabilities", [])
+    if not isinstance(raw_capabilities, list) or any(
+        not isinstance(item, str) for item in raw_capabilities
+    ):
+        raise QuickstartError("quickstart 字段 chat_capabilities 必须是字符串数组")
+    if len(set(raw_capabilities)) != len(raw_capabilities):
+        raise QuickstartError("quickstart 字段 chat_capabilities 不得包含重复值")
+
+    raw_embedding = raw.get("embedding")
+    if raw_embedding is None:
+        embedding: dict[str, Any] = {}
+    elif isinstance(raw_embedding, dict):
+        embedding = raw_embedding
+    else:
+        raise QuickstartError("quickstart 字段 embedding 必须是对象或 null")
+    embedding_allowed = {"model", "dimensions", "space", "author"}
+    embedding_unknown = sorted(str(key) for key in embedding if key not in embedding_allowed)
+    if embedding_unknown:
+        raise QuickstartError(
+            "quickstart embedding 含未知字段：" + ", ".join(embedding_unknown)
+        )
+    if raw_embedding is not None:
+        missing_embedding = sorted(
+            name for name in ("model", "dimensions", "space") if name not in embedding
+        )
+        if missing_embedding:
+            raise QuickstartError(
+                "quickstart embedding 缺少字段：" + ", ".join(missing_embedding)
+            )
+    dimensions = embedding.get("dimensions")
+    if dimensions is not None and (
+        isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1
+    ):
+        raise QuickstartError("quickstart embedding.dimensions 必须是正整数")
+    replace_existing_routes = raw.get("replace_existing_routes", False)
+    if not isinstance(replace_existing_routes, bool):
+        raise QuickstartError("quickstart 字段 replace_existing_routes 必须是布尔值")
+
+    preset_id = string_value(raw, "preset")
+    preset = get_channel_preset(preset_id) if preset_id else None
+    spec = QuickstartSpec(
+        channel_operator=string_value(
+            raw,
+            "channel",
+            preset.channel_operator if preset else "",
+        ),
+        base_url=string_value(raw, "base_url", preset.base_url if preset else ""),
+        chat_model=string_value(raw, "chat_model"),
+        api_key=api_key,
+        adapter=string_value(raw, "adapter", preset.adapter if preset else "generic"),
+        plan=string_value(raw, "plan", "payg"),
+        chat_author=string_value(raw, "chat_author"),
+        chat_capabilities=tuple(raw_capabilities),
+        reasoning_default=string_value(raw, "reasoning_default", "inherit"),
+        embedding_model=string_value(embedding, "model"),
+        embedding_dimensions=dimensions,
+        embedding_space=string_value(embedding, "space"),
+        embedding_author=string_value(embedding, "author"),
+        connect_memory=connect_memory,
+        replace_existing_routes=replace_existing_routes,
+    )
+    spec.validate()
+    return spec
+
+
 @dataclass(slots=True)
 class QuickstartSpec:
     """A complete, TTY-free description of a first-run model setup."""
@@ -82,6 +313,7 @@ class QuickstartSpec:
     embedding_space: str = ""
     embedding_author: str = ""
     connect_memory: bool = True
+    replace_existing_routes: bool = False
 
     def validate(self) -> None:
         if self.adapter not in _ADAPTERS:
@@ -134,6 +366,13 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     spec.validate()
     config = load_config(paths.config)
     existing_secrets = read_secrets(paths.secrets)
+    existing_routes = sorted(route_id for route_id in CHAT_ROUTES if route_id in config.routes)
+    if existing_routes and not spec.replace_existing_routes:
+        raise QuickstartError(
+            "已有文字用途路由，quickstart 未覆盖："
+            + ", ".join(existing_routes)
+            + "；确认替换时显式启用 replace_existing_routes"
+        )
 
     operator = spec.channel_operator.strip().lower()
     connection_id = _unique_id(_slug(f"{operator}-account"), config.connections)

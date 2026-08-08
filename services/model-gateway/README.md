@@ -51,6 +51,26 @@ modelgw
 
 已有的完整子命令继续保留，供自动化、精细配置和排障使用。显式运行 `modelgw menu` 也会打开同一菜单。
 
+如果由 AI/Agent 帮忙，可让它生成一份不含密钥、符合仓库根 `docs/ai-quickstart.schema.json` 的 JSON 配置单，然后执行：
+
+```bash
+printf '%s\n' "$USER_PROVIDED_API_KEY" | \
+  modelgw quickstart --config /tmp/memory-platform-quickstart.json --json
+```
+
+配置单会严格拒绝未知字段，因而不能把 `api_key` 或 `secret` 混入文件；供应商 API Key 只从标准输入读取。旧的 `quickstart --non-interactive --channel ...` 参数方式继续支持。
+
+想先确认某个 key 当前能看到哪些模型，可只读发现，不保存渠道也不发送推理：
+
+```bash
+printf '%s\n' "$USER_PROVIDED_API_KEY" | \
+  modelgw discover --preset deepseek --non-interactive --json
+```
+
+可用预设为 `deepseek`、`kimi-cn`、`mimo` 和 `dashscope-cn`；自定义渠道改用 `--base-url https://...`。交互式 `modelgw quickstart` 会自动执行同类 `/models` 读取并显示模型编号，失败时才回退为手工输入精确模型 ID。
+
+quickstart 默认拒绝覆盖已有的 `memory.*` / `knowledge.*` 文字 route。交互模式会显示现有 route 并要求确认；自动化必须在 recipe 中显式设置 `replace_existing_routes=true`，或在参数模式中加 `--replace-existing-routes`。已有多渠道 fallback 时优先使用精细 `modelgw route`，不要用 quickstart 收缩配置。
+
 ## 安装与 PATH
 
 ```bash

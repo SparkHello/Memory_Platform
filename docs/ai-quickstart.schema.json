@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memory-platform.local/schemas/ai-quickstart.schema.json",
+  "title": "Memory Platform AI quickstart recipe",
+  "description": "A reviewable model setup recipe. API keys and other secrets are deliberately forbidden and must be supplied through stdin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "chat_model"],
+  "anyOf": [
+    {
+      "required": ["preset"]
+    },
+    {
+      "required": ["channel", "base_url"]
+    }
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "preset": {
+      "enum": ["deepseek", "kimi-cn", "mimo", "dashscope-cn"],
+      "description": "Optional maintained channel preset. Custom channels should provide channel and base_url instead."
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Short name of the channel/operator that owns the API account."
+    },
+    "base_url": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://",
+      "description": "Official OpenAI-compatible API base URL for this channel."
+    },
+    "chat_model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Exact upstream chat model ID shown by the channel."
+    },
+    "adapter": {
+      "enum": ["generic", "kimi", "deepseek", "mimo"],
+      "default": "generic"
+    },
+    "plan": {
+      "enum": [
+        "payg",
+        "subscription",
+        "free_tier",
+        "token_plan",
+        "coding_plan",
+        "direct_tool_only",
+        "custom"
+      ],
+      "default": "payg"
+    },
+    "chat_author": {
+      "type": "string",
+      "default": ""
+    },
+    "chat_capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "tools",
+          "parallel_tools",
+          "reasoning",
+          "multimodal_input",
+          "json_object",
+          "json_schema"
+        ]
+      },
+      "default": []
+    },
+    "reasoning_default": {
+      "enum": ["inherit", "enabled", "disabled"],
+      "default": "inherit"
+    },
+    "replace_existing_routes": {
+      "type": "boolean",
+      "default": false,
+      "description": "Must be explicitly true before quickstart may replace existing memory/knowledge text routes."
+    },
+    "embedding": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["model", "dimensions", "space"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dimensions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "space": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Immutable local name for this exact endpoint/model/dimension vector space."
+        },
+        "author": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    }
+  }
+}
