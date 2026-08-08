@@ -543,16 +543,24 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     gateway_key_supplied = not gateway_key_generated and gateway_key != persisted_gateway_key
 
     memory_port = int(read_json(paths.project_file).get("port") or 2026)
+    # 在容器里 uvicorn 固定绑 2026，宿主机映射到哪个端口只有 compose 知道。用户
+    # 会照着这段日志填客户端地址（文档也让他们回来看日志找密钥），所以必须打印
+    # 宿主机上真正能访问的端口，否则改过端口的人拿到的是一份连不上的地址。
+    public_port = str(memory_port)
+    declared_public = environment.get("MEMORY_PUBLIC_PORT", "").strip()
+    if declared_public.isdigit():
+        public_port = declared_public
     print("双服务运行栈已经安装并安全接线。")
     print(f"Model Gateway 配置：{model_home}")
     print("backend key 已在两端同步，值未显示，也未写入项目 .env。")
     print("")
     print("接入信息")
     print("-" * 36)
-    print(f"Web Console            http://127.0.0.1:{memory_port}/ui/")
-    print(f"OpenAI 兼容 base URL   http://127.0.0.1:{memory_port}/v1")
-    print(f"MCP                    http://127.0.0.1:{memory_port}/mcp")
+    print(f"Web Console            http://127.0.0.1:{public_port}/ui/")
+    print(f"OpenAI 兼容 base URL   http://127.0.0.1:{public_port}/v1")
+    print(f"MCP                    http://127.0.0.1:{public_port}/mcp")
     print(f"Model Gateway base URL http://127.0.0.1:{port}/v1")
+    print("                       ↑ 内部接线地址，不要填进客户端")
     if gateway_key_generated:
         print("")
         print("已为你自动生成客户端访问密钥（GATEWAY_API_KEY）。")

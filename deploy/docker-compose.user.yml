@@ -25,6 +25,9 @@ services:
       # 留空则容器自动生成一枚高强度密钥。之后更换请用 memgw / modelgw secret set。
       GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
       MEMORY_CONSOLE_ADMIN_KEY: "${MEMORY_CONSOLE_ADMIN_KEY:-}"
+      # 容器内固定监听 2026，宿主机映射到哪个端口只有这里知道。告诉容器一声，
+      # 它打印的接入地址才是用户真正能访问的那个。
+      MEMORY_PUBLIC_PORT: "${MEMORY_PORT:-2026}"
     volumes:
       - memory-platform-data:/data
     restart: unless-stopped
