@@ -95,8 +95,12 @@ export MEMORY_HOST="$HOST" MEMORY_PORT="$PORT"
 
 # 密钥只在首启日志里打印一次。必须在 up -d 之前判断数据卷是否已存在，才能区分
 # “这是重装、密钥沿用旧的” 和 “这是首装、但日志没解析出来”——两者的处置完全不同。
+# Compose 以安装目录名作为 project 名（小写、去掉 [a-z0-9_-] 以外的字符），数据卷
+# 即 <project>_memory-platform-data。这里必须精确匹配本项目的卷：只按后缀匹配的话，
+# 装在另一个目录下的另一套安装会让全新安装被误判成“已经装过”。
+COMPOSE_PROJECT=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
 PREEXISTING=0
-if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -q 'memory-platform-data$'; then
+if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "${COMPOSE_PROJECT}_memory-platform-data"; then
   PREEXISTING=1
 fi
 
