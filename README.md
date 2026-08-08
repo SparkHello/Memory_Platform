@@ -133,7 +133,7 @@ API Key:  安装时生成的 GATEWAY_API_KEY
 
 普通聊天不需要安装 MCP，也不需要在 system prompt 里要求模型判断“什么时候该保存记忆”。默认 `read-write` 模式由 Memory Gateway 自动处理相关记忆的召回、注入和回答后提取。
 
-手机上的 `localhost` 和 `127.0.0.1` 指手机自己。局域网或 Tailscale 设备需要改用运行 Memory Platform 的电脑地址。具体填写位置、验证步骤和常见问题见[客户端接入指南](docs/client-setup.md)。
+手机上的 `localhost` 和 `127.0.0.1` 指手机自己。局域网或 Tailscale 设备需要改用运行 Memory Platform 的电脑地址；Docker 部署还需先在 Compose 同目录 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 并重启，放开局域网监听。具体填写位置、验证步骤和常见问题见[客户端接入指南](docs/client-setup.md)。
 
 ### 可选 MCP：让模型显式使用记忆和知识库
 

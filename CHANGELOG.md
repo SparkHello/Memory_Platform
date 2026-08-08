@@ -12,7 +12,7 @@
 - AI 安装契约、结构化成功/失败输出与社区贡献、安全模板。
 - 根级 `Dockerfile` 与 `deploy/`：单容器双服务一体化镜像、首启自动接线入口脚本、开发/用户 compose 文件，以及 tag 推送 GHCR 的 `docker.yml` workflow（含 PR smoke test）。
 - `deploy/install.sh` 一键安装脚本：检查 Docker、下载用户版 Compose、自动避开已占用端口、等待首启就绪并打印两枚一次性密钥；重复运行即升级到最新镜像。
-- 用户版 compose 支持 `MEMORY_PORT` 覆盖宿主机端口映射，并内置 healthcheck 覆盖首启安装期。
+- 用户版 compose 支持 `MEMORY_PORT` 覆盖宿主机端口映射、`MEMORY_HOST=0.0.0.0` 放开局域网/手机访问，并内置 healthcheck 覆盖首启安装期；一键脚本在开启局域网模式时会直接打印手机可用地址。
 - 面向 Chatbox / RikkaHub 用户的 `docs/client-setup.md` 接入指南：三项配置、领 key 指引、常见坑速查表。
 - `memgw stack install` 现在自动生成 Model Gateway admin key（`memory-console-admin`）并只打印一次，Web Console 的渠道管理不再需要手工创建 admin 身份。
 - Web Console「模型与路由」页新增「新建渠道」分步向导：选预设/自定义渠道 → 单向写入渠道 key → discovery 拉取可见模型 → 选定聊天/向量模型并一键接管八条用途路由；全新安装后无需 CLI 即可完成首次模型配置。

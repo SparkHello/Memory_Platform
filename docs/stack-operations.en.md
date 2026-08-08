@@ -60,6 +60,18 @@ MEMORY_PORT=3026
 
 Then restart with `docker compose -f docker-compose.user.yml up -d`. From then on, replace every `2026` in this repository's docs with `3026` (Web Console, Base URL, MCP address, and so on). The container-internal port stays 2026; only the host mapping changes.
 
+## Phone and LAN access (Docker)
+
+The Docker deployment listens on the loopback interface only, so phones and other devices cannot reach it. Add one line to a `.env` file next to `docker-compose.user.yml`:
+
+```bash
+MEMORY_HOST=0.0.0.0
+```
+
+Then restart with `docker compose -f docker-compose.user.yml up -d` and point clients at the computer's LAN IP (`ipconfig getifaddr en0` on macOS), for example `http://192.168.1.20:2026/v1`. Installer users can also re-run `deploy/install.sh` with `MEMORY_HOST=0.0.0.0`; it prints the phone-ready address at the end. Source installs already listen on all interfaces by default.
+
+Do this only on trusted home networks or Tailscale. The API still requires `GATEWAY_API_KEY`, but never expose the service to the public internet.
+
 ## Keys and identity
 
 The stack has several keys with separate responsibilities. Do not reuse them:

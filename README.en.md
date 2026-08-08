@@ -133,7 +133,7 @@ After one complete message, open `http://127.0.0.1:2026/ui/` to check whether a 
 
 Ordinary chat does not require MCP or a system prompt telling the model when to save memory. In the default `read-write` mode, Memory Gateway handles relevant-memory recall, context injection, and post-answer extraction automatically.
 
-On a phone, `localhost` and `127.0.0.1` point to the phone itself. LAN or Tailscale devices must use the address of the computer running Memory Platform. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
+On a phone, `localhost` and `127.0.0.1` point to the phone itself. LAN or Tailscale devices must use the address of the computer running Memory Platform; Docker deployments also need `MEMORY_HOST=0.0.0.0` in a `.env` file next to the Compose file, plus a restart, to listen on the LAN. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
 
 ### Optional MCP: let the model use memory and knowledge explicitly
 

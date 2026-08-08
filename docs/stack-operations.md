@@ -60,6 +60,18 @@ MEMORY_PORT=3026
 
 然后 `docker compose -f docker-compose.user.yml up -d` 重启生效。之后本仓库文档中的所有 `2026` 都换成 `3026`（Web Console、Base URL、MCP 地址等）。容器内部端口保持 2026 不变，只改宿主机映射。
 
+## 手机和局域网访问（Docker）
+
+Docker 部署默认只监听本机回环，手机和其他设备连不上。在 `docker-compose.user.yml` 同目录的 `.env` 加一行：
+
+```bash
+MEMORY_HOST=0.0.0.0
+```
+
+然后 `docker compose -f docker-compose.user.yml up -d` 重启，客户端改用电脑的局域网 IP（macOS 用 `ipconfig getifaddr en0` 查询），例如 `http://192.168.1.20:2026/v1`。一键脚本用户也可以直接 `MEMORY_HOST=0.0.0.0` 重跑 `deploy/install.sh`，结束时会直接打印手机可用地址。源码安装默认已监听所有接口，无需此设置。
+
+只在可信家庭网络或 Tailscale 内这样用；接口仍有 `GATEWAY_API_KEY` 鉴权，但不要把服务暴露到公网。
+
 ## 密钥和身份
 
 系统中的密钥用途不同，不应复用：

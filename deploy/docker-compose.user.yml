@@ -9,12 +9,14 @@
 #   docker compose -f docker-compose.user.yml logs memory-platform
 # 端口 2026 被占用时，在本文件同目录的 .env 写入一行 MEMORY_PORT=3026 后重启，
 # 之后所有文档中的 2026 换成 3026。
+# 想在手机/其他设备上访问时，在 .env 加一行 MEMORY_HOST=0.0.0.0 后重启，
+# 然后改用电脑的局域网 IP（仅限可信家庭网络，不要把服务无鉴权暴露到公网）。
 services:
   memory-platform:
     image: ghcr.io/sparkhello/memory-platform:latest
     ports:
-      # 默认只绑回环；手机/局域网访问改为 "0.0.0.0:${MEMORY_PORT:-2026}:2026"
-      - "127.0.0.1:${MEMORY_PORT:-2026}:2026"
+      # 默认只绑回环；手机/局域网访问在同目录 .env 加 MEMORY_HOST=0.0.0.0
+      - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
     volumes:
       - memory-platform-data:/data
     restart: unless-stopped
