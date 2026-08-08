@@ -18,8 +18,8 @@
       <text x="34" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="#241811">1</text>
       <text x="28" y="92" font-size="24" font-weight="700" fill="#fffaf4">Chat normally</text>
       <text x="28" y="136" font-size="16" fill="#d8ced2">“I take my coffee</text>
-      <text x="28" y="166" font-size="16" fill="#d8ced2">without sugar. Please</text>
-      <text x="28" y="196" font-size="16" fill="#d8ced2">remember that.”</text>
+      <text x="28" y="166" font-size="16" fill="#d8ced2">without sugar and recently</text>
+      <text x="28" y="196" font-size="16" fill="#d8ced2">started learning pour-over.”</text>
     </g>
     <path d="M310 160 H338" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
     <g transform="translate(348 42)">

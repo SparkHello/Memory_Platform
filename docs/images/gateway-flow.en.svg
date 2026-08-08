@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Platform two-gateway flow</title>
+  <desc id="desc">An existing chat client connects to Memory Gateway through its OpenAI-compatible endpoint for automatic recall, injection, and saving. Model Gateway then handles model routing and failover. MCP is an optional entry point for explicit memory and knowledge operations.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151217"/>
+      <stop offset="1" stop-color="#241c1a"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#c79a5a"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="360" rx="28" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <g transform="translate(32 48)">
+      <rect width="228" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="24" y="48" font-size="22" font-weight="700" fill="#fffaf4">Your chat client</text>
+      <text x="24" y="88" font-size="16" fill="#d8ced2">Chatbox · RikkaHub · FLIT</text>
+      <rect x="24" y="116" width="180" height="42" rx="21" fill="#2d2427" stroke="#71583f"/>
+      <text x="114" y="143" text-anchor="middle" font-size="16" font-weight="600" fill="#e8bd78">OpenAI-compatible /v1</text>
+      <text x="24" y="193" font-size="16" fill="#a99da2">Keep the client you know</text>
+    </g>
+
+    <path d="M270 159 H290" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(300 30)">
+      <rect width="410" height="258" rx="24" fill="#211b20" stroke="#8a6742" stroke-width="2"/>
+      <text x="26" y="48" font-size="24" font-weight="700" fill="#fffaf4">Memory Gateway</text>
+      <text x="26" y="78" font-size="16" fill="#e8bd78">Transparent automatic memory proxy</text>
+      <rect x="24" y="100" width="362" height="62" rx="14" fill="#2b2326"/>
+      <text x="42" y="126" font-size="16" font-weight="700" fill="#fffaf4">Ordinary /v1</text>
+      <text x="42" y="150" font-size="14" fill="#d8ced2">Recall → inject → extract and save after the answer</text>
+      <rect x="24" y="174" width="362" height="58" rx="14" fill="#1d2522" stroke="#39564a"/>
+      <text x="42" y="198" font-size="16" font-weight="700" fill="#8dd8b5">Optional /mcp</text>
+      <text x="42" y="220" font-size="14" fill="#c6d8cf">Explicit memory tools and knowledge retrieval</text>
+    </g>
+
+    <path d="M720 159 H742" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(752 48)">
+      <rect width="264" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="24" y="48" font-size="23" font-weight="700" fill="#fffaf4">Model Gateway</text>
+      <text x="24" y="86" font-size="16" fill="#d8ced2">Purpose-based model choice</text>
+      <text x="24" y="122" font-size="16" fill="#d8ced2">Provider routes and fallback</text>
+      <text x="24" y="158" font-size="16" fill="#d8ced2">Failover, usage, and pricing</text>
+      <text x="24" y="198" font-size="15" fill="#a99da2">Clients stay vendor-neutral</text>
+    </g>
+
+    <path d="M1026 159 H1062" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(1072 48)">
+      <rect width="176" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="22" y="48" font-size="22" font-weight="700" fill="#fffaf4">Model channels</text>
+      <text x="22" y="88" font-size="16" fill="#d8ced2">Chat</text>
+      <text x="22" y="120" font-size="16" fill="#d8ced2">Memory tasks</text>
+      <text x="22" y="152" font-size="16" fill="#d8ced2">Knowledge</text>
+      <text x="22" y="184" font-size="16" fill="#d8ced2">Embeddings</text>
+    </g>
+
+    <rect x="300" y="306" width="716" height="34" rx="17" fill="#2d2427" stroke="#71583f"/>
+    <text x="658" y="329" text-anchor="middle" font-size="16" font-weight="600" fill="#e8bd78">Ordinary chat needs neither MCP nor an extra memory prompt</text>
+  </g>
+</svg>

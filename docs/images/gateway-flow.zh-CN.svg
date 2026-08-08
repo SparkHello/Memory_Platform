@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Platform 双网关数据流</title>
+  <desc id="desc">现有聊天客户端通过 OpenAI 兼容入口连接 Memory Gateway，由它自动召回、注入和保存记忆，再通过 Model Gateway 完成模型路由与故障切换。MCP 是显式操作记忆与知识库的可选入口。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151217"/>
+      <stop offset="1" stop-color="#241c1a"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#c79a5a"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="360" rx="28" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <g transform="translate(32 48)">
+      <rect width="228" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="24" y="48" font-size="22" font-weight="700" fill="#fffaf4">现有聊天客户端</text>
+      <text x="24" y="88" font-size="16" fill="#d8ced2">Chatbox · RikkaHub · FLIT</text>
+      <rect x="24" y="116" width="180" height="42" rx="21" fill="#2d2427" stroke="#71583f"/>
+      <text x="114" y="143" text-anchor="middle" font-size="16" font-weight="600" fill="#e8bd78">OpenAI-compatible /v1</text>
+      <text x="24" y="193" font-size="16" fill="#a99da2">继续使用熟悉的客户端</text>
+    </g>
+
+    <path d="M270 159 H306" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(316 30)">
+      <rect width="380" height="258" rx="24" fill="#211b20" stroke="#8a6742" stroke-width="2"/>
+      <text x="26" y="48" font-size="24" font-weight="700" fill="#fffaf4">Memory Gateway</text>
+      <text x="26" y="78" font-size="16" fill="#e8bd78">透明自动记忆代理</text>
+      <rect x="24" y="100" width="332" height="62" rx="14" fill="#2b2326"/>
+      <text x="42" y="126" font-size="16" font-weight="700" fill="#fffaf4">普通 /v1</text>
+      <text x="42" y="150" font-size="15" fill="#d8ced2">自动召回 → 注入 → 完整回答后提取与保存</text>
+      <rect x="24" y="174" width="332" height="58" rx="14" fill="#1d2522" stroke="#39564a"/>
+      <text x="42" y="198" font-size="16" font-weight="700" fill="#8dd8b5">可选 /mcp</text>
+      <text x="42" y="220" font-size="15" fill="#c6d8cf">显式搜索、整理记忆与检索知识库</text>
+    </g>
+
+    <path d="M706 159 H742" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(752 48)">
+      <rect width="264" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="24" y="48" font-size="23" font-weight="700" fill="#fffaf4">Model Gateway</text>
+      <text x="24" y="86" font-size="16" fill="#d8ced2">按稳定用途选择模型</text>
+      <text x="24" y="122" font-size="16" fill="#d8ced2">渠道路由与备用顺序</text>
+      <text x="24" y="158" font-size="16" fill="#d8ced2">故障切换、用量与价格</text>
+      <text x="24" y="198" font-size="15" fill="#a99da2">客户端无需跟着模型迁移</text>
+    </g>
+
+    <path d="M1026 159 H1062" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g transform="translate(1072 48)">
+      <rect width="176" height="222" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <text x="22" y="48" font-size="22" font-weight="700" fill="#fffaf4">模型渠道</text>
+      <text x="22" y="88" font-size="16" fill="#d8ced2">聊天模型</text>
+      <text x="22" y="120" font-size="16" fill="#d8ced2">记忆任务</text>
+      <text x="22" y="152" font-size="16" fill="#d8ced2">知识检索</text>
+      <text x="22" y="184" font-size="16" fill="#d8ced2">Embedding</text>
+    </g>
+
+    <rect x="316" y="306" width="700" height="34" rx="17" fill="#2d2427" stroke="#71583f"/>
+    <text x="666" y="329" text-anchor="middle" font-size="16" font-weight="600" fill="#e8bd78">普通聊天无需 MCP，也无需额外记忆提示词</text>
+  </g>
+</svg>
