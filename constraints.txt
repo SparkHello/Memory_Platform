@@ -1,0 +1,13 @@
+# Direct dependency versions exercised by CI and the release image.
+# Update deliberately after running scripts/test.sh and the Docker smoke test.
+fastapi==0.141.1
+httpx==0.28.1
+httpx2==2.7.0
+mcp==1.29.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pypdf==6.14.2
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-dotenv==1.2.2
+uvicorn==0.52.1

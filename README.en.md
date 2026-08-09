@@ -69,17 +69,25 @@ This is not a performance ranking. Memory Platform currently targets personal ma
 
 ### Easiest path: one-line installer (Docker)
 
-You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone. Run one line in a macOS / Linux terminal:
+You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone.
+
+macOS / Linux terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
 ```
 
-The script does everything: checks Docker → downloads the Compose file → picks a free port if 2026 is taken → starts the stack and waits until it is ready → prints `GATEWAY_API_KEY` and the Model Gateway admin key. First start takes 1–2 minutes of internal setup; save both keys when the script finishes. Re-running the script upgrades to the latest image; your data stays in the `memory-platform-data` volume.
+Windows PowerShell:
 
-**Windows**: install Docker Desktop, then use the manual path below in PowerShell (same result).
+```powershell
+irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+```
 
-### Manual path (Windows, or to review each step)
+The installer checks Docker, uses a stable per-user install directory, picks a free port, starts the base service, prints `GATEWAY_API_KEY` and the admin key, and opens browser-based onboarding. First start takes 1–2 minutes. “Base service ready” does not mean chat is ready yet; choose a model provider in the browser before connecting a client.
+
+Save both keys. Re-running the same command from any directory finds the existing installation, writes a pre-upgrade backup under `backups/`, and then upgrades the image. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows; runtime data remains in the Docker `memory-platform-data` volume.
+
+### Manual path (to review each step)
 
 ```bash
 curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml

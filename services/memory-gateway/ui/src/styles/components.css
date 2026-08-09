@@ -1517,6 +1517,26 @@ code {
   margin-top: 18px;
 }
 
+.settings-advanced-connection {
+  margin-top: 16px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+.settings-advanced-connection summary {
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.settings-advanced-connection small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .connection-checks {
   display: grid;
   gap: 9px;
@@ -1760,4 +1780,3 @@ code {
 .drawer-actions.end {
   justify-content: flex-end;
 }
-

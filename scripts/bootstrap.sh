@@ -62,8 +62,11 @@ if [ ! -x "$RUNTIME_VENV/bin/python" ]; then
 fi
 
 "$RUNTIME_VENV/bin/python" -m pip install \
+  -c "$PLATFORM_ROOT/constraints.txt" \
   -e "${MEMORY_SERVICE}[dev]" \
   -e "${MODEL_SERVICE}[dev]"
+
+"$RUNTIME_VENV/bin/python" -m pip check
 
 if [ "$INSTALL_UI" -eq 1 ]; then
   if ! command -v node >/dev/null 2>&1 \

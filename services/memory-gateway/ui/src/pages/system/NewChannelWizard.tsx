@@ -1,5 +1,6 @@
 import {
   CheckCircle2,
+  ClipboardCopy,
   Eye,
   EyeOff,
   PlugZap,
@@ -9,6 +10,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import type { MemoryApi } from "../../api";
+import { loadSettings } from "../../storage";
 import type {
   ModelGatewayCapabilities,
   ModelGatewayControlSnapshot,
@@ -141,6 +143,7 @@ export function NewChannelWizard({
 
   const hasAdminKey = Boolean(adminKey.trim());
   const channelReady = channelCreated && secretWritten;
+  const connectionVerified = channelReady && Boolean(checkDetail && checkDetail.level !== "error");
 
   const selectPreset = (id: PresetId) => {
     setPreset(id);
@@ -209,18 +212,23 @@ export function NewChannelWizard({
         setRevision(currentRevision);
         setChannelCreated(true);
       }
-      if (!secretWritten) {
-        if (!apiKey.trim()) {
+      const nextApiKey = apiKey.trim();
+      if (!secretWritten && !nextApiKey) {
           setFeedback({ tone: "error", message: "请填写渠道 API Key 后再继续。" });
           return;
-        }
-        await api.updateProviderSecret(id, apiKey.trim(), adminKey.trim());
+      }
+      // 检查失败后允许直接在向导内粘贴新 key。只要输入框非空，
+      // 就先替换再检查；空白则保留已经写入的值。
+      if (nextApiKey) {
+        await api.updateProviderSecret(id, nextApiKey, adminKey.trim());
         setSecretWritten(true);
-        // 密钥只用于这一次单向写入，立即从页面状态中丢弃。
         setApiKey("");
       }
       const info = applyCheckReport(await api.checkProviderConnection(id, adminKey.trim()));
       if (info && info.level !== "error") {
+        if (info.discovered_models?.length === 1) {
+          setChatModel(info.discovered_models[0]);
+        }
         setFeedback({
           tone: info.discovered_models?.length ? "success" : "warning",
           message: info.discovered_models?.length
@@ -241,7 +249,7 @@ export function NewChannelWizard({
   };
 
   const runPhase2 = async () => {
-    if (!hasAdminKey || !channelReady || Boolean(busy)) return;
+    if (!hasAdminKey || !connectionVerified || Boolean(busy)) return;
     const chat = chatModel.trim();
     if (!chat) {
       setFeedback({ tone: "error", message: "请填写聊天模型的精确 upstream_model ID。" });
@@ -337,14 +345,23 @@ export function NewChannelWizard({
     (!channelCreated && (!operator.trim() || !baseUrl.trim())) ||
     (!secretWritten && !apiKey.trim());
 
+  const copyClientSettings = async () => {
+    const settings = loadSettings();
+    const baseUrl = `${settings.apiBaseUrl.replace(/\/+$/, "")}/v1`;
+    await navigator.clipboard.writeText(
+      `Base URL: ${baseUrl}\nAPI Key: ${settings.apiKey}\n模型名: memory-auto`
+    );
+    setFeedback({ tone: "success", message: "客户端配置已复制；内容包含访问密钥，请妥善保管。" });
+  };
+
   return (
     <section className="panel provider-editor-section provider-wizard" aria-labelledby="new-channel-title">
       <div className="panel-header provider-section-header">
         <div>
           <h2 id="new-channel-title">新建渠道</h2>
           <p>
-            与 <code>modelgw quickstart</code> 相同的分阶段流程：先创建渠道并单向写入密钥，
-            再从该密钥可见的模型中选择部署，最后把用途路由指向新 deployment。
+            选择你购买或注册过的模型服务，粘贴 API Key，再选一个聊天模型。
+            普通使用不需要理解路由或 deployment。
           </p>
         </div>
         <button
@@ -375,11 +392,18 @@ export function NewChannelWizard({
 
         {done ? (
           <div className="provider-wizard-step">
-            <p className="provider-wizard-hint">
-              渠道已可用。接下来可以在下方「用途与优先顺序」中调整每条用途的故障切换顺序，
-              或回到对话页验证效果。
-            </p>
+            <h3><CheckCircle2 size={18} aria-hidden /> 模型配置完成</h3>
+            <p className="provider-wizard-hint">现在可以把下面三项填进 Chatbox、RikkaHub、FLIT 等客户端。</p>
+            <div className="client-config-summary">
+              <span><small>类型</small><strong>OpenAI 兼容 · Chat Completions</strong></span>
+              <span><small>Base URL</small><code>{loadSettings().apiBaseUrl.replace(/\/+$/, "")}/v1</code></span>
+              <span><small>模型名</small><code>memory-auto</code></span>
+            </div>
             <div className="provider-wizard-actions">
+              <button type="button" className="secondary-button" onClick={() => void copyClientSettings()}>
+                <ClipboardCopy size={16} aria-hidden />
+                复制客户端配置
+              </button>
               <button type="button" className="primary-button" onClick={onClose}>
                 完成
               </button>
@@ -415,13 +439,13 @@ export function NewChannelWizard({
                   disabled={channelCreated || Boolean(busy)}
                 >
                   <strong>自定义渠道</strong>
-                  <span>手动填写官方 base_url 与适配器</span>
+                  <span>填写服务商提供的 OpenAI 兼容地址</span>
                 </button>
               </div>
               {preset === "custom" && (
                 <div className="provider-field-grid">
                   <label className="field-block">
-                    <span>渠道简称（channel_operator，小写字母/数字）</span>
+                    <span>渠道简称</span>
                     <input
                       value={operator}
                       onChange={(event) => setOperator(event.target.value)}
@@ -431,7 +455,7 @@ export function NewChannelWizard({
                     />
                   </label>
                   <label className="field-block">
-                    <span>官方 base_url（远程必须 HTTPS）</span>
+                    <span>官方 API 地址（远程必须 HTTPS）</span>
                     <input
                       value={baseUrl}
                       onChange={(event) => setBaseUrl(event.target.value)}
@@ -440,20 +464,19 @@ export function NewChannelWizard({
                       disabled={channelCreated || Boolean(busy)}
                     />
                   </label>
-                  <label className="field-block">
-                    <span>适配器</span>
-                    <select
-                      value={adapter}
-                      onChange={(event) => setAdapter(event.target.value)}
-                      disabled={channelCreated || Boolean(busy)}
-                    >
-                      {ADAPTER_OPTIONS.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <details className="provider-inline-advanced">
+                    <summary>高级：兼容适配器</summary>
+                    <label className="field-block">
+                      <span>适配器</span>
+                      <select
+                        value={adapter}
+                        onChange={(event) => setAdapter(event.target.value)}
+                        disabled={channelCreated || Boolean(busy)}
+                      >
+                        {ADAPTER_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}
+                      </select>
+                    </label>
+                  </details>
                 </div>
               )}
             </div>
@@ -488,16 +511,14 @@ export function NewChannelWizard({
 
             <div className="provider-wizard-step">
               <h3>
-                <span className="provider-step-index" aria-hidden>3</span>创建渠道并验证
+                <span className="provider-step-index" aria-hidden>3</span>验证渠道
               </h3>
               <p className="provider-wizard-hint">
-                先校验并新增 connection，再单向写入密钥，最后执行免费的 /models 检查（不发起推理）。
-                需要先在上方填入 Model Gateway admin 密钥。
+                将安全保存密钥，并免费读取该账号可见的模型列表；不会发送聊天内容，也不会产生推理费用。
               </p>
               {connectionId && (
                 <p className="provider-wizard-result">
-                  已创建渠道 <code>{connectionId}</code>
-                  {secretWritten && "，密钥已写入"}
+                  渠道记录已创建{secretWritten && "，密钥已安全保存"}
                 </p>
               )}
               {checkDetail && (
@@ -524,13 +545,13 @@ export function NewChannelWizard({
                   {busy === "phase1"
                     ? "正在创建并检查"
                     : channelReady
-                      ? "重新检查连接"
-                      : "创建渠道并检查连接"}
+                      ? apiKey.trim() ? "保存新密钥并重新检查" : "重新检查连接"
+                      : "保存并检查"}
                 </button>
               </div>
             </div>
 
-            {channelReady && checkDetail && (
+            {connectionVerified && (
               <>
                 <div className="provider-wizard-step">
                   <h3>
@@ -538,60 +559,49 @@ export function NewChannelWizard({
                   </h3>
                   <div className="provider-field-grid">
                     <label className="field-block">
-                      <span>聊天模型（精确 upstream_model ID）</span>
-                      <input
-                        value={chatModel}
-                        onChange={(event) => setChatModel(event.target.value)}
-                        list="new-channel-models"
-                        spellCheck={false}
-                        placeholder="从检查到的列表选择或手动输入"
-                        disabled={Boolean(busy)}
-                      />
-                    </label>
-                    <label className="field-block">
-                      <span>模型作者（model_author，留空取渠道简称）</span>
-                      <input
-                        value={modelAuthor}
-                        onChange={(event) => setModelAuthor(event.target.value)}
-                        spellCheck={false}
-                        placeholder={operator || "模型作者"}
-                        disabled={Boolean(busy)}
-                      />
+                      <span>聊天模型</span>
+                      {models.length > 0 ? (
+                        <select value={chatModel} onChange={(event) => setChatModel(event.target.value)} disabled={Boolean(busy)}>
+                          <option value="">请选择一个模型</option>
+                          {models.map((model) => <option key={model} value={model}>{model}</option>)}
+                        </select>
+                      ) : (
+                        <input
+                          value={chatModel}
+                          onChange={(event) => setChatModel(event.target.value)}
+                          spellCheck={false}
+                          placeholder="填写服务商给出的精确模型名"
+                          disabled={Boolean(busy)}
+                        />
+                      )}
                     </label>
                   </div>
-                  <datalist id="new-channel-models">
-                    {models.map((model) => (
-                      <option key={model} value={model} />
-                    ))}
-                  </datalist>
-                  <fieldset className="provider-capability-field" disabled={Boolean(busy)}>
-                    <legend>聊天能力声明（按渠道官方资料勾选）</legend>
-                    <div className="provider-capability-grid">
-                      {CAPABILITY_OPTIONS.map((option) => (
-                        <label key={option.key}>
-                          <input
-                            type="checkbox"
-                            checked={Boolean(capabilities[option.key])}
-                            onChange={(event) => toggleCapability(option.key, event.target.checked)}
-                          />
-                          <span>{option.label}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </fieldset>
-                  <label className="provider-route-toggle provider-embedding-toggle">
-                    <input
-                      type="checkbox"
-                      checked={embeddingEnabled}
-                      onChange={(event) => setEmbeddingEnabled(event.target.checked)}
-                      disabled={Boolean(busy)}
-                    />
-                    <span>同时配置向量模型（用于语义搜索）</span>
-                  </label>
-                  {embeddingEnabled && (
+                  <details className="provider-inline-advanced">
+                    <summary>高级设置（普通使用无需修改）</summary>
                     <div className="provider-field-grid">
                       <label className="field-block">
-                        <span>向量模型（精确 upstream_model ID）</span>
+                        <span>模型作者标识</span>
+                        <input value={modelAuthor} onChange={(event) => setModelAuthor(event.target.value)} spellCheck={false} placeholder={operator || "自动使用渠道简称"} disabled={Boolean(busy)} />
+                      </label>
+                    </div>
+                    <fieldset className="provider-capability-field" disabled={Boolean(busy)}>
+                      <legend>只有在服务商明确支持时才勾选</legend>
+                      <div className="provider-capability-grid">
+                        {CAPABILITY_OPTIONS.map((option) => (
+                          <label key={option.key}>
+                            <input type="checkbox" checked={Boolean(capabilities[option.key])} onChange={(event) => toggleCapability(option.key, event.target.checked)} />
+                            <span>{option.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                    <label className="provider-route-toggle provider-embedding-toggle">
+                      <input type="checkbox" checked={embeddingEnabled} onChange={(event) => setEmbeddingEnabled(event.target.checked)} disabled={Boolean(busy)} />
+                      <span>同时配置向量模型（可选，用于语义搜索）</span>
+                    </label>
+                    {embeddingEnabled && <div className="provider-field-grid">
+                      <label className="field-block">
+                        <span>向量模型</span>
                         <input
                           value={embeddingModel}
                           onChange={(event) => updateEmbeddingModel(event.target.value)}
@@ -601,7 +611,7 @@ export function NewChannelWizard({
                         />
                       </label>
                       <label className="field-block">
-                        <span>向量维度 dimensions</span>
+                        <span>向量维度</span>
                         <input
                           value={embeddingDimensions}
                           onChange={(event) => updateEmbeddingDimensions(event.target.value)}
@@ -612,7 +622,7 @@ export function NewChannelWizard({
                         />
                       </label>
                       <label className="field-block">
-                        <span>向量空间 embedding_space</span>
+                        <span>向量空间名称</span>
                         <input
                           value={embeddingSpace}
                           onChange={(event) => {
@@ -623,18 +633,16 @@ export function NewChannelWizard({
                           disabled={Boolean(busy)}
                         />
                       </label>
-                    </div>
-                  )}
+                    </div>}
+                  </details>
                 </div>
 
                 <div className="provider-wizard-step">
                   <h3>
-                    <span className="provider-step-index" aria-hidden>5</span>应用用途路由
+                    <span className="provider-step-index" aria-hidden>5</span>保存并启用
                   </h3>
                   <p className="provider-wizard-hint">
-                    将把 {CHAT_ROUTE_IDS.map((id) => ROUTE_LABELS[id] || id).join("、")}
-                    {embeddingEnabled ? `，以及${ROUTE_LABELS[EMBEDDING_ROUTE_ID]}` : ""}
-                    指向新 deployment。
+                    日常聊天、记忆提取和知识检索将使用这个模型。以后可以在高级设置中添加备用模型。
                   </p>
                   {replacedRoutes.length > 0 && (
                     <div className="provider-feedback is-warning" role="status">
@@ -650,10 +658,10 @@ export function NewChannelWizard({
                       type="button"
                       className="primary-button"
                       onClick={() => void runPhase2()}
-                      disabled={!hasAdminKey || Boolean(busy)}
+                      disabled={!hasAdminKey || !connectionVerified || !chatModel.trim() || Boolean(busy)}
                     >
                       <Save size={16} aria-hidden />
-                      {busy === "apply" ? "正在校验并应用" : "校验并应用"}
+                      {busy === "apply" ? "正在保存" : "保存并启用"}
                     </button>
                   </div>
                 </div>

@@ -20,6 +20,8 @@ from app.cli_config import (
     read_env_file,
     write_env_atomic,
 )
+from app.model_catalog import validate_catalog_and_routes
+from app.usage.pricing import load_pricing_catalog
 
 
 STACK_BACKUP_VERSION = 1
@@ -200,30 +202,55 @@ def restore_stack_backup(
         )
         os.chmod(rollback_root, 0o700)
         restored: list[str] = []
-        for archive_name, (target, validator) in targets.items():
-            payload = extracted.get(archive_name)
-            if payload is None:
-                continue
-            _save_rollback(target, rollback_root, archive_name)
-            _atomic_restore(target, payload, validator=validator)
-            restored.append(archive_name)
-
-        settings_payload = extracted.get("memory/settings.json")
-        if settings_payload is not None:
-            safe_settings = _json_object(
-                settings_payload.read_bytes(), "memory/settings.json"
-            )
-            current_settings = read_env_file(paths.settings_env)
-            for raw_name, raw_value in safe_settings.items():
-                name = str(raw_name).strip().upper()
-                if is_secret_name(name) or name in _DEVICE_LOCAL_SETTINGS:
+        modified: list[
+            tuple[Path, Path | None, Callable[[Path], None] | None]
+        ] = []
+        try:
+            for archive_name, (target, validator) in targets.items():
+                payload = extracted.get(archive_name)
+                if payload is None:
                     continue
-                if not isinstance(raw_value, str):
-                    raise ValueError(f"便携配置 {name} 必须是字符串")
-                current_settings[name] = raw_value
-            _save_rollback(paths.settings_env, rollback_root, "memory/settings.env")
-            write_env_atomic(paths.settings_env, current_settings)
-            restored.append("memory/settings.json")
+                rollback_payload = _save_rollback(target, rollback_root, archive_name)
+                # Record the original state before replacement. If a filesystem
+                # failure is raised immediately after os.replace(), the target
+                # must still participate in the reverse rollback pass.
+                modified.append((target, rollback_payload, validator))
+                _atomic_restore(target, payload, validator=validator)
+                restored.append(archive_name)
+
+            settings_payload = extracted.get("memory/settings.json")
+            if settings_payload is not None:
+                safe_settings = _json_object(
+                    settings_payload.read_bytes(), "memory/settings.json"
+                )
+                current_settings = read_env_file(paths.settings_env)
+                for raw_name, raw_value in safe_settings.items():
+                    name = str(raw_name).strip().upper()
+                    if is_secret_name(name) or name in _DEVICE_LOCAL_SETTINGS:
+                        continue
+                    if not isinstance(raw_value, str):
+                        raise ValueError(f"便携配置 {name} 必须是字符串")
+                    current_settings[name] = raw_value
+                settings_rollback = _save_rollback(
+                    paths.settings_env,
+                    rollback_root,
+                    "memory/settings.env",
+                )
+                modified.append((paths.settings_env, settings_rollback, None))
+                write_env_atomic(paths.settings_env, current_settings)
+                restored.append("memory/settings.json")
+        except Exception as exc:
+            rollback_errors = _rollback_modified_targets(modified)
+            rollback_detail = (
+                "自动回滚未完整完成：" + ", ".join(rollback_errors)
+                if rollback_errors
+                else "已自动恢复原文件"
+            )
+            raise ValueError(
+                "整栈恢复失败；"
+                f"{rollback_detail}；回滚副本位于 {rollback_root}；"
+                f"原始错误类型：{type(exc).__name__}"
+            ) from exc
 
     return {
         "archive": str(archive_path),
@@ -245,6 +272,16 @@ def _validate_restore_payloads(
     settings_payload = extracted.get("memory/settings.json")
     if settings_payload is not None:
         _json_object(settings_payload.read_bytes(), "memory/settings.json")
+    catalog = extracted.get("memory/models.json")
+    routes = extracted.get("memory/routes.json")
+    if catalog is not None and routes is not None:
+        validate_catalog_and_routes(catalog_path=catalog, routes_path=routes)
+    pricing = extracted.get("memory/pricing.json")
+    if pricing is not None:
+        load_pricing_catalog(pricing)
+    model_gateway_config = extracted.get("model-gateway/config.json")
+    if model_gateway_config is not None:
+        _validate_model_gateway_config(model_gateway_config)
 
 
 def _stage_file(source: Path, staged: dict[str, Path], archive_name: str) -> None:
@@ -343,13 +380,29 @@ def _verified_payloads(
     return payloads
 
 
-def _save_rollback(target: Path, root: Path, archive_name: str) -> None:
+def _save_rollback(target: Path, root: Path, archive_name: str) -> Path | None:
     if not target.is_file():
-        return
+        return None
     destination = root / archive_name
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(target, destination)
     os.chmod(destination, 0o600)
+    return destination
+
+
+def _rollback_modified_targets(
+    modified: list[tuple[Path, Path | None, Callable[[Path], None] | None]],
+) -> list[str]:
+    errors: list[str] = []
+    for target, rollback_payload, validator in reversed(modified):
+        try:
+            if rollback_payload is None:
+                target.unlink(missing_ok=True)
+            else:
+                _atomic_restore(target, rollback_payload, validator=validator)
+        except Exception as exc:
+            errors.append(f"{target.name}({type(exc).__name__})")
+    return errors
 
 
 def _atomic_restore(
@@ -388,6 +441,17 @@ def _validate_json_object(path: Path) -> None:
     payload = _json_object(path.read_bytes(), path.name)
     if not payload:
         raise ValueError(f"JSON 配置不能为空：{path.name}")
+
+
+def _validate_model_gateway_config(path: Path) -> None:
+    try:
+        from model_gateway.models import GatewayConfig
+
+        GatewayConfig.model_validate_json(path.read_text(encoding="utf-8"))
+    except ImportError as exc:
+        raise ValueError("当前环境缺少 Model Gateway，无法校验其恢复配置") from exc
+    except Exception as exc:
+        raise ValueError("Model Gateway 配置未通过完整 schema 校验") from exc
 
 
 def _json_object(payload: bytes, name: str) -> dict[str, Any]:

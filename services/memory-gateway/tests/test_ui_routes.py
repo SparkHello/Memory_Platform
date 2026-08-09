@@ -36,6 +36,12 @@ def test_ui_entrypoints_redirect_or_fall_back_to_index(tmp_path, monkeypatch):
             response = client.get(path)
             assert response.status_code == 200
             assert "text/html" in response.headers["content-type"]
+            assert response.headers["x-content-type-options"] == "nosniff"
+            assert response.headers["x-frame-options"] == "DENY"
+            assert response.headers["referrer-policy"] == "no-referrer"
+            assert "frame-ancestors 'none'" in response.headers[
+                "content-security-policy"
+            ]
 
         response = client.get("/ui/assets/missing.js")
         assert response.status_code == 404

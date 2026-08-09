@@ -49,14 +49,47 @@ ROUTE_DESCRIPTIONS: dict[str, str] = {
     "pricing.research": "价格信息提取",
 }
 
+REQUIRED_CHAT_ROUTES: tuple[str, ...] = (
+    "memory.chat",
+    "memory.extract",
+    "memory.compact",
+    "memory.core",
+    "memory.review",
+    "knowledge.fast",
+    "knowledge.pro",
+)
+
 
 @router.get("/status")
 async def providers_status(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
-    if settings.model_gateway_enabled:
-        return await _model_gateway_status(settings)
-    return _direct_provider_status(settings)
+    payload = (
+        await _model_gateway_status(settings)
+        if settings.model_gateway_enabled
+        else _direct_provider_status(settings)
+    )
+    return {**payload, "setup": _setup_summary(payload)}
+
+
+@router.post("/admin/check")
+async def check_provider_admin_key(
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    response = await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="GET",
+        path="/admin/configuration",
+        payload=None,
+    )
+    if response.status_code < 300:
+        return JSONResponse({"valid": True})
+    return response
 
 
 @router.post("/routes/validate")
@@ -423,6 +456,47 @@ def _settings_embedding_status(settings: Settings) -> dict[str, Any]:
         "base_url": settings.embedding_base_url,
         "dimensions": settings.embedding_dimensions,
         "configured": bool(settings.embedding_api_key.strip()),
+    }
+
+
+def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    routes = payload.get("routes")
+    route_by_id = (
+        {
+            str(route.get("id") or ""): route
+            for route in routes
+            if isinstance(route, dict)
+        }
+        if isinstance(routes, list)
+        else {}
+    )
+    usable = [
+        route_id
+        for route_id in REQUIRED_CHAT_ROUTES
+        if bool(route_by_id.get(route_id, {}).get("usable"))
+    ]
+    missing = [route_id for route_id in REQUIRED_CHAT_ROUTES if route_id not in usable]
+    config_error = str(payload.get("config_error") or "")
+    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    model_gateway_connected = bool(runtime.get("model_gateway_enabled"))
+    if config_error:
+        state = "configuration_error"
+        next_action = "repair_model_gateway"
+    elif missing:
+        state = "needs_model"
+        next_action = "configure_model"
+    else:
+        state = "ready"
+        next_action = "connect_client"
+    return {
+        "state": state,
+        "service_ready": True,
+        "model_gateway_connected": model_gateway_connected,
+        "chat_ready": not missing and not config_error,
+        "required_chat_routes": list(REQUIRED_CHAT_ROUTES),
+        "usable_chat_routes": usable,
+        "missing_chat_routes": missing,
+        "next_action": next_action,
     }
 
 

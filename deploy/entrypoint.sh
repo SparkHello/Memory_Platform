@@ -3,6 +3,17 @@
 # Model Gateway（2030，仅容器内回环）和 Memory Gateway（2026，对外）。
 set -eu
 
+# Older releases ran as root, so an existing named volume can contain mode-600
+# root-owned databases and keys. Migrate that volume once, then replace PID 1
+# with the unprivileged process. New volumes inherit this marker from the image.
+if [ "$(id -u)" -eq 0 ]; then
+  if [ ! -e /data/.memory-platform-owner-10001 ]; then
+    chown -R memory-platform:memory-platform /data
+    gosu memory-platform touch /data/.memory-platform-owner-10001
+  fi
+  exec gosu memory-platform "$0" "$@"
+fi
+
 : "${XDG_CONFIG_HOME:=/data}"
 : "${MEMGW_HOME:=/data/memory-gateway}"
 : "${MEMGW_PROJECT_ROOT:=/app/services/memory-gateway}"

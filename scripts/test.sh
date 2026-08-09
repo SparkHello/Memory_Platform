@@ -20,6 +20,8 @@ if [ ! -x "$PYTHON" ]; then
   exit 1
 fi
 
+"$PYTHON" -m pip check
+
 (
   cd "$MEMORY_SERVICE"
   "$PYTHON" -m pytest
@@ -30,5 +32,6 @@ fi
 )
 (
   cd "$MEMORY_SERVICE/ui"
+  npm test
   npm run build
 )

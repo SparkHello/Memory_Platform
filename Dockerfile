@@ -19,7 +19,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# gosu 只在入口阶段用于把旧版本 root 所有的持久卷迁移给运行用户，
+# 随后立即 exec 为非 root 服务进程。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gosu \
+ && rm -rf /var/lib/apt/lists/*
+
 # 只拷贝安装两个服务所需的文件，保持镜像层最小
+COPY constraints.txt ./constraints.txt
 COPY services/memory-gateway/pyproject.toml services/memory-gateway/README.md services/memory-gateway/
 COPY services/memory-gateway/app services/memory-gateway/app
 COPY services/model-gateway/pyproject.toml services/model-gateway/README.md services/model-gateway/
@@ -30,11 +37,19 @@ COPY services/model-gateway/model_gateway services/model-gateway/model_gateway
 # 用 editable 安装，app/catalog、app/providers 下的 JSON 数据文件直接从源码树读取
 RUN python -m venv services/memory-gateway/.venv \
  && services/memory-gateway/.venv/bin/pip install --no-cache-dir \
-    -e ./services/memory-gateway -e ./services/model-gateway
+    -c ./constraints.txt \
+    -e ./services/memory-gateway -e ./services/model-gateway \
+ && services/memory-gateway/.venv/bin/pip check
 
 COPY --from=ui-build /build/ui/dist /app/ui/dist
 COPY deploy/entrypoint.sh /usr/local/bin/memory-platform-entrypoint
-RUN chmod +x /usr/local/bin/memory-platform-entrypoint && mkdir -p /data
+RUN groupadd --gid 10001 memory-platform \
+ && useradd --uid 10001 --gid memory-platform --no-create-home \
+    --home-dir /nonexistent --shell /usr/sbin/nologin memory-platform \
+ && chmod +x /usr/local/bin/memory-platform-entrypoint \
+ && mkdir -p /data \
+ && touch /data/.memory-platform-owner-10001 \
+ && chown -R memory-platform:memory-platform /data
 
 # 全部运行数据（配置、密钥、SQLite、日志）都在 /data，挂载卷即可持久化
 VOLUME /data

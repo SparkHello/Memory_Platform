@@ -23,7 +23,7 @@ import { ProvidersPage } from "./pages/system/ProvidersPage";
 import { SettingsPage } from "./pages/system/SettingsPage";
 import { UsagePage } from "./pages/system/UsagePage";
 import { loadSettings, loadTheme, saveSettings, saveTheme, type ThemeMode } from "./storage";
-import type { ConnectionSettings, KnowledgeStatus, PageKey } from "./types";
+import type { ConnectionSettings, KnowledgeStatus, PageKey, ProvidersStatus } from "./types";
 import { errorMessage } from "./utils/format";
 
 export function App() {
@@ -48,6 +48,7 @@ export function App() {
   }>({ loading: true, tone: "warning", message: "检查中" });
   const [navSignals, setNavSignals] = useState<NavSignals>({});
   const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeStatus | null>(null);
+  const [setupStatus, setSetupStatus] = useState<ProvidersStatus["setup"] | null>(null);
 
   const api = useMemo(() => new MemoryApi(settings), [settings]);
   const { toast, notify, clearToast } = useToast();
@@ -64,11 +65,12 @@ export function App() {
     }
     const next: NavSignals = {};
     try {
-      const [report, review, workbench, knowledge] = await Promise.all([
+      const [report, review, workbench, knowledge, providers] = await Promise.all([
         api.memoryReport(),
         api.reviewMemories(),
         api.recallEvaluationWorkbench().catch(() => null),
-        api.knowledgeStatus().catch(() => null)
+        api.knowledgeStatus().catch(() => null),
+        api.providersStatus().catch(() => null)
       ]);
       if (review.recommendations.length > 0) {
         next.review = { text: String(review.recommendations.length), tone: "warning" };
@@ -96,6 +98,12 @@ export function App() {
         0;
       if (failedIndexes > 0) {
         next.knowledge = { text: String(failedIndexes), tone: "warning" };
+      }
+      if (providers && !providers.setup.chat_ready) {
+        next.providers = { text: "配置", tone: "warning" };
+        setSetupStatus(providers.setup);
+      } else if (providers) {
+        setSetupStatus(providers.setup);
       }
       setKnowledgeStatus(knowledge);
     } catch {
@@ -203,11 +211,23 @@ export function App() {
         setServiceStatus({ loading: false, tone: "warning", message: "服务在线 · 待配置" });
         return;
       }
-      await api.memoryReport();
+      const [, providers] = await Promise.all([api.memoryReport(), api.providersStatus()]);
+      setSetupStatus(providers.setup);
+      if (!providers.setup.chat_ready) {
+        setServiceStatus({
+          loading: false,
+          tone: "warning",
+          message:
+            providers.setup.state === "configuration_error"
+              ? "服务在线 · 模型配置需处理"
+              : "服务在线 · 待配置模型"
+        });
+        return;
+      }
       setServiceStatus({
         loading: false,
         tone: "ok",
-        message: "服务与鉴权正常"
+        message: "聊天配置已就绪"
       });
     } catch (error) {
       setServiceStatus({
@@ -228,7 +248,16 @@ export function App() {
     setSettings(saved);
     notify(message, "success");
     if (isFirstConnection && saved.apiKey) {
-      navigateToPage("dashboard");
+      // 首次连接先进入模型配置。若这其实是已配置环境中的新浏览器，
+      // 状态检查成功后再自动回到工作室。
+      navigateToPage("providers");
+      const savedApi = new MemoryApi(saved);
+      void savedApi.providersStatus()
+        .then((providers) => {
+          setSetupStatus(providers.setup);
+          if (providers.setup.chat_ready) navigateToPage("dashboard");
+        })
+        .catch(() => undefined);
     }
   };
 
@@ -289,7 +318,9 @@ export function App() {
         )}
         {activePage === "logs" && <DecisionLogsPage api={api} />}
         {activePage === "usage" && <UsagePage api={api} />}
-        {activePage === "providers" && <ProvidersPage api={api} />}
+        {activePage === "providers" && (
+          <ProvidersPage api={api} initialSetup={!setupStatus?.chat_ready} />
+        )}
         {activePage === "settings" && (
           <SettingsPage settings={settings} onSave={applySettings} notify={notify} />
         )}

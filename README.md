@@ -69,13 +69,23 @@ Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜�
 
 ### 最省事：一键脚本（Docker）
 
-只需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要 clone 仓库。在 macOS / Linux 终端里运行一行：
+只需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要 clone 仓库。
+
+macOS / Linux 终端：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
 ```
 
-脚本会自动完成全部步骤：检查 Docker → 下载 Compose 配置 → 自动避开已被占用的端口 → 启动服务并等待就绪 → 打印 `GATEWAY_API_KEY` 和 admin key。首次启动需要 1–2 分钟完成内部安装，请耐心等待；脚本结束后把两枚密钥保存好。以后重复运行该脚本即升级到最新镜像，数据保留在 `memory-platform-data` 卷中，不会丢失。
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+```
+
+脚本会自动完成全部步骤：检查 Docker → 安装到固定的用户目录 → 自动避开已占用端口 → 启动基础服务并等待 → 打印 `GATEWAY_API_KEY` 和 admin key → 打开浏览器首次设置页。首次启动需要 1–2 分钟；此时只是本地基础服务就绪，还要在网页里选择一个模型渠道后才能聊天。
+
+把两枚密钥保存好。以后在任意目录重复运行同一条命令，脚本会找到原安装、先把数据备份到安装目录的 `backups/`，再升级最新镜像。默认安装目录是 macOS/Linux 的 `~/memory-platform` 或 Windows 的 `$HOME\memory-platform`；数据仍保存在 Docker 的 `memory-platform-data` 卷中。
 
 两枚密钥用途不同：**只有 `GATEWAY_API_KEY` 需要填进客户端**（包括手机），admin key 权限更高，只在这台电脑的浏览器里解锁模型渠道配置时用，不需要传到手机上。不想用自动生成的随机值，可以在首次安装时自己指定（至少 16 个字符）：
 
@@ -83,9 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/dep
 GATEWAY_API_KEY=你自己的密钥 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
 ```
 
-**Windows 用户**：安装 Docker Desktop 后，在 PowerShell 中使用下面的手工方式（效果相同）。
-
-### 手工方式（Windows，或想自己控制每一步）
+### 手工方式（想自己控制每一步）
 
 ```bash
 curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml

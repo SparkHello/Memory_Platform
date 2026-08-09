@@ -150,6 +150,17 @@ export class MemoryApi {
     return this.request("/providers/status", { signal });
   }
 
+  async checkProviderAdminKey(
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<{ valid: boolean }> {
+    return this.request("/providers/admin/check", {
+      method: "POST",
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
   async validateProviderRoutes(
     revision: string,
     routes: ModelGatewayRouteDraft[],

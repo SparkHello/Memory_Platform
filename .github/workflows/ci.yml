@@ -22,8 +22,29 @@ jobs:
       - name: Install both services with dev extras
         run: >-
           python -m pip install
+          -c constraints.txt
           -e 'services/memory-gateway[dev]'
           -e 'services/model-gateway[dev]'
+
+      - name: Check Python dependency consistency
+        run: python -m pip check
+
+      - name: Check installer syntax
+        if: matrix.python-version == '3.12'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/deploy/install.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+          sh -n deploy/install.sh
 
       - name: Test Memory Gateway
         working-directory: services/memory-gateway
@@ -34,7 +55,7 @@ jobs:
         run: python -m pytest -ra
 
   ui-build:
-    name: UI production build
+    name: UI tests and production build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -52,6 +73,9 @@ jobs:
 
       - name: Install UI dependencies
         run: npm ci
+
+      - name: Test UI onboarding behavior
+        run: npm test
 
       - name: Build UI
         run: npm run build

@@ -32,7 +32,7 @@ scripts/memgw stack stop
 - [Memory Gateway documentation](../services/memory-gateway/README.md)
 - [Model Gateway operations](../services/model-gateway/docs/operations.md)
 
-Docker users who downloaded only `docker-compose.user.yml` should use:
+The one-line installer stores the Compose file in `~/memory-platform` by default (`$HOME\memory-platform` on Windows). From that directory, Docker users can run:
 
 ```bash
 docker compose -f docker-compose.user.yml ps
@@ -52,7 +52,7 @@ docker compose -f docker-compose.user.yml logs -f memory-platform
 
 ## Port 2026 already in use
 
-The `deploy/install.sh` one-line installer automatically picks a free port. For manual deployments, create a `.env` file next to `docker-compose.user.yml` with one line:
+Both the macOS/Linux `deploy/install.sh` and Windows `deploy/install.ps1` installers pick a free port automatically. For manual deployments, create a `.env` file next to `docker-compose.user.yml` with one line:
 
 ```bash
 MEMORY_PORT=3026
@@ -68,7 +68,19 @@ The Docker deployment listens on the loopback interface only, so phones and othe
 MEMORY_HOST=0.0.0.0
 ```
 
-Then restart with `docker compose -f docker-compose.user.yml up -d` and point clients at the computer's LAN IP (`ipconfig getifaddr en0` on macOS), for example `http://192.168.1.20:2026/v1`. Installer users can also re-run `deploy/install.sh` with `MEMORY_HOST=0.0.0.0`; it prints the phone-ready address at the end. Source installs already listen on all interfaces by default.
+Then restart with `docker compose -f docker-compose.user.yml up -d` and point clients at the computer's LAN IP, for example `http://192.168.1.20:2026/v1`. Installer users can re-run with LAN access enabled; the installer prints the phone-ready address:
+
+```bash
+# macOS / Linux
+MEMORY_HOST=0.0.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
+```
+
+```powershell
+# Windows PowerShell
+$env:MEMORY_HOST="0.0.0.0"; irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+```
+
+Source installs already listen on all interfaces by default.
 
 Do this only on trusted home networks or Tailscale. The API still requires `GATEWAY_API_KEY`, but never expose the service to the public internet.
 
@@ -169,6 +181,8 @@ The repository holds only source code and non-sensitive examples. Runtime data l
 Never commit `.env`, real SQLite files, logs, evaluation snapshots, or portable backups.
 
 ## Backup, restore, and migration
+
+Re-running either Docker one-line installer creates a portable backup under the install directory's `backups/` folder before pulling a new image. If backup fails, the upgrade stops without replacing the existing service. Use the commands below for manual backups, migration, and restore.
 
 ### Source installation
 

@@ -335,6 +335,7 @@ curl \
 | `CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS` | `4` | 混合召回的首 token 前预算；超时后回退本地关键词检索，不阻断聊天。 |
 | `CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS` | `600` | 流式聊天等待相邻上游数据块的超时；独立于后台 LLM 任务的普通超时，兼容慢首 token 和长推理。 |
 | `CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS` | `120` | 流式聊天向上游上传请求体的超时；兼容 FLIT 的大图片/音频请求。 |
+| `CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES` | `33554432` | `/v1/chat/completions` 请求体上限；在解析多模态 JSON 前执行，超过时返回 `413 memory_gateway_request_too_large`。 |
 | `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环、网络重试的进程内副作用幂等与工具推理回放窗口。召回复用现有会校验数据库变化的搜索缓存。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS` | `2` | 自动记忆提取时附带的最近完整用户/助手轮数，用于解释“18”“那个”等省略回答；事实值仍必须来自本轮用户原文。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS` | `8000` | 发送给记忆提取模型的“滚动摘要 + 最近原文”总字符上限。 |

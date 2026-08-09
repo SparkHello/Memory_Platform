@@ -39,8 +39,8 @@ API Key:  安装时打印一次的 GATEWAY_API_KEY
 
 `127.0.0.1` 和 `localhost` 指的是「客户端自己」。在手机上填这个地址会连到手机本机，连不上电脑上的服务。正确做法：
 
-0. **Docker 部署先放开局域网监听**：默认只监听本机。在 `docker-compose.user.yml` 同目录的 `.env` 加一行 `MEMORY_HOST=0.0.0.0`，然后 `docker compose -f docker-compose.user.yml up -d` 重启（用一键脚本安装的，也可以 `MEMORY_HOST=0.0.0.0` 重跑脚本）。源码安装默认已监听局域网，跳过这一步。
-1. 查电脑的局域网 IP：macOS 运行 `ipconfig getifaddr en0`，Linux 运行 `hostname -I`；已装 Tailscale 时用 `tailscale ip -4`。
+0. **Docker 部署先放开局域网监听**：默认只监听本机。一键安装用户重新运行安装命令即可：macOS/Linux 在命令前加 `MEMORY_HOST=0.0.0.0`；Windows PowerShell 先运行 `$env:MEMORY_HOST="0.0.0.0"`。安装器会保留数据并直接打印手机地址。手工安装则在 Compose 同目录的 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 后重启。源码安装默认已监听局域网，跳过这一步。
+1. 一键安装结束时会打印电脑的局域网地址。手工查询时：macOS 运行 `ipconfig getifaddr en0`，Linux 运行 `hostname -I`，Windows 运行 `ipconfig`；已装 Tailscale 时用 `tailscale ip -4`。
 2. Base URL 换成 `http://<电脑IP>:2026/v1`，例如 `http://192.168.1.20:2026/v1`。
 3. API Key、模型名不变。MCP 地址同理换成 `http://<电脑IP>:2026/mcp`。
 

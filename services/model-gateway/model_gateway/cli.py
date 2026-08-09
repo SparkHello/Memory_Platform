@@ -907,8 +907,10 @@ def _quickstart_prompt(args: argparse.Namespace) -> Any:
         for index, item in enumerate(presets, start=1):
             print(f"  {index}. {item.label}")
         print(f"  {len(presets) + 1}. 其他 OpenAI-compatible 渠道")
-        raw_choice = input(f"选择 [{len(presets) + 1}]：").strip()
-        if raw_choice:
+        raw_choice = input("选择 [1]：").strip()
+        if not raw_choice:
+            preset = presets[0]
+        else:
             if not raw_choice.isdecimal() or not 1 <= int(raw_choice) <= len(presets) + 1:
                 raise CLIError("渠道编号超出范围")
             if int(raw_choice) <= len(presets):

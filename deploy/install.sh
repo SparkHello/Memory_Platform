@@ -6,9 +6,10 @@
 # → 打印两枚一次性密钥和下一步指引。重复运行即升级到最新镜像，数据保留在
 # memory-platform-data 卷中。
 #
-# Windows 用户：请安装 Docker Desktop 后按 README 的手工两条命令操作。
+# Windows 用户：请使用同目录的 install.ps1。
 # 可选环境变量：
-#   MEMORY_PLATFORM_DIR  安装目录（默认 ./memory-platform）
+#   MEMORY_PLATFORM_DIR  安装目录（默认 ~/memory-platform；会自动识别已有安装）
+#   MEMORY_NO_OPEN       设为 1 时安装完成后不自动打开浏览器
 #   MEMORY_PORT          对外端口（默认 2026；被占用时自动顺延）
 #   MEMORY_HOST          监听地址（默认 127.0.0.1；手机/局域网设备访问用 0.0.0.0，
 #                        仅限可信家庭网络，不要暴露到公网）
@@ -21,7 +22,7 @@ set -eu
 
 REPO_RAW="https://raw.githubusercontent.com/SparkHello/Memory_Platform/main"
 COMPOSE_NAME="docker-compose.user.yml"
-INSTALL_DIR="${MEMORY_PLATFORM_DIR:-memory-platform}"
+INSTALL_DIR="${MEMORY_PLATFORM_DIR:-}"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -47,11 +48,62 @@ command -v docker >/dev/null 2>&1 || fail "未找到 Docker。请先安装并启
 docker info >/dev/null 2>&1 || fail "Docker 已安装但尚未运行。请启动 Docker Desktop 后重试。"
 docker compose version >/dev/null 2>&1 || fail "未找到 docker compose 插件，请升级 Docker Desktop 后重试。"
 
+if [ -z "$INSTALL_DIR" ]; then
+  EXISTING_DIRS=$(docker ps -a \
+    --filter label=com.docker.compose.service=memory-platform \
+    --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+    | awk 'NF && !seen[$0]++')
+  EXISTING_COUNT=$(printf '%s\n' "$EXISTING_DIRS" | awk 'NF {count++} END {print count + 0}')
+  if [ "$EXISTING_COUNT" -gt 1 ]; then
+    fail "检测到多套 Memory Platform。请指定要升级的目录：
+  MEMORY_PLATFORM_DIR=/原安装目录 sh -c \"\$(curl -fsSL $REPO_RAW/deploy/install.sh)\""
+  elif [ "$EXISTING_COUNT" -eq 1 ]; then
+    INSTALL_DIR=$EXISTING_DIRS
+    say "    已找到现有安装：$INSTALL_DIR"
+  else
+    INSTALL_DIR="${HOME:?无法确定用户目录}/memory-platform"
+  fi
+fi
+
 say "==> 下载 Compose 文件到 $INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
+INSTALL_DIR=$(pwd)
 curl -fsSL "$REPO_RAW/deploy/$COMPOSE_NAME" -o "$COMPOSE_NAME" \
   || fail "下载 $COMPOSE_NAME 失败，请检查网络后重试。"
+
+compose_env_value() {
+  [ -f .env ] || return 0
+  awk -F= -v key="$1" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      sub(/\r$/, "", value)
+    }
+    END { if (value != "") print value }
+  ' .env
+}
+
+set_compose_env_value() {
+  key=$1
+  value=$2
+  temporary=$(mktemp .env.tmp.XXXXXX) || fail "无法安全更新 .env"
+  if [ -f .env ]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { updated = 0 }
+      index($0, key "=") == 1 {
+        if (!updated) print key "=" value
+        updated = 1
+        next
+      }
+      { print }
+      END { if (!updated) print key "=" value }
+    ' .env > "$temporary"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$temporary"
+  fi
+  chmod 600 "$temporary"
+  mv "$temporary" .env
+}
 
 port_in_use() {
   if command -v lsof >/dev/null 2>&1; then
@@ -63,9 +115,32 @@ port_in_use() {
   fi
 }
 
-PORT="${MEMORY_PORT:-2026}"
-if port_in_use "$PORT"; then
-  if [ -n "${MEMORY_PORT:-}" ]; then
+compose_owns_port() {
+  published=$(docker compose -f "$COMPOSE_NAME" port memory-platform 2026 2>/dev/null || true)
+  [ -n "$published" ] && [ "${published##*:}" = "$1" ]
+}
+
+PORT_CONFIGURED=0
+PORT_FROM_ENV=0
+EXISTING_PORT=$(compose_env_value MEMORY_PORT)
+if [ -n "${MEMORY_PORT:-}" ]; then
+  PORT=$MEMORY_PORT
+  PORT_CONFIGURED=1
+  PORT_FROM_ENV=1
+elif [ -n "$EXISTING_PORT" ]; then
+  PORT=$EXISTING_PORT
+  PORT_CONFIGURED=1
+else
+  PORT=2026
+fi
+case "$PORT" in
+  *[!0-9]*|'') fail "MEMORY_PORT 必须是 1–65535 的整数" ;;
+esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
+  || fail "MEMORY_PORT 必须是 1–65535 的整数"
+
+if port_in_use "$PORT" && ! compose_owns_port "$PORT"; then
+  if [ "$PORT_CONFIGURED" -eq 1 ]; then
     # 通过 curl | sh 运行时 $0 是 "sh"，不能用它拼重跑命令，否则用户复制到的是
     # 一条跑不起来的 "sh sh"。这里给出可以直接粘贴的完整命令。
     fail "端口 $PORT 已被占用。请换一个空闲端口重试，例如：
@@ -79,40 +154,84 @@ if port_in_use "$PORT"; then
   say "    默认端口 $PORT 已被占用，改用 $CANDIDATE。"
   PORT=$CANDIDATE
 fi
-if [ "$PORT" != "2026" ]; then
-  printf 'MEMORY_PORT=%s\n' "$PORT" > .env
+if [ "$PORT" != "2026" ] || [ "$PORT_FROM_ENV" -eq 1 ] || [ -n "$EXISTING_PORT" ]; then
+  set_compose_env_value MEMORY_PORT "$PORT"
 fi
-HOST="${MEMORY_HOST:-127.0.0.1}"
+
+HOST_FROM_ENV=0
+EXISTING_HOST=$(compose_env_value MEMORY_HOST)
+if [ -n "${MEMORY_HOST:-}" ]; then
+  HOST=$MEMORY_HOST
+  HOST_FROM_ENV=1
+elif [ -n "$EXISTING_HOST" ]; then
+  HOST=$EXISTING_HOST
+else
+  HOST=127.0.0.1
+fi
 case "$HOST" in
   127.0.0.1|0.0.0.0) ;;
   *) fail "MEMORY_HOST 只支持 127.0.0.1（默认，仅本机）或 0.0.0.0（局域网设备可访问）" ;;
 esac
+if [ "$HOST" != "127.0.0.1" ] || [ "$HOST_FROM_ENV" -eq 1 ] || [ -n "$EXISTING_HOST" ]; then
+  set_compose_env_value MEMORY_HOST "$HOST"
+fi
 if [ "$HOST" != "127.0.0.1" ]; then
-  printf 'MEMORY_HOST=%s\n' "$HOST" >> .env
   say "    已开启局域网访问（MEMORY_HOST=0.0.0.0），请只在可信家庭网络中使用。"
 fi
 export MEMORY_HOST="$HOST" MEMORY_PORT="$PORT"
 
 # 密钥只在首启日志里打印一次。必须在 up -d 之前判断数据卷是否已存在，才能区分
 # “这是重装、密钥沿用旧的” 和 “这是首装、但日志没解析出来”——两者的处置完全不同。
-# Compose 以安装目录名作为 project 名（小写、去掉 [a-z0-9_-] 以外的字符），数据卷
-# 即 <project>_memory-platform-data。这里必须精确匹配本项目的卷：只按后缀匹配的话，
-# 装在另一个目录下的另一套安装会让全新安装被误判成“已经装过”。
-COMPOSE_PROJECT=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+# 优先使用 Compose 自己的 project 名，并通过 Compose 写入卷的两个 label 精确判断。
+# 这样既支持默认目录名，也支持用户在环境或 .env 中设置 COMPOSE_PROJECT_NAME。
+COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME:-$(compose_env_value COMPOSE_PROJECT_NAME)}
+if [ -z "$COMPOSE_PROJECT" ]; then
+  COMPOSE_PROJECT=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+fi
 PREEXISTING=0
-if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx "${COMPOSE_PROJECT}_memory-platform-data"; then
+CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -aq memory-platform 2>/dev/null || true)
+if [ -n "$CURRENT_CONTAINER" ] ||
+   docker volume ls \
+     --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
+     --filter "label=com.docker.compose.volume=memory-platform-data" \
+     --format '{{.Name}}' 2>/dev/null | awk 'NF {found=1} END {exit !found}'; then
   PREEXISTING=1
 fi
 
+if [ "$PREEXISTING" -eq 1 ]; then
+  say "==> 升级前创建安全备份"
+  CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -q memory-platform 2>/dev/null || true)
+  if [ -z "$CURRENT_CONTAINER" ]; then
+    docker compose -f "$COMPOSE_NAME" up -d --pull never >/dev/null 2>&1 \
+      || fail "检测到已有数据，但无法启动旧版本完成升级前备份。数据未被修改；请先运行：
+  cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME up -d"
+    CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -q memory-platform 2>/dev/null || true)
+  fi
+  [ -n "$CURRENT_CONTAINER" ] \
+    || fail "检测到已有数据，但没有找到可执行备份的容器。数据未被修改。"
+  BACKUP_NAME="pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)-$$.zip"
+  mkdir -p backups
+  chmod 700 backups
+  docker compose -f "$COMPOSE_NAME" exec -T memory-platform \
+    memgw stack backup --output "/data/$BACKUP_NAME" \
+    || fail "升级前备份失败，已停止升级；现有服务和数据未被替换。"
+  docker cp "$CURRENT_CONTAINER:/data/$BACKUP_NAME" "backups/$BACKUP_NAME" \
+    || fail "备份已在数据卷中生成，但复制到安装目录失败，已停止升级。"
+  chmod 600 "backups/$BACKUP_NAME"
+  say "    备份已保存：$INSTALL_DIR/backups/$BACKUP_NAME"
+fi
+
 say "==> 拉取镜像并启动（镜像约数百 MB，首次拉取需要几分钟）"
-docker compose -f "$COMPOSE_NAME" pull
-docker compose -f "$COMPOSE_NAME" up -d
+docker compose -f "$COMPOSE_NAME" pull \
+  || fail "镜像下载失败。现有数据未被删除；请检查网络或稍后重新运行本脚本。"
+docker compose -f "$COMPOSE_NAME" up -d \
+  || fail "容器启动失败。升级前备份仍保存在 $INSTALL_DIR/backups/。"
 
 say "==> 等待服务就绪（首次启动要完成内部安装，通常 1–2 分钟）"
 i=0
 until curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
   i=$((i + 1))
-  [ "$i" -lt 180 ] || fail "服务 3 分钟内未就绪。请运行：cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
+  [ "$i" -lt 180 ] || fail "服务 3 分钟内未就绪。请运行：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
   sleep 1
 done
 
@@ -131,7 +250,7 @@ LAN_IP=$(lan_ip)
 
 say ""
 say "============================================"
-say "Memory Platform 已就绪"
+say "Memory Platform 基础服务已启动"
 say ""
 say "  Web Console（管理台）  http://127.0.0.1:$PORT/ui/"
 say "  客户端 Base URL        http://127.0.0.1:$PORT/v1"
@@ -159,15 +278,15 @@ if { [ -z "$GATEWAY_KEY" ] && [ -z "$GATEWAY_API_KEY" ]; } ||
    { [ -z "$ADMIN_KEY" ] && [ -z "$MEMORY_CONSOLE_ADMIN_KEY" ]; }; then
   if [ "$PREEXISTING" -eq 1 ]; then
     say "  检测到已有安装：访问密钥沿用首次启动时生成的那一对，本次不会重新打印。"
-    say "  日志还在的话可以查看：cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
+    say "  日志还在的话可以查看：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
     say "  已经找不回了就重新生成一对（旧 key 立即失效，所有客户端要同步更新）："
-    say "    cd $INSTALL_DIR"
+    say "    cd \"$INSTALL_DIR\""
     say "    docker compose -f $COMPOSE_NAME exec memory-platform memgw secret set gateway"
     say "    docker compose -f $COMPOSE_NAME exec memory-platform modelgw secret set memory-console-admin"
   else
     say "  这是首次安装，但没能从日志里解析出密钥（日志可能还没写完或格式有变）。"
     say "  请手动查看，日志里会各打印一次 GATEWAY_API_KEY 和 admin key："
-    say "    cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME logs memory-platform"
+    say "    cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
   fi
 fi
 say "============================================"
@@ -181,9 +300,17 @@ if [ "$HOST" = "127.0.0.1" ]; then
   else
     say "重启后改用本机局域网 IP，例如 http://<电脑IP>:$PORT/v1（API Key 和模型名不变）。"
   fi
-  say "重启命令：cd $INSTALL_DIR && docker compose -f $COMPOSE_NAME up -d"
+  say "重启命令：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME up -d"
   say "只限可信家庭网络，不要把服务暴露到公网。"
 fi
-say "下一步：打开 Web Console →「模型与路由」→ 用 admin key 解锁 → 新建渠道、"
-say "填入供应商 API Key 并选择模型；然后在客户端按上面三项接入。"
+say "下一步：浏览器会打开首次设置页。先粘贴 GATEWAY_API_KEY，再按页面提示"
+say "验证 admin key、选择渠道并粘贴供应商 API Key。模型启用后页面会直接给出客户端配置。"
 say "以后升级到最新版：重新运行本脚本即可，数据不受影响。"
+
+if [ "${MEMORY_NO_OPEN:-0}" != "1" ]; then
+  if command -v open >/dev/null 2>&1; then
+    open "http://127.0.0.1:$PORT/ui/" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    xdg-open "http://127.0.0.1:$PORT/ui/" >/dev/null 2>&1 || true
+  fi
+fi

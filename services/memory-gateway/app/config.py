@@ -67,6 +67,12 @@ class Settings(BaseSettings):
         le=3600.0,
         validation_alias="CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS",
     )
+    chat_gateway_max_request_body_bytes: int = Field(
+        default=32 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024,
+        validation_alias="CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES",
+    )
     chat_gateway_turn_ttl_seconds: float = Field(
         default=3600.0,
         ge=30.0,

@@ -69,6 +69,8 @@ def test_direct_provider_status_remains_read_only(client, auth_headers) -> None:
     assert response.status_code == 200
     assert response.json()["runtime"]["chat_source"] == "legacy_direct"
     assert response.json()["control"] is None
+    assert response.json()["setup"]["chat_ready"] is False
+    assert response.json()["setup"]["next_action"] == "configure_model"
 
 
 def test_model_gateway_status_uses_backend_key_and_never_returns_it(
@@ -92,9 +94,80 @@ def test_model_gateway_status_uses_backend_key_and_never_returns_it(
     assert payload["runtime"]["chat_source"] == "model_gateway"
     assert payload["providers"][0]["configured"] is True
     assert payload["routes"][0]["targets"][0]["model"] == "author/chat-v1"
+    assert payload["setup"]["chat_ready"] is False
+    assert payload["setup"]["missing_chat_routes"] == [
+        "memory.extract",
+        "memory.compact",
+        "memory.core",
+        "memory.review",
+        "knowledge.fast",
+        "knowledge.pro",
+    ]
     assert "backend-key" not in response.text
     assert calls[0]["api_key"] == "backend-key"
     assert calls[0]["path"] == "/admin/configuration"
+
+
+def test_setup_is_ready_only_when_every_chat_route_is_usable(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    snapshot = _control_snapshot()
+    snapshot["routes"] = [
+        {
+            "id": route_id,
+            "kind": "chat",
+            "targets": ["chat-primary"],
+            "required_capabilities": [],
+            "max_attempts": 3,
+            "enabled": True,
+        }
+        for route_id in providers_api.REQUIRED_CHAT_ROUTES
+    ]
+
+    async def fake_request(**kwargs):
+        return httpx.Response(200, json=snapshot)
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    response = client.get("/providers/status", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["setup"] == {
+        "state": "ready",
+        "service_ready": True,
+        "model_gateway_connected": True,
+        "chat_ready": True,
+        "required_chat_routes": list(providers_api.REQUIRED_CHAT_ROUTES),
+        "usable_chat_routes": list(providers_api.REQUIRED_CHAT_ROUTES),
+        "missing_chat_routes": [],
+        "next_action": "connect_client",
+    }
+
+
+def test_admin_key_can_be_checked_without_returning_configuration(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    async def fake_request(**kwargs):
+        assert kwargs["path"] == "/admin/configuration"
+        assert kwargs["api_key"] == "admin-key"
+        return httpx.Response(200, json=_control_snapshot())
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    response = client.post(
+        "/providers/admin/check",
+        headers={**auth_headers, "X-Model-Gateway-Admin-Key": "admin-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"valid": True}
+    assert "connections" not in response.text
 
 
 def test_provider_writes_require_and_forward_only_the_admin_key(

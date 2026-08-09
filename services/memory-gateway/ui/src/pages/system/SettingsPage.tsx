@@ -24,6 +24,7 @@ export function SettingsPage({
   const [authCheck, setAuthCheck] = useState<"idle" | "checking" | "ok" | "error">("idle");
   const [testMessage, setTestMessage] = useState("保存前可先确认服务和访问密钥都有效。");
   const testRequestRef = useRef<AbortController | null>(null);
+  const onboarding = !settings.apiKey;
 
   useEffect(() => {
     setForm(settings);
@@ -74,9 +75,9 @@ export function SettingsPage({
   return (
     <div className={`page-stack settings-page ${!settings.apiKey ? "onboarding-page" : ""}`}>
       <PageHeader
-        eyebrow={!settings.apiKey ? "欢迎使用 Memory Console" : undefined}
-        title={!settings.apiKey ? "连接你的本地记忆服务" : "设置"}
-        subtitle={!settings.apiKey ? "信息只保存在当前浏览器，不会被上传。" : "连接信息与本机偏好。"}
+        eyebrow={onboarding ? "首次设置 · 第 1 步" : undefined}
+        title={onboarding ? "输入客户端访问密钥" : "设置"}
+        subtitle={onboarding ? "粘贴安装完成时显示的 GATEWAY_API_KEY；它只保存在当前浏览器。" : "连接信息与本机偏好。"}
       />
       <section className="panel settings-panel">
         <div className="panel-header">
@@ -85,14 +86,9 @@ export function SettingsPage({
             <h2>连接设置</h2>
           </div>
         </div>
-        <label className="field-block">
-          <span>服务地址</span>
-          <input
-            value={form.apiBaseUrl}
-            onChange={(event) => setForm({ ...form, apiBaseUrl: event.target.value })}
-            placeholder={window.location.origin}
-          />
-        </label>
+        {onboarding && (
+          <div className="notice">已检测到本地服务：<code>{window.location.origin}</code></div>
+        )}
         <label className="field-block">
           <span>访问密钥</span>
           <div className="secret-field">
@@ -112,25 +108,41 @@ export function SettingsPage({
             </button>
           </div>
         </label>
-        <label className="field-block">
-          <span>用户 ID</span>
-          <input
-            value={form.userId}
-            onChange={(event) => setForm({ ...form, userId: event.target.value })}
-            placeholder="default"
-          />
-        </label>
+        {!onboarding && (
+          <details className="settings-advanced-connection">
+            <summary>高级连接设置</summary>
+            <label className="field-block">
+              <span>服务地址</span>
+              <input
+                value={form.apiBaseUrl}
+                onChange={(event) => setForm({ ...form, apiBaseUrl: event.target.value })}
+                placeholder={window.location.origin}
+              />
+            </label>
+            <label className="field-block">
+              <span>用户 ID</span>
+              <input
+                value={form.userId}
+                onChange={(event) => setForm({ ...form, userId: event.target.value })}
+                placeholder="default"
+              />
+              <small>默认凭证绑定到 default。只有管理员明确开启多用户头时才修改。</small>
+            </label>
+          </details>
+        )}
         <div className="button-row">
-          <button className="primary-button" type="button" onClick={() => onSave(form)}>
-            保存到本机浏览器
-          </button>
+          {!onboarding && (
+            <button className="secondary-button" type="button" onClick={() => onSave(form)}>
+              仅保存
+            </button>
+          )}
           <button
-            className="secondary-button"
+            className="primary-button"
             type="button"
-            disabled={testing}
+            disabled={testing || !form.apiKey.trim()}
             onClick={testConnection}
           >
-            测试并保存
+            {testing ? "正在验证" : onboarding ? "验证并继续" : "测试并保存"}
           </button>
         </div>
         <div className="connection-checks" aria-live="polite">
@@ -206,4 +218,3 @@ function ConnectionCheck({
     </div>
   );
 }
-

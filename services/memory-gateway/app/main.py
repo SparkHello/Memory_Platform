@@ -20,6 +20,8 @@ from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
 from app.model_catalog import validate_catalog_and_routes
+from app.request_limits import ChatRequestBodyLimitMiddleware
+from app.security_headers import SecurityHeadersMiddleware
 from app.usage.pricing import configure_pricing_catalog
 from app.usage.store import UsageStore
 
@@ -115,6 +117,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
     )
+    app.add_middleware(
+        ChatRequestBodyLimitMiddleware,
+        max_body_bytes=get_settings().chat_gateway_max_request_body_bytes,
+    )
+    app.add_middleware(SecurityHeadersMiddleware)
     app.include_router(health_router)
     app.include_router(chat_gateway_router)
     app.include_router(memories_router)

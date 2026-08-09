@@ -22,6 +22,11 @@ jobs:
           -p 127.0.0.1:2026:2026
           memory-platform:ci
 
+      - name: Verify unprivileged runtime user
+        run: >-
+          docker exec memory-platform sh -c
+          "grep -Eq '^Uid:[[:space:]]+10001' /proc/1/status"
+
       - name: Wait for Memory Gateway health
         run: |
           for i in $(seq 1 90); do

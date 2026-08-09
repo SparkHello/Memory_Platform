@@ -30,6 +30,7 @@ import type {
   MemorySurfaceRecord,
   MemoryType,
   PageKey,
+  ProvidersStatus,
   ReviewResult,
   SurfaceMode,
   TraversalResponse
@@ -65,6 +66,7 @@ type DashboardData = {
   network: MemoryNetworkData;
   spaces: MemorySpace[];
   evalProgress: EvalProgress | null;
+  setup: ProvidersStatus["setup"] | null;
 };
 
 type NetworkFilters = {
@@ -180,7 +182,7 @@ export function DashboardPage({
       const density =
         NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) ||
         NETWORK_DENSITY_OPTIONS[0];
-      const [health, report, review, logs, surfaced, network, spaces, workbench] = await Promise.all([
+      const [health, report, review, logs, surfaced, network, spaces, workbench, providers] = await Promise.all([
         api.health(signal),
         api.memoryReport(signal),
         api.reviewMemories(signal),
@@ -201,7 +203,8 @@ export function DashboardPage({
           redactSensitive: true
         }, signal),
         api.listMemorySpaces(signal),
-        api.recallEvaluationWorkbench({}, signal).catch(() => null)
+        api.recallEvaluationWorkbench({}, signal).catch(() => null),
+        api.providersStatus(signal).catch(() => null)
       ]);
       setState({
         loading: false,
@@ -214,7 +217,8 @@ export function DashboardPage({
           surfaced,
           network,
           spaces,
-          evalProgress: summarizeEvalProgress(workbench)
+          evalProgress: summarizeEvalProgress(workbench),
+          setup: providers?.setup || null
         }
       });
     } catch (error) {
@@ -384,7 +388,11 @@ export function DashboardPage({
               <div className="studio-head-side">
                 <span className="studio-health">
                   <span className={`status-dot ${data.health === "ok" ? "ok" : "bad"}`} />
-                  {data.health === "ok" ? "服务在线" : data.health}
+                  {data.health === "ok"
+                    ? data.setup && !data.setup.chat_ready
+                      ? "服务在线 · 模型待配置"
+                      : "聊天配置已就绪"
+                    : data.health}
                 </span>
                 <button
                   className="icon-button"
@@ -1027,6 +1035,16 @@ function EmotionQuadrant({ valence, arousal }: { valence: number; arousal: numbe
 
 function buildStudioActions(data: DashboardData): StudioAction[] {
   const list: StudioAction[] = [];
+  if (data.setup && !data.setup.chat_ready) {
+    list.push({
+      key: "model-setup",
+      tone: "warning",
+      title: data.setup.state === "configuration_error" ? "模型配置需处理" : "完成首次配置",
+      value: "还差一步",
+      hint: "选择模型渠道并验证后，客户端才能正常聊天",
+      page: "providers"
+    });
+  }
   const reviewCount = data.review.recommendations.length;
   if (reviewCount > 0) {
     list.push({

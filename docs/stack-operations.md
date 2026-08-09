@@ -32,7 +32,7 @@ scripts/memgw stack stop
 - [Memory Gateway 完整说明](../services/memory-gateway/README.md)
 - [Model Gateway 运行与检查](../services/model-gateway/docs/operations.md)
 
-只下载了 `docker-compose.user.yml` 的 Docker 用户使用：
+一键安装默认把 Compose 文件放在 `~/memory-platform`（Windows 为 `$HOME\memory-platform`）。进入该目录后，Docker 用户使用：
 
 ```bash
 docker compose -f docker-compose.user.yml ps
@@ -52,7 +52,7 @@ docker compose -f docker-compose.user.yml logs -f memory-platform
 
 ## 端口 2026 被占用
 
-一键脚本 `deploy/install.sh` 会自动避开占用的端口。手工部署时，在 `docker-compose.user.yml` 同目录创建 `.env`，写入一行：
+macOS/Linux 的 `deploy/install.sh` 和 Windows 的 `deploy/install.ps1` 都会自动避开占用的端口。手工部署时，在 `docker-compose.user.yml` 同目录创建 `.env`，写入一行：
 
 ```bash
 MEMORY_PORT=3026
@@ -68,7 +68,19 @@ Docker 部署默认只监听本机回环，手机和其他设备连不上。在 
 MEMORY_HOST=0.0.0.0
 ```
 
-然后 `docker compose -f docker-compose.user.yml up -d` 重启，客户端改用电脑的局域网 IP（macOS 用 `ipconfig getifaddr en0` 查询），例如 `http://192.168.1.20:2026/v1`。一键脚本用户也可以直接 `MEMORY_HOST=0.0.0.0` 重跑 `deploy/install.sh`，结束时会直接打印手机可用地址。源码安装默认已监听所有接口，无需此设置。
+然后 `docker compose -f docker-compose.user.yml up -d` 重启，客户端改用电脑的局域网 IP，例如 `http://192.168.1.20:2026/v1`。一键安装用户可以这样重跑，结束时会直接打印手机可用地址：
+
+```bash
+# macOS / Linux
+MEMORY_HOST=0.0.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
+```
+
+```powershell
+# Windows PowerShell
+$env:MEMORY_HOST="0.0.0.0"; irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+```
+
+源码安装默认已监听所有接口，无需此设置。
 
 只在可信家庭网络或 Tailscale 内这样用；接口仍有 `GATEWAY_API_KEY` 鉴权，但不要把服务暴露到公网。
 
@@ -169,6 +181,8 @@ modelgw discover --preset <id> --non-interactive --json
 不要把 `.env`、真实 SQLite、日志、评测快照或便携备份提交到 Git。
 
 ## 备份、恢复与迁移
+
+重新运行 Docker 一键安装脚本升级时，会在拉取新镜像前自动创建便携备份，并复制到安装目录的 `backups/`。备份失败时升级会停止，不会继续替换现有服务。下面的命令用于手动备份、迁移或恢复。
 
 ### 源码安装
 

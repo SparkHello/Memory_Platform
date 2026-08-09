@@ -59,6 +59,26 @@ def test_v1_gateway_requires_auth_and_lists_models(
     ]
 
 
+def test_chat_gateway_rejects_oversized_body_before_forwarding(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_gateway,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "x" * 70_000}],
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "memory_gateway_request_too_large"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert fake_gateway.payloads == []
+
+
 def test_non_stream_gateway_injects_memory_and_preserves_flit_payload(
     client: TestClient,
     auth_headers: dict[str, str],

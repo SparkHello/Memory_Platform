@@ -11,6 +11,15 @@ services:
       - "127.0.0.1:2026:2026"
     volumes:
       - memory-platform-data:/data
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

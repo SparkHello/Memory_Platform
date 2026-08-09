@@ -88,13 +88,20 @@ function useUnsavedChangesGuard(dirty: boolean, message: string, confirm: Confir
   }, [dirty, message, confirm]);
 }
 
-export function ProvidersPage({ api }: { api: MemoryApi }) {
+export function ProvidersPage({
+  api,
+  initialSetup = false
+}: {
+  api: MemoryApi;
+  initialSetup?: boolean;
+}) {
   const [status, setStatus] = useState<ProvidersStatus | null>(null);
   const [drafts, setDrafts] = useState<ModelGatewayRouteDraft[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [adminKey, setAdminKey] = useState("");
   const [showAdminKey, setShowAdminKey] = useState(false);
+  const [adminCheck, setAdminCheck] = useState<"idle" | "checking" | "valid" | "invalid">("idle");
   const [secretValues, setSecretValues] = useState<Record<string, string>>({});
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [checks, setChecks] = useState<Record<string, ConnectionCheckState>>({});
@@ -137,7 +144,7 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
   );
   const draftSignature = useMemo(() => JSON.stringify(drafts), [drafts]);
   const dirty = Boolean(status?.control) && draftSignature !== baselineSignature;
-  const hasAdminKey = Boolean(adminKey.trim());
+  const hasAdminKey = adminCheck === "valid";
   const validated = dirty && validatedSignature === draftSignature;
   useUnsavedChangesGuard(dirty, "路由草稿尚未应用，离开后这些修改会丢失。确定要离开吗？", confirm);
 
@@ -255,11 +262,35 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
     }
   };
 
+  const checkAdminKey = async () => {
+    if (!adminKey.trim() || adminCheck === "checking") return;
+    setAdminCheck("checking");
+    setFeedback(null);
+    try {
+      await api.checkProviderAdminKey(adminKey.trim());
+      setAdminCheck("valid");
+      setFeedback({ tone: "success", message: "管理密钥验证成功，可以继续配置模型。" });
+      if (initialSetup && (status?.control?.connections.length || 0) === 0) {
+        setWizardOpen(true);
+      }
+    } catch (cause) {
+      setAdminCheck("invalid");
+      setFeedback({ tone: "error", message: errorMessage(cause) });
+    }
+  };
+
+  const setupMode = initialSetup && !status?.setup.chat_ready;
+
   return (
     <div className="page-stack providers-page">
       <PageHeader
-        title="模型与路由"
-        subtitle="管理模型渠道密钥和每项用途的故障切换顺序；密钥只单向写入 Model Gateway。"
+        eyebrow={setupMode ? "首次设置 · 第 2 步" : undefined}
+        title={setupMode ? "连接一个模型渠道" : "模型与路由"}
+        subtitle={
+          setupMode
+            ? "选择渠道、粘贴供应商 API Key，再选择一个聊天模型即可。"
+            : "管理模型渠道、密钥和故障切换顺序。"
+        }
         action={
           <div className="provider-page-actions">
             {dirty && (
@@ -307,8 +338,9 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
 
       {status && (
         <>
+          {setupMode && <FirstRunProgress status={status} adminCheck={adminCheck} />}
           {status.config_error && <ErrorBlock message={`配置不可用：${status.config_error}`} />}
-          <RuntimeBanner status={status} dirty={dirty} validated={validated} />
+          {!setupMode && <RuntimeBanner status={status} dirty={dirty} validated={validated} />}
 
           {feedback && (
             <div className={`provider-feedback is-${feedback.tone}`} role={feedback.tone === "error" ? "alert" : "status"}>
@@ -326,11 +358,14 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
               <AdminAccess
                 value={adminKey}
                 show={showAdminKey}
+                state={adminCheck}
                 onChange={(value) => {
                   setAdminKey(value);
+                  setAdminCheck("idle");
                   setValidatedSignature("");
                 }}
                 onToggleShow={() => setShowAdminKey((current) => !current)}
+                onCheck={() => void checkAdminKey()}
               />
               <ConnectionsEditor
                 control={status.control}
@@ -358,12 +393,18 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
                   onCompleted={() => load(undefined, false)}
                 />
               )}
-              <RoutesEditor
-                control={status.control}
-                drafts={drafts}
-                onMove={moveTarget}
-                onToggle={toggleRoute}
-              />
+              <details className="panel provider-advanced-panel">
+                <summary>高级设置：用途与故障切换顺序</summary>
+                <p className="muted">
+                  普通使用无需修改。添加备用模型、调整优先顺序或修复已有配置时再展开。
+                </p>
+                <RoutesEditor
+                  control={status.control}
+                  drafts={drafts}
+                  onMove={moveTarget}
+                  onToggle={toggleRoute}
+                />
+              </details>
             </>
           ) : (
             <ReadOnlyDirectStatus status={status} />
@@ -378,13 +419,17 @@ export function ProvidersPage({ api }: { api: MemoryApi }) {
 function AdminAccess({
   value,
   show,
+  state,
   onChange,
-  onToggleShow
+  onToggleShow,
+  onCheck
 }: {
   value: string;
   show: boolean;
+  state: "idle" | "checking" | "valid" | "invalid";
   onChange: (value: string) => void;
   onToggleShow: () => void;
+  onCheck: () => void;
 }) {
   return (
     <section className="panel provider-admin-access" aria-labelledby="provider-admin-title">
@@ -394,7 +439,7 @@ function AdminAccess({
         </span>
         <div>
           <h2 id="provider-admin-title">解锁本次配置操作</h2>
-          <p>管理密钥只保留在当前页面内存中，刷新或关闭页面后自动清除。</p>
+          <p>粘贴安装时保存的 admin key。它只保留到本页关闭，不会写入浏览器存储。</p>
         </div>
       </div>
       <label className="field-block provider-admin-field">
@@ -419,14 +464,61 @@ function AdminAccess({
           </button>
         </div>
       </label>
+      <div className="provider-admin-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={onCheck}
+          disabled={!value.trim() || state === "checking"}
+        >
+          <KeyRound size={16} aria-hidden />
+          {state === "checking" ? "正在验证" : state === "valid" ? "已验证" : "验证管理密钥"}
+        </button>
+        {state === "invalid" && <span className="field-error">密钥无效，请重新粘贴。</span>}
+        {state === "valid" && <span className="field-success">验证成功</span>}
+      </div>
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>
         <p>
           首次运行 <code>memgw stack install</code>（含 <code>scripts/setup.sh</code> 和容器首启）时会自动生成并打印一次；请从当时的终端或容器日志中查找。
         </p>
-        <p>丢失后在 Model Gateway 终端重新设置：</p>
-        <code>modelgw secret set memory-console-admin</code>
+        <p>丢失后只能换一枚新的；旧密钥会立即失效：</p>
+        <p>Docker：在安装目录（默认 memory-platform）打开终端后运行：</p>
+        <code>docker compose -f docker-compose.user.yml exec memory-platform modelgw secret set memory-console-admin</code>
+        <p>源码安装：</p>
+        <code>services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin</code>
       </details>
+    </section>
+  );
+}
+
+function FirstRunProgress({
+  status,
+  adminCheck
+}: {
+  status: ProvidersStatus;
+  adminCheck: "idle" | "checking" | "valid" | "invalid";
+}) {
+  const hasChannel = status.providers.some((provider) => provider.configured);
+  return (
+    <section className="panel first-run-progress" aria-label="首次设置进度">
+      <div className="panel-header">
+        <div>
+          <span className="panel-kicker">还需约 2 分钟</span>
+          <h2>完成下面三步即可开始聊天</h2>
+        </div>
+      </div>
+      <ol>
+        <li className="is-done"><CheckCircle2 size={17} aria-hidden /><span>本地服务已连接</span></li>
+        <li className={adminCheck === "valid" ? "is-done" : "is-current"}>
+          {adminCheck === "valid" ? <CheckCircle2 size={17} aria-hidden /> : <span>2</span>}
+          <span>验证安装时保存的管理密钥</span>
+        </li>
+        <li className={status.setup.chat_ready ? "is-done" : adminCheck === "valid" ? "is-current" : ""}>
+          {status.setup.chat_ready ? <CheckCircle2 size={17} aria-hidden /> : <span>3</span>}
+          <span>{hasChannel ? "选择聊天模型并启用" : "选择渠道并粘贴供应商 API Key"}</span>
+        </li>
+      </ol>
     </section>
   );
 }

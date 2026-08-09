@@ -1,6 +1,8 @@
 # 用户版：直接拉取预构建镜像，不需要 clone 仓库、不需要 Python/Node。
 # 最简单的用法是一键脚本（自动下载本文件、避开占用端口并打印密钥）：
 #   curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+# Windows PowerShell：
+#   irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
 # 手工用法：
 #   curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
 #   docker compose -f docker-compose.user.yml up -d
@@ -10,7 +12,7 @@
 # 端口 2026 被占用时，在本文件同目录的 .env 写入一行 MEMORY_PORT=3026 后重启，
 # 之后所有文档中的 2026 换成 3026。
 # 想在手机/其他设备上访问时，在 .env 加一行 MEMORY_HOST=0.0.0.0 后重启，
-# 然后改用电脑的局域网 IP（仅限可信家庭网络，不要把服务无鉴权暴露到公网）。
+# 然后改用电脑的局域网 IP（仅限可信家庭网络，不要暴露到公网）。
 # 想自己指定密钥（至少 16 个字符）而不是用自动生成的，在首次启动前这样跑：
 #   GATEWAY_API_KEY=你的密钥 docker compose -f docker-compose.user.yml up -d
 # 建议不要写进 .env，以免密钥明文留在安装目录里。
@@ -30,6 +32,15 @@ services:
       MEMORY_PUBLIC_PORT: "${MEMORY_PORT:-2026}"
     volumes:
       - memory-platform-data:/data
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       # 首次启动的接线安装约 1 分钟，start_period 给足余量

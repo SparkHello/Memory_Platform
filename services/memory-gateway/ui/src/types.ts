@@ -1180,4 +1180,14 @@ export interface ProvidersStatus {
   routes: RouteInfo[];
   control: ModelGatewayControlSnapshot | null;
   config_error: string;
+  setup: {
+    state: "ready" | "needs_model" | "configuration_error";
+    service_ready: boolean;
+    model_gateway_connected: boolean;
+    chat_ready: boolean;
+    required_chat_routes: string[];
+    usable_chat_routes: string[];
+    missing_chat_routes: string[];
+    next_action: "configure_model" | "repair_model_gateway" | "connect_client";
+  };
 }
