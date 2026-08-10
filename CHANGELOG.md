@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-10
+
 ### Changed
 
 - Memory Gateway **仅支持 Model Gateway** 作为模型运行时：移除 `UPSTREAM_*` / `LLM_*` direct-provider 聊天、embedding 与 Knowledge Agent 第二实现；未配置中央网关时启动路径与 `/readyz` 失败并给出迁移指引。见 [docs/migrate-to-model-gateway.md](docs/migrate-to-model-gateway.md)。
