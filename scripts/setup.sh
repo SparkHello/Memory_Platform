@@ -38,18 +38,16 @@ Use --install-only to prepare and start the stack without configuring a model.
 AI / non-interactive mode:
   --config FILE   Non-secret recipe matching docs/ai-quickstart.schema.json.
                   The provider API key is read as one line from stdin.
-  --json          Keep stdout machine-readable; progress and the one-time
-                  client access key are written to stderr.
+  --json          Keep stdout machine-readable; progress and private
+                  credential file paths are written to stderr.
   --configure-only
                   Reuse an installed stack; skip dependency and stack install.
 
 The recipe must never contain API keys or other secrets.
-
-Optional environment variables (first install only, at least 16 characters):
-  GATEWAY_API_KEY           Custom client access key instead of a generated one.
-  MEMORY_CONSOLE_ADMIN_KEY  Custom Web Console admin key. Higher privilege; it
-                            is only used in the browser on this machine and
-                            never needs to be copied to a phone client.
+First-access credentials are generated locally and written only to private
+mode-0600 files. GATEWAY_API_KEY, GATEWAY_SIGNING_SECRET,
+MODEL_GATEWAY_API_KEY, and MEMORY_CONSOLE_ADMIN_KEY environment variables are
+rejected; existing private settings files remain the migration source.
 EOF
 }
 
@@ -128,6 +126,17 @@ if [ "$MODE" = guided ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
 fi
 if [ "$MODE" = config ] && [ ! -f "$CONFIG_FILE" ]; then
   echo "quickstart config not found: $CONFIG_FILE" >&2
+  exit 2
+fi
+
+SECRET_ENV_NAMES=""
+[ -z "${GATEWAY_API_KEY:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES GATEWAY_API_KEY"
+[ -z "${GATEWAY_SIGNING_SECRET:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES GATEWAY_SIGNING_SECRET"
+[ -z "${MODEL_GATEWAY_API_KEY:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES MODEL_GATEWAY_API_KEY"
+[ -z "${MEMORY_CONSOLE_ADMIN_KEY:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES MEMORY_CONSOLE_ADMIN_KEY"
+if [ -n "$SECRET_ENV_NAMES" ]; then
+  echo "refusing first-access credentials from process environment:$SECRET_ENV_NAMES" >&2
+  echo "remove them; setup writes generated credentials only to private files" >&2
   exit 2
 fi
 
@@ -245,7 +254,9 @@ else
   say "============================================"
   say ""
   say "127.0.0.1 指运行本服务的这台电脑。客户端里填以 /v1 结尾的 Base URL，"
-  say "不要填 /ui/ 结尾的管理台地址；手机等其他设备改用本机的局域网 IP。"
-  say "API Key 填安装时打印过一次的 GATEWAY_API_KEY；找不回可运行"
-  say "scripts/memgw secret set gateway 重新生成（旧 key 立即失效）。"
+  say "默认只监听 127.0.0.1。局域网使用请显式运行："
+  say "scripts/memgw stack restart --host 0.0.0.0"
+  say "Web Console token 与 Model admin key 位于安装输出列出的 0600 文件。"
+  say "聊天客户端另建最小权限 token：scripts/memgw token create --name DEVICE --role chat"
+  say "MCP 客户端使用 --role mcp；不要复用 Console token。"
 fi

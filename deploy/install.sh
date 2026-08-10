@@ -1,108 +1,833 @@
 #!/usr/bin/env sh
-# Memory Platform 一键安装（Docker 路径，macOS / Linux 终端）：
-#   curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
-#
-# 脚本会：检查 Docker → 下载用户版 Compose → 避开已占用端口 → 启动并等待就绪
-# → 打印两枚一次性密钥和下一步指引。重复运行即升级到最新镜像，数据保留在
-# memory-platform-data 卷中。
-#
-# Windows 用户：请使用同目录的 install.ps1。
-# 可选环境变量：
-#   MEMORY_PLATFORM_DIR  安装目录（默认 ~/memory-platform；会自动识别已有安装）
-#   MEMORY_NO_OPEN       设为 1 时安装完成后不自动打开浏览器
-#   MEMORY_PORT          对外端口（默认 2026；被占用时自动顺延）
-#   MEMORY_HOST          监听地址（默认 127.0.0.1；手机/局域网设备访问用 0.0.0.0，
-#                        仅限可信家庭网络，不要暴露到公网）
-#   GATEWAY_API_KEY      自定义客户端访问密钥（留空则自动生成；至少 16 个字符）。
-#                        只在首次安装时生效，之后改密钥用 memgw secret set gateway。
-#   MEMORY_CONSOLE_ADMIN_KEY
-#                        自定义 Web 配置管理密钥（同上）。它权限更高，只在浏览器
-#                        里用，不需要填进客户端，也不需要传到手机上。
+# Memory Platform release installer (macOS/Linux).
+# Long-lived services never receive credentials through Compose environment or
+# daemon logs.  Generated access values are delivered only as host 0600 files.
 set -eu
 
-REPO_RAW="https://raw.githubusercontent.com/SparkHello/Memory_Platform/main"
+RELEASE="${MEMORY_PLATFORM_VERSION:-v0.2.0}"
+printf '%s\n' "$RELEASE" \
+  | awk '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ { valid=1 } END { exit !valid }' \
+  || { printf 'error: MEMORY_PLATFORM_VERSION 必须是 vX.Y.Z 形式的发布版本。\n' >&2; exit 1; }
+REPO_RAW="https://raw.githubusercontent.com/SparkHello/Memory_Platform/$RELEASE"
 COMPOSE_NAME="docker-compose.user.yml"
 INSTALL_DIR="${MEMORY_PLATFORM_DIR:-}"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# 自带密钥先在本地过一遍下限，免得拉完几百 MB 镜像才在容器里失败。容器内
-# memgw stack install 会再做一次完整校验。
-check_custom_key() {
-  [ -n "$2" ] || return 0
-  case "$2" in
-    *[[:space:]]*) fail "$1 不能包含空格或换行。" ;;
-  esac
-  [ "${#2}" -ge 16 ] || fail "$1 至少需要 16 个字符，当前只有 ${#2} 个。不设置该变量则自动生成一枚高强度密钥。"
-}
-check_custom_key GATEWAY_API_KEY "${GATEWAY_API_KEY:-}"
-check_custom_key MEMORY_CONSOLE_ADMIN_KEY "${MEMORY_CONSOLE_ADMIN_KEY:-}"
-# 只放进本次 compose 进程的环境，不写入 .env——密钥不落盘在安装目录里。
-export GATEWAY_API_KEY="${GATEWAY_API_KEY:-}"
-export MEMORY_CONSOLE_ADMIN_KEY="${MEMORY_CONSOLE_ADMIN_KEY:-}"
+# Legacy variables would remain visible in docker inspect even though the v2
+# compose ignores them.  Refuse them instead of silently creating that residue.
+if [ -n "${GATEWAY_API_KEY:-}" ] || [ -n "${MEMORY_CONSOLE_ADMIN_KEY:-}" ]; then
+  fail "新版安装器不接受环境变量中的密钥；请让离线初始化写入 credentials/*.key。"
+fi
+unset GATEWAY_API_KEY MEMORY_CONSOLE_ADMIN_KEY 2>/dev/null || true
+# Copy user-facing selection inputs once, then remove every variable that
+# Docker Compose itself would otherwise let override the old or journalled
+# `.env`. Candidate helpers re-inject only these validated private copies.
+REQUESTED_COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-}
+REQUESTED_MEMORY_HOST=${MEMORY_HOST:-}
+REQUESTED_MEMORY_PORT=${MEMORY_PORT:-}
+unset COMPOSE_PROJECT_NAME COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE \
+  COMPOSE_PROFILES COMPOSE_FILE COMPOSE_PATH_SEPARATOR \
+  MEMORY_HOST MEMORY_PORT MEMORY_CREDENTIAL_DIR HOST_UID HOST_GID \
+  2>/dev/null || true
+# Compose gives exported shell variables precedence over values in .env.  Image
+# references are installer-managed persistent state, so inherited values must
+# not be able to override either the old stack during rollback or the staged
+# candidate during validation.
+unset MEMORY_PLATFORM_INIT_IMAGE MEMORY_PLATFORM_MODEL_IMAGE \
+  MEMORY_PLATFORM_MEMORY_IMAGE 2>/dev/null || true
 
-say "==> 检查运行环境"
-command -v curl >/dev/null 2>&1 || fail "未找到 curl，请先安装 curl 后重试。"
-command -v docker >/dev/null 2>&1 || fail "未找到 Docker。请先安装并启动 Docker Desktop（https://docs.docker.com/get-docker/），再重新运行本命令。"
-docker info >/dev/null 2>&1 || fail "Docker 已安装但尚未运行。请启动 Docker Desktop 后重试。"
-docker compose version >/dev/null 2>&1 || fail "未找到 docker compose 插件，请升级 Docker Desktop 后重试。"
+command -v curl >/dev/null 2>&1 || fail "未找到 curl。"
+command -v docker >/dev/null 2>&1 || fail "未找到 Docker。"
+docker info >/dev/null 2>&1 || fail "Docker 尚未运行。"
+docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2。"
+
+existing_install_dirs() {
+  for service in model-gateway memory-gateway memory-platform; do
+    docker ps -a --filter "label=com.docker.compose.service=$service" \
+      --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null || true
+  done | awk 'NF && !seen[$0]++'
+}
 
 if [ -z "$INSTALL_DIR" ]; then
-  EXISTING_DIRS=$(docker ps -a \
-    --filter label=com.docker.compose.service=memory-platform \
-    --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
-    | awk 'NF && !seen[$0]++')
-  EXISTING_COUNT=$(printf '%s\n' "$EXISTING_DIRS" | awk 'NF {count++} END {print count + 0}')
-  if [ "$EXISTING_COUNT" -gt 1 ]; then
-    fail "检测到多套 Memory Platform。请指定要升级的目录：
-  MEMORY_PLATFORM_DIR=/原安装目录 sh -c \"\$(curl -fsSL $REPO_RAW/deploy/install.sh)\""
-  elif [ "$EXISTING_COUNT" -eq 1 ]; then
+  EXISTING_DIRS=$(existing_install_dirs)
+  EXISTING_COUNT=$(printf '%s\n' "$EXISTING_DIRS" | awk 'NF {n++} END {print n+0}')
+  [ "$EXISTING_COUNT" -le 1 ] || fail "检测到多套安装；请显式设置 MEMORY_PLATFORM_DIR。"
+  if [ "$EXISTING_COUNT" -eq 1 ]; then
     INSTALL_DIR=$EXISTING_DIRS
-    say "    已找到现有安装：$INSTALL_DIR"
   else
     INSTALL_DIR="${HOME:?无法确定用户目录}/memory-platform"
   fi
 fi
-
-say "==> 下载 Compose 文件到 $INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 INSTALL_DIR=$(pwd)
-curl -fsSL "$REPO_RAW/deploy/$COMPOSE_NAME" -o "$COMPOSE_NAME" \
-  || fail "下载 $COMPOSE_NAME 失败，请检查网络后重试。"
+
+# Hold one installer-wide transaction lock before recovery, environment reads
+# that can later be committed, backups, or any mutation. A SIGKILL leaves the
+# directory behind; only a well-formed lock whose PID is no longer alive may
+# be atomically quarantined and replaced. PID reuse intentionally fails closed.
+INSTALL_LOCK="$INSTALL_DIR/.memory-platform-install.lock"
+INSTALL_LOCK_HELD=0
+release_install_lock() {
+  [ "$INSTALL_LOCK_HELD" = 1 ] || return 0
+  [ -d "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ] || return 1
+  [ -f "$INSTALL_LOCK/owner" ] && [ ! -L "$INSTALL_LOCK/owner" ] || return 1
+  [ "$(sed -n '1p' "$INSTALL_LOCK/owner")" = "$$" ] || return 1
+  rm -f "$INSTALL_LOCK/owner" || return 1
+  rmdir "$INSTALL_LOCK" || return 1
+  INSTALL_LOCK_HELD=0
+}
+acquire_install_lock() {
+  if mkdir -m 700 "$INSTALL_LOCK" 2>/dev/null; then
+    if ! printf '%s\n' "$$" >"$INSTALL_LOCK/owner" \
+      || ! chmod 600 "$INSTALL_LOCK/owner"; then
+      rm -f "$INSTALL_LOCK/owner"
+      rmdir "$INSTALL_LOCK" 2>/dev/null || true
+      return 1
+    fi
+    INSTALL_LOCK_HELD=1
+    return 0
+  fi
+  [ -d "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ] \
+    || fail "安装事务锁不是安全目录；拒绝继续"
+  [ -f "$INSTALL_LOCK/owner" ] && [ ! -L "$INSTALL_LOCK/owner" ] \
+    || fail "安装事务锁不完整；请确认没有安装器运行后人工检查"
+  lock_owner=$(sed -n '1p' "$INSTALL_LOCK/owner")
+  case "$lock_owner" in ''|*[!0-9]*) fail "安装事务锁 owner 无效；拒绝继续" ;; esac
+  if kill -0 "$lock_owner" 2>/dev/null; then
+    fail "另一安装器仍在运行（PID ${lock_owner}）；本次未修改任何状态"
+  fi
+  stale_lock="$INSTALL_LOCK.stale.$$"
+  [ ! -e "$stale_lock" ] || fail "安装事务 stale lock 路径已存在；拒绝继续"
+  mv "$INSTALL_LOCK" "$stale_lock" \
+    || fail "安装事务锁刚被另一进程接管；请稍后重试"
+  [ -f "$stale_lock/owner" ] && [ ! -L "$stale_lock/owner" ] \
+    || fail "stale 安装事务锁不安全；拒绝自动清理"
+  rm -f "$stale_lock/owner" && rmdir "$stale_lock" \
+    || fail "无法清理已终止安装器留下的 stale lock"
+  mkdir -m 700 "$INSTALL_LOCK" \
+    || fail "另一安装器已取得事务锁；本次未修改任何状态"
+  if ! printf '%s\n' "$$" >"$INSTALL_LOCK/owner" \
+    || ! chmod 600 "$INSTALL_LOCK/owner"; then
+    rm -f "$INSTALL_LOCK/owner"
+    rmdir "$INSTALL_LOCK" 2>/dev/null || true
+    fail "无法写入安装事务锁 owner"
+  fi
+  INSTALL_LOCK_HELD=1
+}
+acquire_install_lock || fail "无法取得安装事务锁"
+ORIGINAL_ENV_SNAPSHOT=""
+cleanup_base() {
+  [ -z "${ORIGINAL_ENV_SNAPSHOT:-}" ] || rm -f "$ORIGINAL_ENV_SNAPSHOT"
+  release_install_lock || true
+}
+trap cleanup_base EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p credentials backups
+chmod 700 credentials backups
 
 compose_env_value() {
   [ -f .env ] || return 0
   awk -F= -v key="$1" '
-    $1 == key {
-      value = substr($0, length(key) + 2)
-      sub(/\r$/, "", value)
-    }
+    $1 == key { value=substr($0,length(key)+2); sub(/\r$/, "", value) }
     END { if (value != "") print value }
   ' .env
 }
 
 set_compose_env_value() {
-  key=$1
-  value=$2
+  key=$1 value=$2
   temporary=$(mktemp .env.tmp.XXXXXX) || fail "无法安全更新 .env"
   if [ -f .env ]; then
     awk -v key="$key" -v value="$value" '
-      BEGIN { updated = 0 }
-      index($0, key "=") == 1 {
-        if (!updated) print key "=" value
-        updated = 1
-        next
-      }
+      BEGIN { found=0 }
+      index($0,key "=")==1 { if (!found) print key "=" value; found=1; next }
       { print }
-      END { if (!updated) print key "=" value }
-    ' .env > "$temporary"
+      END { if (!found) print key "=" value }
+    ' .env >"$temporary"
   else
-    printf '%s=%s\n' "$key" "$value" > "$temporary"
+    printf '%s=%s\n' "$key" "$value" >"$temporary"
   fi
   chmod 600 "$temporary"
   mv "$temporary" .env
+}
+
+remove_compose_env_value() {
+  [ -f .env ] || return 0
+  temporary=$(mktemp .env.tmp.XXXXXX) || fail "无法安全清理 .env"
+  awk -v key="$1" 'index($0,key "=")!=1 { print }' .env >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" .env
+}
+
+restore_compose_env_value() {
+  key=$1 value=$2
+  if [ -n "$value" ]; then
+    set_compose_env_value "$key" "$value"
+  else
+    remove_compose_env_value "$key"
+  fi
+}
+
+CUTOVER_JOURNAL="$INSTALL_DIR/.memory-platform-cutover"
+
+journal_value() {
+  awk -F= -v key="$1" '
+    $1 == key { value=substr($0,length(key)+2) }
+    END { if (value != "") print value }
+  ' "$CUTOVER_JOURNAL/metadata"
+}
+
+valid_sha256_image_id() {
+  case "$1" in
+    sha256:*) journal_digest=${1#sha256:} ;;
+    *) return 1 ;;
+  esac
+  [ "${#journal_digest}" -eq 64 ] || return 1
+  case "$journal_digest" in *[!0-9a-f]*) return 1 ;; esac
+  return 0
+}
+
+valid_old_image_ref() {
+  old_image_ref=$1
+  old_image_repository=$2
+  if valid_sha256_image_id "$old_image_ref"; then
+    return 0
+  fi
+  case "$old_image_ref" in
+    "$old_image_repository"@sha256:*)
+      valid_sha256_image_id "sha256:${old_image_ref#*@sha256:}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_cutover_journal() {
+  [ -e "$CUTOVER_JOURNAL" ] || return 0
+  [ -d "$CUTOVER_JOURNAL" ] && [ ! -L "$CUTOVER_JOURNAL" ] || return 1
+  [ -f "$CUTOVER_JOURNAL/phase" ] && [ ! -L "$CUTOVER_JOURNAL/phase" ] \
+    || return 1
+  [ "$(sed -n '1p' "$CUTOVER_JOURNAL/phase")" = committed ] || return 1
+  for journal_file in metadata old-compose.yml old.env; do
+    [ ! -e "$CUTOVER_JOURNAL/$journal_file" ] \
+      || rm -f "$CUTOVER_JOURNAL/$journal_file" \
+      || return 1
+  done
+  # Make deletion of all rollback material durable while the committed marker
+  # still survives. A crash can therefore only resume cleanup, never infer
+  # that an already accepted new stack must be rolled back.
+  sync
+  rm -f "$CUTOVER_JOURNAL/phase" || return 1
+  rmdir "$CUTOVER_JOURNAL" || return 1
+  sync
+}
+
+commit_cutover_journal() {
+  # This helper is deliberately independent from the current installer
+  # layout.  It is also used during start-up recovery, before LAYOUT has been
+  # discovered and before the later cutover helpers have been defined.
+  committed_phase=$(mktemp "$CUTOVER_JOURNAL/.phase.XXXXXX") || return 1
+  if ! printf 'committed\n' >"$committed_phase" \
+    || ! chmod 600 "$committed_phase" \
+    || ! mv "$committed_phase" "$CUTOVER_JOURNAL/phase"; then
+    rm -f "$committed_phase"
+    return 1
+  fi
+  # Once the committed marker is visible, the accepted state (which may be a
+  # successfully restored old stack) must never be rolled back merely because
+  # best-effort journal cleanup was interrupted.  A later installer run will
+  # resume cleanup from this marker.
+  sync || say "warning: 无法确认 committed journal 已同步到磁盘；保留当前已验收栈"
+  if ! remove_cutover_journal; then
+    say "warning: 已验收升级的 journal 将在下次安装时继续清理"
+  fi
+  return 0
+}
+
+journal_volume_for() {
+  docker volume ls \
+    --filter "label=com.docker.compose.project=$1" \
+    --filter "label=com.docker.compose.volume=$2" \
+    --format '{{.Name}}' | awk 'NF {print; exit}'
+}
+
+legacy_target_volume_exists() {
+  legacy_project=$1
+  legacy_key=$2
+  [ -n "$(journal_volume_for "$legacy_project" "$legacy_key")" ] && return 0
+  legacy_expected="${legacy_project}_${legacy_key}"
+  legacy_inspected=$(docker volume inspect "$legacy_expected" \
+    --format '{{.Name}}' 2>/dev/null || true)
+  [ "$legacy_inspected" = "$legacy_expected" ]
+}
+
+cleanup_legacy_transaction_volumes() {
+  cleanup_project=$1
+  [ "$(journal_value legacy_targets_absent)" = 1 ] || return 1
+  cleanup_containers=$(docker ps -aq \
+    --filter "label=com.docker.compose.project=$cleanup_project")
+  for cleanup_container in $cleanup_containers; do
+    docker rm -f "$cleanup_container" >/dev/null || return 1
+  done
+  for cleanup_key in memory-data memory-secrets model-data model-secrets; do
+    cleanup_volume=$(journal_volume_for "$cleanup_project" "$cleanup_key")
+    if [ -z "$cleanup_volume" ]; then
+      # A Compose-created target always carries both exact labels.  Never
+      # delete an unlabeled look-alike volume, even if its conventional name
+      # happens to match this project.
+      continue
+    fi
+    cleanup_labels=$(docker volume inspect "$cleanup_volume" \
+      --format '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}' \
+      2>/dev/null) || return 1
+    [ "$cleanup_labels" = "$cleanup_project|$cleanup_key" ] || return 1
+    docker volume rm "$cleanup_volume" >/dev/null || return 1
+  done
+  return 0
+}
+
+recover_interrupted_cutover() {
+  [ -e "$CUTOVER_JOURNAL" ] || return 0
+  [ -d "$CUTOVER_JOURNAL" ] && [ ! -L "$CUTOVER_JOURNAL" ] \
+    || fail "升级事务 journal 不是安全目录；拒绝继续"
+  if [ ! -e "$CUTOVER_JOURNAL/phase" ]; then
+    if [ -z "$(find "$CUTOVER_JOURNAL" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      rmdir "$CUTOVER_JOURNAL" || fail "无法清理已完成的升级事务目录"
+      sync
+      return 0
+    fi
+    fail "升级事务 journal 不完整；拒绝覆盖当前状态"
+  fi
+  [ -f "$CUTOVER_JOURNAL/phase" ] && [ ! -L "$CUTOVER_JOURNAL/phase" ] \
+    || fail "升级事务 journal 阶段文件不安全"
+  journal_phase=$(sed -n '1p' "$CUTOVER_JOURNAL/phase")
+  if [ "$journal_phase" = committed ]; then
+    # Metadata is removed only after the committed candidate has already been
+    # published and passed host liveness. If it still exists, a crash happened
+    # between durable commit and port publication; finish the new stack and
+    # never restore the pre-upgrade backup.
+    if [ -f "$CUTOVER_JOURNAL/metadata" ] \
+      && [ ! -L "$CUTOVER_JOURNAL/metadata" ]; then
+      committed_version=$(journal_value version)
+      committed_project=$(journal_value project)
+      committed_host=$(journal_value publish_host)
+      committed_port=$(journal_value publish_port)
+      if [ "$committed_version" = 2 ]; then
+        case "$committed_project" in
+          ''|*[!a-z0-9_-]*) fail "committed journal 的项目名无效" ;;
+        esac
+        case "$committed_host" in 127.0.0.1|0.0.0.0) ;; *) fail "committed journal 的监听地址无效" ;; esac
+        case "$committed_port" in ''|*[!0-9]*) fail "committed journal 的端口无效" ;; esac
+        [ "$committed_port" -ge 1 ] && [ "$committed_port" -le 65535 ] \
+          || fail "committed journal 的端口超出范围"
+        say "==> 完成已提交升级的宿主端口发布"
+        MEMORY_HOST="$committed_host" MEMORY_PORT="$committed_port" \
+          docker compose --env-file "$INSTALL_DIR/.env" \
+          -p "$committed_project" -f "$COMPOSE_NAME" up -d \
+          >/dev/null || fail "已提交新栈无法完成启动；journal 已保留且不会回滚数据"
+        committed_wait=0
+        until curl -fsS "http://127.0.0.1:$committed_port/health" \
+          >/dev/null 2>&1; do
+          committed_wait=$((committed_wait+1))
+          [ "$committed_wait" -lt 180 ] \
+            || fail "已提交新栈无法恢复宿主 liveness；journal 已保留且不会回滚数据"
+          sleep 1
+        done
+      fi
+    fi
+    say "==> 清理已验收升级遗留的 committed journal"
+    remove_cutover_journal || fail "无法清理已验收升级的 journal"
+    return 0
+  fi
+  for required_journal_file in metadata old-compose.yml old.env; do
+    [ -f "$CUTOVER_JOURNAL/$required_journal_file" ] \
+      && [ ! -L "$CUTOVER_JOURNAL/$required_journal_file" ] \
+      || fail "升级事务 journal 不完整；拒绝覆盖当前状态"
+  done
+  journal_version=$(journal_value version)
+  journal_project=$(journal_value project)
+  journal_layout=$(journal_value layout)
+  journal_backup=$(journal_value backup)
+  journal_init_image=$(journal_value old_init_image)
+  journal_model_image=$(journal_value old_model_image)
+  journal_memory_image=$(journal_value old_memory_image)
+  journal_legacy_targets_absent=$(journal_value legacy_targets_absent)
+  journal_old_env_exists=$(journal_value old_env_exists)
+  case "$journal_version" in 1) journal_old_env_exists=1 ;; 2) ;; *) fail "升级事务 journal 版本不受支持" ;; esac
+  case "$journal_old_env_exists" in 0|1) ;; *) fail "升级事务 journal 的旧环境状态无效" ;; esac
+  case "$journal_project" in
+    ''|*[!a-z0-9_-]*) fail "升级事务 journal 的项目名无效" ;;
+  esac
+  case "$journal_layout" in split|legacy) ;; *) fail "升级事务 journal 的布局无效" ;; esac
+  case "$journal_phase" in prepared|data_may_change) ;; *) fail "升级事务 journal 的阶段无效" ;; esac
+  case "$journal_backup" in pre-upgrade-*.zip) ;; *) fail "升级事务 journal 的备份名无效" ;; esac
+  if [ "$journal_layout" = split ]; then
+    valid_old_image_ref "$journal_init_image" ghcr.io/sparkhello/memory-platform-init \
+      && valid_old_image_ref "$journal_model_image" ghcr.io/sparkhello/memory-platform-model \
+      && valid_old_image_ref "$journal_memory_image" ghcr.io/sparkhello/memory-platform-memory \
+      || fail "升级事务 journal 的旧镜像引用无效"
+  else
+    [ "$journal_legacy_targets_absent" = 1 ] \
+      || fail "legacy 升级事务没有可验证的新卷所有权边界"
+  fi
+  journal_backup_path="$INSTALL_DIR/backups/$journal_backup"
+  [ -s "$journal_backup_path" ] || fail "升级事务 journal 对应的备份不存在"
+
+  say "==> 检测到中断的升级事务，先幂等恢复旧栈"
+  journal_containers=$(docker ps -aq \
+    --filter "label=com.docker.compose.project=$journal_project")
+  for journal_container in $journal_containers; do
+    docker stop "$journal_container" >/dev/null \
+      || fail "无法停止中断事务中的容器；journal 已保留"
+  done
+  if [ "$journal_layout" = legacy ]; then
+    cleanup_legacy_transaction_volumes "$journal_project" \
+      || fail "无法安全清理中断 legacy 迁移创建的 split 卷；journal 已保留"
+  fi
+
+  recovery_compose=$(mktemp ".$COMPOSE_NAME.recovery.XXXXXX") \
+    || fail "无法创建恢复 Compose 临时文件"
+  recovery_env=$(mktemp .env.recovery.XXXXXX) \
+    || { rm -f "$recovery_compose"; fail "无法创建恢复环境临时文件"; }
+  cp "$CUTOVER_JOURNAL/old-compose.yml" "$recovery_compose" \
+    && cp "$CUTOVER_JOURNAL/old.env" "$recovery_env" \
+    || { rm -f "$recovery_compose" "$recovery_env"; fail "无法读取升级事务快照"; }
+  chmod 600 "$recovery_compose" "$recovery_env"
+  mv "$recovery_compose" "$COMPOSE_NAME" \
+    || fail "无法原子恢复旧 Compose；journal 已保留"
+  if [ "$journal_old_env_exists" = 1 ]; then
+    mv "$recovery_env" .env \
+      || fail "无法原子恢复旧 .env；journal 已保留"
+  else
+    rm -f .env || fail "无法恢复旧 .env 缺失状态；journal 已保留"
+    rm -f "$recovery_env"
+  fi
+
+  if [ "$journal_layout" = split ] && [ "$journal_phase" = data_may_change ]; then
+    journal_memory_data=$(journal_volume_for "$journal_project" memory-data)
+    journal_memory_secrets=$(journal_volume_for "$journal_project" memory-secrets)
+    journal_model_data=$(journal_volume_for "$journal_project" model-data)
+    [ -n "$journal_memory_data" ] && [ -n "$journal_memory_secrets" ] \
+      && [ -n "$journal_model_data" ] \
+      || fail "无法定位中断事务的分卷；journal 已保留"
+    docker run --rm --network none --read-only \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+      -e RESTORE_ARCHIVE=/backup/restore.zip \
+      --mount "type=volume,source=$journal_memory_data,target=/data" \
+      --mount "type=volume,source=$journal_memory_secrets,target=/secrets" \
+      --mount "type=volume,source=$journal_model_data,target=/model-data" \
+      --mount "type=bind,source=$journal_backup_path,target=/backup/restore.zip,readonly" \
+      --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+      --entrypoint python "$journal_init_image" \
+      /usr/local/libexec/memory-platform/restore_split.py >/dev/null \
+      || fail "中断事务的数据恢复失败；journal 已保留"
+  fi
+
+  if [ "$journal_layout" = split ]; then
+    MEMORY_PLATFORM_INIT_IMAGE="$journal_init_image" \
+      MEMORY_PLATFORM_MODEL_IMAGE="$journal_model_image" \
+      MEMORY_PLATFORM_MEMORY_IMAGE="$journal_memory_image" \
+      docker compose -p "$journal_project" -f "$COMPOSE_NAME" \
+      up -d --pull never >/dev/null \
+      || fail "旧栈重启失败；journal 已保留"
+  else
+    docker compose -p "$journal_project" -f "$COMPOSE_NAME" \
+      up -d --pull never >/dev/null \
+      || fail "旧栈重启失败；journal 已保留"
+  fi
+  commit_cutover_journal || fail "旧栈已恢复，但无法提交升级事务 journal"
+  say "    中断升级已恢复；继续重新执行发布校验。"
+}
+
+recover_interrupted_cutover
+
+# Snapshot the exact pre-install bytes only after interrupted recovery has
+# completed. Candidate hygiene and host settings are staged separately; a
+# failed download, validation or cutover therefore leaves the live file byte
+# for byte unchanged (or absent if it was absent).
+OLD_ENV_EXISTS=0
+[ ! -f .env ] || OLD_ENV_EXISTS=1
+ORIGINAL_ENV_SNAPSHOT=$(mktemp .env.original.XXXXXX) \
+  || fail "无法创建旧环境快照"
+if [ "$OLD_ENV_EXISTS" = 1 ]; then
+  cp .env "$ORIGINAL_ENV_SNAPSHOT" || fail "无法读取旧环境文件"
+else
+  : >"$ORIGINAL_ENV_SNAPSHOT"
+fi
+chmod 600 "$ORIGINAL_ENV_SNAPSHOT"
+
+HOST_UID_VALUE=$(id -u 2>/dev/null || true)
+HOST_GID_VALUE=$(id -g 2>/dev/null || true)
+case "$HOST_UID_VALUE" in *[!0-9]*|'') HOST_UID_VALUE="" ;; esac
+case "$HOST_GID_VALUE" in *[!0-9]*|'') HOST_GID_VALUE="" ;; esac
+
+INVOCATION_PROJECT=$REQUESTED_COMPOSE_PROJECT_NAME
+STORED_PROJECT=$(compose_env_value COMPOSE_PROJECT_NAME)
+discover_projects_for_install_directory() {
+  docker ps -a \
+    --filter "label=com.docker.compose.project.working_dir=$INSTALL_DIR" \
+    --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}' \
+    2>/dev/null \
+    | awk -F'|' '
+        $2=="memory-platform" || $2=="memory-gateway" ||
+        $2=="model-gateway" || $2=="stack-init" { if ($1!="") print $1 }
+      ' \
+    | sort -u
+}
+DISCOVERED_PROJECTS=$(discover_projects_for_install_directory)
+DISCOVERED_PROJECT_COUNT=$(printf '%s\n' "$DISCOVERED_PROJECTS" \
+  | awk 'NF {count++} END {print count+0}')
+[ "$DISCOVERED_PROJECT_COUNT" -le 1 ] \
+  || fail "安装目录对应多个旧 Compose project；拒绝猜测数据归属"
+DISCOVERED_PROJECT=$(printf '%s\n' "$DISCOVERED_PROJECTS" | awk 'NF {print; exit}')
+if [ -n "$DISCOVERED_PROJECT" ]; then
+  [ -z "$INVOCATION_PROJECT" ] || [ "$INVOCATION_PROJECT" = "$DISCOVERED_PROJECT" ] \
+    || fail "COMPOSE_PROJECT_NAME 与旧容器 project 身份冲突；旧栈未修改"
+  [ -z "$STORED_PROJECT" ] || [ "$STORED_PROJECT" = "$DISCOVERED_PROJECT" ] \
+    || fail ".env 的 COMPOSE_PROJECT_NAME 与旧容器身份冲突；拒绝迁移"
+  PROJECT=$DISCOVERED_PROJECT
+else
+  if [ -n "$INVOCATION_PROJECT" ] && [ -n "$STORED_PROJECT" ] \
+    && [ "$INVOCATION_PROJECT" != "$STORED_PROJECT" ]; then
+    fail "本次 COMPOSE_PROJECT_NAME 与现有 .env 冲突；拒绝切换数据 project"
+  fi
+  PROJECT=${INVOCATION_PROJECT:-$STORED_PROJECT}
+  if [ -z "$PROJECT" ]; then
+    PROJECT=$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+  fi
+fi
+[ -n "$PROJECT" ] || PROJECT=memory-platform
+case "$PROJECT" in *[!a-z0-9_-]*|'') fail "Compose project 名无效" ;; esac
+
+compose() {
+  compose_file=$1
+  shift
+  docker compose -p "$PROJECT" -f "$compose_file" "$@"
+}
+
+# Validate/pull a candidate without exporting its image references into the
+# installer process.  A global export would also override the restored .env
+# when Compose starts the old stack during rollback.
+compose_with_images() {
+  compose_image_file=$1
+  compose_init_image=$2
+  compose_model_image=$3
+  compose_memory_image=$4
+  shift 4
+  MEMORY_PLATFORM_INIT_IMAGE="$compose_init_image" \
+    MEMORY_PLATFORM_MODEL_IMAGE="$compose_model_image" \
+    MEMORY_PLATFORM_MEMORY_IMAGE="$compose_memory_image" \
+    docker compose -p "$PROJECT" -f "$compose_image_file" "$@"
+}
+
+compose_candidate_with_images() {
+  compose_image_file=$1
+  compose_init_image=$2
+  compose_model_image=$3
+  compose_memory_image=$4
+  shift 4
+  MEMORY_CREDENTIAL_DIR=./credentials \
+    HOST_UID="$HOST_UID_VALUE" HOST_GID="$HOST_GID_VALUE" \
+    MEMORY_HOST="$HOST" MEMORY_PORT="$PORT" \
+    MEMORY_PLATFORM_INIT_IMAGE="$compose_init_image" \
+    MEMORY_PLATFORM_MODEL_IMAGE="$compose_model_image" \
+    MEMORY_PLATFORM_MEMORY_IMAGE="$compose_memory_image" \
+    docker compose --env-file "$CANDIDATE_EMPTY_ENV" \
+      -p "$PROJECT" -f "$compose_image_file" "$@"
+}
+
+compose_internal_with_images() {
+  compose_image_file=$1
+  compose_override_file=$2
+  compose_init_image=$3
+  compose_model_image=$4
+  compose_memory_image=$5
+  shift 5
+  MEMORY_CREDENTIAL_DIR=./credentials \
+    HOST_UID="$HOST_UID_VALUE" HOST_GID="$HOST_GID_VALUE" \
+    MEMORY_HOST="$HOST" MEMORY_PORT="$PORT" \
+    MEMORY_PLATFORM_INIT_IMAGE="$compose_init_image" \
+    MEMORY_PLATFORM_MODEL_IMAGE="$compose_model_image" \
+    MEMORY_PLATFORM_MEMORY_IMAGE="$compose_memory_image" \
+    docker compose --env-file "$CANDIDATE_EMPTY_ENV" \
+      -p "$PROJECT" -f "$compose_image_file" \
+      -f "$compose_override_file" "$@"
+}
+
+compose_internal() {
+  docker compose --env-file "$INSTALL_DIR/.env" \
+    -p "$PROJECT" -f "$COMPOSE_NAME" \
+    -f "$CANDIDATE_INTERNAL_OVERRIDE" "$@"
+}
+
+compose_candidate_live() {
+  docker compose --env-file "$INSTALL_DIR/.env" \
+    -p "$PROJECT" -f "$COMPOSE_NAME" "$@"
+}
+
+COSIGN_VERSION=v3.0.6
+COSIGN_BIN=""
+COSIGN_TEMP=""
+
+ensure_cosign() {
+  [ -z "$COSIGN_BIN" ] || return 0
+  if command -v cosign >/dev/null 2>&1; then
+    COSIGN_BIN=$(command -v cosign)
+    return 0
+  fi
+  cosign_os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  cosign_arch=$(uname -m 2>/dev/null)
+  case "$cosign_arch" in
+    x86_64|amd64) cosign_arch=amd64 ;;
+    arm64|aarch64) cosign_arch=arm64 ;;
+    *) fail "当前 CPU 架构缺少受支持的 cosign 验证器；请先安全安装 cosign。" ;;
+  esac
+  case "$cosign_os-$cosign_arch" in
+    darwin-amd64) cosign_sha256=4c3e7af8372d3ca3296e62fa56f23fcbb5721cc6ac1827900d398f110d7cd280 ;;
+    darwin-arm64) cosign_sha256=5fadd012ae6381a6a29ff86a7d39aa873878852f1073fc90b15995961ecfb084 ;;
+    linux-amd64) cosign_sha256=c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74 ;;
+    linux-arm64) cosign_sha256=bedac92e8c3729864e13d4a17048007cfafa79d5deca993a43a90ffe018ef2b8 ;;
+    *) fail "当前系统缺少受支持的 cosign 验证器；请先安全安装 cosign。" ;;
+  esac
+  COSIGN_TEMP=$(mktemp .cosign.XXXXXX) || fail "无法创建 cosign 临时文件"
+  cosign_asset="cosign-$cosign_os-$cosign_arch"
+  curl -fsSL \
+    "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/$cosign_asset" \
+    -o "$COSIGN_TEMP" || fail "无法下载固定版本 cosign 验证器"
+  if command -v sha256sum >/dev/null 2>&1; then
+    cosign_actual=$(sha256sum "$COSIGN_TEMP" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    cosign_actual=$(shasum -a 256 "$COSIGN_TEMP" | awk '{print $1}')
+  else
+    fail "系统缺少 SHA-256 校验工具；拒绝执行未校验的 cosign"
+  fi
+  [ "$cosign_actual" = "$cosign_sha256" ] \
+    || fail "cosign 固定版本 SHA-256 校验失败"
+  chmod 700 "$COSIGN_TEMP"
+  COSIGN_BIN=$COSIGN_TEMP
+}
+
+verify_release_compose() {
+  compose_file=$1
+  compose_bundle=$2
+  release_identity="https://github.com/SparkHello/Memory_Platform/.github/workflows/docker.yml@refs/tags/$RELEASE"
+  "$COSIGN_BIN" verify-blob \
+    --bundle "$compose_bundle" \
+    --certificate-identity "$release_identity" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$compose_file" >/dev/null 2>&1 \
+    || fail "发布 Compose 的 Sigstore 签名无效"
+}
+
+verify_release_signature() {
+  signed_image=$1
+  release_identity="https://github.com/SparkHello/Memory_Platform/.github/workflows/docker.yml@refs/tags/$RELEASE"
+  "$COSIGN_BIN" verify \
+    --certificate-identity "$release_identity" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$signed_image" >/dev/null 2>&1 \
+    || fail "发布镜像签名无效或不是由固定 tag 的官方工作流生成"
+}
+
+validate_candidate_topology() {
+  topology_compose=$1
+  topology_init_image=$2
+  topology_model_image=$3
+  topology_memory_image=$4
+  # Parse the fully rendered candidate inside the already signature-verified
+  # init image.  This keeps the POSIX installer free of a host Python
+  # dependency while preventing an authenticated-but-unsafe Compose release
+  # from publishing Model Gateway, sharing secret volumes, or giving Memory a
+  # provider-egress path.
+  compose_candidate_with_images "$topology_compose" \
+    "$topology_init_image" "$topology_model_image" "$topology_memory_image" \
+    --profile maintenance config --format json \
+    | docker run --rm -i --network none --read-only --cap-drop ALL \
+        --entrypoint python "$topology_init_image" \
+        /usr/local/libexec/memory-platform/validate_compose.py \
+        "$topology_init_image" "$topology_model_image" "$topology_memory_image" \
+        "$HOST" "$PORT" "$INSTALL_DIR/credentials" \
+    || fail "候选 Compose 未通过 split stack 安全拓扑校验"
+}
+
+validate_internal_candidate_topology() {
+  topology_compose=$1
+  topology_override=$2
+  topology_init_image=$3
+  topology_model_image=$4
+  topology_memory_image=$5
+  compose_internal_with_images "$topology_compose" "$topology_override" \
+    "$topology_init_image" "$topology_model_image" "$topology_memory_image" \
+    --profile maintenance config --format json \
+    | docker run --rm -i --network none --read-only --cap-drop ALL \
+        --entrypoint python "$topology_init_image" \
+        /usr/local/libexec/memory-platform/validate_compose.py \
+        "$topology_init_image" "$topology_model_image" "$topology_memory_image" \
+        "$HOST" "$PORT" "$INSTALL_DIR/credentials" internal \
+    || fail "本地验收 override 未能生成无发布端口的安全候选拓扑"
+}
+
+stage_compose_image_environment() {
+  staged_environment=$1
+  staged_init_image=$2
+  staged_model_image=$3
+  staged_memory_image=$4
+  staged_source=$5
+  awk \
+    -v init_image="$staged_init_image" \
+    -v model_image="$staged_model_image" \
+    -v memory_image="$staged_memory_image" \
+    -v credential_dir="./credentials" \
+    -v host_uid="$HOST_UID_VALUE" \
+    -v host_gid="$HOST_GID_VALUE" \
+    -v memory_host="$HOST" \
+    -v memory_port="$PORT" \
+    -v compose_project="$PROJECT" '
+      BEGIN {
+        value["MEMORY_PLATFORM_INIT_IMAGE"]=init_image
+        value["MEMORY_PLATFORM_MODEL_IMAGE"]=model_image
+        value["MEMORY_PLATFORM_MEMORY_IMAGE"]=memory_image
+        value["MEMORY_CREDENTIAL_DIR"]=credential_dir
+        value["HOST_UID"]=host_uid
+        value["HOST_GID"]=host_gid
+        value["MEMORY_HOST"]=memory_host
+        value["MEMORY_PORT"]=memory_port
+        value["COMPOSE_PROJECT_NAME"]=compose_project
+        order[1]="MEMORY_PLATFORM_INIT_IMAGE"
+        order[2]="MEMORY_PLATFORM_MODEL_IMAGE"
+        order[3]="MEMORY_PLATFORM_MEMORY_IMAGE"
+        order[4]="MEMORY_CREDENTIAL_DIR"
+        order[5]="HOST_UID"
+        order[6]="HOST_GID"
+        order[7]="MEMORY_HOST"
+        order[8]="MEMORY_PORT"
+        order[9]="COMPOSE_PROJECT_NAME"
+      }
+      {
+        parsed=$0
+        sub(/^[[:space:]]*/, "", parsed)
+        if (parsed ~ /^export[[:space:]]+/) {
+          sub(/^export[[:space:]]+/, "", parsed)
+        }
+        equals=index(parsed,"=")
+        key=equals ? substr(parsed,1,equals-1) : ""
+        sub(/[[:space:]]+$/, "", key)
+        if (key=="GATEWAY_API_KEY" || key=="MEMORY_CONSOLE_ADMIN_KEY" ||
+            key=="COMPOSE_ENV_FILES" || key=="COMPOSE_DISABLE_ENV_FILE" ||
+            key=="COMPOSE_PROFILES" || key=="COMPOSE_FILE" ||
+            key=="COMPOSE_PATH_SEPARATOR") next
+        if (key in value) {
+          if (!(key in seen)) print key "=" value[key]
+          seen[key]=1
+          next
+        }
+        print
+      }
+      END {
+        for (position=1; position<=9; position++) {
+          key=order[position]
+          if (!(key in seen)) print key "=" value[key]
+        }
+      }
+    ' "$staged_source" >"$staged_environment" || return 1
+  chmod 600 "$staged_environment" || return 1
+}
+
+restore_original_environment() {
+  if [ "$OLD_ENV_EXISTS" = 1 ]; then
+    restored_environment=$(mktemp .env.rollback.XXXXXX) || return 1
+    cp "$ORIGINAL_ENV_SNAPSHOT" "$restored_environment" \
+      && chmod 600 "$restored_environment" \
+      && mv "$restored_environment" .env \
+      || { rm -f "$restored_environment"; return 1; }
+  else
+    rm -f .env || return 1
+  fi
+}
+
+create_cutover_journal() {
+  [ "$LAYOUT" != fresh ] || return 0
+  [ ! -e "$CUTOVER_JOURNAL" ] || fail "已有未恢复的升级事务 journal"
+  legacy_targets_absent=0
+  if [ "$LAYOUT" = legacy ]; then
+    for legacy_key in memory-data memory-secrets model-data model-secrets; do
+      legacy_target_volume_exists "$PROJECT" "$legacy_key" \
+        && fail "legacy 迁移目标卷已存在；拒绝覆盖不明 split 状态"
+    done
+    legacy_targets_absent=1
+  fi
+  cutover_pending="$CUTOVER_JOURNAL.pending.$$"
+  [ ! -e "$cutover_pending" ] || fail "升级事务临时目录已存在"
+  mkdir -m 700 "$cutover_pending" || fail "无法创建升级事务 journal"
+  cutover_backup=${BACKUP_PATH##*/}
+  if ! cp "$OLD_COMPOSE_BACKUP" "$cutover_pending/old-compose.yml" \
+    || ! cp "$ORIGINAL_ENV_SNAPSHOT" "$cutover_pending/old.env"; then
+    rm -f "$cutover_pending/old-compose.yml" "$cutover_pending/old.env"
+    rmdir "$cutover_pending" 2>/dev/null || true
+    fail "无法保存升级事务快照"
+  fi
+  printf '%s\n' \
+    'version=2' \
+    "project=$PROJECT" \
+    "layout=$LAYOUT" \
+    "backup=$cutover_backup" \
+    "old_init_image=$OLD_INIT_IMAGE_VALUE" \
+    "old_model_image=$OLD_MODEL_IMAGE_VALUE" \
+    "old_memory_image=$OLD_MEMORY_IMAGE_VALUE" \
+    "legacy_targets_absent=$legacy_targets_absent" \
+    "old_env_exists=$OLD_ENV_EXISTS" \
+    "publish_host=$HOST" \
+    "publish_port=$PORT" \
+    >"$cutover_pending/metadata" \
+    || fail "无法写入升级事务 metadata"
+  printf 'prepared\n' >"$cutover_pending/phase" \
+    || fail "无法写入升级事务阶段"
+  chmod 600 "$cutover_pending"/*
+  mv "$cutover_pending" "$CUTOVER_JOURNAL" \
+    || fail "无法原子发布升级事务 journal"
+  # POSIX shell has no portable directory-fsync primitive. sync makes the
+  # journal and its same-filesystem rename durable before the old stack stops.
+  sync
+}
+
+mark_cutover_data_may_change() {
+  write_cutover_phase data_may_change
+}
+
+write_cutover_phase() {
+  next_cutover_phase=$1
+  [ "$LAYOUT" != fresh ] || return 0
+  case "$next_cutover_phase" in data_may_change|committed) ;; *) return 1 ;; esac
+  cutover_phase=$(mktemp "$CUTOVER_JOURNAL/.phase.XXXXXX") \
+    || fail "无法更新升级事务阶段"
+  printf '%s\n' "$next_cutover_phase" >"$cutover_phase"
+  chmod 600 "$cutover_phase"
+  mv "$cutover_phase" "$CUTOVER_JOURNAL/phase" \
+    || fail "无法原子更新升级事务阶段"
+  sync
+}
+
+finalize_cutover_journal() {
+  [ "$LAYOUT" != fresh ] || return 0
+  commit_cutover_journal
+}
+
+mark_cutover_committed() {
+  [ "$LAYOUT" != fresh ] || return 0
+  write_cutover_phase committed
+}
+
+complete_committed_cutover() {
+  [ "$LAYOUT" != fresh ] || return 0
+  remove_cutover_journal
+}
+
+service_in_compose() {
+  compose "$1" config --services 2>/dev/null | awk -v wanted="$2" '$0==wanted {found=1} END {exit !found}'
 }
 
 port_in_use() {
@@ -116,198 +841,637 @@ port_in_use() {
 }
 
 compose_owns_port() {
-  published=$(docker compose -f "$COMPOSE_NAME" port memory-platform 2026 2>/dev/null || true)
-  [ -n "$published" ] && [ "${published##*:}" = "$1" ]
+  [ -f "$COMPOSE_NAME" ] || return 1
+  for service in model-gateway memory-gateway memory-platform; do
+    published=$(compose "$COMPOSE_NAME" port "$service" 2026 2>/dev/null || true)
+    [ -n "$published" ] && [ "${published##*:}" = "$1" ] && return 0
+  done
+  return 1
 }
 
-PORT_CONFIGURED=0
-PORT_FROM_ENV=0
-EXISTING_PORT=$(compose_env_value MEMORY_PORT)
-if [ -n "${MEMORY_PORT:-}" ]; then
-  PORT=$MEMORY_PORT
-  PORT_CONFIGURED=1
-  PORT_FROM_ENV=1
-elif [ -n "$EXISTING_PORT" ]; then
-  PORT=$EXISTING_PORT
-  PORT_CONFIGURED=1
-else
-  PORT=2026
-fi
-case "$PORT" in
-  *[!0-9]*|'') fail "MEMORY_PORT 必须是 1–65535 的整数" ;;
-esac
-[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
-  || fail "MEMORY_PORT 必须是 1–65535 的整数"
-
+PORT=${REQUESTED_MEMORY_PORT:-$(compose_env_value MEMORY_PORT)}
+PORT=${PORT:-2026}
+case "$PORT" in *[!0-9]*|'') fail "MEMORY_PORT 必须是 1–65535 的整数" ;; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fail "MEMORY_PORT 超出范围"
 if port_in_use "$PORT" && ! compose_owns_port "$PORT"; then
-  if [ "$PORT_CONFIGURED" -eq 1 ]; then
-    # 通过 curl | sh 运行时 $0 是 "sh"，不能用它拼重跑命令，否则用户复制到的是
-    # 一条跑不起来的 "sh sh"。这里给出可以直接粘贴的完整命令。
-    fail "端口 $PORT 已被占用。请换一个空闲端口重试，例如：
-  MEMORY_PORT=3026 sh -c \"\$(curl -fsSL $REPO_RAW/deploy/install.sh)\""
-  fi
-  CANDIDATE=$((PORT + 1))
-  while port_in_use "$CANDIDATE"; do
-    CANDIDATE=$((CANDIDATE + 1))
-    [ "$CANDIDATE" -lt 2100 ] || fail "2026–2099 端口均被占用，请手动指定：MEMORY_PORT=<空闲端口>"
+  [ -z "$REQUESTED_MEMORY_PORT" ] || fail "指定端口 $PORT 已被占用"
+  candidate=$((PORT+1))
+  while port_in_use "$candidate"; do
+    candidate=$((candidate+1))
+    [ "$candidate" -le 2099 ] || fail "2026–2099 均被占用"
   done
-  say "    默认端口 $PORT 已被占用，改用 $CANDIDATE。"
-  PORT=$CANDIDATE
+  PORT=$candidate
 fi
-if [ "$PORT" != "2026" ] || [ "$PORT_FROM_ENV" -eq 1 ] || [ -n "$EXISTING_PORT" ]; then
-  set_compose_env_value MEMORY_PORT "$PORT"
-fi
+HOST=${REQUESTED_MEMORY_HOST:-$(compose_env_value MEMORY_HOST)}
+HOST=${HOST:-127.0.0.1}
+case "$HOST" in 127.0.0.1|0.0.0.0) ;; *) fail "MEMORY_HOST 只允许 127.0.0.1 或 0.0.0.0" ;; esac
 
-HOST_FROM_ENV=0
-EXISTING_HOST=$(compose_env_value MEMORY_HOST)
-if [ -n "${MEMORY_HOST:-}" ]; then
-  HOST=$MEMORY_HOST
-  HOST_FROM_ENV=1
-elif [ -n "$EXISTING_HOST" ]; then
-  HOST=$EXISTING_HOST
-else
-  HOST=127.0.0.1
-fi
-case "$HOST" in
-  127.0.0.1|0.0.0.0) ;;
-  *) fail "MEMORY_HOST 只支持 127.0.0.1（默认，仅本机）或 0.0.0.0（局域网设备可访问）" ;;
-esac
-if [ "$HOST" != "127.0.0.1" ] || [ "$HOST_FROM_ENV" -eq 1 ] || [ -n "$EXISTING_HOST" ]; then
-  set_compose_env_value MEMORY_HOST "$HOST"
-fi
-if [ "$HOST" != "127.0.0.1" ]; then
-  say "    已开启局域网访问（MEMORY_HOST=0.0.0.0），请只在可信家庭网络中使用。"
-fi
-export MEMORY_HOST="$HOST" MEMORY_PORT="$PORT"
-
-# 密钥只在首启日志里打印一次。必须在 up -d 之前判断数据卷是否已存在，才能区分
-# “这是重装、密钥沿用旧的” 和 “这是首装、但日志没解析出来”——两者的处置完全不同。
-# 优先使用 Compose 自己的 project 名，并通过 Compose 写入卷的两个 label 精确判断。
-# 这样既支持默认目录名，也支持用户在环境或 .env 中设置 COMPOSE_PROJECT_NAME。
-COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME:-$(compose_env_value COMPOSE_PROJECT_NAME)}
-if [ -z "$COMPOSE_PROJECT" ]; then
-  COMPOSE_PROJECT=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
-fi
-PREEXISTING=0
-CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -aq memory-platform 2>/dev/null || true)
-if [ -n "$CURRENT_CONTAINER" ] ||
-   docker volume ls \
-     --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
-     --filter "label=com.docker.compose.volume=memory-platform-data" \
-     --format '{{.Name}}' 2>/dev/null | awk 'NF {found=1} END {exit !found}'; then
-  PREEXISTING=1
-fi
-
-if [ "$PREEXISTING" -eq 1 ]; then
-  say "==> 升级前创建安全备份"
-  CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -q memory-platform 2>/dev/null || true)
-  if [ -z "$CURRENT_CONTAINER" ]; then
-    docker compose -f "$COMPOSE_NAME" up -d --pull never >/dev/null 2>&1 \
-      || fail "检测到已有数据，但无法启动旧版本完成升级前备份。数据未被修改；请先运行：
-  cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME up -d"
-    CURRENT_CONTAINER=$(docker compose -f "$COMPOSE_NAME" ps -q memory-platform 2>/dev/null || true)
+ACTIVE_COMPOSE=""
+LAYOUT="fresh"
+OLD_MEMORY_CONTAINER=""
+if [ -f "$COMPOSE_NAME" ]; then
+  ACTIVE_COMPOSE=$COMPOSE_NAME
+  if service_in_compose "$ACTIVE_COMPOSE" memory-gateway; then
+    LAYOUT=split
+    OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -aq memory-gateway 2>/dev/null || true)
+  elif service_in_compose "$ACTIVE_COMPOSE" memory-platform; then
+    LAYOUT=legacy
+    OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -aq memory-platform 2>/dev/null || true)
   fi
-  [ -n "$CURRENT_CONTAINER" ] \
-    || fail "检测到已有数据，但没有找到可执行备份的容器。数据未被修改。"
-  BACKUP_NAME="pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)-$$.zip"
-  mkdir -p backups
-  chmod 700 backups
-  docker compose -f "$COMPOSE_NAME" exec -T memory-platform \
-    memgw stack backup --output "/data/$BACKUP_NAME" \
-    || fail "升级前备份失败，已停止升级；现有服务和数据未被替换。"
-  docker cp "$CURRENT_CONTAINER:/data/$BACKUP_NAME" "backups/$BACKUP_NAME" \
-    || fail "备份已在数据卷中生成，但复制到安装目录失败，已停止升级。"
-  chmod 600 "backups/$BACKUP_NAME"
-  say "    备份已保存：$INSTALL_DIR/backups/$BACKUP_NAME"
+fi
+if [ "$LAYOUT" = fresh ] && docker volume ls \
+  --filter "label=com.docker.compose.project=$PROJECT" \
+  --filter "label=com.docker.compose.volume=memory-platform-data" \
+  --format '{{.Name}}' | awk 'NF {found=1} END {exit !found}'; then
+  fail "发现旧数据卷但安装目录没有可验证的旧 Compose；拒绝猜测迁移。"
 fi
 
-say "==> 拉取镜像并启动（镜像约数百 MB，首次拉取需要几分钟）"
-docker compose -f "$COMPOSE_NAME" pull \
-  || fail "镜像下载失败。现有数据未被删除；请检查网络或稍后重新运行本脚本。"
-docker compose -f "$COMPOSE_NAME" up -d \
-  || fail "容器启动失败。升级前备份仍保存在 $INSTALL_DIR/backups/。"
+# Preserve the exact images that are actually running before candidate image
+# references are written to .env.  Restoring only the old Compose file is not
+# sufficient: its ${MEMORY_PLATFORM_*_IMAGE:-...} expressions would otherwise
+# resolve to the newly downloaded candidate digests during rollback.
+OLD_INIT_IMAGE_VALUE=$(compose_env_value MEMORY_PLATFORM_INIT_IMAGE)
+OLD_MODEL_IMAGE_VALUE=$(compose_env_value MEMORY_PLATFORM_MODEL_IMAGE)
+OLD_MEMORY_IMAGE_VALUE=$(compose_env_value MEMORY_PLATFORM_MEMORY_IMAGE)
+service_image_id() {
+  service=$1
+  service_container=$(compose "$ACTIVE_COMPOSE" ps -aq "$service" 2>/dev/null || true)
+  [ -n "$service_container" ] || return 0
+  docker inspect "$service_container" --format '{{.Image}}' 2>/dev/null || true
+}
+if [ "$LAYOUT" = split ]; then
+  actual_image=$(service_image_id stack-init)
+  [ -z "$actual_image" ] || OLD_INIT_IMAGE_VALUE=$actual_image
+  actual_image=$(service_image_id model-gateway)
+  [ -z "$actual_image" ] || OLD_MODEL_IMAGE_VALUE=$actual_image
+  actual_image=$(service_image_id memory-gateway)
+  [ -z "$actual_image" ] || OLD_MEMORY_IMAGE_VALUE=$actual_image
+elif [ "$LAYOUT" = legacy ]; then
+  actual_image=$(service_image_id memory-platform)
+  [ -z "$actual_image" ] || OLD_MEMORY_IMAGE_VALUE=$actual_image
+fi
 
-say "==> 等待服务就绪（首次启动要完成内部安装，通常 1–2 分钟）"
+BACKUP_PATH=""
+OLD_COMPOSE_BACKUP=""
+BACKUP_RETENTION=${MEMORY_BACKUP_RETENTION:-5}
+case "$BACKUP_RETENTION" in *[!0-9]*|'') fail "MEMORY_BACKUP_RETENTION 必须是 1–50 的整数" ;; esac
+[ "$BACKUP_RETENTION" -ge 1 ] && [ "$BACKUP_RETENTION" -le 50 ] \
+  || fail "MEMORY_BACKUP_RETENTION 必须是 1–50 的整数"
+
+remove_volume_backup() {
+  service=$1 archive=$2
+  compose "$ACTIVE_COMPOSE" exec -T --user 10001:10001 "$service" \
+    python -c 'import os,sys; os.unlink(sys.argv[1])' "/data/$archive" \
+    >/dev/null 2>&1 \
+    || fail "宿主备份已复制，但无法清理数据卷中的临时副本；已停止升级"
+}
+
+prune_host_backups() {
+  find "$INSTALL_DIR/backups" -maxdepth 1 -type f -name 'pre-upgrade-*.zip' -print \
+    | sort -r \
+    | awk -v keep="$BACKUP_RETENTION" 'NR > keep { print }' \
+    | while IFS= read -r stale; do
+        case "$stale" in
+          "$INSTALL_DIR"/backups/pre-upgrade-*.zip)
+            rm -f -- "$stale" "${stale%.zip}.compose.yml"
+            ;;
+          *) fail "拒绝清理非预期备份路径" ;;
+        esac
+      done
+}
+
+if [ "$LAYOUT" != fresh ]; then
+  say "==> 使用旧 Compose 创建升级前备份"
+  if [ -z "$OLD_MEMORY_CONTAINER" ]; then
+    if [ "$LAYOUT" = legacy ]; then
+      identity_volume=memory-platform-data
+    else
+      identity_volume=memory-data
+    fi
+    identity_match=$(docker volume ls \
+      --filter "label=com.docker.compose.project=$PROJECT" \
+      --filter "label=com.docker.compose.volume=$identity_volume" \
+      --format '{{.Name}}' | awk 'NF {print; exit}')
+    [ -n "$identity_match" ] \
+      || fail "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移"
+    compose "$ACTIVE_COMPOSE" up -d --pull never >/dev/null \
+      || fail "无法按旧 Compose 启动服务以创建备份"
+    if [ "$LAYOUT" = legacy ]; then
+      OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -q memory-platform)
+    else
+      OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -q memory-gateway)
+    fi
+  fi
+  [ -n "$OLD_MEMORY_CONTAINER" ] || fail "找不到旧 Memory 容器"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  BACKUP_NAME="pre-upgrade-$stamp.zip"
+  BACKUP_PATH="$INSTALL_DIR/backups/$BACKUP_NAME"
+  OLD_COMPOSE_BACKUP="$INSTALL_DIR/backups/pre-upgrade-$stamp.compose.yml"
+  cp "$ACTIVE_COMPOSE" "$OLD_COMPOSE_BACKUP"
+  chmod 600 "$OLD_COMPOSE_BACKUP"
+  if [ "$LAYOUT" = legacy ]; then
+    # Candidate code is needed to create a complete v2 archive for pre-auth
+    # legacy volumes.  Download and signature checks are read-only, so defer
+    # this online snapshot until the signed init image is available; the final
+    # rollback snapshot is still recreated after the old service is stopped.
+    BACKUP_PATH=""
+    say "    旧单卷备份将在签名 init 镜像就绪后从只读卷创建"
+  else
+    compose "$ACTIVE_COMPOSE" --profile maintenance run --rm --no-deps \
+      stack-maintenance --home /data/config \
+      --project-root /app/services/memory-gateway stack backup \
+      --model-gateway-home /model-data --output "/data/$BACKUP_NAME" \
+      || fail "分卷备份失败；未下载或替换新版本"
+    docker cp "$OLD_MEMORY_CONTAINER:/data/$BACKUP_NAME" "$BACKUP_PATH" \
+      || fail "无法把分卷备份复制到宿主机"
+    remove_volume_backup memory-gateway "$BACKUP_NAME"
+    chmod 600 "$BACKUP_PATH"
+    [ -s "$BACKUP_PATH" ] || fail "升级备份为空"
+  fi
+fi
+
+say "==> 下载 $RELEASE Compose 并校验"
+CANDIDATE_COMPOSE=$(mktemp ".$COMPOSE_NAME.candidate.XXXXXX") || fail "无法创建候选文件"
+CANDIDATE_ENV=""
+CANDIDATE_INTERNAL_OVERRIDE=""
+CANDIDATE_EMPTY_ENV=$(mktemp .env.empty.XXXXXX) || fail "无法创建候选空环境文件"
+chmod 600 "$CANDIDATE_EMPTY_ENV"
+COMPOSE_BUNDLE=""
+cleanup() {
+  [ -z "${CANDIDATE_COMPOSE:-}" ] || rm -f "$CANDIDATE_COMPOSE"
+  [ -z "${CANDIDATE_ENV:-}" ] || rm -f "$CANDIDATE_ENV"
+  [ -z "${CANDIDATE_INTERNAL_OVERRIDE:-}" ] || rm -f "$CANDIDATE_INTERNAL_OVERRIDE"
+  [ -z "${CANDIDATE_EMPTY_ENV:-}" ] || rm -f "$CANDIDATE_EMPTY_ENV"
+  [ -z "${ORIGINAL_ENV_SNAPSHOT:-}" ] || rm -f "$ORIGINAL_ENV_SNAPSHOT"
+  [ -z "${COSIGN_TEMP:-}" ] || rm -f "$COSIGN_TEMP"
+  [ -z "${COMPOSE_BUNDLE:-}" ] || rm -f "$COMPOSE_BUNDLE"
+  release_install_lock || true
+}
+trap cleanup EXIT
+curl -fsSL "$REPO_RAW/deploy/$COMPOSE_NAME" -o "$CANDIDATE_COMPOSE" \
+  || fail "下载发布版 Compose 失败；旧服务未变"
+chmod 600 "$CANDIDATE_COMPOSE"
+COMPOSE_BUNDLE=$(mktemp ".$COMPOSE_NAME.sigstore.XXXXXX") \
+  || fail "无法创建 Compose 签名临时文件"
+curl -fsSL \
+  "https://github.com/SparkHello/Memory_Platform/releases/download/$RELEASE/$COMPOSE_NAME.sigstore.json" \
+  -o "$COMPOSE_BUNDLE" \
+  || fail "下载发布 Compose 的 Sigstore bundle 失败"
+chmod 600 "$COMPOSE_BUNDLE"
+say "==> 验证发布 Compose 的 Sigstore 签名"
+ensure_cosign
+verify_release_compose "$CANDIDATE_COMPOSE" "$COMPOSE_BUNDLE"
+
+INIT_TAG="ghcr.io/sparkhello/memory-platform-init:$RELEASE"
+MODEL_TAG="ghcr.io/sparkhello/memory-platform-model:$RELEASE"
+MEMORY_TAG="ghcr.io/sparkhello/memory-platform-memory:$RELEASE"
+compose_candidate_with_images "$CANDIDATE_COMPOSE" "$INIT_TAG" "$MODEL_TAG" "$MEMORY_TAG" \
+  config >/dev/null || fail "候选 Compose 语法无效"
+
+say "==> 拉取三枚 semver 发布镜像"
+compose_candidate_with_images "$CANDIDATE_COMPOSE" "$INIT_TAG" "$MODEL_TAG" "$MEMORY_TAG" \
+  pull || fail "镜像拉取失败；旧服务未变"
+
+digest_ref() {
+  tag=$1 repository=${1%:*}
+  docker image inspect "$tag" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+    | awk -v prefix="$repository@sha256:" 'index($0,prefix)==1 {print; exit}'
+}
+INIT_IMAGE=$(digest_ref "$INIT_TAG")
+MODEL_IMAGE=$(digest_ref "$MODEL_TAG")
+MEMORY_IMAGE=$(digest_ref "$MEMORY_TAG")
+[ -n "$INIT_IMAGE" ] && [ -n "$MODEL_IMAGE" ] && [ -n "$MEMORY_IMAGE" ] \
+  || fail "无法把发布镜像解析为不可变 digest"
+say "==> 验证三枚镜像的 Sigstore 发布签名"
+verify_release_signature "$INIT_IMAGE"
+verify_release_signature "$MODEL_IMAGE"
+verify_release_signature "$MEMORY_IMAGE"
+compose_candidate_with_images "$CANDIDATE_COMPOSE" "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+  config >/dev/null || fail "digest 固定后的 Compose 无效"
+say "==> 校验 split stack 的端口、网络、UID 与卷隔离"
+validate_candidate_topology \
+  "$CANDIDATE_COMPOSE" "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE"
+CANDIDATE_ENV=$(mktemp .env.candidate.XXXXXX) || fail "无法创建候选环境文件"
+stage_compose_image_environment \
+  "$CANDIDATE_ENV" "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+  "$ORIGINAL_ENV_SNAPSHOT" \
+  || fail "无法生成候选环境文件"
+CANDIDATE_INTERNAL_OVERRIDE=$(mktemp .compose.internal.XXXXXX.yml) \
+  || fail "无法创建本地验收 override"
+printf '%s\n' \
+  'services:' \
+  '  model-gateway:' \
+  '    ports: !reset []' \
+  >"$CANDIDATE_INTERNAL_OVERRIDE" \
+  || fail "无法写入本地验收 override"
+chmod 600 "$CANDIDATE_INTERNAL_OVERRIDE"
+validate_internal_candidate_topology \
+  "$CANDIDATE_COMPOSE" "$CANDIDATE_INTERNAL_OVERRIDE" \
+  "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE"
+
+mount_name() {
+  docker inspect "$1" --format "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}"
+}
+
+volume_for() {
+  docker volume ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.volume=$1" --format '{{.Name}}' | awk 'NF {print; exit}'
+}
+
+update_cutover_backup_reference() {
+  updated_backup=$1
+  updated_name=${updated_backup##*/}
+  case "$updated_name" in pre-upgrade-*.zip) ;; *) return 1 ;; esac
+  [ -s "$updated_backup" ] || return 1
+  updated_metadata=$(mktemp "$CUTOVER_JOURNAL/.metadata.XXXXXX") || return 1
+  if ! awk -v backup="$updated_name" '
+      BEGIN { seen=0 }
+      index($0,"backup=")==1 {
+        if (!seen) print "backup=" backup
+        seen=1
+        next
+      }
+      { print }
+      END { if (!seen) print "backup=" backup }
+    ' "$CUTOVER_JOURNAL/metadata" >"$updated_metadata" \
+    || ! chmod 600 "$updated_metadata" \
+    || ! mv "$updated_metadata" "$CUTOVER_JOURNAL/metadata"; then
+    rm -f "$updated_metadata"
+    return 1
+  fi
+  sync
+}
+
+create_quiesced_backup() {
+  update_journal=${1:-1}
+  case "$update_journal" in 0|1) ;; *) return 1 ;; esac
+  quiesced_stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$-quiesced
+  quiesced_name="pre-upgrade-$quiesced_stamp.zip"
+  quiesced_path="$INSTALL_DIR/backups/$quiesced_name"
+  quiesced_runner="${PROJECT}-cutover-backup-$$"
+  # A previous crashed runner is owned by the still-active journal/lock and is
+  # never silently reused.
+  [ -z "$(docker ps -aq --filter "name=^/$quiesced_runner$")" ] || return 1
+  quiesced_direct=0
+
+  if [ "$LAYOUT" = split ]; then
+    quiesced_memory_data=$(volume_for memory-data)
+    quiesced_memory_secrets=$(volume_for memory-secrets)
+    quiesced_model_data=$(volume_for model-data)
+    [ -n "$quiesced_memory_data" ] \
+      && [ -n "$quiesced_memory_secrets" ] \
+      && [ -n "$quiesced_model_data" ] \
+      && [ -n "$OLD_INIT_IMAGE_VALUE" ] || return 1
+    if ! docker run --name "$quiesced_runner" --network none --read-only \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+      -e MEMGW_HOME=/data/config \
+      -e MEMGW_SETTINGS_PATH=/secrets/settings.env \
+      -e MEMGW_PROJECT_ROOT=/app/services/memory-gateway \
+      -e MODEL_GATEWAY_HOME=/model-data \
+      --mount "type=volume,source=$quiesced_memory_data,target=/data" \
+      --mount "type=volume,source=$quiesced_memory_secrets,target=/secrets" \
+      --mount "type=volume,source=$quiesced_model_data,target=/model-data" \
+      --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+      --entrypoint memgw "$OLD_INIT_IMAGE_VALUE" \
+      --home /data/config --project-root /app/services/memory-gateway \
+      stack backup --model-gateway-home /model-data \
+      --output "/data/$quiesced_name" >/dev/null; then
+      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
+      return 1
+    fi
+    cleanup_image=$OLD_INIT_IMAGE_VALUE
+    cleanup_volume=$quiesced_memory_data
+  else
+    quiesced_legacy_volume=$(mount_name "$OLD_MEMORY_CONTAINER" /data)
+    [ -n "$quiesced_legacy_volume" ] && [ -n "$INIT_IMAGE" ] \
+      || return 1
+    # A pre-scoped-token legacy volume may not contain auth.db.  The signed
+    # candidate init image creates an empty auth database and normalized
+    # SQLite snapshots only in a private sibling stage under the host backup
+    # directory, reads every legacy source from a read-only mount, and stages
+    # the complete v2 archive there. The old volume is never changed.
+    if ! docker run --rm --name "$quiesced_runner" \
+      --network none --read-only --cap-drop ALL \
+      --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+      --mount "type=volume,source=$quiesced_legacy_volume,target=/legacy,readonly" \
+      --mount "type=bind,source=$INSTALL_DIR/backups,target=/backup" \
+      --tmpfs /scratch:rw,noexec,nosuid,size=33554432 \
+      --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+      --entrypoint python "$INIT_IMAGE" \
+      /usr/local/libexec/memory-platform/backup_legacy.py \
+      "$quiesced_name" "$HOST_UID_VALUE" "$HOST_GID_VALUE" >/dev/null; then
+      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
+      rm -f "$quiesced_path"
+      return 1
+    fi
+    quiesced_direct=1
+  fi
+
+  if [ "$quiesced_direct" = 0 ]; then
+    if ! docker cp "$quiesced_runner:/data/$quiesced_name" "$quiesced_path" \
+      >/dev/null 2>&1 \
+      || [ ! -s "$quiesced_path" ]; then
+      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
+      rm -f "$quiesced_path"
+      return 1
+    fi
+  else
+    [ -s "$quiesced_path" ] || return 1
+  fi
+  if [ "$quiesced_direct" = 0 ]; then
+    docker rm -f "$quiesced_runner" >/dev/null 2>&1 || return 1
+  fi
+  chmod 600 "$quiesced_path" || return 1
+  if [ "$quiesced_direct" = 0 ]; then
+    docker run --rm --network none --read-only --user 10001:10001 \
+      --cap-drop ALL \
+      --mount "type=volume,source=$cleanup_volume,target=/data" \
+      --entrypoint python "$cleanup_image" \
+      -c 'import os,sys; os.unlink(sys.argv[1])' "/data/$quiesced_name" \
+      >/dev/null 2>&1 || return 1
+  fi
+
+  BACKUP_NAME=$quiesced_name
+  BACKUP_PATH=$quiesced_path
+  if [ "$update_journal" = 1 ]; then
+    update_cutover_backup_reference "$BACKUP_PATH"
+  fi
+}
+
+rollback() {
+  [ "$LAYOUT" != fresh ] || return 1
+  say "==> 新版本未通过验收，恢复旧 Compose"
+  compose "$COMPOSE_NAME" stop >/dev/null 2>&1 || true
+  if [ "$LAYOUT" = legacy ]; then
+    cleanup_legacy_transaction_volumes "$PROJECT" || return 1
+  fi
+  if [ "$LAYOUT" = split ] && [ -n "$BACKUP_PATH" ]; then
+    memory_data=$(volume_for memory-data)
+    memory_secrets=$(volume_for memory-secrets)
+    model_data=$(volume_for model-data)
+    if [ -n "$memory_data" ] && [ -n "$memory_secrets" ] && [ -n "$model_data" ]; then
+      rollback_init_image=${OLD_INIT_IMAGE_VALUE:-$INIT_IMAGE}
+      docker run --rm --network none --read-only \
+        --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+        -e RESTORE_ARCHIVE=/backup/restore.zip \
+        --mount "type=volume,source=$memory_data,target=/data" \
+        --mount "type=volume,source=$memory_secrets,target=/secrets" \
+        --mount "type=volume,source=$model_data,target=/model-data" \
+        --mount "type=bind,source=$BACKUP_PATH,target=/backup/restore.zip,readonly" \
+        --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+        --entrypoint python "$rollback_init_image" \
+        /usr/local/libexec/memory-platform/restore_split.py >/dev/null \
+        || return 1
+    else
+      return 1
+    fi
+  fi
+  temporary=$(mktemp ".$COMPOSE_NAME.rollback.XXXXXX") || return 1
+  cp "$OLD_COMPOSE_BACKUP" "$temporary" || return 1
+  chmod 600 "$temporary"
+  mv "$temporary" "$COMPOSE_NAME" || return 1
+  restore_original_environment || return 1
+  compose_with_images "$COMPOSE_NAME" \
+    "$OLD_INIT_IMAGE_VALUE" "$OLD_MODEL_IMAGE_VALUE" "$OLD_MEMORY_IMAGE_VALUE" \
+    up -d --pull never >/dev/null || return 1
+  finalize_cutover_journal || return 1
+  return 0
+}
+
+if [ "$LAYOUT" = legacy ]; then
+  say "==> 从只读旧单卷创建并复验 v2 升级前备份"
+  create_quiesced_backup 0 \
+    || fail "无法从只读旧单卷创建完整 v2 备份；旧服务和旧卷未修改"
+fi
+create_cutover_journal
+if [ "$LAYOUT" != fresh ]; then
+  if ! compose "$ACTIVE_COMPOSE" stop >/dev/null; then
+    # stop may have partially stopped a multi-service stack.  Candidate image
+    # refs have not touched .env, and explicit old refs prevent a repulled tag
+    # from changing what this recovery start runs.
+    if compose_with_images "$ACTIVE_COMPOSE" \
+      "$OLD_INIT_IMAGE_VALUE" "$OLD_MODEL_IMAGE_VALUE" "$OLD_MEMORY_IMAGE_VALUE" \
+      up -d --pull never >/dev/null 2>&1; then
+      finalize_cutover_journal || true
+    fi
+    fail "无法停止旧服务；未开始迁移"
+  fi
+  say "==> 旧服务已停写，创建并复验最终一致性备份"
+  if ! create_quiesced_backup; then
+    if compose_with_images "$ACTIVE_COMPOSE" \
+      "$OLD_INIT_IMAGE_VALUE" "$OLD_MODEL_IMAGE_VALUE" "$OLD_MEMORY_IMAGE_VALUE" \
+      up -d --pull never >/dev/null 2>&1; then
+      finalize_cutover_journal || true
+      fail "停写后的最终一致性备份失败；旧服务已恢复"
+    fi
+    fail "停写后的最终一致性备份失败且旧服务重启失败；journal 已保留"
+  fi
+fi
+if ! mv "$CANDIDATE_COMPOSE" "$COMPOSE_NAME"; then
+  if [ "$LAYOUT" != fresh ]; then
+    if compose_with_images "$ACTIVE_COMPOSE" \
+      "$OLD_INIT_IMAGE_VALUE" "$OLD_MODEL_IMAGE_VALUE" "$OLD_MEMORY_IMAGE_VALUE" \
+      up -d --pull never >/dev/null 2>&1; then
+      finalize_cutover_journal || true
+    fi
+  fi
+  fail "无法原子换入候选 Compose"
+fi
+CANDIDATE_COMPOSE=""
+if ! mv "$CANDIDATE_ENV" .env; then
+  if [ "$LAYOUT" != fresh ]; then
+    rollback || true
+  else
+    restore_original_environment || true
+  fi
+  fail "无法原子换入候选环境文件"
+fi
+CANDIDATE_ENV=""
+mark_cutover_data_may_change
+
+if [ "$LAYOUT" = legacy ]; then
+  legacy_volume=$(mount_name "$OLD_MEMORY_CONTAINER" /data)
+  [ -n "$legacy_volume" ] || { rollback || true; fail "无法定位旧单卷"; }
+  compose "$COMPOSE_NAME" create stack-init >/dev/null || { rollback || true; fail "无法创建新分卷"; }
+  init_container=$(compose "$COMPOSE_NAME" ps -aq stack-init)
+  memory_data=$(mount_name "$init_container" /memory-data)
+  memory_secrets=$(mount_name "$init_container" /memory-secrets)
+  model_data=$(mount_name "$init_container" /model-data)
+  model_secrets=$(mount_name "$init_container" /model-secrets)
+  compose "$COMPOSE_NAME" rm -f stack-init >/dev/null 2>&1 || true
+  [ -n "$memory_data" ] && [ -n "$memory_secrets" ] && [ -n "$model_data" ] && [ -n "$model_secrets" ] \
+    || { rollback || true; fail "新分卷解析失败"; }
+  docker run --rm --network none --read-only \
+    --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    --mount "type=volume,source=$legacy_volume,target=/legacy,readonly" \
+    --mount "type=volume,source=$memory_data,target=/memory-data" \
+    --mount "type=volume,source=$memory_secrets,target=/memory-secrets" \
+    --mount "type=volume,source=$model_data,target=/model-data" \
+    --mount "type=volume,source=$model_secrets,target=/model-secrets" \
+    --mount "type=bind,source=$INSTALL_DIR/credentials,target=/credentials" \
+    --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+    --entrypoint python "$INIT_IMAGE" \
+    /usr/local/libexec/memory-platform/migrate_legacy.py >/dev/null \
+    || { rollback || true; fail "旧单卷离线迁移失败；旧卷未修改"; }
+fi
+
+say "==> 在无宿主发布端口的隔离模式启动候选服务"
+if ! compose_internal up -d; then
+  rollback && fail "新栈启动失败；旧服务已恢复"
+  fail "新栈启动失败且自动回滚不完整；请保留 backups/ 与旧卷"
+fi
+
+# The override is installer-owned fixed text and was canonically validated.
+# Check both rendered ownership and runtime bindings before any acceptance
+# request so the candidate cannot receive external writes pre-commit.
+candidate_model=$(compose_internal ps -q model-gateway 2>/dev/null || true)
+candidate_published=$(compose_internal port model-gateway 2026 2>/dev/null || true)
+runtime_published=""
+[ -z "$candidate_model" ] \
+  || runtime_published=$(docker port "$candidate_model" 2026/tcp 2>/dev/null || true)
+if [ -n "$candidate_published" ] || [ -n "$runtime_published" ] \
+  || curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  rollback && fail "候选验收阶段意外发布了宿主端口；旧服务已恢复"
+  fail "候选验收阶段意外发布宿主端口且自动回滚不完整"
+fi
+
+candidate_http_check() {
+  candidate_service=$1
+  candidate_url=$2
+  compose_internal exec -T "$candidate_service" python -c \
+    'import sys,urllib.request; response=urllib.request.urlopen(sys.argv[1],timeout=3); raise SystemExit(0 if response.status==200 else 1)' \
+    "$candidate_url" >/dev/null 2>&1
+}
+
 i=0
-until curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
-  i=$((i + 1))
-  [ "$i" -lt 180 ] || fail "服务 3 分钟内未就绪。请运行：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
+until candidate_http_check memory-gateway http://127.0.0.1:2026/health; do
+  i=$((i+1))
+  if [ "$i" -ge 180 ]; then
+    rollback && fail "新栈 liveness 超时；旧服务已恢复"
+    fail "新栈 liveness 超时且回滚不完整"
+  fi
   sleep 1
 done
-
-LOGS=$(docker compose -f "$COMPOSE_NAME" logs --no-log-prefix memory-platform 2>/dev/null || true)
-GATEWAY_KEY=$(printf '%s\n' "$LOGS" | awk '/自动生成客户端访问密钥/{f=1;next} f && /^  [^ ]/{print $1; exit}')
-ADMIN_KEY=$(printf '%s\n' "$LOGS" | awk '/自动生成 Web 配置管理密钥/{f=1;next} f && /^  [^ ]/{print $1; exit}')
-
-lan_ip() {
-  if command -v ipconfig >/dev/null 2>&1; then
-    ipconfig getifaddr en0 2>/dev/null || true
-  elif command -v hostname >/dev/null 2>&1; then
-    hostname -I 2>/dev/null | awk '{print $1}' || true
+i=0
+until candidate_http_check model-gateway http://127.0.0.1:2026/health; do
+  i=$((i+1))
+  if [ "$i" -ge 180 ]; then
+    rollback && fail "候选 ingress relay 无法连接 Memory；旧服务已恢复"
+    fail "候选 ingress relay 无法连接 Memory 且自动回滚不完整"
   fi
-}
-LAN_IP=$(lan_ip)
+  sleep 1
+done
+if [ "$LAYOUT" != fresh ]; then
+  i=0
+  until candidate_http_check memory-gateway http://127.0.0.1:2026/readyz; do
+    i=$((i+1))
+    if [ "$i" -ge 90 ]; then
+      rollback && fail "新栈 readiness 退化；旧服务和数据已恢复"
+      fail "新栈 readiness 退化且回滚不完整"
+    fi
+    sleep 1
+  done
+  i=0
+  until candidate_http_check model-gateway http://127.0.0.1:2026/readyz; do
+    i=$((i+1))
+    if [ "$i" -ge 90 ]; then
+      rollback && fail "候选 ingress relay readiness 退化；旧服务和数据已恢复"
+      fail "候选 ingress relay readiness 退化且回滚不完整"
+    fi
+    sleep 1
+  done
+fi
 
-say ""
-say "============================================"
-say "Memory Platform 基础服务已启动"
-say ""
-say "  Web Console（管理台）  http://127.0.0.1:$PORT/ui/"
-say "  客户端 Base URL        http://127.0.0.1:$PORT/v1"
-say "  客户端模型名           memory-auto"
-if [ "$HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ]; then
-  say "  手机/其他设备地址      http://$LAN_IP:$PORT/v1"
-fi
-say ""
-if [ -n "$GATEWAY_API_KEY" ]; then
-  say "  GATEWAY_API_KEY（客户端和 Web Console 登录用）：使用了你提供的值"
-elif [ -n "$GATEWAY_KEY" ]; then
-  say "  GATEWAY_API_KEY（客户端和 Web Console 登录用）："
-  say "    $GATEWAY_KEY"
-fi
-if [ -n "$MEMORY_CONSOLE_ADMIN_KEY" ]; then
-  say "  admin key（浏览器里解锁模型渠道配置用）：使用了你提供的值"
-elif [ -n "$ADMIN_KEY" ]; then
-  say "  admin key（浏览器里解锁模型渠道配置用，权限更高）："
-  say "    $ADMIN_KEY"
-fi
-say ""
-say "  只有 GATEWAY_API_KEY 需要填进客户端（含手机）。admin key 权限更高，"
-say "  只在这台电脑的浏览器里用，不要传到手机上。"
-if { [ -z "$GATEWAY_KEY" ] && [ -z "$GATEWAY_API_KEY" ]; } ||
-   { [ -z "$ADMIN_KEY" ] && [ -z "$MEMORY_CONSOLE_ADMIN_KEY" ]; }; then
-  if [ "$PREEXISTING" -eq 1 ]; then
-    say "  检测到已有安装：访问密钥沿用首次启动时生成的那一对，本次不会重新打印。"
-    say "  日志还在的话可以查看：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
-    say "  已经找不回了就重新生成一对（旧 key 立即失效，所有客户端要同步更新）："
-    say "    cd \"$INSTALL_DIR\""
-    say "    docker compose -f $COMPOSE_NAME exec memory-platform memgw secret set gateway"
-    say "    docker compose -f $COMPOSE_NAME exec memory-platform modelgw secret set memory-console-admin"
-  else
-    say "  这是首次安装，但没能从日志里解析出密钥（日志可能还没写完或格式有变）。"
-    say "  请手动查看，日志里会各打印一次 GATEWAY_API_KEY 和 admin key："
-    say "    cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME logs memory-platform"
+credentials_accepted=1
+for credential in gateway.key admin.key; do
+  if [ ! -s "$INSTALL_DIR/credentials/$credential" ] \
+    || ! chmod 600 "$INSTALL_DIR/credentials/$credential"; then
+    credentials_accepted=0
+    break
+  fi
+done
+if [ "$credentials_accepted" -eq 1 ]; then
+  if ! compose_internal exec -T memory-gateway python -c \
+      'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2026/auth/tokens",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
+      <"$INSTALL_DIR/credentials/gateway.key" >/dev/null 2>&1; then
+    credentials_accepted=0
   fi
 fi
-say "============================================"
-say ""
-say "请把上面的密钥保存到密码管理器或备忘录。"
-if [ "$HOST" = "127.0.0.1" ]; then
-  say ""
-  say "想在手机或其他设备上使用？在 $INSTALL_DIR/.env 加一行 MEMORY_HOST=0.0.0.0，"
-  if [ -n "$LAN_IP" ]; then
-    say "重启后改用本机局域网地址 http://$LAN_IP:$PORT/v1（API Key 和模型名不变）。"
-  else
-    say "重启后改用本机局域网 IP，例如 http://<电脑IP>:$PORT/v1（API Key 和模型名不变）。"
+if [ "$credentials_accepted" -eq 1 ]; then
+  if ! compose_internal exec -T model-gateway python -c \
+      'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2030/admin/configuration",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
+      <"$INSTALL_DIR/credentials/admin.key" >/dev/null 2>&1; then
+    credentials_accepted=0
   fi
-  say "重启命令：cd \"$INSTALL_DIR\" && docker compose -f $COMPOSE_NAME up -d"
-  say "只限可信家庭网络，不要把服务暴露到公网。"
 fi
-say "下一步：浏览器会打开首次设置页。先粘贴 GATEWAY_API_KEY，再按页面提示"
-say "验证 admin key、选择渠道并粘贴供应商 API Key。模型启用后页面会直接给出客户端配置。"
-say "以后升级到最新版：重新运行本脚本即可，数据不受影响。"
+if [ "$credentials_accepted" -ne 1 ]; then
+  if [ "$LAYOUT" != fresh ] && rollback; then
+    fail "初始化未交付安全的 credentials；旧服务和数据已恢复"
+  fi
+  if [ "$LAYOUT" = fresh ]; then
+    compose "$COMPOSE_NAME" stop >/dev/null 2>&1 || true
+  fi
+  fail "初始化未交付安全的 credentials；自动回滚不完整"
+fi
 
-if [ "${MEMORY_NO_OPEN:-0}" != "1" ]; then
+if ! mark_cutover_committed; then
+  rollback && fail "候选已隔离验收，但无法持久提交事务；旧服务和数据已恢复"
+  fail "候选已隔离验收，但无法持久提交事务且自动回滚不完整"
+fi
+
+say "==> 事务已持久提交，发布宿主 Memory 端口"
+if ! compose_candidate_live up -d --no-deps --force-recreate model-gateway; then
+  fail "新栈已提交但宿主端口发布失败；数据不会回滚，下一次安装将幂等完成发布"
+fi
+i=0
+until curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
+  i=$((i+1))
+  [ "$i" -lt 180 ] \
+    || fail "新栈已提交但宿主 liveness 失败；数据不会回滚，journal 已保留"
+  sleep 1
+done
+if [ "$LAYOUT" != fresh ]; then
+  i=0
+  until curl -fsS "http://127.0.0.1:$PORT/readyz" >/dev/null 2>&1; do
+    i=$((i+1))
+    [ "$i" -lt 90 ] \
+      || fail "新栈已提交但宿主 readiness 失败；数据不会回滚，journal 已保留"
+    sleep 1
+  done
+fi
+public_model=$(compose_candidate_live ps -q model-gateway 2>/dev/null || true)
+public_memory_port=$(compose_candidate_live port model-gateway 2026 2>/dev/null || true)
+public_model_port=$(compose_candidate_live port model-gateway 2030 2>/dev/null || true)
+[ -n "$public_model" ] && [ -n "$public_memory_port" ] \
+  && [ -z "$public_model_port" ] \
+  || fail "新栈已提交但最终端口契约不成立；journal 已保留且不会回滚"
+
+if ! complete_committed_cutover; then
+  fail "新栈已验收并发布，但 committed journal 清理失败；下次安装将幂等清理"
+fi
+
+say ""
+say "Memory Platform $RELEASE 已启动"
+say "  Web Console:  http://127.0.0.1:$PORT/ui/"
+say "  Client URL:   http://127.0.0.1:$PORT/v1"
+say "  Model:        memory-auto"
+say "  Console token: $INSTALL_DIR/credentials/gateway.key"
+say "  Admin key:    $INSTALL_DIR/credentials/admin.key"
+say "密钥值没有进入本脚本输出、Compose 环境或 Docker 日志。"
+if [ "$HOST" = 0.0.0.0 ]; then
+  say "已监听可信局域网；请确认路由器没有把端口映射到公网。"
+fi
+if [ "$LAYOUT" = legacy ]; then
+  say "gateway.key 仅在迁移兼容期保留 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
+  say "旧单卷仍保留用于观察期回滚；完成客户端/备份验证后再显式删除。"
+fi
+if [ -n "$BACKUP_PATH" ]; then
+  say "升级前备份: $BACKUP_PATH"
+fi
+prune_host_backups
+
+if [ "${MEMORY_NO_OPEN:-0}" != 1 ]; then
   if command -v open >/dev/null 2>&1; then
     open "http://127.0.0.1:$PORT/ui/" >/dev/null 2>&1 || true
   elif command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then

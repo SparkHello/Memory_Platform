@@ -1,54 +1,159 @@
-# 用户版：直接拉取预构建镜像，不需要 clone 仓库、不需要 Python/Node。
-# 最简单的用法是一键脚本（自动下载本文件、避开占用端口并打印密钥）：
-#   curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
-# Windows PowerShell：
-#   irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
-# 手工用法：
-#   curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
-#   docker compose -f docker-compose.user.yml up -d
-# 首次启动需 1–2 分钟完成内部安装，之后容器日志会各打印一次
-# GATEWAY_API_KEY 和 admin key：
-#   docker compose -f docker-compose.user.yml logs memory-platform
-# 端口 2026 被占用时，在本文件同目录的 .env 写入一行 MEMORY_PORT=3026 后重启，
-# 之后所有文档中的 2026 换成 3026。
-# 想在手机/其他设备上访问时，在 .env 加一行 MEMORY_HOST=0.0.0.0 后重启，
-# 然后改用电脑的局域网 IP（仅限可信家庭网络，不要暴露到公网）。
-# 想自己指定密钥（至少 16 个字符）而不是用自动生成的，在首次启动前这样跑：
-#   GATEWAY_API_KEY=你的密钥 docker compose -f docker-compose.user.yml up -d
-# 建议不要写进 .env，以免密钥明文留在安装目录里。
+# Memory Platform split-container release stack.
+#
+# Recommended: use deploy/install.sh.  It creates ./credentials with mode 0700,
+# resolves these semver images to immutable digests, initializes the four
+# private volumes offline, and reports only credential *file paths*.
+# No API key is accepted through Compose environment variables or daemon logs.
 services:
-  memory-platform:
-    image: ghcr.io/sparkhello/memory-platform:latest
-    ports:
-      # 默认只绑回环；手机/局域网访问在同目录 .env 加 MEMORY_HOST=0.0.0.0
-      - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
+  stack-init:
+    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.2.0}"
+    pull_policy: missing
+    network_mode: none
     environment:
-      # 自定义密钥（可选，至少 16 个字符），只在首次启动生成密钥时生效；
-      # 留空则容器自动生成一枚高强度密钥。之后更换请用 memgw / modelgw secret set。
-      GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
-      MEMORY_CONSOLE_ADMIN_KEY: "${MEMORY_CONSOLE_ADMIN_KEY:-}"
-      # 容器内固定监听 2026，宿主机映射到哪个端口只有这里知道。告诉容器一声，
-      # 它打印的接入地址才是用户真正能访问的那个。
-      MEMORY_PUBLIC_PORT: "${MEMORY_PORT:-2026}"
+      HOST_UID: "${HOST_UID:-}"
+      HOST_GID: "${HOST_GID:-}"
+      MEMGW_HOME: /memory-data/config
+      MEMGW_SETTINGS_PATH: /memory-secrets/settings.env
+      MODEL_GATEWAY_HOME: /model-data
+      MODEL_GATEWAY_SECRETS_PATH: /model-secrets/secrets.env
     volumes:
-      - memory-platform-data:/data
+      - memory-data:/memory-data
+      - memory-secrets:/memory-secrets
+      - model-data:/model-data
+      - model-secrets:/model-secrets
+      - type: bind
+        source: "${MEMORY_CREDENTIAL_DIR:-./credentials}"
+        target: /credentials
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  model-gateway:
+    image: "${MEMORY_PLATFORM_MODEL_IMAGE:-ghcr.io/sparkhello/memory-platform-model:v0.2.0}"
+    pull_policy: missing
+    depends_on:
+      stack-init:
+        condition: service_completed_successfully
+    user: "10002:10002"
+    environment:
+      MODEL_GATEWAY_HOME: /data
+      MODEL_GATEWAY_SECRETS_PATH: /secrets/secrets.env
+    # Only this container has a non-internal network. A fixed raw TCP relay
+    # forwards the public Memory port over `backend`; Model port 2030 remains
+    # private and the relay never parses or logs HTTP bytes.
+    ports:
+      - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
+    volumes:
+      - model-data:/data
+      # The Model control plane atomically rotates provider/admin candidates in
+      # this private volume.  It is writable only by UID 10002 and is never
+      # mounted by Memory Gateway.
+      - model-secrets:/secrets
+    networks:
+      - backend
+      - provider-egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     init: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
+    cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     healthcheck:
-      # 首次启动的接线安装约 1 分钟，start_period 给足余量
-      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2026/health', timeout=3).status == 200 else 1)"]
+      # Verify both the fixed ingress listener and Model liveness. The relay
+      # target starts after this service becomes healthy, so this only probes
+      # its local listener; cross-service acceptance uses Memory /readyz.
+      test: ["CMD", "python", "-c", "import socket,sys,urllib.request; s=socket.create_connection(('127.0.0.1',2026),timeout=3); s.close(); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2030/health',timeout=3).status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 120s
+      start_period: 20s
+
+  memory-gateway:
+    image: "${MEMORY_PLATFORM_MEMORY_IMAGE:-ghcr.io/sparkhello/memory-platform-memory:v0.2.0}"
+    pull_policy: missing
+    depends_on:
+      stack-init:
+        condition: service_completed_successfully
+      model-gateway:
+        condition: service_healthy
+    user: "10001:10001"
+    environment:
+      MEMGW_HOME: /data/config
+      MEMGW_SETTINGS_PATH: /secrets/settings.env
+      MEMGW_PROJECT_ROOT: /app/services/memory-gateway
+    volumes:
+      - memory-data:/data
+      - memory-secrets:/secrets:ro
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    init: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      # Keep the setup UI reachable before a first provider is configured.
+      # Upgrade/final acceptance separately requires authenticated /readyz.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2026/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # Run only through an explicit `--profile maintenance ... run` command.
+  # Provider/admin secrets are intentionally absent and networking is disabled.
+  stack-maintenance:
+    profiles: [maintenance]
+    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.2.0}"
+    pull_policy: missing
+    entrypoint: ["memgw"]
+    user: "0:0"
+    network_mode: none
+    environment:
+      MEMGW_HOME: /data/config
+      MEMGW_SETTINGS_PATH: /secrets/settings.env
+      MEMGW_PROJECT_ROOT: /app/services/memory-gateway
+      MODEL_GATEWAY_HOME: /model-data
+    volumes:
+      - memory-data:/data
+      - memory-secrets:/secrets
+      - model-data:/model-data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+networks:
+  backend:
+    internal: true
+  provider-egress: {}
 
 volumes:
-  memory-platform-data:
+  memory-data: {}
+  memory-secrets: {}
+  model-data: {}
+  model-secrets: {}

@@ -10,6 +10,7 @@ node_modules
 **/node_modules
 ui/dist
 **/ui/dist
+services/memory-gateway/ui/test-results
 data
 **/data
 logs
@@ -23,3 +24,14 @@ docs/reviews
 .kun-design
 .playwright-mcp
 memory-stack*.zip
+/key.md
+.env
+**/.env
+credentials
+**/credentials
+*.key
+**/*.key
+settings.env
+**/settings.env
+secrets.env
+**/secrets.env

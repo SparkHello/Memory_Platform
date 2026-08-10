@@ -6,75 +6,297 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
-    name: Build and smoke test
+    name: Build and isolated-stack smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Build image
-        run: docker build -t memory-platform:ci .
-
-      - name: Start stack
-        run: >-
-          docker run -d --name memory-platform
-          -p 127.0.0.1:2026:2026
-          memory-platform:ci
-
-      - name: Verify unprivileged runtime user
-        run: >-
-          docker exec memory-platform sh -c
-          "grep -Eq '^Uid:[[:space:]]+10001' /proc/1/status"
-
-      - name: Wait for Memory Gateway health
+      - name: Prepare private credential destination
         run: |
-          for i in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:2026/health > /dev/null 2>&1; then
-              echo "Memory Gateway is healthy"
+          install -d -m 0700 "$RUNNER_TEMP/memory-platform-credentials"
+          echo "MEMORY_CREDENTIAL_DIR=$RUNNER_TEMP/memory-platform-credentials" >> "$GITHUB_ENV"
+          echo "HOST_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "HOST_GID=$(id -g)" >> "$GITHUB_ENV"
+
+      - name: Build and start split stack
+        run: >-
+          docker compose -p memory-platform-ci
+          -f deploy/docker-compose.yml up -d --build
+
+      - name: Wait for Memory Gateway liveness
+        run: |
+          for attempt in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:2026/health >/dev/null 2>&1; then
               exit 0
             fi
             sleep 2
           done
-          echo "Stack failed to become healthy; container logs:"
-          docker logs memory-platform
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml ps
           exit 1
 
-      - name: Show first-run output
+      - name: Verify UID, mount and network isolation
+        run: |
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T memory-gateway sh -ec \
+            'test "$(id -u)" = 10001; test ! -e /secrets/secrets.env; test ! -e /model-data'
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T model-gateway sh -ec \
+            'test "$(id -u)" = 10002; test ! -e /secrets/settings.env; test ! -e /memory-data'
+          test -z "$(docker port memory-platform-ci-model-gateway-1 2030/tcp)"
+          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/gateway.key")" = 600
+          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/admin.key")" = 600
+
+      - name: Verify provider egress is Model-only
+        run: |
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T model-gateway python -c \
+            'import socket; connection=socket.create_connection(("example.com",443),5); connection.close()'
+          if docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T memory-gateway python -c \
+            'import socket; connection=socket.create_connection(("example.com",443),5); connection.close()'
+          then
+            echo "Memory Gateway unexpectedly has public provider egress" >&2
+            exit 1
+          fi
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T memory-gateway python -c \
+            'import urllib.request; response=urllib.request.urlopen("http://model-gateway:2030/health",timeout=5); assert response.status == 200'
+
+      - name: Verify generated credentials never entered daemon logs
+        run: |
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml logs --no-color \
+            > "$RUNNER_TEMP/memory-platform.log"
+          python3 - "$RUNNER_TEMP/memory-platform.log" \
+            "$MEMORY_CREDENTIAL_DIR/gateway.key" "$MEMORY_CREDENTIAL_DIR/admin.key" <<'PY'
+          import pathlib
+          import sys
+
+          log = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          for filename in sys.argv[2:]:
+              value = pathlib.Path(filename).read_text(encoding="ascii").strip()
+              if not value or value in log:
+                  raise SystemExit("credential leaked to container log")
+          PY
+
+      - name: Tear down isolated test volumes
         if: always()
-        run: docker logs memory-platform 2>&1 | head -40
+        run: >-
+          docker compose -p memory-platform-ci
+          -f deploy/docker-compose.yml down -v --remove-orphans
+
+  release-gate:
+    name: Full backend, UI and browser release gate
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Reject non-semver release tags
+        shell: bash
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install both services with dev extras
+        run: >-
+          python -m pip install
+          -c constraints.txt
+          -e 'services/memory-gateway[dev]'
+          -e 'services/model-gateway[dev]'
+
+      - name: Check Python dependency consistency and installer syntax
+        run: |
+          python -m pip check
+          sh -n deploy/install.sh
+
+      - name: Check Windows installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/deploy/install.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+      - name: Exercise Windows cutover journal crash recovery
+        shell: pwsh
+        run: '& ./services/memory-gateway/tests/windows_installer_journal.ps1'
+
+      - name: Test Memory Gateway
+        working-directory: services/memory-gateway
+        run: python -m pytest -ra
+
+      - name: Test Model Gateway
+        working-directory: services/model-gateway
+        run: python -m pytest -ra
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/memory-gateway/ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: services/memory-gateway/ui
+        run: npm ci
+
+      - name: Test and build UI
+        working-directory: services/memory-gateway/ui
+        run: |
+          npm test
+          npm run build
+
+      - name: Install Chromium for isolated browser acceptance
+        working-directory: services/memory-gateway/ui
+        run: npm exec playwright install --with-deps chromium
+
+      - name: Test UI in real Chromium viewports
+        working-directory: services/memory-gateway/ui
+        run: npm run test:e2e
 
   publish:
-    name: Push to GHCR
+    name: Publish ${{ matrix.component }} image
     if: startsWith(github.ref, 'refs/tags/')
-    needs: smoke
+    needs: [smoke, release-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: memory
+            target: memory-runtime
+            package: memory-platform-memory
+          - component: model
+            target: model-runtime
+            package: memory-platform-model
+          - component: init
+            target: stack-init
+            package: memory-platform-init
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Lowercase repository owner
-        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - name: Reject non-semver release tags
+        shell: bash
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
 
-      - uses: docker/setup-qemu-action@v3
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=ghcr.io/$owner/${{ matrix.package }}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push immutable release image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          target: ${{ matrix.target }}
           push: true
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: |
-            ghcr.io/${{ env.OWNER_LC }}/memory-platform:latest
-            ghcr.io/${{ env.OWNER_LC }}/memory-platform:${{ github.ref_name }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          provenance: mode=max
+          sbom: true
+
+      # Keep unfixed findings visible instead of silently suppressing them. The
+      # second pass blocks vulnerabilities for which an upgrade is actually
+      # available; unfixed findings require an explicit reachability/VEX review
+      # in the release notes until the pinned base image can be renewed.
+      - name: Report all HIGH or CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Fail release on fixable HIGH or CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # Attestation and signature are promotion markers, so they are emitted
+      # only after the full release gate and both vulnerability passes have
+      # succeeded. Installers require this exact workflow identity.
+      - name: Attest build provenance after release gates
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign promoted immutable image digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+  publish-compose-signature:
+    name: Publish authenticated Compose bundle
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Reject non-semver release tags
+        shell: bash
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the exact release Compose blob
+        run: >-
+          cosign sign-blob --yes
+          --bundle docker-compose.user.yml.sigstore.json
+          deploy/docker-compose.user.yml
+
+      - name: Publish the authenticated Compose bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "Memory Platform $GITHUB_REF_NAME" \
+              --notes "Signed Memory Platform release artifacts."
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            docker-compose.user.yml.sigstore.json --clobber

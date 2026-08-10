@@ -12,10 +12,10 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -46,6 +46,11 @@ jobs:
           }
           sh -n deploy/install.sh
 
+      - name: Exercise Windows cutover journal crash recovery
+        if: matrix.python-version == '3.12'
+        shell: pwsh
+        run: '& ./services/memory-gateway/tests/windows_installer_journal.ps1'
+
       - name: Test Memory Gateway
         working-directory: services/memory-gateway
         run: python -m pytest -ra
@@ -62,10 +67,10 @@ jobs:
         working-directory: services/memory-gateway/ui
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -76,6 +81,12 @@ jobs:
 
       - name: Test UI onboarding behavior
         run: npm test
+
+      - name: Install Chromium for isolated browser acceptance
+        run: npm exec playwright install --with-deps chromium
+
+      - name: Test UI in real Chromium viewports
+        run: npm run test:e2e
 
       - name: Build UI
         run: npm run build

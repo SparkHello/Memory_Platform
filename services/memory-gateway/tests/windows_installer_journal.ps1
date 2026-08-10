@@ -1,0 +1,340 @@
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version 2.0
+
+$repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../.."))
+$installer = Join-Path $repository "deploy/install.ps1"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $installer,
+    [ref] $tokens,
+    [ref] $errors
+)
+if ($errors.Count -gt 0) { throw "install.ps1 did not parse" }
+$definitions = @($ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true) | ForEach-Object { $_.Extent.Text })
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("memory-platform-windows-journal-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+$functionsPath = Join-Path $temporaryRoot "installer-functions.ps1"
+[IO.File]::WriteAllText(
+    $functionsPath,
+    ([string]::Join("`n`n", $definitions)),
+    (New-Object Text.UTF8Encoding($false))
+)
+. $functionsPath
+
+# Native MoveFileEx is Windows-only. The journal state machine itself is
+# exercised cross-platform with an atomic same-filesystem move substitute;
+# Windows CI separately parses and runs the production P/Invoke path.
+function Move-PathWriteThrough([string] $Source, [string] $Destination) {
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    $item = Get-Item -LiteralPath $Source -Force
+    if ($item.PSIsContainer) {
+        [IO.Directory]::Move($Source, $Destination)
+    } else {
+        [IO.File]::Move($Source, $Destination)
+    }
+}
+function Protect-PrivatePath([string] $Path) { }
+function Write-Step([string] $Message) { }
+function Stop-Install([string] $Message) { throw $Message }
+function Write-DurableTextAtomic([string] $Path, [string] $Content) {
+    [IO.File]::WriteAllText(
+        $Path,
+        $Content,
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+function Assert-True([bool] $Condition, [string] $Message) {
+    if (-not $Condition) { throw $Message }
+}
+
+try {
+    $runningOnWindows = [Environment]::OSVersion.Platform -eq `
+        [PlatformID]::Win32NT
+    if (-not $runningOnWindows) {
+        $nativeBin = Join-Path $temporaryRoot "native-bin"
+        New-Item -ItemType Directory -Path $nativeBin | Out-Null
+        $fakeDocker = Join-Path $nativeBin "docker"
+        $fakeDockerScript = @'
+#!/bin/sh
+[ "$1" = alpha ] || exit 2
+[ "$2" = "path with spaces" ] || exit 3
+IFS= read -r value
+[ "$value" = synthetic-input ] || exit 4
+'@
+        [IO.File]::WriteAllText(
+            $fakeDocker,
+            $fakeDockerScript,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        & chmod 700 $fakeDocker
+        $inputFile = Join-Path $temporaryRoot "synthetic-input"
+        [IO.File]::WriteAllText($inputFile, "synthetic-input`n")
+        $savedPath = $env:PATH
+        $env:PATH = "$nativeBin$([IO.Path]::PathSeparator)$savedPath"
+        try {
+            Assert-True `
+                (Invoke-DockerWithInputFile @("alpha", "path with spaces") $inputFile) `
+                "credential stdin helper did not preserve native arguments/input"
+        } finally {
+            $env:PATH = $savedPath
+        }
+    }
+
+    foreach ($shape in @("complete", "phase-only", "empty")) {
+        $case = Join-Path $temporaryRoot $shape
+        New-Item -ItemType Directory -Path $case | Out-Null
+        $script:InstallDirectory = $case
+        $script:ComposePath = Join-Path $case "docker-compose.user.yml"
+        $script:CutoverJournal = Join-Path $case ".memory-platform-cutover"
+        $script:CutoverCommittedCleanup = "$($script:CutoverJournal).committed-cleanup"
+        $script:Layout = "split"
+        New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
+        if ($shape -ne "empty") {
+            [IO.File]::WriteAllText(
+                (Join-Path $script:CutoverJournal "phase.txt"),
+                "committed`n"
+            )
+        }
+        if ($shape -eq "complete") {
+            $digest = "sha256:" + ("a" * 64)
+            [IO.File]::WriteAllText(
+                (Join-Path $script:CutoverJournal "metadata.json"),
+                (@{
+                    version = 1
+                    project = "journal-project"
+                    layout = "split"
+                    backup = "pre-upgrade-test.zip"
+                    old_init_image = $digest
+                    old_model_image = $digest
+                    old_memory_image = $digest
+                    legacy_targets_absent = $false
+                } | ConvertTo-Json -Compress)
+            )
+            [IO.File]::WriteAllText(
+                (Join-Path $script:CutoverJournal "old-compose.yml"),
+                "synthetic"
+            )
+            [IO.File]::WriteAllText(
+                (Join-Path $script:CutoverJournal "old.env"),
+                "synthetic"
+            )
+        }
+        $environmentPath = Join-Path $case ".env"
+        [IO.File]::WriteAllText($environmentPath, "ACCEPTED_NEW_STATE=1`n")
+        Restore-InterruptedCutover $environmentPath
+        Assert-True (-not (Test-Path -LiteralPath $script:CutoverJournal)) `
+            "committed journal shape $shape was not cleaned"
+        Assert-True `
+            ([IO.File]::ReadAllText($environmentPath) -eq "ACCEPTED_NEW_STATE=1`n") `
+            "committed journal shape $shape rolled back accepted state"
+    }
+
+    $digest = "sha256:" + ("b" * 64)
+    $committedV2 = Join-Path $temporaryRoot "committed-v2-publish"
+    New-Item -ItemType Directory -Path $committedV2 | Out-Null
+    $script:InstallDirectory = $committedV2
+    $script:ComposePath = Join-Path $committedV2 "docker-compose.user.yml"
+    $script:CutoverJournal = Join-Path $committedV2 ".memory-platform-cutover"
+    $script:CutoverCommittedCleanup = "$($script:CutoverJournal).committed-cleanup"
+    New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
+    [IO.File]::WriteAllText($script:ComposePath, "accepted-compose`n")
+    $environmentPath = Join-Path $committedV2 ".env"
+    [IO.File]::WriteAllText(
+        $environmentPath,
+        "COMPOSE_PROJECT_NAME=journal-project`nMEMORY_HOST=127.0.0.1`nMEMORY_PORT=3026`n"
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "metadata.json"),
+        (@{
+            version = 2
+            project = "journal-project"
+            layout = "split"
+            backup = "pre-upgrade-v2.zip"
+            old_init_image = $digest
+            old_model_image = $digest
+            old_memory_image = $digest
+            legacy_targets_absent = $false
+            old_env_exists = $true
+            publish_host = "127.0.0.1"
+            publish_port = 3026
+        } | ConvertTo-Json -Compress)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "old-compose.yml"), "old-compose`n"
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "old.env"), "OLD=1`n"
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "phase.txt"), "committed`n"
+    )
+    $script:CommittedPublishCalled = $false
+    function docker {
+        $Arguments = @($args)
+        $global:LASTEXITCODE = 0
+        if ($Arguments -contains "up") { $script:CommittedPublishCalled = $true }
+    }
+    function Wait-HttpEndpoint([string] $Url, [int] $Attempts) { return $true }
+    Restore-InterruptedCutover $environmentPath
+    Assert-True $script:CommittedPublishCalled `
+        "v2 committed recovery did not finish publishing the accepted stack"
+    Assert-True (-not (Test-Path -LiteralPath $script:CutoverJournal)) `
+        "v2 committed recovery did not clean the journal"
+    Assert-True `
+        ([IO.File]::ReadAllText($environmentPath) -match "MEMORY_PORT=3026") `
+        "v2 committed recovery changed the accepted environment"
+
+    $preparedV2 = Join-Path $temporaryRoot "prepared-v2-no-old-env"
+    New-Item -ItemType Directory -Path $preparedV2 | Out-Null
+    $script:InstallDirectory = $preparedV2
+    $script:ComposePath = Join-Path $preparedV2 "docker-compose.user.yml"
+    $script:CutoverJournal = Join-Path $preparedV2 ".memory-platform-cutover"
+    $script:CutoverCommittedCleanup = "$($script:CutoverJournal).committed-cleanup"
+    New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
+    [IO.File]::WriteAllText($script:ComposePath, "candidate-compose`n")
+    $environmentPath = Join-Path $preparedV2 ".env"
+    [IO.File]::WriteAllText($environmentPath, "CANDIDATE=1`n")
+    New-Item -ItemType Directory -Path (Join-Path $preparedV2 "backups") | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $preparedV2 "backups/pre-upgrade-v2.zip"), "backup"
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "metadata.json"),
+        (@{
+            version = 2
+            project = "journal-project"
+            layout = "split"
+            backup = "pre-upgrade-v2.zip"
+            old_init_image = $digest
+            old_model_image = $digest
+            old_memory_image = $digest
+            legacy_targets_absent = $false
+            old_env_exists = $false
+            publish_host = "127.0.0.1"
+            publish_port = 3026
+        } | ConvertTo-Json -Compress)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "old-compose.yml"), "old-compose`n"
+    )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $script:CutoverJournal "old.env"), [byte[]]@()
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "phase.txt"), "prepared`n"
+    )
+    function docker {
+        $Arguments = @($args)
+        $global:LASTEXITCODE = 0
+    }
+    function Replace-ComposeAtomically([string] $Source, [string] $Destination) {
+        [IO.File]::Copy($Source, $Destination, $true)
+        Remove-Item -LiteralPath $Source -Force
+    }
+    Restore-InterruptedCutover $environmentPath
+    Assert-True (-not (Test-Path -LiteralPath $environmentPath)) `
+        "v2 recovery recreated an .env that did not exist before cutover"
+    Assert-True `
+        ([IO.File]::ReadAllText($script:ComposePath) -eq "old-compose`n") `
+        "v2 recovery did not restore the exact old Compose"
+
+    $identityDirectory = Join-Path $temporaryRoot "project-identity"
+    New-Item -ItemType Directory -Path $identityDirectory | Out-Null
+    function docker {
+        $Arguments = @($args)
+        $global:LASTEXITCODE = 0
+        if ($Arguments[0] -eq "ps") {
+            "$identityDirectory|authoritative-project"
+        }
+    }
+    $projects = @(Get-ProjectsForInstallDirectory $identityDirectory)
+    Assert-True `
+        ($projects.Count -eq 1 -and $projects[0] -eq "authoritative-project") `
+        "Windows project identity discovery did not deduplicate matching labels"
+
+    $aclFailure = Join-Path $temporaryRoot "committed-acl-failure"
+    New-Item -ItemType Directory -Path $aclFailure | Out-Null
+    $script:CutoverJournal = Join-Path $aclFailure ".memory-platform-cutover"
+    $script:CutoverCommittedCleanup = "$($script:CutoverJournal).committed-cleanup"
+    $script:Layout = "split"
+    New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "phase.txt"),
+        "data_may_change`n"
+    )
+    function Protect-PrivatePath([string] $Path) {
+        if ($Path.EndsWith("phase.txt")) { throw "synthetic ACL failure" }
+    }
+    Assert-True (Complete-CutoverJournal) `
+        "post-commit ACL failure incorrectly requested rollback"
+    Assert-True (-not (Test-Path -LiteralPath $script:CutoverJournal)) `
+        "post-commit ACL failure left an active rollback journal"
+    function Protect-PrivatePath([string] $Path) { }
+
+    $legacy = Join-Path $temporaryRoot "legacy-cleanup"
+    New-Item -ItemType Directory -Path $legacy | Out-Null
+    $script:CutoverJournal = Join-Path $legacy ".memory-platform-cutover"
+    New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $script:CutoverJournal "metadata.json"),
+        '{"legacy_targets_absent":true}'
+    )
+    $script:ProjectName = "journal-project"
+    $script:LegacyTestVolumes = @{
+        "memory-data" = $true
+        "memory-secrets" = $true
+        "model-data" = $true
+        "model-secrets" = $true
+    }
+    $script:LegacyRemovedContainer = $false
+    function Get-ProjectVolume([string] $VolumeKey) {
+        if ($script:LegacyTestVolumes.ContainsKey($VolumeKey)) {
+            return "journal-project_$VolumeKey"
+        }
+        return ""
+    }
+    function docker {
+        $Arguments = @($args)
+        $global:LASTEXITCODE = 0
+        if ($Arguments[0] -eq "ps") {
+            "candidate-container"
+            return
+        }
+        if ($Arguments[0] -eq "rm") {
+            $script:LegacyRemovedContainer = $true
+            return
+        }
+        if ($Arguments[0] -eq "volume" -and $Arguments[1] -eq "inspect") {
+            $volume = [string] $Arguments[2]
+            $key = $volume.Substring("journal-project_".Length)
+            "journal-project|$key"
+            return
+        }
+        if ($Arguments[0] -eq "volume" -and $Arguments[1] -eq "rm") {
+            $volume = [string] $Arguments[2]
+            $key = $volume.Substring("journal-project_".Length)
+            [void] $script:LegacyTestVolumes.Remove($key)
+            return
+        }
+        throw "unexpected docker invocation: $Arguments"
+    }
+    Assert-True (Remove-LegacyTransactionVolumes) `
+        "legacy transaction volumes were not removed"
+    Assert-True ($script:LegacyTestVolumes.Count -eq 0) `
+        "partial legacy volumes survived cleanup"
+    Assert-True $script:LegacyRemovedContainer `
+        "candidate container was not removed before volume cleanup"
+
+    Write-Output "windows-installer-journal: committed crash shapes and legacy cleanup passed"
+} finally {
+    Remove-Item -LiteralPath $temporaryRoot -Recurse -Force `
+        -ErrorAction SilentlyContinue
+}

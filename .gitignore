@@ -33,7 +33,16 @@ ui/node_modules/
 **/ui/node_modules/
 ui/dist/
 **/ui/dist/
+services/memory-gateway/ui/test-results/
 memory-stack*.zip
+/key.md
+# Runtime credentials and secret-bearing settings are never source artifacts.
+credentials/
+**/credentials/
+settings.env
+**/settings.env
+secrets.env
+**/secrets.env
 # Ad-hoc console screenshots captured at the repo root. Scoped to the root so
 # real image assets under ui/ or docs/ stay committable.
 /*.png
