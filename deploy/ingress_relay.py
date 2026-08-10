@@ -9,7 +9,9 @@ LISTEN_PORT = 2026
 TARGET_HOST = "memory-gateway"
 TARGET_PORT = 2026
 MAX_CONNECTIONS = 128
+MAX_CONNECTIONS_PER_SOURCE = 32
 CONNECT_TIMEOUT_SECONDS = 5.0
+FIRST_BYTE_TIMEOUT_SECONDS = 10.0
 IDLE_TIMEOUT_SECONDS = 1800.0
 IO_TIMEOUT_SECONDS = 30.0
 BUFFER_LIMIT_BYTES = 64 * 1024
@@ -34,16 +36,17 @@ async def _copy(
     writer: asyncio.StreamWriter,
     *,
     idle_timeout: float,
+    first_timeout: float | None = None,
 ) -> None:
+    timeout = idle_timeout if first_timeout is None else first_timeout
     while True:
-        data = await asyncio.wait_for(
-            reader.read(CHUNK_BYTES), timeout=idle_timeout
-        )
+        data = await asyncio.wait_for(reader.read(CHUNK_BYTES), timeout=timeout)
         if not data:
             await _half_close(writer)
             return
         writer.write(data)
         await asyncio.wait_for(writer.drain(), timeout=IO_TIMEOUT_SECONDS)
+        timeout = idle_timeout
 
 
 class FixedTargetRelay:
@@ -55,29 +58,43 @@ class FixedTargetRelay:
         target_host: str = TARGET_HOST,
         target_port: int = TARGET_PORT,
         max_connections: int = MAX_CONNECTIONS,
+        max_connections_per_source: int = MAX_CONNECTIONS_PER_SOURCE,
         connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+        first_byte_timeout: float | None = FIRST_BYTE_TIMEOUT_SECONDS,
     ) -> None:
         if max_connections < 1:
             raise ValueError("max_connections")
+        if max_connections_per_source < 1:
+            raise ValueError("max_connections_per_source")
         self._target_host = target_host
         self._target_port = target_port
         self._max_connections = max_connections
+        self._max_connections_per_source = max_connections_per_source
         self._connect_timeout = connect_timeout
         self._idle_timeout = idle_timeout
+        self._first_byte_timeout = first_byte_timeout
         self._active_connections = 0
+        self._per_source_counts: dict[str, int] = {}
 
     async def handle(
         self,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
-        # The event loop runs handlers cooperatively, so this check and
-        # increment are atomic until the first await.
+        # The event loop runs handlers cooperatively, so these checks and
+        # increments are atomic until the first await.
         if self._active_connections >= self._max_connections:
             await _close(client_writer)
             return
+        peername = client_writer.get_extra_info("peername")
+        source = peername[0] if peername else ""
+        per_source = self._per_source_counts.get(source, 0)
+        if per_source >= self._max_connections_per_source:
+            await _close(client_writer)
+            return
         self._active_connections += 1
+        self._per_source_counts[source] = per_source + 1
         upstream_writer: asyncio.StreamWriter | None = None
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
@@ -93,6 +110,7 @@ class FixedTargetRelay:
                     client_reader,
                     upstream_writer,
                     idle_timeout=self._idle_timeout,
+                    first_timeout=self._first_byte_timeout,
                 )
             )
             upstream = asyncio.create_task(
@@ -117,6 +135,11 @@ class FixedTargetRelay:
                 await _close(upstream_writer)
             await _close(client_writer)
             self._active_connections -= 1
+            remaining = self._per_source_counts.get(source, 1) - 1
+            if remaining > 0:
+                self._per_source_counts[source] = remaining
+            else:
+                self._per_source_counts.pop(source, None)
 
 
 async def serve(
@@ -126,15 +149,19 @@ async def serve(
     target_host: str = TARGET_HOST,
     target_port: int = TARGET_PORT,
     max_connections: int = MAX_CONNECTIONS,
+    max_connections_per_source: int = MAX_CONNECTIONS_PER_SOURCE,
     connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+    first_byte_timeout: float | None = FIRST_BYTE_TIMEOUT_SECONDS,
 ) -> None:
     relay = FixedTargetRelay(
         target_host=target_host,
         target_port=target_port,
         max_connections=max_connections,
+        max_connections_per_source=max_connections_per_source,
         connect_timeout=connect_timeout,
         idle_timeout=idle_timeout,
+        first_byte_timeout=first_byte_timeout,
     )
     server = await asyncio.start_server(
         relay.handle,
