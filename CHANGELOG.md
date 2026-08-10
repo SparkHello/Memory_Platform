@@ -30,6 +30,8 @@
 - Client/provider secret ref 与值域强制隔离，token 使用高熵 ASCII/UTF-8 bytes 常量时间比较；provider/admin/backend key 不再进入日志、Compose 展开、命令参数或长期容器环境。
 - 所有带凭据的出站请求禁用 ambient proxy 和重定向；远端仅 HTTPS，loopback/private HTTP 需显式、受限启用；限制 discovery、请求/响应、上传、解析和内部模型输出大小。
 - Memory 与 Model 长期容器互相不能读取对方 secret；rootfs 只读、capabilities 全部移除，provider egress 仅授予 Model。
+- 入口 relay 增加首字节截止时间（默认 10 秒）与按源 IP 并发上限（默认 32），长期空闲 TCP 连接不能再占满入口槽位。
+- `/readyz` 增加 3 秒结果缓存与 single-flight，未鉴权高频探测不再放大 SQLite quick_check 与 Model 控制面调用。
 
 ## 0.1.2 - 2026-08-08
 

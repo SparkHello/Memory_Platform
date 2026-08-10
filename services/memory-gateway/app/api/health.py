@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 from pathlib import Path
 import sqlite3
+import time
 from typing import Annotated, Any
 from urllib.parse import quote
 
@@ -25,12 +27,49 @@ def health() -> dict[str, str]:
 
 _MAX_CONTROL_RESPONSE_BYTES = 2 * 1024 * 1024
 
+READYZ_CACHE_TTL_SECONDS = 3.0
+_READYZ_CACHE_MAX_ENTRIES = 8
+
+# fingerprint -> (expires_at, status_code, content). The fingerprint keeps
+# tests with different dependency-overridden Settings from sharing results.
+_readyz_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+# Single global single-flight lock. It is only ever held for one computation
+# and released before the event loop can change, so per-test event loops are
+# safe (an unheld asyncio.Lock may be reused across loops).
+_readyz_lock = asyncio.Lock()
+
 
 @router.get("/readyz")
 async def readiness(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> JSONResponse:
-    """Operational readiness; liveness remains dependency-free ``/health``."""
+    """Operational readiness; liveness remains dependency-free ``/health``.
+
+    Results are cached per settings fingerprint for ``READYZ_CACHE_TTL_SECONDS``
+    and concurrent misses share one computation (single-flight), so
+    unauthenticated high-frequency probes cannot amplify the SQLite quick_check
+    and model control-plane calls.
+    """
+    fingerprint = _readyz_cache_fingerprint(settings)
+    async with _readyz_lock:
+        now = time.monotonic()
+        cached = _readyz_cache.get(fingerprint)
+        if cached is not None and cached[0] > now:
+            _, status_code, content = cached
+        else:
+            status_code, content = await _readiness_result(settings)
+            _readyz_cache.pop(fingerprint, None)
+            _readyz_cache[fingerprint] = (
+                now + READYZ_CACHE_TTL_SECONDS,
+                status_code,
+                content,
+            )
+            while len(_readyz_cache) > _READYZ_CACHE_MAX_ENTRIES:
+                _readyz_cache.pop(next(iter(_readyz_cache)))
+    return JSONResponse(status_code=status_code, content=content)
+
+
+async def _readiness_result(settings: Settings) -> tuple[int, dict[str, Any]]:
     try:
         runtime = resolve_model_runtime(settings)
     except ModelRuntimeConfigurationError:
@@ -47,20 +86,50 @@ async def readiness(
         model_code = await _central_model_readiness_code(settings, runtime)
         if model_code:
             return _not_ready(model_code)
-    return JSONResponse(
-        content={
-            "status": "ready",
-            "model_runtime": runtime.mode,
-            "embedding_enabled": runtime.embedding.enabled,
-        }
-    )
+    return 200, {
+        "status": "ready",
+        "model_runtime": runtime.mode,
+        "embedding_enabled": runtime.embedding.enabled,
+    }
 
 
-def _not_ready(code: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"status": "not_ready", "code": code},
+def _not_ready(code: str) -> tuple[int, dict[str, Any]]:
+    return 503, {"status": "not_ready", "code": code}
+
+
+def _readyz_cache_fingerprint(settings: Settings) -> str:
+    """Hash every field that can change the readiness verdict, secrets included.
+
+    Hashing keeps raw API keys and signing secrets out of the long-lived
+    in-memory cache keys.
+    """
+    fields = (
+        settings.database_path,
+        settings.knowledge_database_path,
+        settings.auth_database_path,
+        settings.gateway_api_key,
+        str(settings.gateway_legacy_api_key_enabled),
+        settings.gateway_signing_secret,
+        settings.model_gateway_base_url,
+        settings.model_gateway_api_key,
+        settings.model_gateway_chat_model,
+        settings.model_gateway_memory_extract_model,
+        settings.model_gateway_memory_compact_model,
+        settings.model_gateway_memory_core_model,
+        settings.model_gateway_memory_review_model,
+        settings.model_gateway_knowledge_fast_model,
+        settings.model_gateway_knowledge_pro_model,
+        settings.model_gateway_embedding_model,
+        settings.model_gateway_embedding_space_id,
+        str(settings.embedding_dimensions),
+        settings.embedding_base_url,
+        settings.embedding_api_key,
+        settings.embedding_model,
+        str(settings.request_timeout_seconds),
+        str(settings.disk_soft_reserve_bytes),
+        str(settings.disk_hard_reserve_bytes),
     )
+    return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
 
 
 def _database_readiness_code(settings: Settings) -> str:

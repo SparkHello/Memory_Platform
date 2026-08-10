@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
 from pathlib import Path
+import threading
+from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from app.api import health as health_api
 from app.api.knowledge import _knowledge_runtime_status
@@ -294,3 +299,172 @@ def test_central_knowledge_status_uses_resolved_routes_and_embedding(
     assert status["agent_pro_model"] == "knowledge.pro"
     assert status["embedding_enabled"] is True
     assert status["embedding_model"] == "memory.embedding"
+
+
+@pytest.fixture(autouse=True)
+def _clear_readyz_cache() -> Iterator[None]:
+    health_api._readyz_cache.clear()
+    yield
+    health_api._readyz_cache.clear()
+
+
+def _direct_settings(memory_store, knowledge_store) -> Settings:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_base_url = ""
+    settings.model_gateway_api_key = ""
+    return settings
+
+
+def _count_database_checks(monkeypatch) -> list[int]:
+    calls = [0]
+    original = health_api._database_readiness_code
+
+    def counting(settings: Settings) -> str:
+        calls[0] += 1
+        return original(settings)
+
+    monkeypatch.setattr(health_api, "_database_readiness_code", counting)
+    return calls
+
+
+def test_readyz_caches_ready_result_within_ttl(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _direct_settings(memory_store, knowledge_store)
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    calls = _count_database_checks(monkeypatch)
+
+    first = client.get("/readyz")
+    second = client.get("/readyz")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json() == {
+        "status": "ready",
+        "model_runtime": "direct",
+        "embedding_enabled": False,
+    }
+    assert calls[0] == 1
+
+
+def test_readyz_caches_not_ready_result_within_ttl(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _direct_settings(memory_store, knowledge_store)
+    settings.gateway_api_key = ""
+    settings.gateway_legacy_api_key_enabled = False
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    calls = _count_database_checks(monkeypatch)
+
+    first = client.get("/readyz")
+    second = client.get("/readyz")
+
+    assert first.status_code == 503
+    assert second.status_code == 503
+    assert second.json() == first.json() == {
+        "status": "not_ready",
+        "code": "auth_credentials_unavailable",
+    }
+    assert calls[0] == 1
+
+
+def test_readyz_recomputes_after_cache_expiry(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _direct_settings(memory_store, knowledge_store)
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    calls = _count_database_checks(monkeypatch)
+    now = [1000.0]
+    monkeypatch.setattr(
+        health_api, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+
+    assert client.get("/readyz").status_code == 200
+    now[0] += health_api.READYZ_CACHE_TTL_SECONDS - 1.0
+    assert client.get("/readyz").status_code == 200
+    assert calls[0] == 1
+    now[0] += 2.0
+    assert client.get("/readyz").status_code == 200
+    assert calls[0] == 2
+
+
+def test_readyz_cache_is_scoped_to_settings_fingerprint(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings_a = _direct_settings(memory_store, knowledge_store)
+    settings_b = _direct_settings(memory_store, knowledge_store)
+    settings_b.embedding_dimensions = 512
+    calls = _count_database_checks(monkeypatch)
+
+    client.app.dependency_overrides[get_settings] = lambda: settings_a
+    assert client.get("/readyz").status_code == 200
+    client.app.dependency_overrides[get_settings] = lambda: settings_b
+    assert client.get("/readyz").status_code == 200
+    client.app.dependency_overrides[get_settings] = lambda: settings_a
+    assert client.get("/readyz").status_code == 200
+
+    assert calls[0] == 2
+
+
+def test_readyz_cache_evicts_oldest_beyond_capacity(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    base = _direct_settings(memory_store, knowledge_store)
+    calls = _count_database_checks(monkeypatch)
+
+    client.app.dependency_overrides[get_settings] = lambda: base
+    assert client.get("/readyz").status_code == 200
+    for extra in range(health_api._READYZ_CACHE_MAX_ENTRIES):
+        settings = _direct_settings(memory_store, knowledge_store)
+        settings.embedding_dimensions = 64 + extra
+        client.app.dependency_overrides[get_settings] = lambda: settings
+        assert client.get("/readyz").status_code == 200
+    assert calls[0] == health_api._READYZ_CACHE_MAX_ENTRIES + 1
+
+    client.app.dependency_overrides[get_settings] = lambda: base
+    assert client.get("/readyz").status_code == 200
+    assert calls[0] == health_api._READYZ_CACHE_MAX_ENTRIES + 2
+
+
+async def test_readyz_concurrent_requests_share_single_computation(
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _direct_settings(memory_store, knowledge_store)
+    calls = [0]
+    started = threading.Event()
+    release = threading.Event()
+    original = health_api._database_readiness_code
+
+    def blocking(settings: Settings) -> str:
+        calls[0] += 1
+        started.set()
+        assert release.wait(timeout=10.0)
+        return original(settings)
+
+    monkeypatch.setattr(health_api, "_database_readiness_code", blocking)
+
+    first = asyncio.create_task(health_api.readiness(settings))
+    assert await asyncio.to_thread(started.wait, 10.0)
+    others = [asyncio.create_task(health_api.readiness(settings)) for _ in range(4)]
+    release.set()
+    responses = await asyncio.gather(first, *others)
+
+    assert calls[0] == 1
+    assert [response.status_code for response in responses] == [200] * 5
