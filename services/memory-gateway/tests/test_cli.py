@@ -696,6 +696,12 @@ def test_server_command_exports_settings_path_but_not_secret_values(
     args = _base_args(tmp_path)
     assert main([*args, "init", "--no-import-env"]) == 0
     paths = cli_paths(tmp_path / "memgw-home")
+    # _server_command requires the project venv to exist; stub it so the test
+    # does not depend on a real .venv in the checkout (CI has none).
+    fake_python = tmp_path / "project-venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.touch()
+    monkeypatch.setattr("app.cli._project_python", lambda _root: fake_python)
     synthetic = {
         "GATEWAY_API_KEY": "synthetic-legacy-secret",
         "GATEWAY_SIGNING_SECRET": "synthetic-signing-secret-at-least-32-bytes",
