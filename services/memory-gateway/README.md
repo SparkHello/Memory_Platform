@@ -31,7 +31,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - 提取模型返回空候选时，自由文本理由仍只保留长度和 SHA-256，但会额外保存受控 `model_reason_code`，用于区分临时事项、假设、非用户陈述、敏感授权不足或无长期价值。
 - 保存门槛会先验证逐字 `source_quote`，再检查候选与引用的事实锚点、否定一致性、敏感级别下限和子句级“记住”授权。
 - 敏感内容默认不进入远程提取、embedding、AI 体检、普通搜索或自然浮现；远程处理需显式配置。
-- 回收站永久删除：仅允许删除已经软删除的记忆，要求完整 ID 确认，并清理派生记忆、核心证据、旧日志和本地评测工作区。
+- 回收站永久删除：批量操作先在单一 SQLite 快照中预览实际 evidence 删除闭包与 Core 影响，再用短期签名 token 原子提交；提交时任一相关状态漂移都会拒绝，不会部分删除。
 - 数据库健康检查：只读报告孤立证据、空间链接、embedding、导出一致性和历史引用问题。
 - 历史分类回填：对旧库一次性补齐主题、实体和空间，执行前自动 SQLite backup，并写决策日志。
 - 评估闭环：机制诊断、真实数据库快照、人工标注、关键词/embedding 召回指标。
@@ -93,7 +93,7 @@ memgw stack install --model-gateway-source ../model-gateway --start
 memgw stack status
 ```
 
-如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建标准 backend/admin client，轮换一枚只在两端仓库外保存的 backend key，并生成只在此时各打印一次的 `GATEWAY_API_KEY` 和 admin key；除这两次性打印外不显示密钥，也不修改项目 `.env`。以后只使用：
+如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建精确 route scope 的 backend client、独立 admin client 和仓库外密钥。Docker 全新安装会在 Auth DB 创建唯一 Console-only 初始 token，关闭 legacy 认证，并把它与 admin key 写入宿主 `credentials/*.key` 私有文件；旧卷迁移才保留一个版本的 legacy key。密钥不写 daemon 日志、Compose 环境或长期进程环境。日常客户端应创建按设备 chat/MCP token；以后只使用：
 
 ```bash
 memgw stack start
@@ -112,7 +112,7 @@ memgw stack restore memory-stack.zip \
   --yes --start
 ```
 
-便携包包含记忆库、知识库、Model Gateway 配置与用量库、模型/路由/价格目录和可移植的非密钥设置。SQLite 在服务运行时通过一致性快照导出；恢复前会校验全部哈希、SQLite 和 JSON，停止两个服务，并把被替换的本机文件保存到 `restore-backups/`。供应商密钥、admin key、backend key 与 `GATEWAY_API_KEY` 均不会进入备份；新设备缺失时需重新输入。虽然没有密钥，备份仍包含完整记忆和知识正文，必须按敏感文件保管。
+便携包 v2 必含记忆库、知识库、Auth token 哈希库和 Model Gateway 脱敏配置，usage 明确标记 present/absent。创建和恢复都会复核哈希、SQLite、schema 与 `secrets_included=false`，恢复使用 journal 原子替换并保留仓库外回滚。供应商、admin、backend、legacy key 和设备 token 明文均不会进入备份；虽然没有密钥，备份仍包含完整记忆和知识正文，必须按敏感文件保管。
 
 第一次使用可按这个顺序完成：
 
@@ -298,13 +298,12 @@ tailscale ip -4
 > powershell -ExecutionPolicy Bypass -File scripts\show-access-urls.ps1 -Port 2026
 > ```
 
-服务需要以 `--host 0.0.0.0` 启动。Windows 上需允许 Windows 防火墙在可信私有网络中访问端口 `2026`（仅 Windows）；macOS 若开启应用防火墙，首次启动时允许 Python/uvicorn 接受传入连接即可。不要把该端口无鉴权暴露到公网；远程请求仍必须携带 `GATEWAY_API_KEY`。
+源码服务默认只监听回环；仅在需要可信局域网访问时显式使用 `--host 0.0.0.0`。Windows 上需允许 Windows 防火墙在可信私有网络中访问端口 `2026`；macOS 若开启应用防火墙，首次启动时允许 Python/uvicorn 接受传入连接即可。不要把端口映射到公网；远程请求必须携带与入口匹配的 scoped token。
 
-除 `/health` 外，受保护接口都需要 Bearer token。凭证默认绑定 `GATEWAY_USER_ID`；`X-User-Id` 只能与绑定值相同：
+除 `/health` 外，受保护接口都需要 Bearer token。chat、MCP、Console token 各自固定角色与 user，调用方不能通过 Header 改写命名空间：
 
 ```http
-Authorization: Bearer <GATEWAY_API_KEY>
-X-User-Id: default
+Authorization: Bearer <mgw_... 设备 token>
 ```
 
 启动后可先做两步只读验证：
@@ -312,8 +311,7 @@ X-User-Id: default
 ```bash
 curl http://localhost:2026/health
 curl \
-  -H "Authorization: Bearer <GATEWAY_API_KEY>" \
-  -H "X-User-Id: default" \
+  -H "Authorization: Bearer <chat token>" \
   http://localhost:2026/v1/models
 ```
 
@@ -325,9 +323,10 @@ curl \
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GATEWAY_API_KEY` | 空 | `/v1`、MCP、REST 和 Web 控制台共用访问令牌。未配置时受保护接口返回 500。 |
-| `GATEWAY_USER_ID` | `default` | 将该访问令牌绑定到固定记忆用户命名空间。 |
-| `GATEWAY_ALLOW_USER_ID_HEADER` | `false` | 旧版共享 key 迁移开关；开启后调用者可用 `X-User-Id` 选择命名空间，不建议用于不可信网络。 |
+| `GATEWAY_API_KEY` | 空 | 一个版本迁移期的 legacy all-scope 凭据；新客户端改用 Auth DB 中的按设备 token。 |
+| `GATEWAY_LEGACY_API_KEY_ENABLED` | `true` | 所有设备迁移并验证后设为 `false`，立即停用 legacy key。 |
+| `GATEWAY_SIGNING_SECRET` | 空 | 独立签名 cursor、review/purge preview 等短期状态；缺失时相关能力 503，绝不回退访问 token。 |
+| `AUTH_DATABASE_PATH` | `data/auth.db` | 只保存 token ID、SHA-256、固定 user/role、使用与撤销时间，不保存 token 明文。 |
 | `CHAT_GATEWAY_ENABLED` | `true` | 是否启用 `/v1/models` 和 `/v1/chat/completions`。 |
 | `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | `read-write` | 默认记忆模式：`off` 仅透明代理，`read` 只召回/注入，`read-write` 还会在完整最终回答后自动提取新记忆。可由请求头 `X-Memory-Mode` 覆盖。 |
 | `CHAT_GATEWAY_SEARCH_LIMIT` | `8` | 每轮自动召回的长期记忆上限，范围 1–20。 |
@@ -335,14 +334,15 @@ curl \
 | `CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS` | `4` | 混合召回的首 token 前预算；超时后回退本地关键词检索，不阻断聊天。 |
 | `CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS` | `600` | 流式聊天等待相邻上游数据块的超时；独立于后台 LLM 任务的普通超时，兼容慢首 token 和长推理。 |
 | `CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS` | `120` | 流式聊天向上游上传请求体的超时；兼容 FLIT 的大图片/音频请求。 |
-| `CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES` | `33554432` | `/v1/chat/completions` 请求体上限；在解析多模态 JSON 前执行，超过时返回 `413 memory_gateway_request_too_large`。 |
-| `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环、网络重试的进程内副作用幂等与工具推理回放窗口。召回复用现有会校验数据库变化的搜索缓存。 |
+| `CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES` | `16777216` | `/v1/chat/completions` 请求体上限；在解析多模态 JSON 前执行，超过时返回 `413 memory_gateway_request_too_large`。 |
+| `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环与网络重试窗口。记忆激活、上下文写入和 ingest claim 持久化到 SQLite，跨 worker/重启仍去重；推理回放仍是短期进程缓存。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS` | `2` | 自动记忆提取时附带的最近完整用户/助手轮数，用于解释“18”“那个”等省略回答；事实值仍必须来自本轮用户原文。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS` | `8000` | 发送给记忆提取模型的“滚动摘要 + 最近原文”总字符上限。 |
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS` | `8` | 未压缩轮次达到该数量时，在聊天结束后的后台任务中压缩较早普通上下文。 |
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS` | `6000` | 较早普通上下文与已有摘要达到该字符数时触发后台压缩。 |
 | `CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS` | `4000` | 滚动压缩摘要的最大字符数。 |
 | `MODEL_GATEWAY_BASE_URL` | 空 | 推荐的独立 Model Gateway `/v1` 地址；只允许 HTTPS，或 `localhost`/回环地址上的 HTTP。必须与客户端 key 同时配置。 |
+| `MODEL_GATEWAY_ALLOW_PRIVATE_HTTP` | `false` | 仅供隔离 Docker 网络或明确 LAN 私网接线使用。开启后 HTTP 仍只接受 RFC1918/ULA 地址或精确服务名 `model-gateway`，公网地址和任意 DNS 名继续拒绝。 |
 | `MODEL_GATEWAY_API_KEY` | 空 | My_Memory 调用独立 Model Gateway 的 backend client key。可用 `memgw secret set model-gateway` 保存到仓库外。启用后不会回退到项目内 `LLM_*` / `UPSTREAM_*` provider。 |
 | `MODEL_GATEWAY_CHAT_MODEL` | `memory.chat` | `/v1` 透明聊天使用的稳定 route。 |
 | `MODEL_GATEWAY_MEMORY_*_MODEL` | 见 `.env.example` | 提取、压缩、核心整理和体检分别使用 `memory.extract`、`memory.compact`、`memory.core`、`memory.review`。 |
@@ -359,6 +359,8 @@ curl \
 | `EMBEDDING_DIMENSIONS` | `1024` | embedding 向量维度；direct-provider 模式下参与稳定本地向量空间 ID 的生成。 |
 | `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
 | `KNOWLEDGE_DATABASE_PATH` | `data/knowledge.db` | 独立知识库 SQLite 路径；不得与 `DATABASE_PATH` 相同。 |
+| `DISK_SOFT_RESERVE_BYTES` | `67108864` | memory、knowledge、auth、usage 所在卷的就绪软保留量；低于阈值时 `/readyz` 返回安全原因码 `disk_low`。小于 1 GiB 的卷自动按容量上限适配，避免小型设备/tmpfs 永久不就绪。 |
+| `DISK_HARD_RESERVE_BYTES` | `16777216` | 写入硬保留量；预计写入会侵占该空间时提前返回 507，且必须不大于软保留量。小于 1 GiB 的卷同样自适配。 |
 | `KNOWLEDGE_MAX_DOCUMENT_BYTES` | `52428800` | 单个知识源文件/版本的字节上限（默认 50 MiB）。 |
 | `KNOWLEDGE_EMBEDDING_BATCH_SIZE` | `20` | 知识 chunk 批量生成 embedding 时的批大小；兼容 `qwen3.7-text-embedding` 单次最多 20 行。 |
 | `KNOWLEDGE_EMBEDDING_MIN_COSINE` | `0.25` | 知识向量候选的最低余弦相似度。 |
@@ -389,7 +391,9 @@ curl \
 
 ### 共享模型优先级与故障切换
 
-`LLM_PROVIDER_PRIORITY` 同时控制 `memory-auto` 聊天代理、记忆提取、会话上下文压缩、核心记忆整理、体检 AI 修改和知识代理快速阶段。优先级是静态配置，运行时只临时跳过正在冷却或未填写 key 的 provider：
+以下机制只适用于不运行 Model Gateway 的 direct-provider 兼容模式。新部署由中央 route 明确控制用途与 fallback，默认 `max_attempts=1`、`fallback_scope=none`。
+
+`LLM_PROVIDER_PRIORITY` 同时控制 direct 模式的 `memory-auto` 聊天代理、记忆提取、会话上下文压缩、核心记忆整理、体检 AI 修改和知识代理快速阶段。优先级是静态配置，运行时只临时跳过正在冷却或未填写 key 的 provider：
 
 | 配置值 | 正常尝试顺序 | `M` 返回 429 后的冷却期 |
 | --- | --- | --- |
@@ -401,8 +405,8 @@ curl \
 - 首次 429 会在同一次快速阶段立即尝试下一个已配置 provider；后续请求在冷却结束前完全跳过受限 provider，避免重复 429。它不会在队尾再次尝试，所以 `MKD` 的临时有效顺序是 `KD`，不是 `KDM`。
 - 默认冷却 300 秒；如果服务端 `Retry-After` 更长，则采用更长时间。冷却只存在于当前进程，程序重启后自然清空，`.env` 始终保持用户设置的静态顺序。
 - 空格和大小写会自动规范化；重复字母或 `M/K/D` 之外的字符属于无效配置。未填写完整 base URL、key、model 的 provider 会被跳过。
-- 记忆任务遇到 provider 的模型不存在/不支持、鉴权失效、余额不足、请求超时、网络错误或 5xx 时，会继续尝试下一个已配置 provider；其他 400/403/422 等内容或契约错误仍直接返回，避免绕过安全拒绝。知识代理失败时安全回退本地检索结果。复杂知识检索的 Pro 升级阶段仍固定使用 DeepSeek Pro。
-- MiMo、Kimi、DeepSeek 的知识代理调用显式开启思考；多轮工具调用会保留并回传 `reasoning_content`。Kimi K2.7 使用 `keep=all` 和 `temperature=1`。MiMo UltraSpeed 的体检修改预览使用强制函数调用返回结构化参数；其他支持 JSON mode 的模型继续使用 `response_format=json_object`。DeepSeek 思考模式不发送不兼容的 `tool_choice`。
+- 只有尚未完成建连的连接错误，以及明确 408/429/5xx，才允许尝试下一项。400、401/402、403/404、redirect、read/write timeout 和已返回 2xx 的流协议错误都保留原错误，不重发正文，避免隐藏的重复计费和跨渠道披露。远程知识代理失败、越权引用或工具拒绝时返回安全空结果；只有明确关闭外发的本地模式继续使用本地检索结果。复杂知识检索的 Pro 升级阶段仍固定使用 DeepSeek Pro。
+- Knowledge fast 显式关闭思考，Knowledge pro 显式使用 high；多轮工具调用会保留并回传 `reasoning_content`，思考模式下只使用 `tool_choice=auto`。Kimi K2.7 使用 `keep=all` 和 `temperature=1`。MiMo UltraSpeed 的体检修改预览使用强制函数调用返回结构化参数；其他支持 JSON mode 的模型继续使用 `response_format=json_object`。中央网关按 deployment 声明在付费请求前拒绝不兼容的思考/工具组合。
 - 旧的 `KNOWLEDGE_AGENT_PROVIDER_PRIORITY`、`KNOWLEDGE_AGENT_MIMO_*`、`KNOWLEDGE_AGENT_KIMI_*`、`KNOWLEDGE_AGENT_BASE_URL/API_KEY/FLASH_MODEL/PRO_MODEL` 和 `KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS` 仍作为兼容别名读取；新配置应使用 `LLM_*`。
 
 ### 兼容模式：项目内 memgw 模型目录与按功能路由
@@ -706,7 +710,9 @@ curl \
 | `POST` | `/memories/forget` | 按自然语言查询批量软删除。 |
 | `DELETE` | `/memories/{memory_id}` | 软删除。 |
 | `POST` | `/memories/{memory_id}/restore` | 从回收站恢复；若属于时态版本链，会在同一事务中按有效时间重新接链。 |
-| `DELETE` | `/memories/deleted/{memory_id}/purge` | 永久删除回收站记忆及其 evidence 派生/审计副本，需要 `confirm_memory_id` 完整匹配。外部导出和用户自行复制的备份不受影响；若提交后的本地 eval 清理失败，响应仍明确 `purged=true` 并附带 warning。 |
+| `POST` | `/memories/deleted/purge/preview` | 预览 1–1000 条回收站记忆的实际 evidence 删除闭包、Core/历史/审计影响和 fingerprint，返回绑定当前用户的短期签名 token；部分 ID 缺失时整体拒绝。 |
+| `POST` | `/memories/deleted/purge/commit` | 使用原 ID 集、fingerprint 与 preview token 在单个 `BEGIN IMMEDIATE` 内重新校验并永久删除；任一漂移返回 409，成功只写一条批量审计。 |
+| `DELETE` | `/memories/deleted/{memory_id}/purge` | 单条永久删除的一个版本兼容入口，响应带 `compatibility_mode=legacy_single_purge_v1`；新客户端应使用 preview → commit。 |
 | `POST` | `/memories/merge` | 合并 2–100 条记忆；可选合并正文上限 20,000 字符。 |
 | `POST` | `/memories/re-embed` | 对指定记忆或扫描出的缺失/无效 embedding 重新生成向量。 |
 | `POST` | `/memories/archive-expired` | 归档过期记忆。 |
@@ -750,7 +756,7 @@ curl \
 | `POST` | `/memories/evaluation/recall/run` | 运行关键词或 embedding 评估，`k` 为 1–20；P@k 使用固定 `k` 作分母，另返回实际返回集精确率；完全重复 query 会折叠，冲突重复标注会拒绝运行。结果还包含无答案误召、拒答及实际 fallback 信息。 |
 | `GET` | `/memories/report?format=json\|markdown` | 生成记忆报告。 |
 | `GET` | `/memories/export?format=json\|markdown\|obsidian_markdown` | 导出备份或 Obsidian zip 单向镜像。 |
-| `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆、近期摘要和对话分支节点；核心历史与决策日志仅供审计，不写回，响应会显式列出。 |
+| `POST` | `/memories/restore` | 从 JSON 导出恢复空间、记忆、近期摘要和对话分支节点；传 `dry_run=true` 可返回同一领域恢复计划而不持久化。核心历史与决策日志仅供审计，不写回。 |
 
 ### 独立知识库
 
@@ -825,12 +831,18 @@ curl \
 .venv/bin/python -m pytest
 ```
 
-前端构建：
+前端单元测试、隔离浏览器验收与构建：
 
 ```bash
 cd ui
+npm test
+# 首次运行或 CI 镜像尚未包含浏览器时执行
+npm exec playwright install chromium
+npm run test:e2e
 npm run build
 ```
+
+Playwright 验收通过 route interception 提供合成 API，禁止访问真实 Memory/Model Gateway，覆盖桌面与两种移动视口。测试页仅使用临时浏览器存储；结果目录不会进入 Git 或 Docker 构建上下文。
 
 只读真实数据库审计：
 
@@ -891,15 +903,16 @@ Windows 服务辅助脚本：
 - `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、体检和知识代理的默认安全边界；它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。
 - 知识文档的“按用户选择导入”确认只决定该文档保存后的敏感标签，不会修改全局 `ALLOW_SENSITIVE_EGRESS`；保存为 private/sensitive 时，默认仍禁止远程 embedding/代理出站。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
-- `GATEWAY_API_KEY` 默认与 `GATEWAY_USER_ID` 固定绑定。旧客户端迁移期可短暂设置 `GATEWAY_ALLOW_USER_ID_HEADER=true`，但这会恢复共享 key 可伪造命名空间的旧行为；多租户部署应为每个入口使用独立凭证/实例。
-- `GATEWAY_API_KEY` 只能读取模型配置状态，不能写 Model Gateway。`/providers/*` 配置写入还要求 `X-Model-Gateway-Admin-Key`；Web 页面不把该 admin 密钥写入 `localStorage`，My_Memory 也不保存或回显它，只将其转发到配置好的固定 Model Gateway 地址。管理写入仅允许 HTTPS，或本机 `localhost`/回环 HTTP；上游渠道密钥仍只单向写入 Model Gateway 的 `secrets.env`。
+- chat token 只允许 `/v1`，MCP token 只允许 `/mcp`，Console token 才能访问管理 REST；每枚都固定 user、可单独撤销。legacy all-scope key 仅保留一个版本迁移期。
+- Web Console 不允许撤销某个用户最后一个仍可用的 Console token；接口稳定返回 `409 last_active_console_token`，避免页面把自己永久锁在门外。需要轮换当前 Console token 时，先在运行主机执行 `memgw token create --role console --name <名称> --user <用户>`，保存新 token 并确认可登录后再撤销旧 token。
+- Console token 只能读取模型配置状态；`/providers/*` 写入另需独立 Model Gateway admin key。页面不把 admin key 写入 `localStorage`，Memory Gateway 也不保存或回显它；上游渠道 key 只单向写入 Model Gateway 的隔离 secret volume。
 - Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。
 
 ## 当前边界与后续方向
 
 - 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
 - OpenAI-compatible 入口只实现 `/v1/models` 与 `/v1/chat/completions`；不提供 Responses API、文件、音频或图片生成等其他 OpenAI API。
-- `/v1` 工具循环的副作用幂等、工具推理回放和缓存统计是单进程短 TTL 状态；服务重启或多 worker 部署不会共享。对话分支节点本身持久化在 SQLite，但当前个人部署仍建议使用单 worker。
+- `/v1` 的记忆激活、近期上下文和长期 ingest 副作用 claim 已持久化到 SQLite；工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
 - FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点并持久化滚动摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。
 - 分支节点和长期记忆提取在完整最终回答后的后台任务中完成，属于最终一致；极快的并发下一轮可能暂时看不到刚结束的一轮。
 - 没有动态 conversation ID 时，短 TTL 内“完全相同的消息历史 + 完全相同的最终回答”无法与 HTTP 重试区分，会按重试去重；不同最终回答仍可独立 ingest。

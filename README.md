@@ -29,7 +29,7 @@
 | --- | --- |
 | **它是做什么的？** | 一个运行在聊天客户端和模型之间的自动记忆网关：需要时召回并注入相关记忆，完整回答结束后提取值得长期保留的信息。 |
 | **适合谁？** | 已在使用 Chatbox、RikkaHub、FLIT 或其他 OpenAI 兼容客户端，希望 AI 记得个人偏好与长期项目的人。 |
-| **数据保存在哪里？** | 记忆、知识文档和运行配置保存在本机；Docker 用户的数据位于本地 `memory-platform-data` 卷。 |
+| **数据保存在哪里？** | 记忆、知识文档和运行配置保存在本机；Docker 把 Memory 数据/密钥与 Model 数据/密钥分成四个私有卷。 |
 | **需要更换客户端吗？** | 不需要。把现有客户端的 Base URL 指向 Memory Platform 的 OpenAI 兼容 `/v1` 即可。 |
 | **需要 MCP 或记忆提示词吗？** | 普通聊天不需要。网关自动处理召回与保存；`/mcp` 只用于模型显式搜索、整理记忆和检索知识库。 |
 | **会绑定某个模型吗？** | 不会。客户端始终使用 `memory-auto`，以后更换渠道或模型只改服务端配置。 |
@@ -71,53 +71,45 @@ Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜�
 
 只需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要 clone 仓库。
 
-macOS / Linux 终端：
+macOS / Linux 终端（版本号必须固定到要安装的 release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
+MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-Windows PowerShell：
+脚本会：先用旧版本创建并验证备份 → 下载固定 release → 把三枚镜像解析为不可变 digest → 离线初始化或迁移 → 启动独立的 Memory/Model 容器。访问密钥不会进入环境变量、命令参数或 Docker 日志，只写入安装目录下的 `credentials/gateway.key` 与 `credentials/admin.key`（权限 `0600`）；终端只报告文件路径。首次启动需要 1–2 分钟，此时还要在网页中配置模型渠道后才能聊天。
 
-```powershell
-irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
-```
-
-脚本会自动完成全部步骤：检查 Docker → 安装到固定的用户目录 → 自动避开已占用端口 → 启动基础服务并等待 → 打印 `GATEWAY_API_KEY` 和 admin key → 打开浏览器首次设置页。首次启动需要 1–2 分钟；此时只是本地基础服务就绪，还要在网页里选择一个模型渠道后才能聊天。
-
-把两枚密钥保存好。以后在任意目录重复运行同一条命令，脚本会找到原安装、先把数据备份到安装目录的 `backups/`，再升级最新镜像。默认安装目录是 macOS/Linux 的 `~/memory-platform` 或 Windows 的 `$HOME\memory-platform`；数据仍保存在 Docker 的 `memory-platform-data` 卷中。
-
-两枚密钥用途不同：**只有 `GATEWAY_API_KEY` 需要填进客户端**（包括手机），admin key 权限更高，只在这台电脑的浏览器里解锁模型渠道配置时用，不需要传到手机上。不想用自动生成的随机值，可以在首次安装时自己指定（至少 16 个字符）：
-
-```bash
-GATEWAY_API_KEY=你自己的密钥 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
-```
+重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。安装器会先备份，再升级，`/readyz` 退化时自动恢复旧 Compose 和数据。默认目录是 `~/memory-platform`。
 
 ### 手工方式（想自己控制每一步）
 
 ```bash
-curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
+VERSION=v0.2.0
+curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
+mkdir -m 700 credentials
+printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" > .env
 docker compose -f docker-compose.user.yml up -d
 ```
 
-Compose 会匿名拉取公开的 amd64/arm64 镜像 `ghcr.io/sparkhello/memory-platform:latest`；也可以先在 [GHCR 包页面](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform)核对版本与摘要。
-
-首次启动需要 1–2 分钟完成内部安装，期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后容器日志会各打印一次 `GATEWAY_API_KEY` 和 Model Gateway admin key：
+Compose 拉取同一 semver 的 `memory-platform-memory`、`memory-platform-model` 和 `memory-platform-init` 镜像；正式安装器还会把 tag 固定成实际 digest。首次启动期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后查看密钥文件：
 
 ```bash
-docker compose -f docker-compose.user.yml logs memory-platform
+cat credentials/gateway.key
+cat credentials/admin.key
 ```
 
-如果日志里还没出现 key，稍等片刻再跑一次。请妥善保存它们：`GATEWAY_API_KEY` 用于登录 Web Console 和连接客户端；admin key 只用于在浏览器里修改模型渠道与路由。端口 2026 被占用时，在 Compose 文件同目录的 `.env` 写一行 `MEMORY_PORT=3026` 后重启即可（详见[栈运维指南](docs/stack-operations.md#端口-2026-被占用)）。
+全新安装时，第一枚是仅有 Console scope 的 `first-console` token；旧卷迁移时才保留一个版本的 legacy all-scope key。登录后在「接入信息」为每台聊天客户端/MCP 客户端创建独立 token。第二枚 admin key 只用于修改模型渠道与路由。端口 2026 被占用时，在 `.env` 增加 `MEMORY_PORT=3026` 后重启即可。
 
 接下来：
 
-1. 打开 `http://127.0.0.1:2026/ui/`，用 `GATEWAY_API_KEY` 连接。
+1. 打开 `http://127.0.0.1:2026/ui/`，用 `credentials/gateway.key` 中的初始 Console token 连接（迁移旧卷时该文件暂为 legacy key）。
 2. 进入「模型与路由」，用 admin key 解锁本次配置操作。
 3. 新建渠道、填写供应商 API Key，并从自动发现的列表中选择模型。
-4. 按下方的[客户端接入](#-客户端接入)填写 Base URL、API Key 和模型名。
+4. 在「接入信息」创建命名的 chat token，再按下方的[客户端接入](#-客户端接入)填写 Base URL、token 和模型名。
 
-镜像升级不会删除 `memory-platform-data` 卷中的数据。日常命令、密钥重设、备份和迁移见[栈运维指南](docs/stack-operations.md)。
+镜像升级不会删除四个私有卷中的数据。日常命令、token 撤销、备份和迁移见[栈运维指南](docs/stack-operations.md)。
 
 ### 从源码安装
 
@@ -139,7 +131,7 @@ scripts/setup.sh
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  安装时生成的 GATEWAY_API_KEY
+API Key:  在「接入信息」为该设备创建的 chat token
 模型名:   memory-auto
 ```
 
@@ -157,7 +149,7 @@ API Key:  安装时生成的 GATEWAY_API_KEY
 http://127.0.0.1:2026/mcp
 ```
 
-鉴权使用同一个 `GATEWAY_API_KEY`。MCP 适合让模型显式搜索、保存或整理记忆，以及检索你明确导入的知识文档；它是增强入口，不是自动记忆的前提。普通聊天只配置上面的 OpenAI 兼容入口即可。
+鉴权使用为该 MCP 客户端单独创建的 mcp token，不与 chat 或 Console 共用。MCP 适合让模型显式搜索、保存或整理记忆，以及检索你明确导入的知识文档；它是增强入口，不是自动记忆的前提。
 
 | 你想做什么 | 使用入口 | 谁决定何时使用记忆 |
 | --- | --- | --- |
@@ -205,7 +197,7 @@ http://127.0.0.1:2026/mcp
 | 服务 | 默认地址 | 负责 | 不负责 |
 | --- | --- | --- | --- |
 | [Memory Gateway](services/memory-gateway/README.md) | `127.0.0.1:2026` | 长期记忆、近期上下文、知识库、MCP、OpenAI 兼容代理和 Web Console | 管理供应商账号和渠道价格 |
-| [Model Gateway](services/model-gateway/README.md) | `127.0.0.1:2030` | 模型连接、用途路由、备用顺序、密钥引用、用量和价格快照 | 保存聊天、记忆或知识正文 |
+| [Model Gateway](services/model-gateway/README.md) | Docker 私有网络 `model-gateway:2030`（不发布宿主端口） | 模型连接、用途路由、备用顺序、密钥引用、用量和价格快照 | 保存聊天、记忆或知识正文 |
 
 记忆行为与模型供应商配置的变化速度、安全职责不同，因此分别运行；安装、测试、备份和迁移仍由仓库根命令统一完成。Memory Gateway 只通过稳定 route 和独立 backend key 调用 Model Gateway。
 

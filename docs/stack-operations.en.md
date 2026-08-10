@@ -12,7 +12,7 @@ This guide holds the daily operations, advanced model configuration, security bo
 | Memory Gateway health | `http://127.0.0.1:2026/health` |
 | MCP | `http://127.0.0.1:2026/mcp` |
 | OpenAI-compatible Memory base URL | `http://127.0.0.1:2026/v1` |
-| Model Gateway base URL | `http://127.0.0.1:2030/v1` |
+| Model Gateway base URL (inside Docker only) | `http://model-gateway:2030/v1`; no host port is published |
 
 ## Daily operation and checks
 
@@ -36,18 +36,18 @@ The one-line installer stores the Compose file in `~/memory-platform` by default
 
 ```bash
 docker compose -f docker-compose.user.yml ps
-docker compose -f docker-compose.user.yml exec memory-platform memgw stack doctor
+docker compose -f docker-compose.user.yml exec memory-gateway memgw stack doctor
 
 docker compose -f docker-compose.user.yml restart
 docker compose -f docker-compose.user.yml stop
 docker compose -f docker-compose.user.yml start
 ```
 
-Read first-run output and follow later logs with:
+Follow later logs (generated credentials are never written there) with:
 
 ```bash
-docker compose -f docker-compose.user.yml logs memory-platform
-docker compose -f docker-compose.user.yml logs -f memory-platform
+docker compose -f docker-compose.user.yml logs memory-gateway model-gateway
+docker compose -f docker-compose.user.yml logs -f memory-gateway model-gateway
 ```
 
 ## Port 2026 already in use
@@ -71,18 +71,24 @@ MEMORY_HOST=0.0.0.0
 Then restart with `docker compose -f docker-compose.user.yml up -d` and point clients at the computer's LAN IP, for example `http://192.168.1.20:2026/v1`. Installer users can re-run with LAN access enabled; the installer prints the phone-ready address:
 
 ```bash
-# macOS / Linux
-MEMORY_HOST=0.0.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
+# macOS / Linux; select an immutable release
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
+MEMORY_HOST=0.0.0.0 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
 ```powershell
-# Windows PowerShell
-$env:MEMORY_HOST="0.0.0.0"; irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+# Windows PowerShell; select the same immutable release
+$Version = "v0.2.0"
+$env:MEMORY_HOST = "0.0.0.0"
+$env:MEMORY_PLATFORM_VERSION = $Version
+irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
+& .\install-memory-platform.ps1
 ```
 
-Source installs already listen on all interfaces by default.
+Source installs listen on loopback by default. Pass `--host 0.0.0.0` explicitly only when LAN access is required.
 
-Do this only on trusted home networks or Tailscale. The API still requires `GATEWAY_API_KEY`, but never expose the service to the public internet.
+Do this only on trusted home networks or Tailscale. Every entry point still requires a scoped or migration-time credential, but never expose the service to the public internet.
 
 ## Keys and identity
 
@@ -90,16 +96,22 @@ The stack has several keys with separate responsibilities. Do not reuse them:
 
 | Key | Purpose | Stored in |
 | --- | --- | --- |
-| Memory Gateway API key | Client access to `/v1`, MCP, REST, and Web Console APIs | Memory Gateway user config directory |
-| Model Gateway backend key | Memory Gateway calling permitted `memory.*` / `knowledge.*` routes | A file outside the repository on each side |
+| Per-device chat token | One chat client accessing `/v1` | Auth SQLite stores only SHA-256; plaintext is shown once |
+| Per-device MCP token | One MCP client accessing `/mcp` | Same, independently revocable |
+| Console token | Management REST and Web Console | A fresh install delivers the initial token to `credentials/gateway.key`; later Console tokens are local-CLI-only |
+| Legacy Gateway key | One-version all-scope credential for migrated volumes only | Host `credentials/gateway.key` and Memory secret volume; disable after migration |
+| Model Gateway backend key | Memory Gateway calling the eight exact configured chat/memory/knowledge/embedding routes | Each service's isolated secret file |
 | Model Gateway admin key | Changing channel secrets and route configuration | Admin-side only; never persisted by Memory Gateway |
 | Provider API key | Calling the real upstream provider | Model Gateway `secrets.env` outside the repository |
 
-The first installation prints the client `GATEWAY_API_KEY` and Model Gateway admin key once each. Lost values cannot be displayed again; reset them instead:
+A fresh Docker initialization creates one `first-console` token in the Auth DB, disables legacy authentication, and writes that Console token plus the Model admin credential to host `credentials/gateway.key` and `credentials/admin.key` with owner-only permissions. Values never enter daemon logs or the long-lived process environment. A migrated legacy volume retains its old key for one transition version. Create normal device tokens after the first Console login:
 
 ```bash
-scripts/memgw secret set gateway
-modelgw secret set memory-console-admin
+scripts/memgw token create --role chat --name <device> --user <user>
+scripts/memgw token create --role mcp --name <device> --user <user>
+scripts/memgw token create --role console --name <browser> --user <user>
+scripts/memgw token list
+scripts/memgw token revoke <token-id>
 ```
 
 If `modelgw` is not on `PATH`, a source installation can use the shared virtual environment:
@@ -108,9 +120,11 @@ If `modelgw` is not on `PATH`, a source installation can use the shared virtual 
 services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin
 ```
 
-These commands read the new value without echoing it. For automation, prefer each command's `--stdin` option. Never put secrets in command-line arguments, configuration recipes, example `.env` files, or shell history.
+Reset the independent admin credential with `modelgw secret set memory-console-admin --stdin` only when necessary. Never put secrets in command-line arguments, configuration recipes, example `.env` files, shell history, or Docker environment variables.
 
-`GATEWAY_API_KEY` is bound to a fixed `GATEWAY_USER_ID` by default, so callers cannot rewrite the namespace with `X-User-Id`. `GATEWAY_ALLOW_USER_ID_HEADER=true` exists only for migration from an older shared-key setup and is not recommended on untrusted networks.
+Every scoped token is bound to its user, so callers cannot rewrite the namespace with a header. After all clients use chat/MCP/Console tokens, set `GATEWAY_LEGACY_API_KEY_ENABLED=false`; do not keep the legacy all-scope credential as a multi-device key.
+
+The Web Console refuses to revoke a user's final active Console token and returns stable `409 last_active_console_token`. To rotate the current browser credential, first create a backup with the local `--role console` command above, save it and verify login, then revoke the old token. The browser REST API cannot mint Console tokens.
 
 ## Model quickstart and advanced configuration
 
@@ -164,25 +178,26 @@ The default deployment target is a personal computer or trusted home network:
 
 - SQLite, caches, tool idempotency, and some background state are designed for one process;
 - do not treat the default deployment as a public internet multi-tenant SaaS;
-- Model Gateway's admin interface listens on loopback by default, and cross-host exposure must sit behind HTTPS;
-- for strong isolation, use separate credentials and instances per user instead of a shared key with mutable `X-User-Id`.
+- Docker publishes only Memory Gateway. Model Gateway stays on an internal backend network and Memory cannot mount provider/admin secrets;
+- the two long-lived containers run as UID 10001/10002 with separate data/secret volumes, read-only root filesystems, and no capabilities;
+- use individually revocable fixed-role device tokens instead of a shared credential or mutable user header.
 
 For complete contracts, see the [Memory Gateway security boundary](../services/memory-gateway/README.md#安全边界) and [Model Gateway core boundary](../services/model-gateway/AGENTS.md#核心边界). Report vulnerabilities privately through the [security policy](../SECURITY.md).
 
 ## Where data lives
 
-The repository holds only source code and non-sensitive examples. Runtime data lives in the user configuration directories or the Docker `memory-platform-data` volume, including:
+The repository holds only source code and non-sensitive examples. Docker separates runtime state into `memory-data`, `memory-secrets`, `model-data`, and `model-secrets` volumes, including:
 
 - long-term memory, recent context, and branch nodes;
 - the isolated knowledge base and document versions;
 - Model Gateway configuration, usage database, and price snapshots;
-- each service's own key file and logs.
+- Auth token hashes and each service's isolated secret file.
 
 Never commit `.env`, real SQLite files, logs, evaluation snapshots, or portable backups.
 
 ## Backup, restore, and migration
 
-Re-running either Docker one-line installer creates a portable backup under the install directory's `backups/` folder before pulling a new image. If backup fails, the upgrade stops without replacing the existing service. Use the commands below for manual backups, migration, and restore.
+Re-running either Docker release installer creates and re-verifies a portable archive under the install directory's `backups/` folder before pulling replacement images, then removes the temporary copy from the data volume. The default retention is the five newest upgrade archives (`MEMORY_BACKUP_RETENTION=1..50` changes it). Backup or safe-cleanup failure stops the upgrade before replacing the existing service.
 
 ### Source installation
 
@@ -192,7 +207,7 @@ Create a portable archive from the repository root:
 scripts/memgw stack backup --output memory-stack.zip
 ```
 
-The archive contains the migratable memory database, knowledge database, redacted Model Gateway configuration, usage database, and non-secret settings. It excludes provider keys, the admin key, the backend key, and the Memory Gateway API key.
+Backup v2 requires the memory database, knowledge database, Auth token hash database, redacted Model configuration, and a manifest that explicitly marks usage present or absent. It excludes provider, admin, backend, legacy Gateway, and device-token plaintext secrets.
 
 Even without keys, the archive contains complete private memory and knowledge content. Treat it as a sensitive file.
 
@@ -212,24 +227,27 @@ Restore verifies manifest hashes, SQLite, and JSON, stops both services, and cre
 Users with only the Compose file can create the archive inside the container and copy it into the current directory:
 
 ```bash
-docker compose -f docker-compose.user.yml exec memory-platform \
-  memgw stack backup --output /data/memory-stack.zip
+docker compose -f docker-compose.user.yml --profile maintenance run --rm \
+  stack-maintenance --home /data/config \
+  --project-root /app/services/memory-gateway stack backup \
+  --model-gateway-home /model-data --output /data/memory-stack.zip
 docker compose -f docker-compose.user.yml cp \
-  memory-platform:/data/memory-stack.zip ./memory-stack.zip
+  memory-gateway:/data/memory-stack.zip ./memory-stack.zip
 ```
 
 Restore must run while the main services are stopped. Copy the archive into the container, stop the service, and use a one-off container for restore:
 
 ```bash
 docker compose -f docker-compose.user.yml cp \
-  ./memory-stack.zip memory-platform:/data/memory-stack.zip
+  ./memory-stack.zip memory-gateway:/data/restore.zip
 docker compose -f docker-compose.user.yml stop
-docker compose -f docker-compose.user.yml run --rm --entrypoint memgw \
-  memory-platform stack restore /data/memory-stack.zip --yes
+docker compose -f docker-compose.user.yml --profile maintenance run --rm \
+  --entrypoint python stack-maintenance \
+  /usr/local/libexec/memory-platform/restore_split.py
 docker compose -f docker-compose.user.yml up -d
 ```
 
-The portable archive neither brings in nor overwrites the target's existing `GATEWAY_API_KEY`, admin key, or provider API keys; restore only rewires the backend key internally. Continue using the access keys saved during that target's first start. If any are missing, reset them as described in [Keys and identity](#keys-and-identity) and re-enter provider API keys as needed. Do not restore with `docker compose exec` inside the running main container: its foreground services still own the databases and ports, so restore correctly refuses to overwrite them.
+The portable archive never brings in or overwrites a target's secret volumes. Auth DB contains only token hashes, so known device token plaintext can migrate; the plaintext still exists only at the device. Stop both long-lived services before restore. The one-shot maintenance process validates disk space, hashes, SQLite integrity, schema, and `secrets_included=false`, then journals atomic replacement and retains a rollback copy.
 
 ### Migrating from the former two-directory layout
 

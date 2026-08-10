@@ -4,6 +4,33 @@
 
 ## Unreleased
 
+### Added
+
+- Model Gateway 配置 schema v2：请求能力感知路由、显式 fallback scope、Qwen/DeepSeek V4 deployment profile、逐 attempt 账本、进程内 breaker、配置 revision/CAS/crash journal，以及零落盘渠道发现和原子 channel bundle API。
+- Memory Gateway 统一中央运行时：透明聊天、八条后台 route、Knowledge Agent 与 Embedding 共用 Model Gateway，并校验完整归因、deployment 亲和、向量空间和维度；新增可操作的 `/readyz`。
+- 按设备、用途隔离的 `chat`、`mcp`、`console` token，独立签名密钥、提前鉴权、限流和并发门禁；Console 可一次性创建 chat/MCP token。
+- Memory/Core revision 与条件更新、持久化聊天副作用 claim、原子 restore、50K keyset 召回、所选导出，以及永久删除 preview/commit 事务。
+- split Docker 栈：Memory UID 10001 与 Model UID 10002 使用独立数据/secret 卷，Model 仅在内部网络提供 2030；新增离线初始化、旧单卷迁移、portable backup v2 和自动回滚。
+
+### Changed
+
+- 默认 UI 收敛为面向普通用户的简洁导航，高级诊断按设备显式开启；渠道向导改为 discover → validate → apply 的单次原子提交，现有 route 默认保留。
+- 发布版本进入 0.2.x：三个 runtime/init 镜像使用固定 semver，完整 hash lock、固定基础镜像 digest、SBOM、provenance、签名和 HIGH/CRITICAL 扫描。
+- Linux/macOS/Windows 安装器都先用旧版本创建并校验备份，再拉取 digest 固定的新镜像；凭据只写宿主机私有文件，不再从 daemon log 读取。
+
+### Fixed
+
+- 修复中央 Model Gateway 配置存在时透明聊天、Knowledge Agent 和 Embedding 仍读取旧 provider 目录而不可用的问题。
+- 修复并发 ingest/Core 更新、restore 半提交、10K 召回截断、批量选择导出越界和危险批量删除确认不足。
+- 修复移动端路由滚动、当前底栏重复点击、LAN HTTP clipboard、危险对话框默认焦点及首次渠道配置遗留孤儿。
+- 修复 Embedding input-only 费用漏计、可变维请求与声明 header 不一致、Retry-After 无限冷却、gzip 原始字节损坏和失败 fallback 账本缺失。
+
+### Security
+
+- Client/provider secret ref 与值域强制隔离，token 使用高熵 ASCII/UTF-8 bytes 常量时间比较；provider/admin/backend key 不再进入日志、Compose 展开、命令参数或长期容器环境。
+- 所有带凭据的出站请求禁用 ambient proxy 和重定向；远端仅 HTTPS，loopback/private HTTP 需显式、受限启用；限制 discovery、请求/响应、上传、解析和内部模型输出大小。
+- Memory 与 Model 长期容器互相不能读取对方 secret；rootfs 只读、capabilities 全部移除，provider egress 仅授予 Model。
+
 ## 0.1.2 - 2026-08-08
 
 ### Fixed

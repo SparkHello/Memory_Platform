@@ -29,7 +29,7 @@ Memory stays on your own device, where you can inspect, edit, delete, and back i
 | --- | --- |
 | **What does it do?** | It is an automatic memory gateway between a chat client and a model: it recalls and injects relevant memory, then extracts durable information after a complete answer. |
 | **Who is it for?** | People using Chatbox, RikkaHub, FLIT, or another OpenAI-compatible client who want durable preferences and project context. |
-| **Where is the data?** | Memory, knowledge documents, and runtime configuration remain local; Docker stores them in the `memory-platform-data` volume. |
+| **Where is the data?** | Memory, knowledge documents, and runtime configuration remain local; Docker separates them into Memory/Model data and secret volumes. |
 | **Must I change clients?** | No. Point your current client's Base URL at Memory Platform's OpenAI-compatible `/v1` endpoint. |
 | **Do I need MCP or a memory prompt?** | Not for ordinary chat. The gateway handles recall and saving automatically; `/mcp` is only for explicit memory organization and knowledge retrieval. |
 | **Does it lock me to a model?** | No. Clients use `memory-auto`; provider and model changes stay on the server. |
@@ -71,47 +71,53 @@ This is not a performance ranking. Memory Platform currently targets personal ma
 
 You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone.
 
-macOS / Linux terminal:
+Choose a released version instead of tracking the mutable `main` branch. On macOS or Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh | sh
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
+MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-Windows PowerShell:
+Windows PowerShell uses the matching release installer:
 
 ```powershell
-irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+$Version = "v0.2.0"
+$env:MEMORY_PLATFORM_VERSION = $Version
+irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
+& .\install-memory-platform.ps1
 ```
 
-The installer checks Docker, uses a stable per-user install directory, picks a free port, starts the base service, prints `GATEWAY_API_KEY` and the admin key, and opens browser-based onboarding. First start takes 1–2 minutes. “Base service ready” does not mean chat is ready yet; choose a model provider in the browser before connecting a client.
+The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. First start takes 1–2 minutes. “Base service ready” does not mean chat is ready yet; choose a model provider in the browser before connecting a client.
 
-Save both keys. Re-running the same command from any directory finds the existing installation, writes a pre-upgrade backup under `backups/`, and then upgrades the image. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows; runtime data remains in the Docker `memory-platform-data` volume.
+Initial credentials are written directly to `credentials/gateway.key` and `credentials/admin.key` with owner-only permissions; their values are never printed to Docker logs or passed through Compose environment variables. Re-running the same release installer finds the existing installation, creates and verifies a pre-upgrade backup before downloading replacement Compose content, then rolls back automatically if the new stack regresses. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows.
 
 ### Manual path (to review each step)
 
 ```bash
-curl -O https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/docker-compose.user.yml
+VERSION=v0.2.0
+curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
 docker compose -f docker-compose.user.yml up -d
 ```
 
-Compose anonymously pulls the public amd64/arm64 image `ghcr.io/sparkhello/memory-platform:latest`. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists its versions and digests.
+The release Compose file starts separate Memory, Model, and one-shot initializer images. The installer resolves the selected semver images to immutable digests; do the same when maintaining a manual deployment. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists versions and digests.
 
-First start takes 1–2 minutes of internal setup, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Once ready, the container logs print `GATEWAY_API_KEY` and the admin key once each:
+First start takes 1–2 minutes of offline initialization, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Generated credentials are host files, not log output:
 
 ```bash
-docker compose -f docker-compose.user.yml logs memory-platform
+ls -l credentials/gateway.key credentials/admin.key
 ```
 
-If no key has appeared yet, wait a moment and run the command again. Save both: `GATEWAY_API_KEY` connects the Web Console and clients; the admin key is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
+On a fresh install, `gateway.key` contains the sole Console-scoped `first-console` token. Only migrated legacy volumes retain a one-version all-scope bootstrap key. The Web Console can create separate chat and MCP device tokens after login. `admin.key` is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
 
 Then:
 
-1. Open `http://127.0.0.1:2026/ui/` and connect with `GATEWAY_API_KEY`.
+1. Open `http://127.0.0.1:2026/ui/` and connect with the value in `credentials/gateway.key`.
 2. Open Models & Routes and use the admin key to unlock this configuration session.
 3. Add a channel, enter the provider API key, and choose a model from the discovered list.
 4. Follow [Connecting clients](#-connecting-clients) below for the Base URL, API key, and model name.
 
-Image upgrades do not remove data from the `memory-platform-data` volume. Daily commands, key resets, backup, and migration are in the [stack operations guide](docs/stack-operations.en.md).
+Image upgrades preserve the four isolated data/secret volumes. Daily commands, scoped-token management, backup, and migration are in the [stack operations guide](docs/stack-operations.en.md).
 
 ### Install from source
 
@@ -133,7 +139,7 @@ Add a new “OpenAI-compatible” provider in Chatbox, RikkaHub, FLIT, or anothe
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  the GATEWAY_API_KEY generated during installation
+API Key:  a per-device chat token created in the Web Console or CLI
 Model:    memory-auto
 ```
 
@@ -151,7 +157,7 @@ Clients that support Streamable HTTP MCP can connect to:
 http://127.0.0.1:2026/mcp
 ```
 
-Authenticate with the same `GATEWAY_API_KEY`. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported. It is an enhancement, not a prerequisite for automatic memory. For ordinary chat, the OpenAI-compatible endpoint above is enough.
+Authenticate with a separate per-device MCP token. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported. It is an enhancement, not a prerequisite for automatic memory. For ordinary chat, the OpenAI-compatible endpoint above is enough.
 
 | What you want to do | Entry point | Who decides when to use memory |
 | --- | --- | --- |
@@ -199,9 +205,9 @@ The complete interface and behavior contracts are documented in [Memory Gateway]
 | Service | Default address | Owns | Does not own |
 | --- | --- | --- | --- |
 | [Memory Gateway](services/memory-gateway/README.md) | `127.0.0.1:2026` | Long-term memory, recent context, knowledge base, MCP, OpenAI-compatible proxy, and Web Console | Provider accounts and channel pricing |
-| [Model Gateway](services/model-gateway/README.md) | `127.0.0.1:2030` | Model connections, purpose routes, fallback order, secret references, usage, and price snapshots | Chat, memory, or knowledge content |
+| [Model Gateway](services/model-gateway/README.md) | Docker-internal `model-gateway:2030` | Model connections, purpose routes, fallback order, secret references, usage, and price snapshots | Chat, memory, or knowledge content |
 
-Memory behavior and model-provider configuration have different change rates and security responsibilities, so they run separately. Root commands still install, test, back up, and migrate them together. Memory Gateway calls Model Gateway only through stable routes and a separate backend key.
+Memory behavior and model-provider configuration have different change rates and security responsibilities, so they run in separate containers and OS identities. Model Gateway is not published to the host; Memory Gateway calls it over a private backend network through exact stable routes and a separate backend key. Memory cannot mount provider or admin secrets.
 
 ## 🔐 Current boundaries
 

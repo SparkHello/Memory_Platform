@@ -22,16 +22,16 @@ Memory Platform 对外是一个标准的 OpenAI 兼容接口。在客户端里�
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  安装时打印一次的 GATEWAY_API_KEY
+API Key:  为这台设备创建的 chat token
 模型名:   memory-auto
 ```
 
 要点：
 
-- **API Key 是安装时打印的那一个**。运行 `scripts/setup.sh` 完成安装时，终端会打印一次 `GATEWAY_API_KEY`，之后不再显示。用 Docker 部署时，它在首次启动的容器日志里：`docker compose -f docker-compose.user.yml logs memory-platform`。它和你填给模型渠道（DeepSeek、Kimi 等）的 key 完全是两回事：客户端只认 Memory Platform 的 key，真实供应商 key 只保存在服务端。
-- **只有这一枚密钥要填进客户端**。安装时会打印两枚：`GATEWAY_API_KEY` 给客户端和 Web Console 登录用；admin key 权限更高，只在电脑的浏览器里解锁模型渠道配置时用，**不需要填进任何客户端，也不需要传到手机上**。所以要想办法传到手机的只有一枚。
-- **嫌随机密钥太长可以自己指定**：首次安装时传入即可（至少 16 个字符），Docker 用 `GATEWAY_API_KEY=你的密钥 sh -c "$(curl -fsSL .../install.sh)"`，源码安装用 `GATEWAY_API_KEY=你的密钥 scripts/setup.sh`。装好之后再改用 `memgw secret set gateway`。注意别用微信、剪贴板同步这类第三方工具传密钥——那等于把它交给了第三方；自己设一个能记住的强密码反而更安全。
-- **找不回 key 就换一个新的**：在仓库目录运行 `scripts/memgw secret set gateway`（Docker 部署用 `docker compose -f docker-compose.user.yml exec memory-platform memgw secret set gateway`），按提示生成新 key，然后更新所有客户端。旧 key 会立即失效。
+- **每台设备用自己的 chat token**。在 Web Console「接入信息」创建，明文只显示一次；服务端 Auth DB 只保存不可逆 SHA-256。Docker 全新安装交付到 `credentials/gateway.key` 的是 Console-only 初始 token；迁移旧卷时该文件才暂存 legacy key。两者都不应复制给聊天设备。
+- **聊天、MCP、Console 权限分开**。聊天客户端只拿 chat token；MCP 客户端只拿 MCP token；Model Gateway admin key 仅在电脑浏览器中临时解锁渠道配置，绝不能填进聊天或 MCP 客户端。
+- **丢一台设备只撤销这一枚 token**。在 Console 撤销，或运行 `scripts/memgw token revoke <token-id>`；其他设备不用重配。不要为了好记而自定义低熵密码，也不要经聊天软件或跨设备剪贴板传递 token。
+- **Docker 初始密钥不在日志或环境变量里**。安装器只报告宿主机 `credentials/gateway.key` 与 `credentials/admin.key` 路径；文件应保持仅当前用户可读。不要再用 `GATEWAY_API_KEY=...` 环境变量运行安装器。
 - **模型名固定填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」。以后换渠道、换模型只改服务端，客户端不用动。
 - **关闭 Responses API / 使用 Chat Completions**。如果客户端有「API 类型」选项，选 `Chat Completions`（大多数客户端默认就是）。
 
@@ -42,7 +42,7 @@ API Key:  安装时打印一次的 GATEWAY_API_KEY
 0. **Docker 部署先放开局域网监听**：默认只监听本机。一键安装用户重新运行安装命令即可：macOS/Linux 在命令前加 `MEMORY_HOST=0.0.0.0`；Windows PowerShell 先运行 `$env:MEMORY_HOST="0.0.0.0"`。安装器会保留数据并直接打印手机地址。手工安装则在 Compose 同目录的 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 后重启。源码安装默认已监听局域网，跳过这一步。
 1. 一键安装结束时会打印电脑的局域网地址。手工查询时：macOS 运行 `ipconfig getifaddr en0`，Linux 运行 `hostname -I`，Windows 运行 `ipconfig`；已装 Tailscale 时用 `tailscale ip -4`。
 2. Base URL 换成 `http://<电脑IP>:2026/v1`，例如 `http://192.168.1.20:2026/v1`。
-3. API Key、模型名不变。MCP 地址同理换成 `http://<电脑IP>:2026/mcp`。
+3. 模型名不变；在手机上填写专门为它创建的 chat token。MCP 地址同理换成 `http://<电脑IP>:2026/mcp`，但使用独立 MCP token。
 
 只在可信家庭网络或 Tailscale 内这样用，不要把服务无鉴权暴露到公网。
 
@@ -57,7 +57,7 @@ API Key:  安装时打印一次的 GATEWAY_API_KEY
 ### 验证接通了没有
 
 1. 在客户端随便聊一句，比如「我喜欢黑咖啡，以后推荐咖啡时记住这一点」。
-2. 打开浏览器访问 `http://127.0.0.1:2026/ui/`（Web Console，用同一个 API Key 登录）。
+2. 打开浏览器访问 `http://127.0.0.1:2026/ui/`（Web Console 使用 Console/迁移期 legacy 凭据，不复用 chat token）。
 3. 新开一个对话问「我喜欢什么咖啡」，回答里应该能用到上一轮记住的信息；Web Console 的记忆列表里也能看到新记忆。
 
 如果没记住：确认客户端确实填的是 Memory Platform 的地址而不是直连渠道；确认上一轮的最终回答完整结束（中途断开不会写入记忆）。
@@ -80,14 +80,14 @@ MCP 地址：
 http://127.0.0.1:2026/mcp
 ```
 
-鉴权用同一个 `GATEWAY_API_KEY`（作为 Bearer token）。支持远程 MCP 的客户端（如 RikkaHub）在 MCP 服务器配置里选择「Streamable HTTP」，填上面的地址，并在请求头里加 `Authorization: Bearer <你的GATEWAY_API_KEY>`。
+在 Web Console「接入信息」为该客户端创建独立 MCP token。支持远程 MCP 的客户端（如 RikkaHub）在 MCP 服务器配置里选择「Streamable HTTP」，填上面的地址，并在请求头里加 `Authorization: Bearer <你的 MCP token>`。chat token 调 MCP 会得到 403，而不是被提升为管理权限。
 
 为了让模型正确使用这些工具，建议把 [Client Integration](../services/memory-gateway/docs/client_integration.md#mcp-client-rules) 里的推荐系统提示词放进该 MCP 会话的系统提示。两个路径可以同时开启；普通聊天客户端只配网关即可，知识库检索再由支持 MCP 的客户端负责。
 
 ## 常见问题
 
-**这套 key 会发给 DeepSeek / Kimi 吗？**
-不会。`GATEWAY_API_KEY` 只用于客户端访问 Memory Platform 本机服务；真实供应商 key 保存在服务端仓库外的密钥文件里，永远不会透传给客户端。
+**设备 token 会发给 DeepSeek / Kimi 吗？**
+不会。设备 token 只用于访问本机 Memory Gateway；它在进入 Model Gateway 前被替换为独立 backend key。真实供应商 key 只存在 Model Gateway 的隔离 secret volume，永远不会透传给客户端。
 
 **换模型要改客户端吗？**
 不用。运行 `services/memory-gateway/.venv/bin/modelgw quickstart` 重新配置服务端即可，客户端始终填 `memory-auto`。
@@ -96,18 +96,18 @@ http://127.0.0.1:2026/mcp
 `http://127.0.0.1:2026/ui/` 是本地管理台：查看、编辑、删除记忆，导入知识文档，看用量和费用，备份恢复数据。删除记忆只在这里操作，客户端没有删除工具。
 
 **多人共用一套服务？**
-默认所有请求属于同一个 `default` 用户。给家人用建议各跑一套实例，而不是共享 key。
+token 会固定绑定创建时的用户，调用方不能改写命名空间；但当前产品仍面向个人/可信家庭网络，而不是公开多租户服务。需要强隔离时建议各跑一套实例。
 
 ## 常见坑速查表
 
 | 现象 | 原因和做法 |
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
-| API Key 找不回了 | 它只在安装时打印一次；运行 `scripts/memgw secret set gateway` 换新，旧 key 立即失效，所有客户端要更新 |
-| 配置模型时要的 admin 密钥找不到了 | admin key 同样只打印一次；运行 `services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin` 重设（Docker 部署把命令前缀换成 `docker compose -f docker-compose.user.yml exec memory-platform modelgw`） |
+| 设备 token 找不回了 | 明文只显示一次；撤销该 token 并为这台设备新建一枚，其他设备不受影响 |
+| 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.key`；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
 | 模型名不知道填什么 | 固定 `memory-auto`；以后换渠道换模型只改服务端，客户端不动 |
 | 聊了但什么都没记住 | 记忆只在**完整**最终回答后写入；中途断开、被截断、内容被过滤都不会写 |
-| 担心渠道 key 被发给客户端 | 不会。供应商 key 只存在服务端仓库外的密钥文件，客户端永远只拿 `GATEWAY_API_KEY` |
+| 担心渠道 key 被发给客户端 | 不会。供应商 key 只存在 Model Gateway 的隔离 secret volume，客户端只拿固定角色的设备 token |
 | 私密内容会不会发给提取/embedding 模型 | 默认不会（`ALLOW_SENSITIVE_EGRESS=false`），本地识别为敏感的内容不出站 |
 | 导入的文档没出现在聊天里 | 知识库设计为不自动进入聊天上下文；用 MCP 工具、REST 或 Web Console 显式检索 |
 | 想删除某条记忆 | 客户端没有这个工具；打开 `http://127.0.0.1:2026/ui/` 在 Web Console 里操作 |

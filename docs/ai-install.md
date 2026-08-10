@@ -67,7 +67,7 @@ printf '%s\n' "$USER_PROVIDED_API_KEY" | \
 - 连接 Memory Gateway，重启生效；
 - 运行完整 `stack doctor`。
 
-`--json` 模式只在 stdout 返回一个最终 JSON 对象，并以 `setup_verified=true` 表示 doctor 已通过。安装进度以及首次生成的客户端访问密钥 `GATEWAY_API_KEY` 写到 stderr，避免污染机器可解析输出；AI 仍应把该访问密钥完整转达给用户并提醒妥善保存。
+`--json` 模式只在 stdout 返回一个最终 JSON 对象，并以 `setup_verified=true` 表示 doctor 已通过。安装进度以及首次凭据的私有文件路径写到 stderr，避免污染机器可解析输出。密钥值不得进入命令行、环境变量、日志或 AI 回复；新设备应通过 `memgw token create` 按用途创建 scoped token。
 
 任一步失败时 stdout 仍返回一个对象，例如：
 
@@ -89,12 +89,11 @@ printf '%s\n' "$USER_PROVIDED_API_KEY" | \
 ```json
 "embedding": {
   "model": "exact-embedding-model-id",
-  "dimensions": 1024,
-  "space": "channel-model-1024-v1"
+  "dimensions": 1024
 }
 ```
 
-没有向量模型时保留 `null`；记忆和知识检索会安全回退到关键词/FTS。`space` 代表精确 endpoint + 模型 + 维度形成的不可变向量空间，任何一项改变都必须使用新名称。
+没有向量模型时保留 `null`；记忆和知识检索会安全回退到关键词/FTS。默认会根据渠道 origin、精确模型 ID 与维度自动派生不可混用的向量空间。只有明确验证过兼容性的专家场景才填写可选 `space` 覆盖值。
 
 ## 已有环境：只重新配置模型
 
@@ -126,7 +125,8 @@ printf '%s\n' "$USER_PROVIDED_API_KEY" | \
 - **Web Console**：`http://127.0.0.1:2026/ui/`
 - **OpenAI 兼容 base URL**：`http://127.0.0.1:2026/v1`
 - **MCP**：`http://127.0.0.1:2026/mcp`
-- **客户端 API Key**：安装过程在 stderr 打印一次的 `GATEWAY_API_KEY`
+- **Web Console token**：安装输出列出的 `gateway.key` 私有文件（仅 Console 管理用途）
+- **客户端 token**：运行 `scripts/memgw token create --name DEVICE --role chat`；MCP 改用 `--role mcp`
 - **模型名**：客户端填 `memory-auto`
 
 ## 手工校验
@@ -144,6 +144,6 @@ scripts/memgw stack doctor
 | recipe 报未知字段 | 按 `docs/ai-quickstart.schema.json` 修正；不要把 key/secret 加入 JSON |
 | JSON 中 `warnings` 非空或 `memgw_wired=false` | 按 warning 处理，再运行 `scripts/memgw stack doctor` |
 | `stack doctor` 报 chat 路由无可用模型 | 确认渠道 API Key、base URL、模型 ID 正确，用 `modelgw check --live` 核实 |
-| 忘记 `GATEWAY_API_KEY` | 运行 `scripts/memgw secret set gateway` 重新设置一枚 |
+| scoped token 丢失 | 撤销旧 token，再用 `scripts/memgw token create` 按设备和用途新建 |
 
 更完整的说明见根 [README](../README.md) 与两个服务各自的 README。

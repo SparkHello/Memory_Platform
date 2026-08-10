@@ -12,7 +12,7 @@
 | Memory Gateway 健康检查 | `http://127.0.0.1:2026/health` |
 | MCP | `http://127.0.0.1:2026/mcp` |
 | OpenAI 兼容 Memory base URL | `http://127.0.0.1:2026/v1` |
-| Model Gateway base URL | `http://127.0.0.1:2030/v1` |
+| Model Gateway base URL（Docker 内部） | `http://model-gateway:2030/v1`；不发布宿主端口 |
 
 ## 日常运行与检查
 
@@ -36,18 +36,18 @@ scripts/memgw stack stop
 
 ```bash
 docker compose -f docker-compose.user.yml ps
-docker compose -f docker-compose.user.yml exec memory-platform memgw stack doctor
+docker compose -f docker-compose.user.yml exec memory-gateway memgw stack doctor
 
 docker compose -f docker-compose.user.yml restart
 docker compose -f docker-compose.user.yml stop
 docker compose -f docker-compose.user.yml start
 ```
 
-查看首次启动输出和后续日志：
+查看后续日志（生成的密钥永远不会写入这里）：
 
 ```bash
-docker compose -f docker-compose.user.yml logs memory-platform
-docker compose -f docker-compose.user.yml logs -f memory-platform
+docker compose -f docker-compose.user.yml logs memory-gateway model-gateway
+docker compose -f docker-compose.user.yml logs -f memory-gateway model-gateway
 ```
 
 ## 端口 2026 被占用
@@ -71,18 +71,24 @@ MEMORY_HOST=0.0.0.0
 然后 `docker compose -f docker-compose.user.yml up -d` 重启，客户端改用电脑的局域网 IP，例如 `http://192.168.1.20:2026/v1`。一键安装用户可以这样重跑，结束时会直接打印手机可用地址：
 
 ```bash
-# macOS / Linux
-MEMORY_HOST=0.0.0.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.sh)"
+# macOS / Linux；VERSION 固定到目标 release
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
+MEMORY_HOST=0.0.0.0 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
 ```powershell
-# Windows PowerShell
-$env:MEMORY_HOST="0.0.0.0"; irm https://raw.githubusercontent.com/SparkHello/Memory_Platform/main/deploy/install.ps1 | iex
+# Windows PowerShell；固定到目标 release，先下载再执行
+$Version = "v0.2.0"
+$env:MEMORY_HOST = "0.0.0.0"
+$env:MEMORY_PLATFORM_VERSION = $Version
+irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
+& .\install-memory-platform.ps1
 ```
 
-源码安装默认已监听所有接口，无需此设置。
+源码命令默认只监听回环；确需局域网监听时显式传入 `--host 0.0.0.0`，并确认宿主防火墙和路由器没有公网端口映射。
 
-只在可信家庭网络或 Tailscale 内这样用；接口仍有 `GATEWAY_API_KEY` 鉴权，但不要把服务暴露到公网。
+只在可信家庭网络或 Tailscale 内这样用；所有入口仍要求对应 scope 的设备 token（或迁移期 legacy key），但不要把服务暴露到公网。
 
 ## 密钥和身份
 
@@ -90,16 +96,22 @@ $env:MEMORY_HOST="0.0.0.0"; irm https://raw.githubusercontent.com/SparkHello/Mem
 
 | 密钥 | 用途 | 保存位置 |
 | --- | --- | --- |
-| Memory Gateway API key | 客户端访问 `/v1`、MCP、REST 和 Web Console API | Memory Gateway 用户配置目录 |
-| Model Gateway backend key | Memory Gateway 调用允许的 `memory.*`、`knowledge.*` route | 两端各自的仓库外密钥文件 |
+| per-device chat token | 单台聊天客户端访问 `/v1` | Auth SQLite 仅保存 SHA-256；明文只在创建时显示一次 |
+| per-device MCP token | 单台 MCP 客户端访问 `/mcp` | 同上，可单独撤销 |
+| Console token | 管理 REST 与 Web Console | 新装时初始 token 交付到 `credentials/gateway.key`；后续只能由本机 CLI 创建 |
+| Legacy Gateway key | 仅旧卷迁移的一个版本全 scope 兼容 | `credentials/gateway.key` 与 Memory 私有 settings；迁移完即禁用 |
+| Model Gateway backend key | Memory Gateway 调用配置解析出的 8 条精确 chat/memory/knowledge/embedding route | 两端各自的隔离密钥文件 |
 | Model Gateway admin key | 修改渠道密钥和 route 配置 | 仅管理端临时使用，不由 Memory Gateway 持久化 |
 | Provider API key | 调用真实上游渠道 | Model Gateway 仓库外 `secrets.env` |
 
-首次安装会各打印一次客户端 `GATEWAY_API_KEY` 和 Model Gateway admin key。它们丢失后不能回显旧值，只能重设：
+Docker 全新安装在 Auth DB 中创建唯一的 `first-console` token，关闭 legacy key，并把 Console token 与 Model admin key 分别写入宿主机 `credentials/gateway.key`、`credentials/admin.key`（`0600`），只报告路径；它们不进入 daemon logs 或长期进程环境。旧卷迁移仍临时交付 legacy key。日常客户端应在 Console「接入信息」创建 chat/MCP token。源码 CLI 可创建、查看元数据或撤销 token：
 
 ```bash
-scripts/memgw secret set gateway
-modelgw secret set memory-console-admin
+scripts/memgw token create --role chat --name <设备名> --user <用户>
+scripts/memgw token create --role mcp --name <设备名> --user <用户>
+scripts/memgw token create --role console --name <浏览器名> --user <用户>
+scripts/memgw token list
+scripts/memgw token revoke <token-id>
 ```
 
 如果 `modelgw` 尚未加入 PATH，源码环境可使用共享虚拟环境中的命令：
@@ -110,7 +122,9 @@ services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin
 
 命令默认以无回显方式读取新值。自动化场景优先使用各命令的 `--stdin`，不要把密钥写进命令行参数、配置 recipe、`.env` 示例或 shell 历史。
 
-`GATEWAY_API_KEY` 默认绑定固定的 `GATEWAY_USER_ID`，调用方不能通过 `X-User-Id` 改写命名空间。`GATEWAY_ALLOW_USER_ID_HEADER=true` 只用于旧版共享 key 迁移，不建议用于不可信网络。
+scoped token 固定绑定创建时的 user，调用方不能通过 Header 改写命名空间。全部客户端迁移后设置 `GATEWAY_LEGACY_API_KEY_ENABLED=false`；不要把 legacy key 长期当作多设备共享凭据。
+
+Web Console 会拒绝撤销某个用户最后一个可用的 Console token，并返回稳定的 `409 last_active_console_token`。轮换当前浏览器凭据时，先在运行主机用上面的 `--role console` 命令创建备用凭据、保存并验证登录，再撤销旧 token；浏览器 REST 不能创建新的 Console token。
 
 ## 模型 quickstart 与进阶配置
 
@@ -164,25 +178,26 @@ modelgw discover --preset <id> --non-interactive --json
 
 - SQLite、缓存、工具幂等和部分后台状态按单进程设计；
 - 不应把默认部署直接当成公开互联网多租户 SaaS；
-- Model Gateway 管理接口默认只监听回环地址，跨主机暴露必须置于 HTTPS 后；
-- 需要强隔离时，为不同用户使用不同凭证和实例，不要依赖共享 key 加可变 `X-User-Id`。
+- Docker 中 Model Gateway 仅位于 internal backend network，2030 不发布；Memory 容器不挂载 provider/admin secret；
+- 两个长期容器分别使用 UID 10001/10002、独立数据/密钥卷、只读 rootfs 和 `cap_drop: ALL`；
+- 每台设备使用可单独撤销的固定角色 token，不依赖共享 key 或可变 `X-User-Id`。
 
 更细的安全契约见 [Memory Gateway 安全边界](../services/memory-gateway/README.md#安全边界)和 [Model Gateway 核心边界](../services/model-gateway/AGENTS.md#核心边界)。安全漏洞请按[安全策略](../SECURITY.md)私密报告。
 
 ## 数据在哪里
 
-仓库只保存源代码和非敏感示例。实际运行数据位于用户配置目录或 Docker 的 `memory-platform-data` 卷，主要包括：
+仓库只保存源代码和非敏感示例。Docker 将状态分成 `memory-data`、`memory-secrets`、`model-data`、`model-secrets` 四个卷：
 
 - 长期记忆、近期上下文和分支节点；
 - 独立知识库和文档版本；
 - Model Gateway 配置、用量库和价格快照；
-- 两个服务各自的密钥文件和日志。
+- Auth token 哈希库；两个服务各自隔离的密钥文件和轮转日志。
 
 不要把 `.env`、真实 SQLite、日志、评测快照或便携备份提交到 Git。
 
 ## 备份、恢复与迁移
 
-重新运行 Docker 一键安装脚本升级时，会在拉取新镜像前自动创建便携备份，并复制到安装目录的 `backups/`。备份失败时升级会停止，不会继续替换现有服务。下面的命令用于手动备份、迁移或恢复。
+重新运行 Docker 一键安装脚本升级时，会在拉取新镜像前自动创建并复核便携备份，复制到安装目录的 `backups/` 后删除数据卷内的临时副本。默认只保留最近 5 份升级备份（可用 `MEMORY_BACKUP_RETENTION=1..50` 调整）；备份失败或临时副本无法安全清理时升级都会停止，不会继续替换现有服务。下面的命令用于手动备份、迁移或恢复。
 
 ### 源码安装
 
@@ -192,7 +207,7 @@ modelgw discover --preset <id> --non-interactive --json
 scripts/memgw stack backup --output memory-stack.zip
 ```
 
-备份包含允许迁移的记忆库、知识库、Model Gateway 脱敏配置、用量库和非密钥设置，但不包含 provider key、admin key、backend key 或 Memory Gateway API key。
+备份 v2 必含记忆库、知识库、Auth token 哈希库和 Model Gateway 脱敏配置；usage 明确标记 present/absent。它不包含 provider key、admin key、backend key、legacy gateway key 或任何 token 明文。
 
 备份虽然不含密钥，仍包含完整私人记忆和知识正文，必须按敏感文件保管。
 
@@ -212,24 +227,27 @@ scripts/memgw stack restore /path/to/memory-stack.zip --yes --start
 只下载了 Compose 文件的用户可以在容器内备份，再复制到当前目录：
 
 ```bash
-docker compose -f docker-compose.user.yml exec memory-platform \
-  memgw stack backup --output /data/memory-stack.zip
+docker compose -f docker-compose.user.yml --profile maintenance run --rm \
+  stack-maintenance --home /data/config \
+  --project-root /app/services/memory-gateway stack backup \
+  --model-gateway-home /model-data --output /data/memory-stack.zip
 docker compose -f docker-compose.user.yml cp \
-  memory-platform:/data/memory-stack.zip ./memory-stack.zip
+  memory-gateway:/data/memory-stack.zip ./memory-stack.zip
 ```
 
 恢复必须在主服务停止时进行。先把备份复制进容器并停止服务，再用一次性容器执行恢复：
 
 ```bash
 docker compose -f docker-compose.user.yml cp \
-  ./memory-stack.zip memory-platform:/data/memory-stack.zip
+  ./memory-stack.zip memory-gateway:/data/restore.zip
 docker compose -f docker-compose.user.yml stop
-docker compose -f docker-compose.user.yml run --rm --entrypoint memgw \
-  memory-platform stack restore /data/memory-stack.zip --yes
+docker compose -f docker-compose.user.yml --profile maintenance run --rm \
+  --entrypoint python stack-maintenance \
+  /usr/local/libexec/memory-platform/restore_split.py
 docker compose -f docker-compose.user.yml up -d
 ```
 
-便携备份不会带入或覆盖目标机已有的 `GATEWAY_API_KEY`、admin key 和供应商 API Key；恢复命令只会在内部重新接线 backend key。继续使用目标机首次启动时保存的访问密钥；缺失时按[密钥和身份](#密钥和身份)重设，并按需重新输入供应商 API Key。不要在正在运行的主容器里用 `docker compose exec` 恢复，因为前台服务仍占用数据库和端口，恢复命令会安全拒绝覆盖。
+便携备份不会带入或覆盖目标机已有的 secret volume；恢复后继续使用目标机的 provider/admin/backend 密钥。Auth DB 只含不可逆 token 哈希，因此已有设备 token 可随备份迁移；token 明文本身仍只存在设备端。恢复必须在两个长期服务停止时执行。
 
 ### 从旧版双目录迁移
 

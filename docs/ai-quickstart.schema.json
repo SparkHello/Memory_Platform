@@ -39,7 +39,7 @@
       "description": "Exact upstream chat model ID shown by the channel."
     },
     "adapter": {
-      "enum": ["generic", "kimi", "deepseek", "mimo"],
+      "enum": ["generic", "kimi", "deepseek", "mimo", "dashscope_openai"],
       "default": "generic"
     },
     "plan": {
@@ -85,7 +85,7 @@
     "embedding": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["model", "dimensions", "space"],
+      "required": ["model", "dimensions"],
       "properties": {
         "model": {
           "type": "string",
@@ -98,7 +98,7 @@
         "space": {
           "type": "string",
           "minLength": 1,
-          "description": "Immutable local name for this exact endpoint/model/dimension vector space."
+          "description": "Optional expert override. Omit it to derive an immutable ID from channel origin, exact model and dimensions."
         },
         "author": {
           "type": "string",
