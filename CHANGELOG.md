@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-08-10
+
 ### Added
 
 - Model Gateway 配置 schema v2：请求能力感知路由、显式 fallback scope、Qwen/DeepSeek V4 deployment profile、逐 attempt 账本、进程内 breaker、配置 revision/CAS/crash journal，以及零落盘渠道发现和原子 channel bundle API。
