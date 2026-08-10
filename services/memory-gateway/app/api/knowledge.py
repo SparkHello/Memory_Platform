@@ -7,18 +7,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    embedding_runtime_enabled,
     get_knowledge_search_agent,
     get_knowledge_embedding_indexer,
     get_knowledge_store,
+    get_signing_secret,
     get_user_id,
     require_api_key,
 )
 from app.config import Settings, get_settings
+from app.disk_capacity import DiskCapacityError, is_storage_exhausted
 from app.knowledge.agent import KnowledgeSearchAgent
 from app.knowledge.backup import build_knowledge_export, restore_knowledge_export
 from app.knowledge.models import KnowledgeDocument, KnowledgeSearchHit, KnowledgeVersion
-from app.knowledge.parsing import parse_knowledge_file
+from app.knowledge.parsing import KnowledgeFileParseError, parse_knowledge_file
 from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
 from app.knowledge.store import (
     KnowledgeConflictError,
@@ -27,6 +28,10 @@ from app.knowledge.store import (
     KnowledgeSensitivityConfirmationRequired,
     KnowledgeStore,
     KnowledgeValidationError,
+)
+from app.llm.runtime import (
+    ModelRuntimeConfigurationError,
+    resolve_model_runtime,
 )
 
 
@@ -39,13 +44,16 @@ router = APIRouter(
 
 KnowledgeSensitivity = Literal["normal", "private", "sensitive"]
 KnowledgeQuality = Literal["fast", "balanced", "deep"]
+QUERY_MAX_CHARS = 4096
+PUBLIC_ID_MAX_CHARS = 200
+PublicKnowledgeId = Annotated[str, Field(min_length=1, max_length=PUBLIC_ID_MAX_CHARS)]
 
 
 class KnowledgeUploadBeginRequest(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     content_type: Literal["text/plain", "text/markdown"] = "text/markdown"
     source_name: str = Field(default="", max_length=500)
-    replace_document_ref: str = Field(default="", max_length=300)
+    replace_document_ref: str = Field(default="", max_length=PUBLIC_ID_MAX_CHARS)
     sensitivity: KnowledgeSensitivity = "normal"
     tags: list[str] | None = Field(default=None, max_length=32)
     metadata: dict[str, str | int | float | bool] | None = None
@@ -72,13 +80,13 @@ class KnowledgeDocumentUpdateRequest(BaseModel):
 
 
 class KnowledgePurgeRequest(BaseModel):
-    confirm_document_id: str = Field(min_length=1, max_length=200)
+    confirm_document_id: PublicKnowledgeId
 
 
 class KnowledgeSearchRequest(BaseModel):
-    request: str = Field(min_length=1, max_length=8000)
+    request: str = Field(min_length=1, max_length=QUERY_MAX_CHARS)
     limit: int = Field(default=5, ge=1, le=10)
-    document_refs: list[str] = Field(default_factory=list, max_length=50)
+    document_refs: list[PublicKnowledgeId] = Field(default_factory=list, max_length=50)
     quality: KnowledgeQuality = "balanced"
     include_sensitive: bool = False
     tags: list[str] = Field(default_factory=list, max_length=32)
@@ -86,7 +94,7 @@ class KnowledgeSearchRequest(BaseModel):
 
 
 class KnowledgeReadRequest(BaseModel):
-    reference: str = Field(min_length=1, max_length=300)
+    reference: PublicKnowledgeId
     cursor: str = Field(default="", max_length=4000)
     max_chars: int = Field(default=12_000, ge=1, le=20_000)
     include_sensitive: bool = False
@@ -127,9 +135,36 @@ def knowledge_status(
 
 
 def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
-    if settings.model_gateway_enabled:
-        embedding_enabled = embedding_runtime_enabled(settings)
+    try:
+        model_runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError as exc:
         return {
+            "model_runtime": "invalid",
+            "model_runtime_error": str(exc),
+            "model_gateway_enabled": False,
+            "agent_enabled": False,
+            "agent_egress_policy": settings.knowledge_agent_egress_policy,
+            "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
+            "agent_provider_priority": "",
+            "agent_configured_providers": [],
+            "agent_rate_limit_cooldown_seconds": 0.0,
+            "llm_provider_priority": "",
+            "llm_configured_providers": [],
+            "llm_rate_limit_cooldown_seconds": 0.0,
+            "agent_mimo_model": "",
+            "agent_kimi_model": "",
+            "agent_flash_model": "",
+            "agent_pro_model": "",
+            "sensitive_egress_enabled": settings.allow_sensitive_egress,
+            "embedding_enabled": False,
+            "embedding_model": "",
+        }
+
+    if model_runtime.is_central:
+        embedding_enabled = model_runtime.embedding.enabled
+        return {
+            "model_runtime": "central",
+            "model_runtime_error": "",
             "model_gateway_enabled": True,
             "agent_enabled": settings.knowledge_agent_egress_policy != "none",
             "agent_egress_policy": settings.knowledge_agent_egress_policy,
@@ -142,12 +177,12 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
             "llm_rate_limit_cooldown_seconds": 0.0,
             "agent_mimo_model": "",
             "agent_kimi_model": "",
-            "agent_flash_model": settings.model_gateway_knowledge_fast_model,
-            "agent_pro_model": settings.model_gateway_knowledge_pro_model,
+            "agent_flash_model": model_runtime.route_for("knowledge.fast"),
+            "agent_pro_model": model_runtime.route_for("knowledge.pro"),
             "sensitive_egress_enabled": settings.allow_sensitive_egress,
             "embedding_enabled": embedding_enabled,
             "embedding_model": (
-                settings.model_gateway_embedding_model if embedding_enabled else ""
+                model_runtime.embedding.model if embedding_enabled else ""
             ),
         }
 
@@ -188,8 +223,10 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
     llm_configured_providers = [
         code for code in provider_priority if llm_provider_configured[code]
     ]
-    embedding_enabled = embedding_runtime_enabled(settings)
+    embedding_enabled = model_runtime.embedding.enabled
     return {
+        "model_runtime": "direct",
+        "model_runtime_error": "",
         "model_gateway_enabled": False,
         "agent_enabled": bool(
             configured_providers
@@ -211,7 +248,7 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
         "agent_pro_model": settings.llm_deepseek_pro_model,
         "sensitive_egress_enabled": settings.allow_sensitive_egress,
         "embedding_enabled": embedding_enabled,
-        "embedding_model": settings.embedding_model if embedding_enabled else "",
+        "embedding_model": model_runtime.embedding.model if embedding_enabled else "",
     }
 
 
@@ -222,7 +259,7 @@ def list_knowledge_documents(
     document_status: Literal["active", "deleted", "all"] = Query(
         default="active", alias="status"
     ),
-    query: str = "",
+    query: str = Query(default="", max_length=QUERY_MAX_CHARS),
     limit: int = Query(default=100, ge=1, le=1000),
     include_sensitive: bool = True,
 ) -> dict:
@@ -336,7 +373,7 @@ async def import_knowledge_file(
     filename: str = Query(min_length=1, max_length=500),
     title: str = Query(default="", max_length=300),
     source_name: str = Query(default="", max_length=500),
-    replace_document_ref: str = Query(default="", max_length=300),
+    replace_document_ref: str = Query(default="", max_length=PUBLIC_ID_MAX_CHARS),
     sensitivity: KnowledgeSensitivity = "normal",
     confirm_sensitivity_override: bool = False,
     tags: str = Query(default="", max_length=2000),
@@ -580,7 +617,7 @@ def read_knowledge(
     body: KnowledgeReadRequest,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
-    settings: Annotated[Settings, Depends(get_settings)],
+    signing_secret: Annotated[str, Depends(get_signing_secret)],
 ) -> dict:
     return _store_call(
         store.read_reference,
@@ -589,7 +626,7 @@ def read_knowledge(
         cursor=body.cursor,
         max_chars=body.max_chars,
         include_sensitive=body.include_sensitive,
-        signing_key=settings.gateway_api_key,
+        signing_key=signing_secret,
     )
 
 
@@ -771,6 +808,8 @@ def _store_call(function, /, **kwargs):
 
 
 def _raise_store_error(exc: Exception) -> None:
+    if is_storage_exhausted(exc):
+        raise DiskCapacityError("knowledge storage exhausted") from exc
     if isinstance(exc, KnowledgeNotFoundError):
         raise HTTPException(status_code=404, detail="知识文档或引用不存在") from exc
     if isinstance(exc, KnowledgeSensitivityConfirmationRequired):
@@ -788,6 +827,11 @@ def _raise_store_error(exc: Exception) -> None:
         ) from exc
     if isinstance(exc, KnowledgeConflictError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, KnowledgeFileParseError):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
     if isinstance(exc, KnowledgeValidationError) or isinstance(exc, ValueError):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raise HTTPException(status_code=503, detail="知识库暂时不可用") from exc

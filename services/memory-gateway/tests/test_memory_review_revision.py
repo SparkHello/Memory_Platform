@@ -2,6 +2,7 @@
 
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime
 
@@ -113,7 +114,7 @@ def test_review_preview_uses_thinking_structured_generation(
 
     assert response.status_code == 200
     assert fake_llm.review_revision_thinking == "enabled"
-    assert fake_llm.review_revision_request.max_tokens == 2048
+    assert fake_llm.review_revision_request.max_tokens == 4096
     assert fake_llm.review_revision_request.response_format == {"type": "json_object"}
     assert fake_llm.review_revision_structured_tool["name"] == (
         "submit_memory_review_revision"
@@ -217,7 +218,10 @@ def test_review_preview_token_expires(
     payload_part, _ = preview["preview_token"].split(".", 1)
     payload = _json.loads(revision._unb64(payload_part).decode("utf-8"))
     payload["expires_at"] = "2000-01-01T00:00:00+00:00"
-    expired_token = revision._sign_preview(secret="test-gateway-key", payload=payload)
+    expired_token = revision._sign_preview(
+        secret=get_settings().gateway_signing_secret,
+        payload=payload,
+    )
 
     applied = client.post(
         "/memories/review/revise/apply",

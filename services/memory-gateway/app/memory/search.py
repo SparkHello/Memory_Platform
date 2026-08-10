@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 import hashlib
+import heapq
 import json
 import math
 import re
@@ -27,8 +28,9 @@ from app.memory.temporal import (
     temporal_query_window,
 )
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
-from app.usage.context import model_usage_scope
+from app.usage.context import current_usage_context, model_usage_scope
 from app.usage.recorder import UsageRecorder
+from app.usage.attribution import model_gateway_usage_headers
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +52,8 @@ _CACHE_METRICS: dict[str, dict[str, int]] = {}
 _CACHE_METRICS_LOCK = threading.Lock()
 _CACHE_METRICS_MAX_USERS = 1024
 _RECALL_LIMIT = 20
-# SQLite/FTS 候选生成接入前，宁可扫描当前个人库，也不能按重要度提前丢掉
-# 低频但精确匹配的旧记忆。该上限只是异常数据量保护，不参与相关性裁剪。
+# The evaluation workbench still uses this bounded preview size. Live recall no
+# longer uses it: correctness must not depend on an importance-ordered cutoff.
 RECALL_CANDIDATE_POOL = 10_000
 EMBEDDING_MIN_COSINE = 0.55
 KEYWORD_MIN_SCORE = 20.0
@@ -342,6 +344,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         timeout_seconds: float = 60.0,
         allow_sensitive_egress: bool = False,
         usage_recorder: UsageRecorder | None = None,
+        usage_hmac_secret: str = "",
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -353,6 +356,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self.timeout_seconds = timeout_seconds
         self.allow_sensitive_egress = allow_sensitive_egress
         self.usage_recorder = usage_recorder
+        self.usage_hmac_secret = usage_hmac_secret
 
     async def embed(self, text: str) -> list[float] | None:
         if not self.allow_sensitive_egress and detect_text_sensitivity(text) != "normal":
@@ -394,6 +398,18 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         expected_count = len(input_value) if isinstance(input_value, list) else 1
         url = f"{self.base_url.rstrip('/')}/embeddings"
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.model_gateway_mode:
+            context_operation = current_usage_context().operation
+            headers.update(
+                model_gateway_usage_headers(
+                    signing_secret=self.usage_hmac_secret,
+                    operation=(
+                        context_operation
+                        if context_operation != "unspecified"
+                        else "memory.embedding"
+                    ),
+                )
+            )
         payload = {
             "model": self.model,
             "input": input_value,
@@ -401,7 +417,11 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
             "dimensions": self.dimensions,
         }
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 metadata = parse_model_gateway_metadata(response.headers)
@@ -424,7 +444,11 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return []
 
-        if self.usage_recorder is not None and isinstance(data, dict):
+        if (
+            self.usage_recorder is not None
+            and not self.model_gateway_mode
+            and isinstance(data, dict)
+        ):
             await anyio.to_thread.run_sync(
                 partial(
                     self.usage_recorder.record_response,
@@ -619,22 +643,88 @@ class MemorySearchService:
         limit: int,
         include_sensitive: bool,
     ) -> list[MemorySearchHit]:
-        memories = self.store.list_memories(user_id=user_id, limit=RECALL_CANDIDATE_POOL)
-        memories = [
-            memory
-            for memory in memories
-            if memory.origin == "user_asserted"
-            and (include_sensitive or not _memory_is_locally_sensitive(memory))
-        ]
-        if not memories:
-            return []
-        return self._rank_hits(
-            memories=memories,
-            query=query,
-            query_embedding=query_embedding,
-            embedding_space_id=embedding_space_id,
-            limit=limit,
+        now = datetime.now(UTC)
+        temporal_mode = temporal_query_mode(query, now=now)
+        temporal_window = temporal_query_window(query)
+        keyword_query = _keyword_query_text(query)
+        query_terms = _terms(keyword_query)
+        document_frequency = {term: 0 for term in query_terms}
+        document_count = 0
+
+        def eligible(memories: list[MemoryRecord]) -> list[MemoryRecord]:
+            return [
+                memory
+                for memory in memories
+                if memory.origin == "user_asserted"
+                and (include_sensitive or not _memory_is_locally_sensitive(memory))
+                and memory_matches_temporal_mode(
+                    memory,
+                    mode=temporal_mode,
+                    now=now,
+                    query_window=temporal_window,
+                )
+                and not _query_memory_subject_conflict(query, memory)
+            ]
+
+        # A keyword score contains corpus-wide metadata IDF.  The first pass
+        # computes those statistics; the second pass ranks from the exact same
+        # SQLite snapshot and keeps only bounded global channel candidates.
+        with self.store.memory_recall_snapshot(user_id=user_id) as read_pages:
+            for page in read_pages():
+                page = eligible(page)
+                document_count += len(page)
+                for memory in page:
+                    all_terms = (
+                        _terms(memory.content)
+                        | _terms(" ".join(memory.topics))
+                        | _terms(" ".join(memory.entities))
+                    )
+                    for term in query_terms & all_terms:
+                        document_frequency[term] += 1
+
+            embedding_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
+            keyword_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
+            sequence = 0
+            for page in read_pages():
+                page = eligible(page)
+                if query_embedding:
+                    for score, memory in self._score_by_embedding(
+                        page,
+                        query_embedding,
+                        embedding_space_id=embedding_space_id,
+                    ):
+                        sequence += 1
+                        _push_bounded_scored_memory(
+                            embedding_heap,
+                            score=score,
+                            memory=memory,
+                            sequence=sequence,
+                        )
+                for score, memory in self._score_by_keywords(
+                    page,
+                    query,
+                    document_frequency=document_frequency,
+                    document_count=document_count,
+                ):
+                    sequence += 1
+                    _push_bounded_scored_memory(
+                        keyword_heap,
+                        score=score,
+                        memory=memory,
+                        sequence=sequence,
+                    )
+
+        combined: dict[str, MemorySearchHit] = {}
+        for score, memory in _scored_memories_descending(embedding_heap):
+            _upsert_hit(combined, memory, score, "embedding", now=now)
+        for score, memory in _scored_memories_descending(keyword_heap):
+            _upsert_hit(combined, memory, score, "keyword", now=now)
+        hits = list(combined.values())
+        hits.sort(
+            key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
+            reverse=True,
         )
+        return hits[:limit]
 
     def _finalize_hits(
         self,
@@ -955,6 +1045,9 @@ class MemorySearchService:
         self,
         memories: list[MemoryRecord],
         query: str,
+        *,
+        document_frequency: dict[str, int] | None = None,
+        document_count: int | None = None,
     ) -> list[tuple[float, MemoryRecord]]:
         keyword_query = _keyword_query_text(query)
         query_terms = _terms(keyword_query)
@@ -973,7 +1066,7 @@ class MemorySearchService:
         indexed: list[
             tuple[MemoryRecord, str, set[str], set[str], set[str], list[str]]
         ] = []
-        document_frequency = {term: 0 for term in query_terms}
+        computed_document_frequency = {term: 0 for term in query_terms}
         for memory in memories:
             content_lower = memory.content.lower()
             content_terms = _terms(memory.content)
@@ -989,9 +1082,14 @@ class MemorySearchService:
             )
             all_terms = content_terms | topic_terms | entity_terms
             for term in query_terms & all_terms:
-                document_frequency[term] += 1
+                computed_document_frequency[term] += 1
 
-        document_count = max(1, len(indexed))
+        if document_frequency is None:
+            document_frequency = computed_document_frequency
+        effective_document_count = max(
+            1,
+            len(indexed) if document_count is None else int(document_count),
+        )
 
         for memory, content_lower, content_terms, topic_terms, entity_terms, labels in indexed:
             shared_terms = query_terms & content_terms
@@ -1039,7 +1137,7 @@ class MemorySearchService:
             metadata_idf_score = sum(
                 (
                     math.log(
-                        (document_count + 1.0)
+                        (effective_document_count + 1.0)
                         / (document_frequency.get(term, 0) + 1.0)
                     )
                     + 1.0
@@ -1240,6 +1338,33 @@ def _upsert_hit(
             topic_score,
         )
     _refresh_hit_ranking(existing, now=now)
+
+
+def _push_bounded_scored_memory(
+    heap: list[tuple[float, int, str, int, MemoryRecord]],
+    *,
+    score: float,
+    memory: MemoryRecord,
+    sequence: int,
+) -> None:
+    """Keep the globally best raw channel scores in bounded memory."""
+    item = (
+        score,
+        memory.importance,
+        memory.updated_at,
+        -sequence,
+        memory,
+    )
+    if len(heap) < _RECALL_LIMIT:
+        heapq.heappush(heap, item)
+    elif item[:4] > heap[0][:4]:
+        heapq.heapreplace(heap, item)
+
+
+def _scored_memories_descending(
+    heap: list[tuple[float, int, str, int, MemoryRecord]],
+) -> list[tuple[float, MemoryRecord]]:
+    return [(item[0], item[4]) for item in sorted(heap, reverse=True)]
 
 
 def _build_hit(

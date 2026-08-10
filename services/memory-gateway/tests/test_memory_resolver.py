@@ -1,4 +1,5 @@
-﻿import json
+﻿import asyncio
+import json
 
 import pytest
 
@@ -14,6 +15,20 @@ class StaticEmbeddingClient:
 
     async def embed(self, text: str) -> list[float] | None:
         return self.vector
+
+
+class CoordinatedEmbeddingClient:
+    def __init__(self) -> None:
+        self.embedding_space_id = ""
+        self.calls = 0
+        self.both_started = asyncio.Event()
+
+    async def embed(self, text: str) -> list[float] | None:
+        self.calls += 1
+        if self.calls == 2:
+            self.both_started.set()
+        await self.both_started.wait()
+        return None
 
 
 @pytest.mark.asyncio
@@ -37,6 +52,30 @@ async def test_resolver_ignores_exact_duplicate(memory_store: MemoryStore) -> No
     assert result.action == "ignore"
     assert result.memory == existing
     assert len(memory_store.list_memories(user_id="default")) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resolvers_atomically_recheck_before_create(
+    memory_store: MemoryStore,
+) -> None:
+    embedding_client = CoordinatedEmbeddingClient()
+    resolver = MemoryResolver(
+        store=memory_store,
+        embedding_client=embedding_client,
+    )
+
+    async def resolve_once():
+        return await resolver.resolve(
+            user_id="default",
+            candidate=_candidate("用户偏好并发写入只保存一次。", type="semantic"),
+            auto_classify=False,
+        )
+
+    first, second = await asyncio.gather(resolve_once(), resolve_once())
+
+    assert sorted([first.action, second.action]) == ["create", "ignore"]
+    memories = memory_store.list_memories(user_id="default")
+    assert [memory.content for memory in memories] == ["用户偏好并发写入只保存一次。"]
 
 
 @pytest.mark.asyncio

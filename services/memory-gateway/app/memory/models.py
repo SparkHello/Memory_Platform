@@ -238,6 +238,7 @@ class MemoryRecord(BaseModel):
     updated_at: str
     archived_at: str | None = None
     archived: int = 0
+    revision: int = Field(default=1, ge=1, le=9_223_372_036_854_775_806)
 
     @field_validator("type", mode="before")
     @classmethod
@@ -293,6 +294,7 @@ class CoreMemorySection(BaseModel):
     created_at: str
     updated_at: str
     archived: int = 0
+    revision: int = Field(default=1, ge=1, le=9_223_372_036_854_775_806)
 
 
 class CoreMemorySectionHistory(BaseModel):
@@ -307,12 +309,19 @@ class CoreMemorySectionHistory(BaseModel):
     created_at: str
     updated_at: str
     replaced_at: str
+    revision: int = Field(default=1, ge=1, le=9_223_372_036_854_775_806)
 
 
 class RecentContextTurn(BaseModel):
-    user: str
-    assistant: str
+    user: str = Field(max_length=65_536)
+    assistant: str = Field(max_length=65_536)
     sensitivity: MemorySensitivity = "normal"
+
+    @model_validator(mode="after")
+    def validate_turn_bytes(self):
+        if len(self.user.encode("utf-8")) + len(self.assistant.encode("utf-8")) > 64 * 1024:
+            raise ValueError("recent context turn exceeds 64 KiB")
+        return self
 
 
 class RecentContextSummary(BaseModel):
@@ -326,6 +335,19 @@ class RecentContextSummary(BaseModel):
     created_at: str
     updated_at: str
     archived: int = 0
+
+    @model_validator(mode="after")
+    def validate_context_bytes(self):
+        turns_bytes = sum(
+            len(turn.user.encode("utf-8")) + len(turn.assistant.encode("utf-8"))
+            for turn in self.recent_turns
+        )
+        compressed_bytes = len(self.compressed_summary.encode("utf-8"))
+        if turns_bytes + compressed_bytes > 512 * 1024:
+            raise ValueError("recent context state exceeds 512 KiB")
+        if len(self.summary.encode("utf-8")) > 512 * 1024:
+            raise ValueError("recent context summary exceeds 512 KiB")
+        return self
 
 
 class ConversationBranchNode(RecentContextSummary):

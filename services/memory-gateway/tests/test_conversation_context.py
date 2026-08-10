@@ -38,6 +38,7 @@ async def test_recent_context_compacts_older_turns_and_keeps_latest_two(
     assert state.recent_turns[0].user == "第 3 个问题"
     assert state.compressed_summary == "较早对话的测试压缩摘要。"
     assert fake_llm.context_compaction_calls == 1
+    assert fake_llm.context_compaction_request.max_tokens == 2048
     compaction_payload = str(fake_llm.context_compaction_messages)
     assert "第 1 个问题" in compaction_payload
     assert "第 2 个问题" in compaction_payload
@@ -181,3 +182,33 @@ async def test_recent_context_has_a_hard_local_turn_bound(
     assert state.turn_count == 201
     assert len(state.recent_turns) == 200
     assert state.recent_turns[-1].user.endswith("9999")
+
+
+@pytest.mark.asyncio
+async def test_recent_context_caps_each_turn_and_total_utf8_bytes(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    for index in range(10):
+        state = await append_and_compact_recent_context(
+            store=memory_store,
+            llm_client=fake_llm,
+            user_id="default",
+            conversation_id="byte-bounded",
+            user_text=f"{index}:" + "你" * 30_000,
+            assistant_text="答" * 30_000,
+            allow_sensitive_egress=False,
+            keep_recent_turns=200,
+            compact_after_turns=1000,
+            compact_after_chars=100_000_000,
+            summary_max_chars=4000,
+        )
+
+    assert state is not None
+    sizes = [
+        len(turn.user.encode()) + len(turn.assistant.encode())
+        for turn in state.recent_turns
+    ]
+    assert sizes
+    assert all(size <= 64 * 1024 for size in sizes)
+    assert sum(sizes) <= 512 * 1024

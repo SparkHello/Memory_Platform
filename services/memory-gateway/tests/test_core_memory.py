@@ -43,12 +43,52 @@ def test_core_memory_consolidation_creates_section(
     payload = response.json()
     assert payload["created"] == 1
     assert payload["updated"] == 0
+    assert fake_llm.core_request.max_tokens == 4096
+    assert fake_llm.core_request.response_format == {"type": "json_object"}
+    assert fake_llm.core_thinking == "enabled"
+    assert fake_llm.core_structured_tool["name"] == "submit_core_memory_sections"
+    assert set(fake_llm.core_structured_tool["parameters"]["required"]) == {"sections"}
     assert payload["sections"][0]["section"] == "preferences"
     assert payload["sections"][0]["evidence_memory_ids"] == [preference.id]
 
     listed = client.get("/memories/core", headers=auth_headers)
     assert listed.status_code == 200
     assert listed.json()["data"][0]["content"] == "- 用户长期喜欢黑咖啡。"
+
+
+def test_core_memory_consolidation_accepts_structured_tool_arguments(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    preference = memory_store.create_memory(
+        user_id="default",
+        content="用户长期喜欢黑咖啡。",
+        type="emotional",
+        importance=8,
+        confidence=0.9,
+    )
+    fake_llm.core_tool_arguments = json.dumps(
+        {
+            "sections": [
+                {
+                    "section": "preferences",
+                    "content": "- 用户长期喜欢黑咖啡。",
+                    "evidence_memory_ids": [preference.id],
+                    "confidence": 0.92,
+                }
+            ],
+            "reason": "结构化工具提交",
+        },
+        ensure_ascii=False,
+    )
+
+    response = client.post("/memories/core/consolidate", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+    assert response.json()["sections"][0]["evidence_memory_ids"] == [preference.id]
 
 
 def test_core_memory_consolidation_excludes_sensitive_memory(

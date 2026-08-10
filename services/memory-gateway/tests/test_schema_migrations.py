@@ -8,6 +8,7 @@
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import multiprocessing
 from queue import Empty
 import sqlite3
@@ -19,6 +20,9 @@ from app.knowledge.store import KnowledgeStore
 from app.memory.store import MemoryStore
 from app.schema_migrations import enable_wal_with_retry
 from app.usage.store import UsageStore
+
+
+_LATEST_MEMORY_SCHEMA_VERSION = 4
 
 
 def _initialize_memory_store_in_process(db_path: str, start, results) -> None:
@@ -72,7 +76,7 @@ class TestMemorySchemaMigrations:
     def test_fresh_database_reaches_latest_version(self, tmp_path) -> None:
         db_path = str(tmp_path / "fresh-memory.db")
         MemoryStore(db_path).init_db()
-        assert _user_version(db_path) == 2
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
 
     def test_init_db_twice_is_idempotent(self, tmp_path) -> None:
         db_path = str(tmp_path / "twice-memory.db")
@@ -80,7 +84,7 @@ class TestMemorySchemaMigrations:
         store.init_db()
         store.create_memory(user_id="default", content="重复初始化不应丢数据")
         store.init_db()
-        assert _user_version(db_path) == 2
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
         memory = store.get_memory(memory_id="unknown", user_id="default")
         assert memory is None
         rows = store.list_memories(user_id="default")
@@ -92,7 +96,7 @@ class TestMemorySchemaMigrations:
         with ThreadPoolExecutor(max_workers=8) as executor:
             list(executor.map(lambda _: MemoryStore(db_path).init_db(), range(16)))
 
-        assert _user_version(db_path) == 2
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
         with MemoryStore(db_path)._connect() as connection:
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
@@ -146,7 +150,7 @@ class TestMemorySchemaMigrations:
             except Empty:
                 pytest.fail("schema initializer process did not report a result")
         assert outcomes == [("ok", "")] * len(processes)
-        assert _user_version(db_path) == 2
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
 
     def test_legacy_database_migrates_columns_and_backfills_once(self, tmp_path) -> None:
         db_path = tmp_path / "legacy-migrate.db"
@@ -182,7 +186,7 @@ class TestMemorySchemaMigrations:
 
         MemoryStore(str(db_path)).init_db()
 
-        assert _user_version(str(db_path)) == 2
+        assert _user_version(str(db_path)) == _LATEST_MEMORY_SCHEMA_VERSION
         store = MemoryStore(str(db_path))
         with store._connect() as connection:
             columns = {
@@ -198,6 +202,7 @@ class TestMemorySchemaMigrations:
                 "temporal_subject",
                 "temporal_predicate",
                 "embedding_space_id",
+                "revision",
             ):
                 assert required in columns, f"迁移后缺少列 {required}"
         memory = store.get_memory(memory_id="legacy-1", user_id="default")
@@ -208,7 +213,7 @@ class TestMemorySchemaMigrations:
         assert memory.embedding_space_id is None  # 旧向量不按当前配置猜空间
 
     def test_already_migrated_database_does_not_rerun_migration(self, tmp_path) -> None:
-        """v1 老库只运行新增的 v2，不重跑历史迁移。"""
+        """v1 老库只运行新增的 v2/v3/v4，不重跑历史迁移。"""
         db_path = tmp_path / "locked-memory.db"
         legacy = MemoryStore(str(db_path))
         with legacy._connect() as connection:
@@ -232,11 +237,12 @@ class TestMemorySchemaMigrations:
             )
             connection.execute("PRAGMA user_version = 1")
 
-        # 只运行 v2：应补空间列，但不重跑 v1 的其他缺列修复。
+        # 只运行 v2/v3/v4：应补空间、revision 和 claim 表，但不重跑 v1。
         with MemoryStore(str(db_path))._connect() as connection:
             MemoryStore._run_migrations(connection)
             assert (
-                int(connection.execute("PRAGMA user_version").fetchone()[0]) == 2
+                int(connection.execute("PRAGMA user_version").fetchone()[0])
+                == _LATEST_MEMORY_SCHEMA_VERSION
             )
             columns = {
                 row["name"]
@@ -244,6 +250,106 @@ class TestMemorySchemaMigrations:
             }
             assert "valence" not in columns  # 迁移未重跑
             assert "embedding_space_id" in columns
+            assert "revision" in columns
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'chat_side_effect_claims'"
+            ).fetchone()
+
+    def test_v2_migration_merges_duplicate_active_core_sections_before_unique_index(
+        self,
+        tmp_path,
+    ) -> None:
+        db_path = str(tmp_path / "v2-duplicate-core.db")
+        store = MemoryStore(db_path)
+        store.init_db()
+        with store._connect() as connection:
+            connection.execute("DROP INDEX ux_core_memory_user_section_active")
+            connection.execute("ALTER TABLE memories DROP COLUMN revision")
+            connection.execute(
+                "ALTER TABLE core_memory_sections DROP COLUMN revision"
+            )
+            connection.execute(
+                "ALTER TABLE core_memory_section_history DROP COLUMN revision"
+            )
+            connection.executemany(
+                """
+                INSERT INTO core_memory_sections (
+                    id, user_id, section, content, evidence_memory_ids_json,
+                    confidence, version, created_at, updated_at, archived
+                )
+                VALUES (?, 'alice', 'preferences', ?, ?, ?, ?, ?, ?, 0)
+                """,
+                [
+                    (
+                        "core-old",
+                        "旧偏好",
+                        '["memory-old", "memory-shared"]',
+                        0.7,
+                        1,
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                    (
+                        "core-new",
+                        "新偏好",
+                        '["memory-new", "memory-shared"]',
+                        0.9,
+                        2,
+                        "2026-01-02T00:00:00+00:00",
+                        "2026-01-02T00:00:00+00:00",
+                    ),
+                ],
+            )
+            connection.execute("PRAGMA user_version = 2")
+
+        store.init_db()
+
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
+        with store._connect() as connection:
+            active = connection.execute(
+                """
+                SELECT * FROM core_memory_sections
+                WHERE user_id = 'alice' AND section = 'preferences' AND archived = 0
+                """
+            ).fetchall()
+            archived = connection.execute(
+                """
+                SELECT * FROM core_memory_sections
+                WHERE user_id = 'alice' AND section = 'preferences' AND archived = 1
+                """
+            ).fetchall()
+            history = connection.execute(
+                """
+                SELECT * FROM core_memory_section_history
+                WHERE user_id = 'alice' AND section = 'preferences'
+                """
+            ).fetchall()
+            assert len(active) == 1
+            assert active[0]["id"] == "core-new"
+            assert active[0]["content"] == "新偏好"
+            assert set(json.loads(active[0]["evidence_memory_ids_json"])) == {
+                "memory-old",
+                "memory-new",
+                "memory-shared",
+            }
+            assert int(active[0]["revision"]) >= 2
+            assert len(archived) == 1
+            assert len(history) == 2
+
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO core_memory_sections (
+                        id, user_id, section, content, evidence_memory_ids_json,
+                        confidence, version, created_at, updated_at, archived, revision
+                    )
+                    VALUES (
+                        'core-third', 'alice', 'preferences', '重复', '[]',
+                        0.5, 1, 'now', 'now', 0, 1
+                    )
+                    """
+                )
 
     def test_future_database_version_is_rejected_before_creating_tables(
         self,

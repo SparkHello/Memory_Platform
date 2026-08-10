@@ -144,6 +144,19 @@ class MemoryResolver:
                 auto_classify=auto_classify,
             )
         )
+        final_suppression: tuple[MemoryRecord, str] | None = None
+
+        def final_matcher(latest: list[MemoryRecord]) -> MemoryRecord | None:
+            nonlocal final_suppression
+            final_suppression = _find_suppressing_memory(
+                candidate=candidate,
+                existing=latest,
+                normalized_new=normalized_new,
+                vector=vector,
+                embedding_space_id=embedding_space_id,
+            )
+            return final_suppression[0] if final_suppression is not None else None
+
         created = await anyio.to_thread.run_sync(
             partial(
                 self.store.create_memory,
@@ -165,9 +178,18 @@ class MemoryResolver:
                 sensitivity=candidate.sensitivity,
                 temporal_subject=candidate.temporal_subject,
                 temporal_predicate=candidate.temporal_predicate,
+                final_matcher=final_matcher,
                 **classification_kwargs,
             )
         )
+        if final_suppression is not None:
+            matched, reason = final_suppression
+            return ResolveResult(
+                action="ignore",
+                memory=matched,
+                relation="same",
+                reason=reason,
+            )
         if target:
             return ResolveResult(
                 action="create",
@@ -243,6 +265,34 @@ def _can_suppress_new_candidate(
             and memory.temporal_predicate == candidate.temporal_predicate
         )
     return True
+
+
+def _find_suppressing_memory(
+    *,
+    candidate: CandidateMemory,
+    existing: list[MemoryRecord],
+    normalized_new: str,
+    vector: list[float] | None,
+    embedding_space_id: str,
+) -> tuple[MemoryRecord, str] | None:
+    """Repeat the suppressing checks while the final write lock is held."""
+    for memory in existing:
+        if not _can_suppress_new_candidate(candidate, memory):
+            continue
+        normalized_old = _normalize(memory.content)
+        if normalized_old == normalized_new:
+            return memory, "已有相同记忆"
+        if normalized_new in normalized_old:
+            return memory, "已有更完整的同主题记忆"
+    covered_by = _find_semantically_covering_memory(
+        candidate,
+        existing,
+        vector,
+        embedding_space_id,
+    )
+    if covered_by is not None:
+        return covered_by, "已有更完整的语义等价记忆"
+    return None
 
 
 def _find_semantically_covering_memory(

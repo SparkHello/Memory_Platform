@@ -3,9 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from io import BytesIO
+import multiprocessing
+from multiprocessing.connection import Connection
+import os
 from pathlib import PurePosixPath
 import posixpath
 import re
+import signal
+import sys
+import threading
+import time
 from typing import Final
 from urllib.parse import unquote, urlsplit
 import zipfile
@@ -18,6 +25,13 @@ _SUPPORTED_EXTENSIONS: Final = {".txt", ".md", ".markdown", ".pdf", ".docx", ".e
 _MAX_ARCHIVE_FILES: Final = 10_000
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES: Final = 100 * 1024 * 1024
 _MAX_TABLE_CELLS: Final = 200_000
+_MAX_PDF_PAGES: Final = 1000
+_MAX_PDF_TEXT_CHARS: Final = 10_000_000
+_PDF_WALL_SECONDS: Final = 30.0
+_PDF_CPU_SECONDS: Final = 20
+_PDF_ADDRESS_SPACE_BYTES: Final = 512 * 1024 * 1024
+_PDF_MEMORY_EXIT_CODE: Final = 75
+_PDF_PARSE_SLOTS = threading.BoundedSemaphore(1)
 _WORD_NS: Final = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _CONTAINER_NS: Final = "urn:oasis:names:tc:opendocument:xmlns:container"
 _OPF_NS: Final = "http://www.idpf.org/2007/opf"
@@ -33,6 +47,14 @@ class ParsedKnowledgeDocument:
     content_type: str = "text/markdown"
     page_count: int | None = None
     warnings: tuple[str, ...] = ()
+
+
+class KnowledgeFileParseError(KnowledgeValidationError):
+    """Stable machine code plus a user-safe parsing explanation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def parse_knowledge_file(
@@ -52,7 +74,7 @@ def parse_knowledge_file(
     if extension in {".txt", ".md", ".markdown"}:
         return _parse_text(data, safe_name, extension)
     if extension == ".pdf":
-        return _parse_pdf(data, safe_name)
+        return _parse_pdf_isolated(data, safe_name)
     if extension == ".docx":
         return _parse_docx(data, safe_name)
     return _parse_epub(data, safe_name)
@@ -75,7 +97,150 @@ def _parse_text(data: bytes, filename: str, extension: str) -> ParsedKnowledgeDo
     )
 
 
-def _parse_pdf(data: bytes, filename: str) -> ParsedKnowledgeDocument:
+def _parse_pdf_isolated(data: bytes, filename: str) -> ParsedKnowledgeDocument:
+    if not _PDF_PARSE_SLOTS.acquire(timeout=_PDF_WALL_SECONDS):
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_busy",
+            "PDF parser is busy; retry after the current import finishes",
+        )
+    try:
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_pdf_worker_entry,
+            args=(data, filename, sender),
+            name="memory-gateway-pdf-parser",
+            daemon=True,
+        )
+        process.start()
+        sender.close()
+        try:
+            if not receiver.poll(_PDF_WALL_SECONDS):
+                _terminate_process(process)
+                raise KnowledgeFileParseError(
+                    "knowledge_pdf_wall_timeout",
+                    "PDF parsing exceeded the 30 second wall-time limit",
+                )
+            try:
+                kind, payload = receiver.recv()
+            except EOFError:
+                kind, payload = "exit", None
+        finally:
+            receiver.close()
+        process.join(timeout=1.0)
+        if process.is_alive():
+            _terminate_process(process)
+        if kind == "ok" and isinstance(payload, ParsedKnowledgeDocument):
+            return payload
+        if kind == "error" and isinstance(payload, tuple) and len(payload) == 2:
+            raise KnowledgeFileParseError(str(payload[0]), str(payload[1]))
+        _raise_pdf_worker_exit(process.exitcode)
+    finally:
+        _PDF_PARSE_SLOTS.release()
+
+
+def _pdf_worker_entry(data: bytes, filename: str, sender: Connection) -> None:
+    try:
+        _apply_pdf_worker_limits()
+        result = _parse_pdf_in_worker(data, filename)
+        sender.send(("ok", result))
+    except KnowledgeFileParseError as exc:
+        sender.send(("error", (exc.code, str(exc))))
+    except MemoryError:
+        sender.send(
+            (
+                "error",
+                (
+                    "knowledge_pdf_memory_limit",
+                    "PDF parsing exceeded the 512 MiB address-space limit",
+                ),
+            )
+        )
+    except BaseException:
+        sender.send(
+            (
+                "error",
+                ("knowledge_pdf_invalid", "PDF could not be parsed safely"),
+            )
+        )
+    finally:
+        sender.close()
+
+
+def _apply_pdf_worker_limits() -> None:
+    try:
+        import resource
+    except ImportError as exc:
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_sandbox_unavailable",
+            "PDF parsing is unavailable because OS resource limits are unsupported",
+        ) from exc
+    resource.setrlimit(
+        resource.RLIMIT_CPU,
+        (_PDF_CPU_SECONDS, _PDF_CPU_SECONDS + 1),
+    )
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (_PDF_ADDRESS_SPACE_BYTES, _PDF_ADDRESS_SPACE_BYTES),
+        )
+    except (OSError, ValueError):
+        if sys.platform != "darwin":
+            raise
+        # Darwin exposes RLIMIT_AS but rejects lowering it. Keep production
+        # Linux on the strict virtual-address limit and enforce the same byte
+        # ceiling against peak resident memory in the macOS development build.
+        threading.Thread(
+            target=_darwin_memory_watchdog,
+            args=(resource,),
+            daemon=True,
+        ).start()
+
+
+def _darwin_memory_watchdog(resource_module) -> None:
+    while True:
+        peak_bytes = int(
+            resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss
+        )
+        if peak_bytes > _PDF_ADDRESS_SPACE_BYTES:
+            os._exit(_PDF_MEMORY_EXIT_CODE)
+        time.sleep(0.05)
+
+
+def _terminate_process(process: multiprocessing.Process) -> None:
+    if not process.is_alive():
+        process.join(timeout=0.1)
+        return
+    process.terminate()
+    process.join(timeout=1.0)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=1.0)
+
+
+def _raise_pdf_worker_exit(exitcode: int | None) -> None:
+    if exitcode == _PDF_MEMORY_EXIT_CODE:
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_memory_limit",
+            "PDF parsing exceeded the 512 MiB memory limit",
+        )
+    if exitcode == -getattr(signal, "SIGXCPU", -1):
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_cpu_limit",
+            "PDF parsing exceeded the 20 second CPU limit",
+        )
+    if exitcode == -getattr(signal, "SIGKILL", -1):
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_worker_terminated",
+            "PDF parser was terminated by its resource boundary",
+        )
+    raise KnowledgeFileParseError(
+        "knowledge_pdf_worker_failed",
+        "PDF parser process exited without a valid result",
+    )
+
+
+def _parse_pdf_in_worker(data: bytes, filename: str) -> ParsedKnowledgeDocument:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -85,23 +250,43 @@ def _parse_pdf(data: bytes, filename: str) -> ParsedKnowledgeDocument:
     try:
         reader = PdfReader(BytesIO(data), strict=False)
         if reader.is_encrypted and not reader.decrypt(""):
-            raise KnowledgeValidationError("encrypted PDF files are not supported")
+            raise KnowledgeFileParseError(
+                "knowledge_pdf_encrypted",
+                "encrypted PDF files are not supported",
+            )
+        page_count = len(reader.pages)
+        if page_count > _MAX_PDF_PAGES:
+            raise KnowledgeFileParseError(
+                "knowledge_pdf_page_limit",
+                "PDF exceeds the 1000 page limit",
+            )
         sections: list[str] = []
         empty_pages = 0
+        extracted_characters = 0
         for index, page in enumerate(reader.pages, start=1):
             extracted = page.extract_text() or ""
             extracted = _clean_text(extracted).strip()
             if not extracted:
                 empty_pages += 1
                 continue
+            extracted_characters += len(extracted)
+            if extracted_characters > _MAX_PDF_TEXT_CHARS:
+                raise KnowledgeFileParseError(
+                    "knowledge_pdf_text_limit",
+                    "PDF extracted text exceeds the 10000000 character limit",
+                )
             sections.append(f"# 第 {index} 页\n\n{extracted}")
-    except KnowledgeValidationError:
+    except KnowledgeFileParseError:
         raise
     except Exception as exc:
-        raise KnowledgeValidationError("PDF could not be parsed") from exc
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_invalid",
+            "PDF could not be parsed safely",
+        ) from exc
     if not sections:
-        raise KnowledgeValidationError(
-            "PDF contains no extractable text; scanned PDFs require OCR before import"
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_no_text",
+            "PDF contains no extractable text; scanned PDFs require OCR before import",
         )
     metadata_title = ""
     try:
@@ -116,7 +301,7 @@ def _parse_pdf(data: bytes, filename: str) -> ParsedKnowledgeDocument:
         suggested_title=metadata_title or _filename_title(filename),
         source_name=filename,
         source_format="pdf",
-        page_count=len(reader.pages),
+        page_count=page_count,
         warnings=warnings,
     )
 

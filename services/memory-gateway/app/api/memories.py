@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse, Response
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from app.config import Settings, get_settings
 from app.api.deps import (
@@ -16,6 +16,7 @@ from app.api.deps import (
     get_llm_client,
     get_memory_search_service,
     get_memory_store,
+    get_signing_secret,
     get_user_id,
     require_api_key,
 )
@@ -43,6 +44,7 @@ from app.memory.health import MemoryHealthChecker
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
     CandidateMemory,
+    CoreMemorySection,
     CoreMemorySectionName,
     MemoryRecord,
     MemoryRelation,
@@ -60,6 +62,11 @@ from app.memory.models import (
 )
 from app.memory.network import build_memory_network
 from app.memory.resolver import MemoryResolver
+from app.memory.purge_preview import (
+    PurgePreviewTokenError,
+    sign_purge_preview,
+    verify_purge_preview,
+)
 from app.memory.review import MemoryReviewer
 from app.memory.review_revision import (
     ReviewRevisionError,
@@ -68,8 +75,10 @@ from app.memory.review_revision import (
     preview_review_revision,
 )
 from app.memory.report import (
+    MemorySelectionConflict,
     build_obsidian_markdown_zip,
     build_memory_export,
+    build_memory_selection_export,
     build_memory_report,
     format_memory_export,
     restore_memory_export,
@@ -86,7 +95,11 @@ from app.memory.search import (
     embedding_space_id_for,
     search_cache_stats,
 )
-from app.memory.store import MemoryStore
+from app.memory.store import (
+    MemoryStore,
+    PurgePreviewConflictError,
+    RevisionConflictError,
+)
 from app.memory.utils import parse_embedding_vector
 from app.usage.context import model_usage_scope
 
@@ -95,6 +108,12 @@ router = APIRouter(
     tags=["memories"],
     dependencies=[Depends(require_api_key)],
 )
+
+QUERY_MAX_CHARS = 4096
+MEMORY_TEXT_MAX_CHARS = 65_536
+NOTE_MAX_CHARS = 20_000
+PUBLIC_ID_MAX_CHARS = 200
+PublicId = Annotated[str, Field(min_length=1, max_length=PUBLIC_ID_MAX_CHARS)]
 
 
 @router.get("/cache-stats")
@@ -105,7 +124,7 @@ def memory_search_cache_stats(
 
 
 class MemorySearchRequest(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=QUERY_MAX_CHARS)
     limit: int = Field(default=8, ge=1, le=20)
     include_sensitive: bool = False
     redact_sensitive: bool = False
@@ -123,7 +142,7 @@ class MemoryNetworkRequest(BaseModel):
     limit: int = Field(default=80, ge=1, le=150)
     similarity_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
     max_similarity_edges: int = Field(default=80, ge=0, le=200)
-    space_id: str | None = None
+    space_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     type: MemoryType | None = None
     sensitivity: MemorySensitivity | None = None
     valence_min: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -134,7 +153,7 @@ class MemoryNetworkRequest(BaseModel):
 
 
 class MemoryNetworkTraverseRequest(BaseModel):
-    seed_id: str = Field(min_length=1)
+    seed_id: PublicId
     depth: int = Field(default=2, ge=1, le=3)
     limit: int = Field(default=10, ge=1, le=50)
     similarity_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
@@ -152,29 +171,48 @@ class MemoryMergeRequest(BaseModel):
 
 
 class MemoryReviewRevisionPreviewRequest(BaseModel):
-    memory_ids: list[str] = Field(min_length=1)
-    user_note: str = Field(min_length=1)
-    recommendation_reason: str | None = None
+    memory_ids: list[PublicId] = Field(min_length=1, max_length=100)
+    user_note: str = Field(min_length=1, max_length=NOTE_MAX_CHARS)
+    recommendation_reason: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
     relation: MemoryRelation | None = None
-    suggested_content: str | None = None
+    suggested_content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
     risk_tags: list[MemoryReviewRiskTag] = Field(default_factory=list)
     severity: MemoryReviewSeverity | None = None
 
 
 class MemoryReviewRevisionRelatedRequest(BaseModel):
-    memory_ids: list[str] = Field(min_length=1)
-    user_note: str = Field(min_length=1)
-    recommendation_reason: str | None = None
-    suggested_content: str | None = None
+    memory_ids: list[PublicId] = Field(min_length=1, max_length=100)
+    user_note: str = Field(min_length=1, max_length=NOTE_MAX_CHARS)
+    recommendation_reason: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
+    suggested_content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
     limit: int = Field(default=8, ge=1, le=8)
 
 
 class MemoryReviewRevisionApplyRequest(BaseModel):
-    memory_ids: list[str] = Field(min_length=1)
-    operations: list[MemoryReviewRevisionOperation] = Field(min_length=1)
-    preview_token: str = Field(min_length=1)
+    memory_ids: list[PublicId] = Field(min_length=1, max_length=100)
+    operations: list[MemoryReviewRevisionOperation] = Field(min_length=1, max_length=100)
+    preview_token: str = Field(min_length=1, max_length=MEMORY_TEXT_MAX_CHARS)
     risk_tags: list[MemoryReviewRiskTag] = Field(default_factory=list)
     severity: MemoryReviewSeverity | None = None
+
+    @model_validator(mode="after")
+    def validate_operation_resource_bounds(self):
+        for operation in self.operations:
+            if len(operation.reason) > NOTE_MAX_CHARS:
+                raise ValueError("operation.reason 不能超过 20000 个字符")
+            if operation.content is not None and len(operation.content) > MEMORY_TEXT_MAX_CHARS:
+                raise ValueError("operation.content 不能超过 65536 个字符")
+            if len(operation.memory_ids) > 100 or any(
+                not memory_id or len(memory_id) > PUBLIC_ID_MAX_CHARS
+                for memory_id in operation.memory_ids
+            ):
+                raise ValueError("operation.memory_ids 超出数量或 ID 长度限制")
+            if operation.target_memory_id is not None and (
+                not operation.target_memory_id
+                or len(operation.target_memory_id) > PUBLIC_ID_MAX_CHARS
+            ):
+                raise ValueError("operation.target_memory_id 不能超过 200 个字符")
+        return self
 
 
 MemoryReviewGovernanceAction = Literal[
@@ -188,16 +226,16 @@ MemoryReviewGovernanceAction = Literal[
 
 class MemoryReviewActionRequest(BaseModel):
     action: MemoryReviewGovernanceAction
-    memory_ids: list[str] = Field(min_length=1)
-    reason: str | None = None
+    memory_ids: list[PublicId] = Field(min_length=1, max_length=100)
+    reason: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
     risk_tags: list[MemoryReviewRiskTag] = Field(default_factory=list)
     severity: MemoryReviewSeverity | None = None
     review_after: str | None = None
-    content: str | None = None
+    content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
 
 
 class MemoryUpdateRequest(BaseModel):
-    content: str | None = None
+    content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
     type: MemoryType | None = None
     importance: int | None = Field(default=None, ge=1, le=10)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -208,44 +246,90 @@ class MemoryUpdateRequest(BaseModel):
     valid_until: str | None = None
     review_after: str | None = None
     sensitivity: MemorySensitivity | None = None
-    source_message: str | None = None
-    source_conversation_id: str | None = None
+    source_message: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
+    source_conversation_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     topics: list[str] | None = None
     entities: list[str] | None = None
     temporal_subject: str | None = None
     temporal_predicate: str | None = None
     status: MemoryStatus | None = None
     preserve_metadata: bool = False
+    expected_revision: int | None = Field(default=None, ge=1)
 
 
 class MemorySpacesUpdateRequest(BaseModel):
     space_ids: list[str] = Field(default_factory=list)
     create_space_names: list[str] = Field(default_factory=list)
+    expected_revision: int | None = Field(default=None, ge=1)
+
+
+class CoreMemoryUpdateRequest(BaseModel):
+    content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
+    evidence_memory_ids: list[PublicId] | None = Field(default=None, max_length=1000)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    expected_revision: int | None = Field(default=None, ge=1)
 
 
 class MemoryRestoreExportRequest(BaseModel):
     data: dict
     overwrite: bool = False
     include_deleted: bool = False
+    dry_run: bool = False
+
+
+class MemorySelectionExportRequest(BaseModel):
+    memory_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=1,
+        max_length=1000,
+    )
+
+    @field_validator("memory_ids")
+    @classmethod
+    def normalize_unique_memory_ids(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("memory_ids 不能为空")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("memory_ids 不能重复")
+        return normalized
 
 
 class MemoryPurgeRequest(BaseModel):
-    confirm_memory_id: str = Field(min_length=1)
+    confirm_memory_id: PublicId
+
+
+class MemoryBatchPurgePreviewRequest(BaseModel):
+    memory_ids: list[PublicId] = Field(min_length=1, max_length=1000)
+
+    @field_validator("memory_ids")
+    @classmethod
+    def validate_unique_memory_ids(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("memory_ids 不能为空")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("memory_ids 不能重复")
+        return normalized
+
+
+class MemoryBatchPurgeCommitRequest(MemoryBatchPurgePreviewRequest):
+    fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    preview_token: str = Field(min_length=1, max_length=MEMORY_TEXT_MAX_CHARS)
 
 
 class MemoryIngestRequest(BaseModel):
-    text: str = Field(min_length=1)
-    conversation_id: str | None = None
+    text: str = Field(min_length=1, max_length=MEMORY_TEXT_MAX_CHARS)
+    conversation_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
 
 
 class RecentContextUpsertRequest(BaseModel):
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     summary: str = Field(min_length=1, max_length=12000)
 
 
 class MemorySaveRequest(BaseModel):
     """直接保存一条结构化记忆，对齐 MCP save_memory。"""
-    content: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=MEMORY_TEXT_MAX_CHARS)
     type: MemoryType = "semantic"
     importance: int = Field(default=5, ge=1, le=10)
     confidence: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -253,7 +337,7 @@ class MemorySaveRequest(BaseModel):
     arousal: float = Field(default=0.3, ge=0.0, le=1.0)
     stability: MemoryStability = "stable"
     sensitivity: MemorySensitivity = "normal"
-    source_quote: str = ""
+    source_quote: str = Field(default="", max_length=MEMORY_TEXT_MAX_CHARS)
     valid_from: str | None = None
     valid_until: str | None = None
     review_after: str | None = None
@@ -265,27 +349,27 @@ class MemorySaveRequest(BaseModel):
 
 class MemoryForgetRequest(BaseModel):
     """按自然语言搜索并批量软删除，对齐 MCP forget_memories。"""
-    query: str = ""
+    query: str = Field(default="", max_length=QUERY_MAX_CHARS)
     limit: int = Field(default=5, ge=1, le=10)
 
 
 class MemoryContextRequest(BaseModel):
     """一站式上下文检索。"""
-    query: str = ""
+    query: str = Field(default="", max_length=QUERY_MAX_CHARS)
     include_core_memory: bool = True
     include_recent_context: bool = True
     search_limit: int = Field(default=5, ge=1, le=20)
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     format: Literal["json", "markdown"] = "json"
 
 
 class MemoryContextExplainRequest(BaseModel):
     """解释一次上下文召回，不记录使用次数。"""
-    query: str = ""
+    query: str = Field(default="", max_length=QUERY_MAX_CHARS)
     include_core_memory: bool = True
     include_recent_context: bool = True
     limit: int = Field(default=5, ge=1, le=20)
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     include_sensitive: bool = False
     redact_sensitive: bool = False
 
@@ -294,27 +378,27 @@ MemorySearchFeedbackValue = Literal["useful", "not_useful", "wrong", "missing"]
 
 
 class MemorySearchFeedbackRequest(BaseModel):
-    query: str = ""
-    memory_id: str | None = None
+    query: str = Field(default="", max_length=QUERY_MAX_CHARS)
+    memory_id: str | None = Field(default=None, max_length=PUBLIC_ID_MAX_CHARS)
     feedback: MemorySearchFeedbackValue
-    note: str | None = None
+    note: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
 
 
 class MemoryReEmbedRequest(BaseModel):
     """重新生成记忆 embedding。指定 memory_ids 或 scan 扫描缺失/无效/维度不匹配的 embedding。"""
-    memory_ids: list[str] | None = None
+    memory_ids: list[PublicId] | None = Field(default=None, max_length=1000)
     scan: bool = False
     include_sensitive: bool = False
 
 
 class RecallEvalLabelRequest(BaseModel):
-    id: str = Field(min_length=1)
+    id: PublicId
     # 不在此处限制 query 非空：交给 save_labels 的领域校验，给出带 label id 的友好提示
     # （否则刚新增、query 仍为空的标注会被 Pydantic 拦下并返回原始 422）。
-    query: str = ""
+    query: str = Field(default="", max_length=QUERY_MAX_CHARS)
     judgment: Literal["unlabeled", "relevant", "no_answer"] | None = None
-    relevant_ids: list[str] = Field(default_factory=list)
-    note: str | None = None
+    relevant_ids: list[PublicId] = Field(default_factory=list, max_length=1000)
+    note: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
 
 
 class RecallEvalLabelsRequest(BaseModel):
@@ -436,6 +520,29 @@ def export_memories(
     return export_data
 
 
+@router.post("/export/selection")
+def export_memory_selection(
+    body: MemorySelectionExportRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    try:
+        return build_memory_selection_export(
+            store=store,
+            user_id=user_id,
+            memory_ids=body.memory_ids,
+        )
+    except MemorySelectionConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "memory_selection_stale",
+                "message": "部分所选记忆已不存在或不属于当前用户，请刷新后重试。",
+                "missing_memory_ids": exc.missing_memory_ids,
+            },
+        ) from exc
+
+
 @router.post("/restore")
 def restore_memories_from_export(
     body: MemoryRestoreExportRequest,
@@ -448,6 +555,7 @@ def restore_memories_from_export(
         export_data=body.data,
         overwrite=body.overwrite,
         include_deleted=body.include_deleted,
+        dry_run=body.dry_run,
     )
 
 
@@ -465,8 +573,14 @@ def _safe_download_filename_part(value: str) -> str:
 def list_decision_logs(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
-    conversation_id: str | None = None,
-    memory_id: str | None = None,
+    conversation_id: Annotated[
+        str | None,
+        Query(max_length=PUBLIC_ID_MAX_CHARS),
+    ] = None,
+    memory_id: Annotated[
+        str | None,
+        Query(max_length=PUBLIC_ID_MAX_CHARS),
+    ] = None,
     limit: int = Query(default=100, ge=1, le=5000),
 ) -> dict[str, list[dict]]:
     logs = store.list_decision_logs(
@@ -611,10 +725,12 @@ def restore_conversation_branch(
 
 @router.get("/core")
 def list_core_memory(
+    response: Response,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
 ) -> dict[str, list[dict]]:
     sections = store.list_core_memory_sections(user_id=user_id)
+    response.headers["ETag"] = _core_memory_collection_etag(sections)
     return {"data": [section.model_dump() for section in sections]}
 
 
@@ -631,6 +747,78 @@ def list_core_memory_history(
         limit=limit,
     )
     return {"data": [item.model_dump() for item in history]}
+
+
+@router.get("/core/{section}")
+def get_core_memory_section(
+    section: CoreMemorySectionName,
+    response: Response,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict[str, dict]:
+    core_memory = store.get_core_memory_section(user_id=user_id, section=section)
+    if core_memory is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Core Memory 分区不存在",
+        )
+    response.headers["ETag"] = _revision_etag(
+        "core-memory",
+        core_memory.id,
+        core_memory.revision,
+    )
+    return {"core_memory": core_memory.model_dump()}
+
+
+@router.patch("/core/{section}")
+def update_core_memory_section(
+    section: CoreMemorySectionName,
+    body: CoreMemoryUpdateRequest,
+    response: Response,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict[str, object]:
+    existing = store.get_core_memory_section(user_id=user_id, section=section)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Core Memory 分区不存在",
+        )
+    if "content" in body.model_fields_set:
+        if body.content is None or not body.content.strip():
+            raise HTTPException(status_code=422, detail="content 不能为空")
+        content = body.content.strip()
+    else:
+        content = existing.content
+    try:
+        action, core_memory = store.upsert_core_memory_section(
+            user_id=user_id,
+            section=section,
+            content=content,
+            evidence_memory_ids=(
+                body.evidence_memory_ids
+                if body.evidence_memory_ids is not None
+                else existing.evidence_memory_ids
+            ),
+            confidence=(
+                body.confidence
+                if body.confidence is not None
+                else existing.confidence
+            ),
+            expected_revision=body.expected_revision,
+        )
+    except RevisionConflictError as exc:
+        _raise_revision_conflict(exc)
+    response.headers["ETag"] = _revision_etag(
+        "core-memory",
+        core_memory.id,
+        core_memory.revision,
+    )
+    return {
+        "updated": action != "ignore",
+        "action": action,
+        "core_memory": core_memory.model_dump(),
+    }
 
 
 @router.post("/core/consolidate")
@@ -1178,6 +1366,7 @@ async def preview_memory_review_revision(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     llm_client: Annotated[OpenAICompatibleClient, Depends(get_llm_client)],
     settings: Annotated[Settings, Depends(get_settings)],
+    signing_secret: Annotated[str, Depends(get_signing_secret)],
 ) -> dict:
     if not settings.allow_sensitive_egress:
         selected = [
@@ -1218,7 +1407,7 @@ async def preview_memory_review_revision(
             user_id=user_id,
             store=store,
             llm_client=llm_client,
-            secret=settings.gateway_api_key,
+            secret=signing_secret,
             memory_ids=body.memory_ids,
             user_note=body.user_note,
             recommendation_reason=body.recommendation_reason,
@@ -1259,13 +1448,13 @@ def apply_memory_review_revision(
     body: MemoryReviewRevisionApplyRequest,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
-    settings: Annotated[Settings, Depends(get_settings)],
+    signing_secret: Annotated[str, Depends(get_signing_secret)],
 ) -> dict:
     try:
         return apply_review_revision(
             user_id=user_id,
             store=store,
-            secret=settings.gateway_api_key,
+            secret=signing_secret,
             memory_ids=body.memory_ids,
             operations=body.operations,
             preview_token=body.preview_token,
@@ -1567,6 +1756,7 @@ def create_search_feedback(
 def update_memory_spaces(
     memory_id: str,
     body: MemorySpacesUpdateRequest,
+    response: Response,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
 ) -> dict:
@@ -1583,7 +1773,10 @@ def update_memory_spaces(
             user_id=user_id,
             space_ids=body.space_ids,
             create_space_names=body.create_space_names,
+            expected_revision=body.expected_revision,
         )
+    except RevisionConflictError as exc:
+        _raise_revision_conflict(exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=422,
@@ -1603,6 +1796,7 @@ def update_memory_spaces(
             before=before,
             after=after,
         )
+    response.headers["ETag"] = _revision_etag("memory", memory.id, memory.revision)
     return {"updated": True, "memory": memory.model_dump(exclude={"embedding_json"})}
 
 
@@ -1610,6 +1804,7 @@ def update_memory_spaces(
 def update_memory(
     memory_id: str,
     body: MemoryUpdateRequest,
+    response: Response,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
 ) -> dict:
@@ -1621,6 +1816,8 @@ def update_memory(
         )
 
     updates = body.model_dump(exclude_unset=True)
+    expected_revision = updates.pop("expected_revision", None)
+    updates.pop("preserve_metadata", None)
     if "content" in body.model_fields_set:
         if body.content is None:
             raise HTTPException(
@@ -1699,12 +1896,32 @@ def update_memory(
                 status_code=422,
                 detail="归档记忆时请仅提交 status 字段",
             )
-        if not store.archive_memory(memory_id=memory_id, user_id=user_id):
+        try:
+            archived = store.archive_memory(
+                memory_id=memory_id,
+                user_id=user_id,
+                expected_revision=expected_revision,
+                return_revision=True,
+            )
+        except RevisionConflictError as exc:
+            _raise_revision_conflict(exc)
+        if not archived:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="记忆不存在或已删除",
             )
-        return {"updated": True, "archived": True, "memory_id": memory_id}
+        archived_revision = int(archived)
+        response.headers["ETag"] = _revision_etag(
+            "memory",
+            memory_id,
+            archived_revision,
+        )
+        return {
+            "updated": True,
+            "archived": True,
+            "memory_id": memory_id,
+            "revision": archived_revision,
+        }
 
     temporal_updates = {
         field_name: updates[field_name]
@@ -1739,8 +1956,17 @@ def update_memory(
             topics=updates.get("topics", existing.topics),
             entities=updates.get("entities", existing.entities),
             status=updates.get("status", None),
+            expected_revision=expected_revision,
+            replacement_space_ids=[] if derived_classification is not None else None,
+            replacement_space_names=(
+                derived_classification.space_names
+                if derived_classification is not None
+                else None
+            ),
             **temporal_updates,
         )
+    except RevisionConflictError as exc:
+        _raise_revision_conflict(exc)
     except ValueError as exc:
         raise HTTPException(
             status_code=422,
@@ -1751,13 +1977,6 @@ def update_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="记忆不存在或已删除",
         )
-    if derived_classification is not None:
-        memory = store.replace_memory_spaces(
-            memory_id=memory_id,
-            user_id=user_id,
-            space_ids=[],
-            create_space_names=derived_classification.space_names,
-        ) or memory
     after = _classification_payload(memory)
     if before != after:
         _write_classification_log(
@@ -1767,6 +1986,7 @@ def update_memory(
             before=before,
             after=after,
         )
+    response.headers["ETag"] = _revision_etag("memory", memory.id, memory.revision)
     return {"updated": True, "memory": memory.model_dump(exclude={"embedding_json"})}
 
 
@@ -1788,6 +2008,7 @@ def restore_temporal_memory(
 @router.get("/{memory_id}")
 def get_memory(
     memory_id: str,
+    response: Response,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     redact_sensitive: bool = False,
@@ -1798,6 +2019,7 @@ def get_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="记忆不存在或已删除",
         )
+    response.headers["ETag"] = _revision_etag("memory", memory.id, memory.revision)
     return {"memory": _memory_to_response(memory, redact_sensitive=redact_sensitive)}
 
 
@@ -1814,6 +2036,108 @@ def restore_memory(
             detail="Memory does not exist or is not deleted.",
         )
     return {"restored": True, "memory": memory.model_dump(exclude={"embedding_json"})}
+
+
+@router.post("/deleted/purge/preview")
+def preview_deleted_memory_purge(
+    body: MemoryBatchPurgePreviewRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    signing_secret: Annotated[str, Depends(get_signing_secret)],
+) -> dict:
+    try:
+        plan = store.preview_archived_memory_purge(
+            memory_ids=body.memory_ids,
+            user_id=user_id,
+        )
+    except PurgePreviewConflictError as exc:
+        raise _purge_preview_http_conflict(exc) from exc
+    requested_ids = list(plan["requested_memory_ids"])
+    purge_ids = list(plan["purge_memory_ids"])
+    fingerprint = str(plan["fingerprint"])
+    token, expires_at = sign_purge_preview(
+        secret=signing_secret,
+        user_id=user_id,
+        requested_memory_ids=requested_ids,
+        purge_memory_ids=purge_ids,
+        fingerprint=fingerprint,
+    )
+    return {
+        **plan,
+        "preview_token": token,
+        "expires_at": expires_at,
+    }
+
+
+@router.post("/deleted/purge/commit")
+def commit_deleted_memory_purge(
+    body: MemoryBatchPurgeCommitRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    signing_secret: Annotated[str, Depends(get_signing_secret)],
+) -> dict:
+    try:
+        token_payload = verify_purge_preview(
+            secret=signing_secret,
+            token=body.preview_token,
+        )
+    except PurgePreviewTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "purge_preview_invalid",
+                "message": str(exc),
+            },
+        ) from exc
+
+    requested_ids = sorted(body.memory_ids)
+    token_requested_ids = token_payload.get("requested_memory_ids")
+    token_purge_digest = token_payload.get("purge_memory_ids_sha256")
+    token_purge_count = token_payload.get("purge_memory_count")
+    if (
+        token_payload.get("user_id") != user_id
+        or token_payload.get("fingerprint") != body.fingerprint
+        or not isinstance(token_requested_ids, list)
+        or not all(isinstance(item, str) for item in token_requested_ids)
+        or sorted(token_requested_ids) != requested_ids
+        or not isinstance(token_purge_digest, str)
+        or len(token_purge_digest) != 64
+        or not isinstance(token_purge_count, int)
+        or token_purge_count < len(requested_ids)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "purge_preview_mismatch",
+                "message": "永久删除提交与签名预览的用户、所选 ID 或 fingerprint 不一致。",
+            },
+        )
+    try:
+        result, log = store.commit_archived_memory_purge(
+            memory_ids=requested_ids,
+            user_id=user_id,
+            expected_purge_memory_ids_digest=token_purge_digest,
+            expected_purge_memory_count=token_purge_count,
+            expected_fingerprint=body.fingerprint,
+            call_source="rest_api",
+        )
+    except PurgePreviewConflictError as exc:
+        raise _purge_preview_http_conflict(exc) from exc
+
+    evaluation_cleanup, warnings = _cleanup_eval_after_purge(
+        settings=settings,
+        user_id=user_id,
+    )
+    payload = {
+        "purged": True,
+        **result,
+        "audit_log_id": log.id,
+        "evaluation_cleanup": evaluation_cleanup,
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 
 @router.delete("/deleted/{memory_id}/purge")
@@ -1855,24 +2179,14 @@ def purge_deleted_memory(
     if isinstance(actual_affected, list):
         affected_payload = actual_affected
     purge_effects = purge_audit.get("scrubbed_artifacts")
-    warnings: list[str] = []
-    try:
-        eval_cleanup = delete_user_eval_workspace(settings.eval_dir, user_id=user_id)
-    except Exception:
-        # The database purge above has already committed.  Report that irreversible
-        # success truthfully while making the remaining local cleanup explicit.
-        eval_cleanup = {
-            "workspace_removed": False,
-            "legacy_artifacts_removed": 0,
-            "cleanup_failed": True,
-        }
-        warnings.append(
-            "记忆已永久删除，但本地评测工作区清理失败；"
-            "请检查 EVAL_DIR 权限并手动清理残留评测文件。"
-        )
+    eval_cleanup, warnings = _cleanup_eval_after_purge(
+        settings=settings,
+        user_id=user_id,
+    )
     payload = {
         "purged": True,
         "id": memory_id,
+        "compatibility_mode": "legacy_single_purge_v1",
         "audit_log_id": log.id,
         "affected_core_memory_sections": affected_payload,
         "evaluation_cleanup": eval_cleanup,
@@ -1882,6 +2196,39 @@ def purge_deleted_memory(
     if warnings:
         payload["warnings"] = warnings
     return payload
+
+
+def _purge_preview_http_conflict(exc: PurgePreviewConflictError) -> HTTPException:
+    detail: dict[str, object] = {
+        "code": exc.code,
+        "message": exc.message,
+    }
+    if exc.missing_memory_ids:
+        detail["missing_memory_ids"] = exc.missing_memory_ids
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _cleanup_eval_after_purge(
+    *,
+    settings: Settings,
+    user_id: str,
+) -> tuple[dict, list[str]]:
+    try:
+        return delete_user_eval_workspace(settings.eval_dir, user_id=user_id), []
+    except Exception:
+        # SQLite has already committed. Report the irreversible database result
+        # truthfully and surface the independent filesystem cleanup failure.
+        return (
+            {
+                "workspace_removed": False,
+                "legacy_artifacts_removed": 0,
+                "cleanup_failed": True,
+            },
+            [
+                "记忆已永久删除，但本地评测工作区清理失败；"
+                "请检查 EVAL_DIR 权限并手动清理残留评测文件。"
+            ],
+        )
 
 
 @router.get("/{memory_id}/why")
@@ -1924,6 +2271,37 @@ def delete_memory(
 def _memory_to_response(memory: MemoryRecord, *, redact_sensitive: bool = False) -> dict:
     payload = memory.model_dump(exclude={"embedding_json"})
     return redact_memory_payload(payload, redact_sensitive=redact_sensitive)
+
+
+def _revision_etag(resource: str, resource_id: str, revision: int) -> str:
+    identity = hashlib.sha256(resource_id.encode("utf-8")).hexdigest()[:24]
+    # Memory responses can be redacted without changing the persisted row.
+    # A weak validator truthfully represents the shared underlying revision.
+    return f'W/"{resource}:{identity}:r{revision}"'
+
+
+def _core_memory_collection_etag(sections: list[CoreMemorySection]) -> str:
+    fingerprint = hashlib.sha256(
+        "\n".join(
+            f"{section.id}:{section.revision}"
+            for section in sorted(sections, key=lambda item: item.id)
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f'"core-memory:{fingerprint}"'
+
+
+def _raise_revision_conflict(exc: RevisionConflictError) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "revision_conflict",
+            "resource": exc.resource,
+            "resource_id": exc.resource_id,
+            "expected_revision": exc.expected_revision,
+            "current_revision": exc.current_revision,
+            "message": "记录已被其他操作更新，请刷新后重试。",
+        },
+    ) from exc
 
 
 def _surface_hit_to_dict(hit, *, redact_sensitive: bool = False) -> dict:

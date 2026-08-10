@@ -1,6 +1,8 @@
 from collections import deque
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 import hashlib
@@ -36,6 +38,7 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.redaction import detect_text_sensitivity
+from app.memory.purge_preview import purge_memory_ids_digest
 from app.memory.utils import _parse_iso_datetime
 from app.schema_migrations import (
     apply_schema_migrations,
@@ -53,6 +56,55 @@ _DECISION_LOG_RETENTION_LIMIT = 5000
 # archive. Old nodes can always fall back to the visible history sent by the client.
 _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT = 5000
 _MEMORY_DB_INIT_LOCK = threading.Lock()
+
+
+class RevisionConflictError(RuntimeError):
+    """A caller attempted to mutate a stale persisted representation."""
+
+    def __init__(
+        self,
+        *,
+        resource: str,
+        resource_id: str,
+        expected_revision: int,
+        current_revision: int,
+    ) -> None:
+        super().__init__(f"stale {resource} revision")
+        self.resource = resource
+        self.resource_id = resource_id
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+
+
+class PurgePreviewConflictError(RuntimeError):
+    """A batch purge preview cannot be safely created or committed."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        missing_memory_ids: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.missing_memory_ids = missing_memory_ids or []
+
+
+@dataclass
+class _BatchPurgeSnapshot:
+    requested_memory_ids: list[str]
+    purge_memory_ids: list[str]
+    dependent_memory_ids: list[str]
+    affected_core_memory_sections: list[dict[str, object]]
+    fingerprint: str
+    effects: dict[str, int]
+    affected_memory_rows: list[sqlite3.Row]
+    affected_core_rows: list[sqlite3.Row]
+    affected_core_history_rows: list[sqlite3.Row]
+    affected_decision_log_rows: list[sqlite3.Row]
+    temporal_repairs: list[tuple[str, str | None, str | None]]
 
 
 def _serialize_memory_init(method):
@@ -120,6 +172,73 @@ class MemoryStore:
             self._create_indexes(connection)
             self._rebuild_all_active_temporal_chains(connection=connection)
 
+    def claim_chat_side_effect(
+        self,
+        *,
+        kind: str,
+        key: str,
+        user_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Atomically claim a retry-sensitive chat side effect.
+
+        Only a hash of the turn key is persisted.  The unique constraint makes
+        the guard effective across workers and process restarts; expired claims
+        are removed while holding the same SQLite write lock used for insert.
+        """
+
+        normalized_kind = str(kind).strip().lower()
+        if normalized_kind not in {"activate", "recent_context", "ingest"}:
+            raise ValueError("unknown chat side-effect kind")
+        normalized_user = str(user_id or "default").strip() or "default"
+        if not key:
+            raise ValueError("chat side-effect key must not be empty")
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(
+            seconds=max(30.0, min(float(ttl_seconds), 86400.0))
+        )
+        key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM chat_side_effect_claims WHERE expires_at <= ?",
+                (now.isoformat(),),
+            )
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO chat_side_effect_claims (
+                    kind, key_hash, user_id, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_kind,
+                    key_hash,
+                    normalized_user[:200],
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def release_chat_side_effect_claim(
+        self,
+        *,
+        kind: str,
+        key: str,
+        user_id: str,
+    ) -> None:
+        normalized_kind = str(kind).strip().lower()
+        normalized_user = str(user_id or "default").strip() or "default"
+        key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM chat_side_effect_claims
+                WHERE kind = ? AND key_hash = ? AND user_id = ?
+                """,
+                (normalized_kind, key_hash, normalized_user[:200]),
+            )
+
     @staticmethod
     def _create_tables(connection: sqlite3.Connection) -> None:
         """幂等建表。老库已存在的表会被跳过；新列由 _run_migrations 补齐。"""
@@ -159,7 +278,8 @@ class MemoryStore:
                 created_at TEXT,
                 updated_at TEXT,
                 archived_at TEXT,
-                archived INTEGER DEFAULT 0
+                archived INTEGER DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -213,7 +333,8 @@ class MemoryStore:
                 version INTEGER DEFAULT 1,
                 created_at TEXT,
                 updated_at TEXT,
-                archived INTEGER DEFAULT 0
+                archived INTEGER DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -230,7 +351,8 @@ class MemoryStore:
                 version INTEGER DEFAULT 1,
                 created_at TEXT,
                 updated_at TEXT,
-                replaced_at TEXT
+                replaced_at TEXT,
+                revision INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -318,6 +440,13 @@ class MemoryStore:
             """
             CREATE INDEX IF NOT EXISTS idx_core_memory_sections_user_archived
             ON core_memory_sections(user_id, archived, section)
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_core_memory_user_section_active
+            ON core_memory_sections(user_id, section)
+            WHERE archived = 0
             """
         )
         connection.execute(
@@ -422,6 +551,7 @@ class MemoryStore:
         temporal_predicate: str | None = None,
         space_ids: list[str] | None = None,
         decay_lambda: float | None = None,
+        final_matcher: Callable[[list[MemoryRecord]], MemoryRecord | None] | None = None,
     ) -> MemoryRecord:
         now = utc_now_iso()
         evidence_memory_ids = evidence_memory_ids or []
@@ -472,6 +602,25 @@ class MemoryStore:
             archived=0,
         )
         with self._connect() as connection:
+            if final_matcher is not None:
+                connection.execute("BEGIN IMMEDIATE")
+                latest_rows = connection.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE user_id = ? AND archived = 0
+                      AND (status IS NULL OR status != 'archived')
+                    ORDER BY importance DESC, updated_at DESC
+                    """,
+                    (user_id,),
+                ).fetchall()
+                matched = final_matcher(
+                    self._rows_to_memories_on_connection(
+                        connection=connection,
+                        rows=latest_rows,
+                    )
+                )
+                if matched is not None:
+                    return matched
             self._validate_space_ids(
                 connection=connection,
                 user_id=user_id,
@@ -519,6 +668,9 @@ class MemoryStore:
         temporal_predicate: object = _UNSET,
         status: str | None = None,
         decay_lambda: object = _UNSET,
+        expected_revision: int | None = None,
+        replacement_space_ids: list[str] | None = None,
+        replacement_space_names: list[str] | None = None,
     ) -> MemoryRecord | None:
         valid_until_was_unset = valid_until is _UNSET
         with self._connect() as connection:
@@ -533,12 +685,51 @@ class MemoryStore:
             if live_row is None:
                 return None
 
-            space_ids = self._space_ids_for_memory_ids_on_connection(
+            current_revision = max(1, int(live_row["revision"] or 1))
+            if (
+                expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise RevisionConflictError(
+                    resource="memory",
+                    resource_id=memory_id,
+                    expected_revision=int(expected_revision),
+                    current_revision=current_revision,
+                )
+
+            existing_space_ids = self._space_ids_for_memory_ids_on_connection(
                 connection=connection,
                 user_id=user_id,
                 memory_ids=[memory_id],
             ).get(memory_id, [])
-            existing = self._row_to_memory(live_row, space_ids=space_ids)
+            existing = self._row_to_memory(live_row, space_ids=existing_space_ids)
+            if replacement_space_ids is not None or replacement_space_names is not None:
+                replacement_space_ids = _ordered_unique(replacement_space_ids or [])
+                replacement_space_names = replacement_space_names or []
+                if len(replacement_space_ids) + len(replacement_space_names) > 10:
+                    raise ValueError("space_ids 最多 10 个")
+                created_spaces = [
+                    self._upsert_memory_space_on_connection(
+                        connection=connection,
+                        user_id=user_id,
+                        display_name=normalize_classification_name(
+                            name,
+                            field_name="space",
+                        ),
+                    )
+                    for name in replacement_space_names
+                ]
+                replacement_space_ids = _ordered_unique(
+                    [
+                        *replacement_space_ids,
+                        *(space.id for space in created_spaces),
+                    ]
+                )
+                self._validate_space_ids(
+                    connection=connection,
+                    user_id=user_id,
+                    space_ids=replacement_space_ids,
+                )
             if evidence_memory_ids is None:
                 evidence_memory_ids = existing.evidence_memory_ids
             if topics is None:
@@ -629,6 +820,7 @@ class MemoryStore:
                     "status": status if status is not None else existing.status,
                     "decay_lambda": decay_lambda,
                     "updated_at": now,
+                    "revision": current_revision + 1,
                 }
             )
             topology_changed = any(
@@ -666,8 +858,9 @@ class MemoryStore:
                     review_after = ?, sensitivity = ?,
                     evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
                     temporal_subject = ?, temporal_predicate = ?, status = ?,
-                    decay_lambda = ?, supersedes = ?, superseded_by = ?, updated_at = ?
-                WHERE id = ? AND user_id = ? AND archived = 0
+                    decay_lambda = ?, supersedes = ?, superseded_by = ?, updated_at = ?,
+                    revision = ?
+                WHERE id = ? AND user_id = ? AND archived = 0 AND revision = ?
                 """,
                 (
                     prospective.content,
@@ -695,12 +888,23 @@ class MemoryStore:
                     prospective.supersedes,
                     prospective.superseded_by,
                     now,
+                    prospective.revision,
                     memory_id,
                     user_id,
+                    current_revision,
                 ),
             )
             if cursor.rowcount == 0:
-                return None
+                raise RuntimeError("Memory revision changed while holding the write lock.")
+            if replacement_space_ids is not None:
+                self._replace_memory_space_links(
+                    connection=connection,
+                    user_id=user_id,
+                    memory_id=memory_id,
+                    space_ids=replacement_space_ids,
+                    created_at=now,
+                )
+                existing_space_ids = replacement_space_ids
             if (
                 topology_changed
                 and prospective.status != "archived"
@@ -743,7 +947,7 @@ class MemoryStore:
             ).fetchone()
             if updated_row is None:
                 raise RuntimeError("Memory update did not persist.")
-            return self._row_to_memory(updated_row, space_ids=space_ids)
+            return self._row_to_memory(updated_row, space_ids=existing_space_ids)
 
     def get_memory(self, *, memory_id: str, user_id: str) -> MemoryRecord | None:
         with self._connect() as connection:
@@ -931,6 +1135,61 @@ class MemoryStore:
             ).fetchall()
         return self._rows_to_memories(rows)
 
+    @contextmanager
+    def memory_recall_snapshot(
+        self,
+        *,
+        user_id: str,
+        page_size: int = 500,
+    ) -> Iterator[Callable[[], Iterator[list[MemoryRecord]]]]:
+        """Expose repeatable, bounded page scans from one SQLite snapshot.
+
+        Search needs two passes because keyword IDF is corpus-wide.  Returning a
+        fresh page iterator for each pass keeps the read transaction (and thus
+        the visible corpus) stable without ever materializing the whole library.
+        """
+        bounded_page_size = max(1, min(int(page_size), 1000))
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+
+            def read_pages() -> Iterator[list[MemoryRecord]]:
+                last_rowid: int | None = None
+                while True:
+                    if last_rowid is None:
+                        rows = connection.execute(
+                            """
+                            SELECT rowid AS recall_rowid, *
+                            FROM memories
+                            WHERE user_id = ? AND archived = 0
+                              AND (status IS NULL OR status != 'archived')
+                            ORDER BY rowid ASC
+                            LIMIT ?
+                            """,
+                            (user_id, bounded_page_size),
+                        ).fetchall()
+                    else:
+                        rows = connection.execute(
+                            """
+                            SELECT rowid AS recall_rowid, *
+                            FROM memories
+                            WHERE user_id = ? AND archived = 0
+                              AND (status IS NULL OR status != 'archived')
+                              AND rowid > ?
+                            ORDER BY rowid ASC
+                            LIMIT ?
+                            """,
+                            (user_id, last_rowid, bounded_page_size),
+                        ).fetchall()
+                    if not rows:
+                        return
+                    last_rowid = int(rows[-1]["recall_rowid"])
+                    yield self._rows_to_memories_on_connection(
+                        connection=connection,
+                        rows=rows,
+                    )
+
+            yield read_pages
+
     def list_all_memories_for_export(
         self,
         *,
@@ -1079,6 +1338,77 @@ class MemoryStore:
                 "decision_logs": [DecisionLog(**dict(row)) for row in decision_rows],
             }
 
+    def read_memory_selection_export_snapshot(
+        self,
+        *,
+        user_id: str,
+        memory_ids: list[str],
+    ) -> dict[str, list[object] | list[str]]:
+        """Read an exact, user-scoped selection from one SQLite snapshot.
+
+        The API deliberately treats an archived row as selectable too so the
+        recycle-bin view can use the same safe export contract. Callers must
+        reject ``missing_memory_ids`` rather than returning a partial archive.
+        """
+        requested_ids = _ordered_unique(memory_ids)
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            rows_by_id: dict[str, sqlite3.Row] = {}
+            for offset in range(0, len(requested_ids), 500):
+                batch = requested_ids[offset : offset + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM memories
+                    WHERE user_id = ? AND id IN ({placeholders})
+                    """,
+                    (user_id, *batch),
+                ).fetchall()
+                rows_by_id.update({str(row["id"]): row for row in rows})
+
+            missing_ids = [
+                memory_id for memory_id in requested_ids if memory_id not in rows_by_id
+            ]
+            ordered_rows = [
+                rows_by_id[memory_id]
+                for memory_id in requested_ids
+                if memory_id in rows_by_id
+            ]
+            memories = self._rows_to_memories_on_connection(
+                connection=connection,
+                rows=ordered_rows,
+            )
+            referenced_space_ids = _ordered_unique(
+                [space_id for memory in memories for space_id in memory.space_ids]
+            )
+            spaces_by_id: dict[str, MemorySpace] = {}
+            for offset in range(0, len(referenced_space_ids), 500):
+                batch = referenced_space_ids[offset : offset + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM memory_spaces
+                    WHERE user_id = ? AND id IN ({placeholders})
+                    """,
+                    (user_id, *batch),
+                ).fetchall()
+                spaces_by_id.update(
+                    {
+                        str(row["id"]): self._row_to_memory_space(row)
+                        for row in rows
+                    }
+                )
+            spaces = [
+                spaces_by_id[space_id]
+                for space_id in referenced_space_ids
+                if space_id in spaces_by_id
+            ]
+            return {
+                "memories": memories,
+                "memory_spaces": spaces,
+                "missing_memory_ids": missing_ids,
+            }
+
     def get_memories_max_updated_at(self, *, user_id: str) -> str | None:
         """返回该用户所有活跃记忆的最新 updated_at，用于缓存失效比对。"""
         with self._connect() as connection:
@@ -1203,12 +1533,69 @@ class MemoryStore:
         content: str,
         evidence_memory_ids: list[str],
         confidence: float,
+        expected_revision: int | None = None,
     ) -> tuple[MemoryAction, CoreMemorySection]:
-        existing = self.get_core_memory_section(user_id=user_id, section=section)
         evidence_json = json.dumps(evidence_memory_ids, ensure_ascii=False)
         now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM core_memory_sections
+                WHERE user_id = ? AND section = ? AND archived = 0
+                LIMIT 1
+                """,
+                (user_id, section),
+            ).fetchone()
+            existing = self._row_to_core_memory_section(row) if row else None
+            if expected_revision is not None:
+                current_revision = existing.revision if existing is not None else 0
+                if int(expected_revision) != current_revision:
+                    raise RevisionConflictError(
+                        resource="core_memory",
+                        resource_id=section,
+                        expected_revision=int(expected_revision),
+                        current_revision=current_revision,
+                    )
 
-        if existing:
+            if existing is None:
+                core_memory = CoreMemorySection(
+                    id=new_memory_id(),
+                    user_id=user_id,
+                    section=section,
+                    content=content.strip(),
+                    evidence_memory_ids=evidence_memory_ids,
+                    confidence=confidence,
+                    version=1,
+                    created_at=now,
+                    updated_at=now,
+                    archived=0,
+                    revision=1,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO core_memory_sections (
+                        id, user_id, section, content, evidence_memory_ids_json,
+                        confidence, version, created_at, updated_at, archived, revision
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        core_memory.id,
+                        core_memory.user_id,
+                        core_memory.section,
+                        core_memory.content,
+                        evidence_json,
+                        core_memory.confidence,
+                        core_memory.version,
+                        core_memory.created_at,
+                        core_memory.updated_at,
+                        core_memory.archived,
+                        core_memory.revision,
+                    ),
+                )
+                return "create", core_memory
+
             normalized_content = content.strip()
             if (
                 existing.content == normalized_content
@@ -1216,83 +1603,80 @@ class MemoryStore:
                 and abs(existing.confidence - confidence) < 0.001
             ):
                 return "ignore", existing
-            with self._connect() as connection:
-                self._create_core_memory_section_history(
-                    connection=connection,
-                    section=existing,
-                    replaced_at=now,
-                )
-                connection.execute(
-                    """
-                    UPDATE core_memory_sections
-                    SET content = ?, evidence_memory_ids_json = ?,
-                        confidence = ?, version = ?, updated_at = ?
-                    WHERE id = ? AND user_id = ? AND archived = 0
-                    """,
-                    (
-                        normalized_content,
-                        evidence_json,
-                        confidence,
-                        existing.version + 1,
-                        now,
-                        existing.id,
-                        user_id,
-                    ),
-                )
-            updated = self.get_core_memory_section(user_id=user_id, section=section)
-            return "update", updated if updated else existing
-
-        core_memory = CoreMemorySection(
-            id=new_memory_id(),
-            user_id=user_id,
-            section=section,
-            content=content.strip(),
-            evidence_memory_ids=evidence_memory_ids,
-            confidence=confidence,
-            version=1,
-            created_at=now,
-            updated_at=now,
-            archived=0,
-        )
-        with self._connect() as connection:
-            connection.execute(
+            self._create_core_memory_section_history(
+                connection=connection,
+                section=existing,
+                replaced_at=now,
+            )
+            cursor = connection.execute(
                 """
-                INSERT INTO core_memory_sections (
-                    id, user_id, section, content, evidence_memory_ids_json,
-                    confidence, version, created_at, updated_at, archived
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE core_memory_sections
+                SET content = ?, evidence_memory_ids_json = ?, confidence = ?,
+                    version = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND user_id = ? AND archived = 0 AND revision = ?
                 """,
                 (
-                    core_memory.id,
-                    core_memory.user_id,
-                    core_memory.section,
-                    core_memory.content,
+                    normalized_content,
                     evidence_json,
-                    core_memory.confidence,
-                    core_memory.version,
-                    core_memory.created_at,
-                    core_memory.updated_at,
-                    core_memory.archived,
+                    confidence,
+                    existing.version + 1,
+                    now,
+                    existing.id,
+                    user_id,
+                    existing.revision,
                 ),
             )
-        return "create", core_memory
+            if cursor.rowcount != 1:
+                raise RuntimeError("Core memory revision changed while holding the write lock.")
+            updated_row = connection.execute(
+                """
+                SELECT * FROM core_memory_sections
+                WHERE id = ? AND user_id = ? AND archived = 0
+                """,
+                (existing.id, user_id),
+            ).fetchone()
+            if updated_row is None:
+                raise RuntimeError("Core memory update did not persist.")
+            return "update", self._row_to_core_memory_section(updated_row)
 
     def archive_core_memory_section(
         self,
         *,
         user_id: str,
         section: CoreMemorySectionName,
+        expected_revision: int | None = None,
     ) -> bool:
         now = utc_now_iso()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id, revision FROM core_memory_sections
+                WHERE user_id = ? AND section = ? AND archived = 0
+                LIMIT 1
+                """,
+                (user_id, section),
+            ).fetchone()
+            if existing is None:
+                return False
+            current_revision = max(1, int(existing["revision"] or 1))
+            if (
+                expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise RevisionConflictError(
+                    resource="core_memory",
+                    resource_id=section,
+                    expected_revision=int(expected_revision),
+                    current_revision=current_revision,
+                )
             cursor = connection.execute(
                 """
                 UPDATE core_memory_sections
-                SET archived = 1, updated_at = ?
-                WHERE user_id = ? AND section = ? AND archived = 0
+                SET archived = 1, updated_at = ?, revision = revision + 1
+                WHERE user_id = ? AND section = ? AND archived = 0 AND revision = ?
                 """,
-                (now, user_id, section),
+                (now, user_id, section, current_revision),
             )
         return cursor.rowcount > 0
 
@@ -2000,7 +2384,14 @@ class MemoryStore:
             raise RuntimeError("conversation branch node write did not persist")
         return self._row_to_conversation_branch_node(row)
 
-    def archive_memory(self, *, memory_id: str, user_id: str) -> bool:
+    def archive_memory(
+        self,
+        *,
+        memory_id: str,
+        user_id: str,
+        expected_revision: int | None = None,
+        return_revision: bool = False,
+    ) -> bool | int:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -2012,15 +2403,27 @@ class MemoryStore:
             ).fetchone()
             if row is None:
                 return False
+            current_revision = max(1, int(row["revision"] or 1))
+            if (
+                expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise RevisionConflictError(
+                    resource="memory",
+                    resource_id=memory_id,
+                    expected_revision=int(expected_revision),
+                    current_revision=current_revision,
+                )
             source = self._row_to_memory(row, space_ids=[])
             now = utc_now_iso()
             cursor = connection.execute(
                 """
                 UPDATE memories
-                SET archived = 1, archived_at = ?, updated_at = ?
-                WHERE id = ? AND user_id = ? AND archived = 0
+                SET archived = 1, archived_at = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE id = ? AND user_id = ? AND archived = 0 AND revision = ?
                 """,
-                (now, now, memory_id, user_id),
+                (now, now, memory_id, user_id, current_revision),
             )
             if cursor.rowcount == 0:
                 return False
@@ -2031,7 +2434,7 @@ class MemoryStore:
                     temporal_subject=source.temporal_subject,
                     temporal_predicate=source.temporal_predicate,
                 )
-            return True
+            return current_revision + 1 if return_revision else True
 
     def restore_memory(self, *, memory_id: str, user_id: str) -> MemoryRecord | None:
         with self._connect() as connection:
@@ -2061,7 +2464,8 @@ class MemoryStore:
             cursor = connection.execute(
                 """
                 UPDATE memories
-                SET archived = 0, archived_at = NULL, status = ?, updated_at = ?
+                SET archived = 0, archived_at = NULL, status = ?, updated_at = ?,
+                    revision = revision + 1
                 WHERE id = ? AND user_id = ? AND archived = 1
                 """,
                 (restored_status, now, memory_id, user_id),
@@ -2149,6 +2553,89 @@ class MemoryStore:
                 (now_iso, now_iso, user_id, *expired_ids),
             )
         return int(cursor.rowcount)
+
+    def preview_archived_memory_purge(
+        self,
+        *,
+        memory_ids: list[str],
+        user_id: str,
+    ) -> dict[str, object]:
+        """Build a repeatable, user-scoped purge plan without writing data."""
+
+        requested_ids = sorted(_ordered_unique(memory_ids))
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            snapshot = _build_batch_purge_snapshot(
+                connection,
+                user_id=user_id,
+                requested_memory_ids=requested_ids,
+            )
+        return {
+            "requested_memory_ids": snapshot.requested_memory_ids,
+            "purge_memory_ids": snapshot.purge_memory_ids,
+            "dependent_memory_ids": snapshot.dependent_memory_ids,
+            "affected_core_memory_sections": snapshot.affected_core_memory_sections,
+            "fingerprint": snapshot.fingerprint,
+            "effects": snapshot.effects,
+        }
+
+    def commit_archived_memory_purge(
+        self,
+        *,
+        memory_ids: list[str],
+        user_id: str,
+        expected_purge_memory_ids_digest: str,
+        expected_purge_memory_count: int,
+        expected_fingerprint: str,
+        call_source: str = "rest_api",
+    ) -> tuple[dict[str, object], DecisionLog]:
+        """Revalidate and apply one batch purge in one immediate transaction."""
+
+        requested_ids = sorted(_ordered_unique(memory_ids))
+        purged_at = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = _build_batch_purge_snapshot(
+                connection,
+                user_id=user_id,
+                requested_memory_ids=requested_ids,
+            )
+            if (
+                len(snapshot.purge_memory_ids) != expected_purge_memory_count
+                or purge_memory_ids_digest(snapshot.purge_memory_ids)
+                != expected_purge_memory_ids_digest
+                or snapshot.fingerprint != expected_fingerprint
+            ):
+                raise PurgePreviewConflictError(
+                    code="purge_preview_stale",
+                    message="永久删除预览已过期：所选记忆、依赖闭包或 Core 影响已变化。",
+                )
+            effects = _apply_batch_purge_snapshot(
+                connection,
+                user_id=user_id,
+                snapshot=snapshot,
+                purged_at=purged_at,
+            )
+            log = _insert_batch_purge_audit(
+                connection,
+                user_id=user_id,
+                snapshot=snapshot,
+                effects=effects,
+                fingerprint=expected_fingerprint,
+                purged_at=purged_at,
+                call_source=call_source,
+            )
+        return (
+            {
+                "requested_memory_ids": snapshot.requested_memory_ids,
+                "purged_memory_ids": snapshot.purge_memory_ids,
+                "dependent_memory_ids": snapshot.dependent_memory_ids,
+                "affected_core_memory_sections": snapshot.affected_core_memory_sections,
+                "fingerprint": snapshot.fingerprint,
+                "effects": effects,
+            },
+            log,
+        )
 
     def purge_archived_memory(
         self,
@@ -2297,58 +2784,95 @@ class MemoryStore:
 
     def upsert_memory_space(self, *, user_id: str, name: str) -> MemorySpace:
         display_name = normalize_classification_name(name, field_name="space")
+        with self._connect() as connection:
+            return self._upsert_memory_space_on_connection(
+                connection=connection,
+                user_id=user_id,
+                display_name=display_name,
+            )
+
+    def _upsert_memory_space_on_connection(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        display_name: str,
+    ) -> MemorySpace:
         normalized_name = display_name.casefold()
         now = utc_now_iso()
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM memory_spaces
-                WHERE user_id = ? AND normalized_name = ?
-                """,
-                (user_id, normalized_name),
-            ).fetchone()
-            if row is not None:
-                connection.execute(
-                    """
-                    UPDATE memory_spaces
-                    SET name = ?, updated_at = ?, archived = 0
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (display_name, now, row["id"], user_id),
-                )
-                updated = connection.execute(
-                    "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
-                    (row["id"], user_id),
-                ).fetchone()
-                return self._row_to_memory_space(updated)
-
-            space = MemorySpace(
-                id=new_memory_id(),
-                user_id=user_id,
-                name=display_name,
-                normalized_name=normalized_name,
-                created_at=now,
-                updated_at=now,
-                archived=0,
-            )
+        row = connection.execute(
+            """
+            SELECT * FROM memory_spaces
+            WHERE user_id = ? AND normalized_name = ?
+            """,
+            (user_id, normalized_name),
+        ).fetchone()
+        if row is not None:
             connection.execute(
                 """
-                INSERT INTO memory_spaces (
-                    id, user_id, name, normalized_name, created_at, updated_at, archived
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                UPDATE memory_spaces
+                SET name = ?, updated_at = ?, archived = 0
+                WHERE id = ? AND user_id = ?
                 """,
-                (
-                    space.id,
-                    space.user_id,
-                    space.name,
-                    space.normalized_name,
-                    space.created_at,
-                    space.updated_at,
-                    space.archived,
-                ),
+                (display_name, now, row["id"], user_id),
             )
+            updated = connection.execute(
+                "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
+                (row["id"], user_id),
+            ).fetchone()
+            return self._row_to_memory_space(updated)
+
+        space = MemorySpace(
+            id=new_memory_id(),
+            user_id=user_id,
+            name=display_name,
+            normalized_name=normalized_name,
+            created_at=now,
+            updated_at=now,
+            archived=0,
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_spaces (
+                id, user_id, name, normalized_name, created_at, updated_at, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                space.id,
+                space.user_id,
+                space.name,
+                space.normalized_name,
+                space.created_at,
+                space.updated_at,
+                space.archived,
+            ),
+        )
         return space
+
+    def prepare_memory_space_import(
+        self,
+        *,
+        data: dict,
+    ) -> dict[str, object] | None:
+        """Validate one exported space without opening or mutating SQLite."""
+        raw_name = data.get("name")
+        if not isinstance(raw_name, str):
+            return None
+        try:
+            display_name = normalize_classification_name(raw_name, field_name="space")
+        except ValueError:
+            return None
+        source_id = str(data.get("id") or "").strip()
+        now = utc_now_iso()
+        return {
+            "source_id": source_id,
+            "requested_id": source_id or new_memory_id(),
+            "name": display_name,
+            "normalized_name": display_name.casefold(),
+            "created_at": str(data.get("created_at") or now),
+            "archived": 1 if data.get("archived") else 0,
+        }
 
     def import_memory_space(
         self,
@@ -2543,6 +3067,7 @@ class MemoryStore:
         user_id: str,
         space_ids: list[str],
         create_space_names: list[str] | None = None,
+        expected_revision: int | None = None,
     ) -> MemoryRecord | None:
         normalized_space_ids = _ordered_unique(
             [str(space_id).strip() for space_id in space_ids if str(space_id).strip()]
@@ -2550,26 +3075,42 @@ class MemoryStore:
         create_space_names = create_space_names or []
         if len(normalized_space_ids) + len(create_space_names) > 10:
             raise ValueError("space_ids 最多 10 个")
-        created_spaces = [
-            self.upsert_memory_space(user_id=user_id, name=name)
-            for name in create_space_names
-        ]
-        normalized_space_ids = _ordered_unique(
-            [*normalized_space_ids, *(space.id for space in created_spaces)]
-        )
-        if len(normalized_space_ids) > 10:
-            raise ValueError("space_ids 最多 10 个")
         now = utc_now_iso()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             memory_exists = connection.execute(
                 """
-                SELECT id FROM memories
+                SELECT id, revision FROM memories
                 WHERE id = ? AND user_id = ? AND archived = 0
                 """,
                 (memory_id, user_id),
             ).fetchone()
             if memory_exists is None:
                 return None
+            current_revision = max(1, int(memory_exists["revision"] or 1))
+            if (
+                expected_revision is not None
+                and int(expected_revision) != current_revision
+            ):
+                raise RevisionConflictError(
+                    resource="memory",
+                    resource_id=memory_id,
+                    expected_revision=int(expected_revision),
+                    current_revision=current_revision,
+                )
+            created_spaces = [
+                self._upsert_memory_space_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    display_name=normalize_classification_name(name, field_name="space"),
+                )
+                for name in create_space_names
+            ]
+            normalized_space_ids = _ordered_unique(
+                [*normalized_space_ids, *(space.id for space in created_spaces)]
+            )
+            if len(normalized_space_ids) > 10:
+                raise ValueError("space_ids 最多 10 个")
             self._validate_space_ids(
                 connection=connection,
                 user_id=user_id,
@@ -2585,12 +3126,24 @@ class MemoryStore:
             connection.execute(
                 """
                 UPDATE memories
-                SET updated_at = ?
+                SET updated_at = ?, revision = revision + 1
+                WHERE id = ? AND user_id = ? AND archived = 0 AND revision = ?
+                """,
+                (now, memory_id, user_id, current_revision),
+            )
+            updated_row = connection.execute(
+                """
+                SELECT * FROM memories
                 WHERE id = ? AND user_id = ? AND archived = 0
                 """,
-                (now, memory_id, user_id),
+                (memory_id, user_id),
+            ).fetchone()
+            if updated_row is None:
+                raise RuntimeError("Memory space update did not persist.")
+            return self._row_to_memory(
+                updated_row,
+                space_ids=normalized_space_ids,
             )
-        return self.get_memory(memory_id=memory_id, user_id=user_id)
 
     def plan_memory_import_ids(
         self,
@@ -2605,38 +3158,56 @@ class MemoryStore:
         )
         if not ordered_ids:
             return {}
-        owners: dict[str, str] = {}
         with self._connect() as connection:
-            for offset in range(0, len(ordered_ids), 500):
-                batch = ordered_ids[offset : offset + 500]
-                placeholders = ", ".join("?" for _ in batch)
-                rows = connection.execute(
-                    f"SELECT id, user_id FROM memories WHERE id IN ({placeholders})",
-                    tuple(batch),
-                ).fetchall()
-                owners.update(
-                    {str(row["id"]): str(row["user_id"] or "default") for row in rows}
-                )
+            return self._plan_memory_import_ids_on_connection(
+                connection=connection,
+                user_id=user_id,
+                source_ids=ordered_ids,
+                rebind_all=rebind_all,
+            )
 
-            result: dict[str, str] = {}
-            allocated = set(ordered_ids)
-            for source_id in ordered_ids:
-                owner = owners.get(source_id)
-                if not rebind_all and (owner is None or owner == user_id):
-                    result[source_id] = source_id
+    @staticmethod
+    def _plan_memory_import_ids_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        source_ids: list[str],
+        rebind_all: bool,
+    ) -> dict[str, str]:
+        ordered_ids = _ordered_unique(
+            [str(memory_id).strip() for memory_id in source_ids if str(memory_id).strip()]
+        )
+        owners: dict[str, str] = {}
+        for offset in range(0, len(ordered_ids), 500):
+            batch = ordered_ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                f"SELECT id, user_id FROM memories WHERE id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            owners.update(
+                {str(row["id"]): str(row["user_id"] or "default") for row in rows}
+            )
+
+        result: dict[str, str] = {}
+        allocated = set(ordered_ids)
+        for source_id in ordered_ids:
+            owner = owners.get(source_id)
+            if not rebind_all and (owner is None or owner == user_id):
+                result[source_id] = source_id
+                continue
+            while True:
+                target_id = new_memory_id()
+                if target_id in allocated:
                     continue
-                while True:
-                    target_id = new_memory_id()
-                    if target_id in allocated:
-                        continue
-                    exists = connection.execute(
-                        "SELECT 1 FROM memories WHERE id = ?",
-                        (target_id,),
-                    ).fetchone()
-                    if exists is None:
-                        break
-                result[source_id] = target_id
-                allocated.add(target_id)
+                exists = connection.execute(
+                    "SELECT 1 FROM memories WHERE id = ?",
+                    (target_id,),
+                ).fetchone()
+                if exists is None:
+                    break
+            result[source_id] = target_id
+            allocated.add(target_id)
         return result
 
     def filter_existing_memory_ids(
@@ -2649,19 +3220,35 @@ class MemoryStore:
         ordered_ids = _ordered_unique(
             [str(memory_id).strip() for memory_id in memory_ids if str(memory_id).strip()]
         )
-        existing: set[str] = set()
         with self._connect() as connection:
-            for offset in range(0, len(ordered_ids), 500):
-                batch = ordered_ids[offset : offset + 500]
-                placeholders = ", ".join("?" for _ in batch)
-                rows = connection.execute(
-                    f"""
-                    SELECT id FROM memories
-                    WHERE user_id = ? AND id IN ({placeholders})
-                    """,
-                    (user_id, *batch),
-                ).fetchall()
-                existing.update(str(row["id"]) for row in rows)
+            return self._filter_existing_memory_ids_on_connection(
+                connection=connection,
+                user_id=user_id,
+                memory_ids=ordered_ids,
+            )
+
+    @staticmethod
+    def _filter_existing_memory_ids_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        memory_ids: list[str],
+    ) -> set[str]:
+        ordered_ids = _ordered_unique(
+            [str(memory_id).strip() for memory_id in memory_ids if str(memory_id).strip()]
+        )
+        existing: set[str] = set()
+        for offset in range(0, len(ordered_ids), 500):
+            batch = ordered_ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id FROM memories
+                WHERE user_id = ? AND id IN ({placeholders})
+                """,
+                (user_id, *batch),
+            ).fetchall()
+            existing.update(str(row["id"]) for row in rows)
         return existing
 
     def prune_dangling_memory_references(
@@ -2676,86 +3263,565 @@ class MemoryStore:
         )
         if not target_ids:
             return 0
-        now = utc_now_iso()
-        changed_references = 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing_ids = {
-                str(row["id"])
-                for row in connection.execute(
-                    "SELECT id FROM memories WHERE user_id = ?",
-                    (user_id,),
-                ).fetchall()
-            }
-            for offset in range(0, len(target_ids), 500):
-                batch = target_ids[offset : offset + 500]
-                placeholders = ", ".join("?" for _ in batch)
-                rows = connection.execute(
-                    f"""
-                    SELECT id, evidence_memory_ids_json, supersedes, superseded_by
-                    FROM memories
-                    WHERE user_id = ? AND id IN ({placeholders})
+            return self._prune_dangling_memory_references_on_connection(
+                connection=connection,
+                user_id=user_id,
+                memory_ids=target_ids,
+            )
+
+    @staticmethod
+    def _prune_dangling_memory_references_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        memory_ids: list[str],
+    ) -> int:
+        target_ids = _ordered_unique(
+            [str(memory_id).strip() for memory_id in memory_ids if str(memory_id).strip()]
+        )
+        if not target_ids:
+            return 0
+        now = utc_now_iso()
+        changed_references = 0
+        existing_ids = {
+            str(row["id"])
+            for row in connection.execute(
+                "SELECT id FROM memories WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        }
+        for offset in range(0, len(target_ids), 500):
+            batch = target_ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT id, evidence_memory_ids_json, supersedes, superseded_by
+                FROM memories
+                WHERE user_id = ? AND id IN ({placeholders})
+                """,
+                (user_id, *batch),
+            ).fetchall()
+            for row in rows:
+                evidence_before = _json_string_list(row["evidence_memory_ids_json"])
+                evidence_after = [
+                    memory_id
+                    for memory_id in evidence_before
+                    if memory_id in existing_ids
+                ]
+                supersedes_before = str(row["supersedes"]) if row["supersedes"] else None
+                superseded_by_before = (
+                    str(row["superseded_by"]) if row["superseded_by"] else None
+                )
+                supersedes_after = (
+                    supersedes_before if supersedes_before in existing_ids else None
+                )
+                superseded_by_after = (
+                    superseded_by_before if superseded_by_before in existing_ids else None
+                )
+                removed = (
+                    len(evidence_before) - len(evidence_after)
+                    + int(bool(supersedes_before and not supersedes_after))
+                    + int(bool(superseded_by_before and not superseded_by_after))
+                )
+                if removed <= 0:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE memories
+                    SET evidence_memory_ids_json = ?, supersedes = ?,
+                        superseded_by = ?, updated_at = ?
+                    WHERE id = ? AND user_id = ?
                     """,
-                    (user_id, *batch),
-                ).fetchall()
-                for row in rows:
-                    evidence_before = _json_string_list(row["evidence_memory_ids_json"])
-                    evidence_after = [
-                        memory_id
-                        for memory_id in evidence_before
-                        if memory_id in existing_ids
-                    ]
-                    supersedes_before = str(row["supersedes"]) if row["supersedes"] else None
-                    superseded_by_before = (
-                        str(row["superseded_by"]) if row["superseded_by"] else None
-                    )
-                    supersedes_after = (
-                        supersedes_before if supersedes_before in existing_ids else None
-                    )
-                    superseded_by_after = (
-                        superseded_by_before
-                        if superseded_by_before in existing_ids
-                        else None
-                    )
-                    removed = (
-                        len(evidence_before) - len(evidence_after)
-                        + int(bool(supersedes_before and not supersedes_after))
-                        + int(bool(superseded_by_before and not superseded_by_after))
-                    )
-                    if removed <= 0:
-                        continue
-                    connection.execute(
-                        """
-                        UPDATE memories
-                        SET evidence_memory_ids_json = ?, supersedes = ?,
-                            superseded_by = ?, updated_at = ?
-                        WHERE id = ? AND user_id = ?
-                        """,
-                        (
-                            json.dumps(evidence_after, ensure_ascii=False),
-                            supersedes_after,
-                            superseded_by_after,
-                            now,
-                            row["id"],
-                            user_id,
-                        ),
-                    )
-                    changed_references += removed
+                    (
+                        json.dumps(evidence_after, ensure_ascii=False),
+                        supersedes_after,
+                        superseded_by_after,
+                        now,
+                        row["id"],
+                        user_id,
+                    ),
+                )
+                changed_references += removed
         return changed_references
 
-    def import_memory_record(
+    def restore_prepared_export(
+        self,
+        *,
+        user_id: str,
+        prepared_spaces: list[dict[str, object]],
+        prepared_memories: list[tuple[str, MemoryRecord]],
+        source_memory_ids: list[str],
+        referenced_source_ids: list[str],
+        recent_contexts: list[dict[str, object]],
+        branch_nodes: list[dict[str, object]],
+        exported_user_id: str,
+        overwrite: bool,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        """Apply one fully prepared export in a single immediate transaction."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            # Finish every database-dependent mapping before the first write.
+            space_plans, space_id_map = self._plan_memory_space_imports_on_connection(
+                connection=connection,
+                user_id=user_id,
+                prepared_spaces=prepared_spaces,
+                overwrite=overwrite,
+            )
+            memory_id_map = self._plan_memory_import_ids_on_connection(
+                connection=connection,
+                user_id=user_id,
+                source_ids=source_memory_ids,
+                rebind_all=bool(exported_user_id and exported_user_id != user_id),
+            )
+            preserve_existing_references = (
+                not exported_user_id or exported_user_id == user_id
+            )
+            allowed_existing_ids = (
+                self._filter_existing_memory_ids_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    memory_ids=referenced_source_ids,
+                )
+                if preserve_existing_references
+                else set()
+            )
+            mapped_memories: list[MemoryRecord] = []
+            for source_id, prepared in prepared_memories:
+                memory = prepared.model_copy(deep=True)
+                if source_id in memory_id_map:
+                    memory.id = memory_id_map[source_id]
+                memory.space_ids = _ordered_unique(
+                    [
+                        mapped
+                        for source_space_id in memory.space_ids
+                        if (mapped := space_id_map.get(source_space_id))
+                    ]
+                )[:10]
+                mapped_evidence: list[str] = []
+                for evidence_id in memory.evidence_memory_ids:
+                    mapped_id = memory_id_map.get(evidence_id)
+                    if mapped_id is None and evidence_id in allowed_existing_ids:
+                        mapped_id = evidence_id
+                    if mapped_id and mapped_id not in mapped_evidence:
+                        mapped_evidence.append(mapped_id)
+                memory.evidence_memory_ids = mapped_evidence
+                for field_name in ("supersedes", "superseded_by"):
+                    reference = getattr(memory, field_name)
+                    mapped_reference = memory_id_map.get(reference) if reference else None
+                    if mapped_reference is None and reference in allowed_existing_ids:
+                        mapped_reference = reference
+                    setattr(memory, field_name, mapped_reference)
+                mapped_memories.append(memory)
+
+            # No validation, parsing or identifier allocation occurs below this
+            # point. Any unexpected exception escapes the context manager and
+            # rolls back every already-written partition.
+            for plan in space_plans:
+                self._apply_memory_space_import_plan_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    plan=plan,
+                )
+
+            memory_results: list[tuple[str, MemoryRecord | None]] = []
+            imported_memory_ids: list[str] = []
+            for memory in mapped_memories:
+                action, persisted = self._import_prepared_memory_record_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    memory=memory,
+                    overwrite=overwrite,
+                    rebind_on_conflict=False,
+                )
+                memory_results.append((action, persisted))
+                if persisted is not None and action in {"created", "updated"}:
+                    imported_memory_ids.append(persisted.id)
+
+            dangling_removed = self._prune_dangling_memory_references_on_connection(
+                connection=connection,
+                user_id=user_id,
+                memory_ids=imported_memory_ids,
+            )
+            final_existing_ids = self._filter_existing_memory_ids_on_connection(
+                connection=connection,
+                user_id=user_id,
+                memory_ids=[*memory_id_map.values(), *referenced_source_ids],
+            )
+
+            recent_context_actions = [
+                self._restore_recent_context_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    prepared=prepared,
+                    overwrite=overwrite,
+                )
+                for prepared in recent_contexts
+            ]
+            branch_node_actions = [
+                self._restore_branch_node_on_connection(
+                    connection=connection,
+                    user_id=user_id,
+                    prepared=prepared,
+                    overwrite=overwrite,
+                )
+                for prepared in branch_nodes
+            ]
+            result: dict[str, object] = {
+                "space_results": [
+                    (str(plan["action"]), plan["space"])
+                    for plan in space_plans
+                ],
+                "memory_results": memory_results,
+                "recent_context_actions": recent_context_actions,
+                "branch_node_actions": branch_node_actions,
+                "dangling_references_removed": dangling_removed,
+                "final_existing_ids": final_existing_ids,
+            }
+            if dry_run:
+                connection.rollback()
+            return result
+
+    def _plan_memory_space_imports_on_connection(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        prepared_spaces: list[dict[str, object]],
+        overwrite: bool,
+    ) -> tuple[list[dict[str, object]], dict[str, str]]:
+        target_rows = connection.execute(
+            "SELECT * FROM memory_spaces WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        by_id = {
+            str(row["id"]): self._row_to_memory_space(row)
+            for row in target_rows
+        }
+        by_name = {space.normalized_name: space for space in by_id.values()}
+        requested_ids = _ordered_unique(
+            [str(item["requested_id"]) for item in prepared_spaces]
+        )
+        owners: dict[str, str] = {}
+        for offset in range(0, len(requested_ids), 500):
+            batch = requested_ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                f"SELECT id, user_id FROM memory_spaces WHERE id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            owners.update(
+                {str(row["id"]): str(row["user_id"] or "default") for row in rows}
+            )
+        reserved_ids = set(requested_ids) | set(owners)
+
+        def allocate_id() -> str:
+            while True:
+                candidate = new_memory_id()
+                if candidate in reserved_ids:
+                    continue
+                if connection.execute(
+                    "SELECT 1 FROM memory_spaces WHERE id = ?",
+                    (candidate,),
+                ).fetchone() is None:
+                    reserved_ids.add(candidate)
+                    return candidate
+
+        plans: list[dict[str, object]] = []
+        space_id_map: dict[str, str] = {}
+        for prepared in prepared_spaces:
+            source_id = str(prepared["source_id"])
+            requested_id = str(prepared["requested_id"])
+            if owners.get(requested_id) not in {None, user_id}:
+                requested_id = allocate_id()
+            name = str(prepared["name"])
+            normalized_name = str(prepared["normalized_name"])
+            now = utc_now_iso()
+            existing_name = by_name.get(normalized_name)
+            if existing_name is not None and (
+                existing_name.id != requested_id or not overwrite
+            ):
+                space = existing_name.model_copy(
+                    update={"name": name, "updated_at": now, "archived": 0}
+                )
+                action = "updated"
+                operation = "update_name"
+            else:
+                existing_id = by_id.get(requested_id)
+                if existing_id is not None and not overwrite:
+                    space = existing_id
+                    action = "skipped"
+                    operation = "none"
+                elif existing_id is not None:
+                    old_normalized_name = existing_id.normalized_name
+                    space = existing_id.model_copy(
+                        update={
+                            "name": name,
+                            "normalized_name": normalized_name,
+                            "updated_at": now,
+                            "archived": int(prepared["archived"]),
+                        }
+                    )
+                    by_name.pop(old_normalized_name, None)
+                    action = "updated"
+                    operation = "update_all"
+                else:
+                    space = MemorySpace(
+                        id=requested_id,
+                        user_id=user_id,
+                        name=name,
+                        normalized_name=normalized_name,
+                        created_at=str(prepared["created_at"]),
+                        updated_at=now,
+                        archived=int(prepared["archived"]),
+                    )
+                    action = "created"
+                    operation = "insert"
+            by_id[space.id] = space
+            by_name[space.normalized_name] = space
+            owners[space.id] = user_id
+            plans.append(
+                {
+                    "action": action,
+                    "operation": operation,
+                    "space": space,
+                }
+            )
+            space_id_map[source_id or space.id] = space.id
+        return plans, space_id_map
+
+    @staticmethod
+    def _apply_memory_space_import_plan_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        plan: dict[str, object],
+    ) -> None:
+        operation = str(plan["operation"])
+        space = plan["space"]
+        if not isinstance(space, MemorySpace) or operation == "none":
+            return
+        if operation == "insert":
+            connection.execute(
+                """
+                INSERT INTO memory_spaces (
+                    id, user_id, name, normalized_name, created_at, updated_at, archived
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    space.id,
+                    space.user_id,
+                    space.name,
+                    space.normalized_name,
+                    space.created_at,
+                    space.updated_at,
+                    space.archived,
+                ),
+            )
+        elif operation == "update_name":
+            connection.execute(
+                """
+                UPDATE memory_spaces
+                SET name = ?, updated_at = ?, archived = 0
+                WHERE id = ? AND user_id = ?
+                """,
+                (space.name, space.updated_at, space.id, user_id),
+            )
+        elif operation == "update_all":
+            connection.execute(
+                """
+                UPDATE memory_spaces
+                SET name = ?, normalized_name = ?, updated_at = ?, archived = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    space.name,
+                    space.normalized_name,
+                    space.updated_at,
+                    space.archived,
+                    space.id,
+                    user_id,
+                ),
+            )
+
+    @staticmethod
+    def _restore_recent_context_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        prepared: dict[str, object],
+        overwrite: bool,
+    ) -> str:
+        conversation_id = prepared["conversation_id"]
+        if conversation_id is None:
+            row = connection.execute(
+                """
+                SELECT id FROM recent_context_summaries
+                WHERE user_id = ? AND conversation_id IS NULL AND archived = 0
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT id FROM recent_context_summaries
+                WHERE user_id = ? AND conversation_id = ? AND archived = 0
+                LIMIT 1
+                """,
+                (user_id, conversation_id),
+            ).fetchone()
+        if row is not None and not overwrite:
+            return "skipped"
+        turns = prepared["recent_turns"]
+        if not isinstance(turns, list):
+            raise RuntimeError("prepared recent context turns are invalid")
+        turns_json = json.dumps(
+            [turn.model_dump() for turn in turns if isinstance(turn, RecentContextTurn)],
+            ensure_ascii=False,
+        )
+        now = utc_now_iso()
+        if row is not None:
+            connection.execute(
+                """
+                UPDATE recent_context_summaries
+                SET summary = ?, compressed_summary = ?, recent_turns_json = ?,
+                    turn_count = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND archived = 0
+                """,
+                (
+                    str(prepared["summary"]),
+                    str(prepared["compressed_summary"]),
+                    turns_json,
+                    int(prepared["turn_count"]),
+                    now,
+                    row["id"],
+                    user_id,
+                ),
+            )
+            return "updated"
+        connection.execute(
+            """
+            INSERT INTO recent_context_summaries (
+                id, user_id, conversation_id, summary, compressed_summary,
+                recent_turns_json, turn_count, created_at, updated_at, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                new_memory_id(),
+                user_id,
+                conversation_id,
+                str(prepared["summary"]),
+                str(prepared["compressed_summary"]),
+                turns_json,
+                int(prepared["turn_count"]),
+                now,
+                now,
+            ),
+        )
+        return "created"
+
+    @staticmethod
+    def _restore_branch_node_on_connection(
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        prepared: dict[str, object],
+        overwrite: bool,
+    ) -> str:
+        history_fingerprint = str(prepared["history_fingerprint"])
+        existing = connection.execute(
+            """
+            SELECT id FROM conversation_branch_nodes
+            WHERE user_id = ? AND history_fingerprint = ? AND archived = 0
+            LIMIT 1
+            """,
+            (user_id, history_fingerprint),
+        ).fetchone()
+        if existing is not None and not overwrite:
+            return "skipped"
+        node_id = "branch-" + hashlib.sha256(
+            f"{user_id}\0{history_fingerprint}".encode("utf-8")
+        ).hexdigest()[:32]
+        turns = prepared["recent_turns"]
+        if not isinstance(turns, list):
+            raise RuntimeError("prepared branch turns are invalid")
+        turns_json = json.dumps(
+            [turn.model_dump() for turn in turns if isinstance(turn, RecentContextTurn)],
+            ensure_ascii=False,
+        )
+        now = utc_now_iso()
+        connection.execute(
+            """
+            INSERT INTO conversation_branch_nodes (
+                id, user_id, conversation_id, history_fingerprint,
+                parent_history_fingerprint, turn_fingerprint,
+                assistant_digest, summary, compressed_summary,
+                recent_turns_json, turn_count, created_at, updated_at, archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(id)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                conversation_id = excluded.conversation_id,
+                history_fingerprint = excluded.history_fingerprint,
+                parent_history_fingerprint = excluded.parent_history_fingerprint,
+                turn_fingerprint = excluded.turn_fingerprint,
+                assistant_digest = excluded.assistant_digest,
+                summary = excluded.summary,
+                compressed_summary = excluded.compressed_summary,
+                recent_turns_json = excluded.recent_turns_json,
+                turn_count = excluded.turn_count,
+                updated_at = excluded.updated_at,
+                archived = 0
+            """,
+            (
+                node_id,
+                user_id,
+                prepared["conversation_id"],
+                history_fingerprint,
+                str(prepared["parent_history_fingerprint"]),
+                str(prepared["turn_fingerprint"]),
+                str(prepared["assistant_digest"]),
+                str(prepared["summary"]),
+                str(prepared["compressed_summary"]),
+                turns_json,
+                int(prepared["turn_count"]),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            DELETE FROM conversation_branch_nodes
+            WHERE user_id = ? AND id IN (
+                SELECT id FROM conversation_branch_nodes
+                WHERE user_id = ? AND archived = 0
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (user_id, user_id, _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT),
+        )
+        return "created" if existing is None else "updated"
+
+    def prepare_memory_import_record(
         self,
         *,
         user_id: str,
         data: dict,
-        overwrite: bool = False,
         archived: int | None = None,
         space_id_map: dict[str, str] | None = None,
-        rebind_on_conflict: bool = True,
-    ) -> tuple[str, MemoryRecord | None]:
+    ) -> MemoryRecord | None:
+        """Validate and normalize an import row without touching SQLite."""
         content = str(data.get("content") or "").strip()
         if not content:
-            return "invalid", None
+            return None
 
         memory_id = str(data.get("id") or new_memory_id())
 
@@ -2775,7 +3841,7 @@ class MemoryStore:
                 field_name="entities",
             )
         except (TypeError, ValueError):
-            return "invalid", None
+            return None
         archived_at = str(data.get("archived_at") or now) if archived_value else None
         raw_space_ids = _coerce_string_list(data.get("space_ids"))
         if space_id_map is not None:
@@ -2823,6 +3889,7 @@ class MemoryStore:
                 updated_at=now,
                 archived_at=archived_at,
                 archived=archived_value,
+                revision=max(1, _coerce_int(data.get("revision"), default=1)),
             )
             memory.sensitivity = _sensitivity_with_floor(
                 declared=memory.sensitivity,
@@ -2831,190 +3898,236 @@ class MemoryStore:
                 entities=memory.entities,
             )
         except (ValidationError, TypeError, ValueError):
+            return None
+
+        return memory
+
+    def import_memory_record(
+        self,
+        *,
+        user_id: str,
+        data: dict,
+        overwrite: bool = False,
+        archived: int | None = None,
+        space_id_map: dict[str, str] | None = None,
+        rebind_on_conflict: bool = True,
+    ) -> tuple[str, MemoryRecord | None]:
+        memory = self.prepare_memory_import_record(
+            user_id=user_id,
+            data=data,
+            archived=archived,
+            space_id_map=space_id_map,
+        )
+        if memory is None:
             return "invalid", None
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            memory.space_ids = self._filter_existing_space_ids(
+            return self._import_prepared_memory_record_on_connection(
                 connection=connection,
                 user_id=user_id,
-                space_ids=memory.space_ids,
+                memory=memory,
+                overwrite=overwrite,
+                rebind_on_conflict=rebind_on_conflict,
             )
-            row = connection.execute(
-                "SELECT * FROM memories WHERE id = ?",
-                (memory.id,),
-            ).fetchone()
-            if row is not None and row["user_id"] != user_id:
-                if not rebind_on_conflict:
-                    return "invalid", None
-                while True:
-                    replacement_id = new_memory_id()
-                    collision = connection.execute(
-                        "SELECT 1 FROM memories WHERE id = ?",
-                        (replacement_id,),
-                    ).fetchone()
-                    if collision is None:
-                        break
-                memory.id = replacement_id
-                row = None
-            elif row is not None and not overwrite:
-                return "skipped", None
 
-            existing_memory = (
-                self._row_to_memory(row, space_ids=[])
-                if row is not None
-                else None
-            )
-            old_temporal_key = (
-                (
-                    existing_memory.temporal_subject,
-                    existing_memory.temporal_predicate,
-                )
-                if existing_memory is not None
-                and existing_memory.temporal_subject
-                and existing_memory.temporal_predicate
-                else None
-            )
-            new_temporal_key = (
-                (memory.temporal_subject, memory.temporal_predicate)
-                if memory.temporal_subject and memory.temporal_predicate
-                else None
-            )
-            if existing_memory is not None and old_temporal_key != new_temporal_key:
-                # Links are meaningful only inside one temporal key.  A partial
-                # overwrite must not leave the old chain pointing through a row
-                # that has moved to a different key.
-                memory.supersedes = None
-                memory.superseded_by = None
+    def _import_prepared_memory_record_on_connection(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        memory: MemoryRecord,
+        overwrite: bool,
+        rebind_on_conflict: bool,
+    ) -> tuple[str, MemoryRecord | None]:
+        """Write a fully validated import row using the caller's transaction."""
+        memory = memory.model_copy(deep=True)
+        now = utc_now_iso()
+        memory.space_ids = self._filter_existing_space_ids(
+            connection=connection,
+            user_id=user_id,
+            space_ids=memory.space_ids,
+        )
+        row = connection.execute(
+            "SELECT * FROM memories WHERE id = ?",
+            (memory.id,),
+        ).fetchone()
+        if row is not None and row["user_id"] != user_id:
+            if not rebind_on_conflict:
+                return "invalid", None
+            while True:
+                replacement_id = new_memory_id()
+                collision = connection.execute(
+                    "SELECT 1 FROM memories WHERE id = ?",
+                    (replacement_id,),
+                ).fetchone()
+                if collision is None:
+                    break
+            memory.id = replacement_id
+            row = None
+        elif row is not None and not overwrite:
+            return "skipped", None
 
-                old_successor = None
-                if existing_memory.superseded_by:
-                    old_successor = connection.execute(
-                        """
-                        SELECT valid_from, created_at
-                        FROM memories
-                        WHERE id = ? AND user_id = ?
-                        """,
-                        (existing_memory.superseded_by, user_id),
-                    ).fetchone()
-                if old_successor is not None and memory.valid_until is not None:
-                    old_successor_start = str(
-                        old_successor["valid_from"] or old_successor["created_at"]
-                    )
-                    if _parse_iso_datetime(memory.valid_until) == _parse_iso_datetime(
-                        old_successor_start
-                    ):
-                        memory.valid_until = None
-                        if memory.status == "resolved":
-                            # The resolved state was derived from that
-                            # synthesized boundary; the moved row re-enters
-                            # its new key as live.
-                            memory.status = "dynamic"
-
-            evidence_json = json.dumps(memory.evidence_memory_ids, ensure_ascii=False)
-            topics_json = json.dumps(memory.topics, ensure_ascii=False)
-            entities_json = json.dumps(memory.entities, ensure_ascii=False)
-            params = (
-                memory.user_id,
-                memory.content,
-                memory.type,
-                memory.importance,
-                memory.confidence,
-                memory.valence,
-                memory.arousal,
-                memory.source_message,
-                memory.source_conversation_id,
-                memory.origin,
-                memory.embedding_json,
-                memory.embedding_space_id,
-                memory.last_used_at,
-                memory.usage_count,
-                memory.stability,
-                memory.valid_from,
-                memory.valid_until,
-                memory.review_after,
-                memory.sensitivity,
-                evidence_json,
-                topics_json,
-                entities_json,
-                memory.temporal_subject,
-                memory.temporal_predicate,
-                memory.status,
-                int(memory.digested),
-                memory.decay_lambda,
-                memory.supersedes,
-                memory.superseded_by,
-                memory.created_at,
-                memory.updated_at,
-                memory.archived_at,
-                memory.archived,
-                memory.id,
+        existing_memory = (
+            self._row_to_memory(row, space_ids=[])
+            if row is not None
+            else None
+        )
+        old_temporal_key = (
+            (
+                existing_memory.temporal_subject,
+                existing_memory.temporal_predicate,
             )
-            if row is not None:
-                cursor = connection.execute(
+            if existing_memory is not None
+            and existing_memory.temporal_subject
+            and existing_memory.temporal_predicate
+            else None
+        )
+        new_temporal_key = (
+            (memory.temporal_subject, memory.temporal_predicate)
+            if memory.temporal_subject and memory.temporal_predicate
+            else None
+        )
+        if existing_memory is not None and old_temporal_key != new_temporal_key:
+            # Links are meaningful only inside one temporal key.  A partial
+            # overwrite must not leave the old chain pointing through a row
+            # that has moved to a different key.
+            memory.supersedes = None
+            memory.superseded_by = None
+
+            old_successor = None
+            if existing_memory.superseded_by:
+                old_successor = connection.execute(
                     """
-                    UPDATE memories
-                    SET user_id = ?, content = ?, type = ?, importance = ?,
-                        confidence = ?, valence = ?, arousal = ?, source_message = ?,
-                        source_conversation_id = ?, origin = ?, embedding_json = ?,
-                        embedding_space_id = ?,
-                        last_used_at = ?, usage_count = ?, stability = ?,
-                        valid_from = ?, valid_until = ?, review_after = ?, sensitivity = ?,
-                        evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
-                        temporal_subject = ?, temporal_predicate = ?,
-                        status = ?, digested = ?, decay_lambda = ?,
-                        supersedes = ?, superseded_by = ?,
-                        created_at = ?,
-                        updated_at = ?, archived_at = ?, archived = ?
+                    SELECT valid_from, created_at
+                    FROM memories
                     WHERE id = ? AND user_id = ?
                     """,
-                    (*params, user_id),
+                    (existing_memory.superseded_by, user_id),
+                ).fetchone()
+            if old_successor is not None and memory.valid_until is not None:
+                old_successor_start = str(
+                    old_successor["valid_from"] or old_successor["created_at"]
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError("Memory import update lost its user-scoped target.")
-                self._replace_memory_space_links(
-                    connection=connection,
-                    user_id=user_id,
-                    memory_id=memory.id,
-                    space_ids=memory.space_ids,
-                    created_at=now,
-                )
-                action = "updated"
-            else:
-                self._insert_memory_row(connection=connection, memory=memory)
-                self._replace_memory_space_links(
-                    connection=connection,
-                    user_id=user_id,
-                    memory_id=memory.id,
-                    space_ids=memory.space_ids,
-                    created_at=now,
-                )
-                action = "created"
+                if _parse_iso_datetime(memory.valid_until) == _parse_iso_datetime(
+                    old_successor_start
+                ):
+                    memory.valid_until = None
+                    if memory.status == "resolved":
+                        # The resolved state was derived from that synthesized
+                        # boundary; the moved row re-enters its new key as live.
+                        memory.status = "dynamic"
 
-            temporal_keys = {
-                key
-                for key in (old_temporal_key, new_temporal_key)
-                if key is not None
-            }
-            for subject, predicate in temporal_keys:
-                self._rebuild_temporal_key(
-                    connection=connection,
-                    user_id=user_id,
-                    temporal_subject=subject,
-                    temporal_predicate=predicate,
-                )
-
-            persisted_row = connection.execute(
-                "SELECT * FROM memories WHERE id = ? AND user_id = ?",
-                (memory.id, user_id),
-            ).fetchone()
-            if persisted_row is None:
-                raise RuntimeError("Memory import did not persist.")
-            persisted = self._row_to_memory(
-                persisted_row,
-                space_ids=memory.space_ids,
+        evidence_json = json.dumps(memory.evidence_memory_ids, ensure_ascii=False)
+        topics_json = json.dumps(memory.topics, ensure_ascii=False)
+        entities_json = json.dumps(memory.entities, ensure_ascii=False)
+        params = (
+            memory.user_id,
+            memory.content,
+            memory.type,
+            memory.importance,
+            memory.confidence,
+            memory.valence,
+            memory.arousal,
+            memory.source_message,
+            memory.source_conversation_id,
+            memory.origin,
+            memory.embedding_json,
+            memory.embedding_space_id,
+            memory.last_used_at,
+            memory.usage_count,
+            memory.stability,
+            memory.valid_from,
+            memory.valid_until,
+            memory.review_after,
+            memory.sensitivity,
+            evidence_json,
+            topics_json,
+            entities_json,
+            memory.temporal_subject,
+            memory.temporal_predicate,
+            memory.status,
+            int(memory.digested),
+            memory.decay_lambda,
+            memory.supersedes,
+            memory.superseded_by,
+            memory.created_at,
+            memory.updated_at,
+            memory.archived_at,
+            memory.archived,
+            memory.id,
+        )
+        if row is not None:
+            cursor = connection.execute(
+                """
+                UPDATE memories
+                SET user_id = ?, content = ?, type = ?, importance = ?,
+                    confidence = ?, valence = ?, arousal = ?, source_message = ?,
+                    source_conversation_id = ?, origin = ?, embedding_json = ?,
+                    embedding_space_id = ?,
+                    last_used_at = ?, usage_count = ?, stability = ?,
+                    valid_from = ?, valid_until = ?, review_after = ?, sensitivity = ?,
+                    evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
+                    temporal_subject = ?, temporal_predicate = ?,
+                    status = ?, digested = ?, decay_lambda = ?,
+                    supersedes = ?, superseded_by = ?,
+                    created_at = ?,
+                    updated_at = ?, archived_at = ?, archived = ?,
+                    revision = revision + 1
+                WHERE id = ? AND user_id = ?
+                """,
+                (*params, user_id),
             )
-            return action, persisted
+            if cursor.rowcount != 1:
+                raise RuntimeError("Memory import update lost its user-scoped target.")
+            self._replace_memory_space_links(
+                connection=connection,
+                user_id=user_id,
+                memory_id=memory.id,
+                space_ids=memory.space_ids,
+                created_at=now,
+            )
+            action = "updated"
+        else:
+            self._insert_memory_row(connection=connection, memory=memory)
+            self._replace_memory_space_links(
+                connection=connection,
+                user_id=user_id,
+                memory_id=memory.id,
+                space_ids=memory.space_ids,
+                created_at=now,
+            )
+            action = "created"
+
+        temporal_keys = {
+            key
+            for key in (old_temporal_key, new_temporal_key)
+            if key is not None
+        }
+        for subject, predicate in temporal_keys:
+            self._rebuild_temporal_key(
+                connection=connection,
+                user_id=user_id,
+                temporal_subject=subject,
+                temporal_predicate=predicate,
+            )
+
+        persisted_row = connection.execute(
+            "SELECT * FROM memories WHERE id = ? AND user_id = ?",
+            (memory.id, user_id),
+        ).fetchone()
+        if persisted_row is None:
+            raise RuntimeError("Memory import did not persist.")
+        persisted_space_ids = self._space_ids_for_memory_ids_on_connection(
+            connection=connection,
+            user_id=user_id,
+            memory_ids=[memory.id],
+        ).get(memory.id, [])
+        persisted = self._row_to_memory(
+            persisted_row,
+            space_ids=persisted_space_ids,
+        )
+        return action, persisted
 
     def mark_memories_used(
         self,
@@ -4025,14 +5138,15 @@ class MemoryStore:
             section.created_at,
             section.updated_at,
             replaced_at,
+            section.revision,
         )
         query = """
             INSERT INTO core_memory_section_history (
                 id, core_memory_section_id, user_id, section, content,
                 evidence_memory_ids_json, confidence, version,
-                created_at, updated_at, replaced_at
+                created_at, updated_at, replaced_at, revision
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         if connection is not None:
             connection.execute(query, params)
@@ -4057,9 +5171,9 @@ class MemoryStore:
                 sensitivity, evidence_memory_ids_json, topics_json, entities_json,
                 temporal_subject, temporal_predicate,
                 status, digested, decay_lambda, supersedes, superseded_by,
-                created_at, updated_at, archived_at, archived
+                created_at, updated_at, archived_at, archived, revision
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -4096,6 +5210,7 @@ class MemoryStore:
                 memory.updated_at,
                 memory.archived_at,
                 memory.archived,
+                memory.revision,
             ),
         )
 
@@ -4256,6 +5371,173 @@ class MemoryStore:
             connection.execute(
                 "ALTER TABLE core_memory_sections ADD COLUMN version INTEGER DEFAULT 1"
             )
+
+    @staticmethod
+    def _ensure_revision_columns(connection: sqlite3.Connection) -> None:
+        for table_name in (
+            "memories",
+            "core_memory_sections",
+            "core_memory_section_history",
+        ):
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            }
+            if not columns:
+                continue
+            if "revision" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+                )
+            connection.execute(
+                f"UPDATE {table_name} SET revision = 1 "
+                "WHERE revision IS NULL OR revision < 1"
+            )
+
+    @staticmethod
+    def _merge_duplicate_active_core_sections(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(core_memory_sections)"
+            ).fetchall()
+        }
+        required = {
+            "id",
+            "user_id",
+            "section",
+            "content",
+            "evidence_memory_ids_json",
+            "confidence",
+            "version",
+            "created_at",
+            "updated_at",
+            "archived",
+            "revision",
+        }
+        if not required.issubset(columns):
+            return
+        connection.execute(
+            """
+            UPDATE core_memory_sections
+            SET user_id = 'default'
+            WHERE user_id IS NULL OR TRIM(user_id) = ''
+            """
+        )
+        history_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(core_memory_section_history)"
+            ).fetchall()
+        }
+        can_write_history = {
+            "id",
+            "core_memory_section_id",
+            "user_id",
+            "section",
+            "content",
+            "evidence_memory_ids_json",
+            "confidence",
+            "version",
+            "created_at",
+            "updated_at",
+            "replaced_at",
+            "revision",
+        }.issubset(history_columns)
+        groups = connection.execute(
+            """
+            SELECT user_id, section
+            FROM core_memory_sections
+            WHERE archived = 0 AND section IS NOT NULL
+            GROUP BY user_id, section
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for group in groups:
+            rows = connection.execute(
+                """
+                SELECT rowid AS merge_rowid, *
+                FROM core_memory_sections
+                WHERE user_id = ? AND section = ? AND archived = 0
+                ORDER BY version DESC, updated_at DESC, merge_rowid DESC
+                """,
+                (group["user_id"], group["section"]),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            winner, *duplicates = rows
+            merged_evidence = _ordered_unique(
+                [
+                    evidence_id
+                    for row in rows
+                    for evidence_id in _json_string_list(
+                        row["evidence_memory_ids_json"]
+                    )
+                ]
+            )
+            merged_evidence_json = json.dumps(merged_evidence, ensure_ascii=False)
+            now = utc_now_iso()
+
+            def write_history(row: sqlite3.Row) -> None:
+                if not can_write_history:
+                    return
+                connection.execute(
+                    """
+                    INSERT INTO core_memory_section_history (
+                        id, core_memory_section_id, user_id, section, content,
+                        evidence_memory_ids_json, confidence, version,
+                        created_at, updated_at, replaced_at, revision
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_memory_id(),
+                        row["id"],
+                        row["user_id"],
+                        row["section"],
+                        row["content"],
+                        row["evidence_memory_ids_json"],
+                        row["confidence"],
+                        row["version"],
+                        row["created_at"],
+                        row["updated_at"],
+                        now,
+                        row["revision"],
+                    ),
+                )
+
+            for duplicate in duplicates:
+                write_history(duplicate)
+                connection.execute(
+                    """
+                    UPDATE core_memory_sections
+                    SET archived = 1, updated_at = ?, revision = revision + 1
+                    WHERE id = ? AND archived = 0
+                    """,
+                    (now, duplicate["id"]),
+                )
+            if merged_evidence_json != str(winner["evidence_memory_ids_json"] or "[]"):
+                write_history(winner)
+                max_version = max(int(row["version"] or 1) for row in rows)
+                max_revision = max(int(row["revision"] or 1) for row in rows)
+                connection.execute(
+                    """
+                    UPDATE core_memory_sections
+                    SET evidence_memory_ids_json = ?, version = ?, revision = ?,
+                        updated_at = ?
+                    WHERE id = ? AND archived = 0
+                    """,
+                    (
+                        merged_evidence_json,
+                        max_version + 1,
+                        max_revision + 1,
+                        now,
+                        winner["id"],
+                    ),
+                )
 
     @staticmethod
     def _ensure_recent_context_summary_columns(connection: sqlite3.Connection) -> None:
@@ -4545,6 +5827,510 @@ def _json_string_list(raw_value: str | None) -> list[str]:
     if not isinstance(values, list):
         return []
     return [str(value) for value in values if value]
+
+
+def _build_batch_purge_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    user_id: str,
+    requested_memory_ids: list[str],
+) -> _BatchPurgeSnapshot:
+    requested_ids = sorted(_ordered_unique(requested_memory_ids))
+    if not requested_ids:
+        raise PurgePreviewConflictError(
+            code="purge_targets_missing",
+            message="至少选择一条回收站记忆。",
+        )
+
+    all_memory_rows = connection.execute(
+        "SELECT * FROM memories WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    rows_by_id = {str(row["id"]): row for row in all_memory_rows}
+    missing_ids = [
+        memory_id
+        for memory_id in requested_ids
+        if memory_id not in rows_by_id or int(rows_by_id[memory_id]["archived"] or 0) != 1
+    ]
+    if missing_ids:
+        raise PurgePreviewConflictError(
+            code="purge_targets_missing",
+            message="部分所选记忆已不存在、不属于当前用户或已离开回收站。",
+            missing_memory_ids=missing_ids,
+        )
+
+    dependents_by_evidence_id: dict[str, list[str]] = {}
+    for row in all_memory_rows:
+        memory_id = str(row["id"])
+        for evidence_id in set(_json_string_list(row["evidence_memory_ids_json"])):
+            dependents_by_evidence_id.setdefault(evidence_id, []).append(memory_id)
+
+    affected_ids = set(requested_ids)
+    frontier = deque(requested_ids)
+    while frontier:
+        evidence_id = frontier.popleft()
+        for dependent_id in dependents_by_evidence_id.get(evidence_id, []):
+            if dependent_id in affected_ids:
+                continue
+            affected_ids.add(dependent_id)
+            frontier.append(dependent_id)
+
+    purge_ids = sorted(affected_ids)
+    dependent_ids = sorted(affected_ids.difference(requested_ids))
+    affected_memory_rows = [rows_by_id[memory_id] for memory_id in purge_ids]
+    affected_core_rows = [
+        row
+        for row in connection.execute(
+            "SELECT * FROM core_memory_sections WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        if affected_ids.intersection(_json_string_list(row["evidence_memory_ids_json"]))
+    ]
+    affected_core_rows.sort(key=lambda row: (str(row["section"]), str(row["id"])))
+    affected_core_history_rows = [
+        row
+        for row in connection.execute(
+            "SELECT * FROM core_memory_section_history WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        if affected_ids.intersection(_json_string_list(row["evidence_memory_ids_json"]))
+    ]
+    affected_core_history_rows.sort(key=lambda row: str(row["id"]))
+
+    affected_conversation_ids = {
+        str(row["source_conversation_id"])
+        for row in affected_memory_rows
+        if row["source_conversation_id"]
+    }
+    sensitive_fragments = {
+        fragment
+        for row in affected_memory_rows
+        for fragment in (
+            str(row["id"]),
+            str(row["content"] or ""),
+            str(row["source_message"] or ""),
+        )
+        if fragment
+    }
+    affected_decision_log_rows = _purge_relevant_decision_log_rows(
+        connection,
+        user_id=user_id,
+        affected_ids=affected_ids,
+        affected_conversation_ids=affected_conversation_ids,
+        sensitive_fragments=sensitive_fragments,
+    )
+    temporal_repairs = _purged_temporal_reference_plan(
+        all_memory_rows,
+        affected_ids=affected_ids,
+    )
+    affected_space_link_rows = [
+        row
+        for row in connection.execute(
+            """
+            SELECT memory_id, space_id, created_at
+            FROM memory_space_links
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+        if str(row["memory_id"]) in affected_ids
+    ]
+    affected_space_link_rows.sort(
+        key=lambda row: (str(row["memory_id"]), str(row["space_id"]))
+    )
+
+    effects = {
+        "requested_memories_deleted": len(requested_ids),
+        "dependent_memories_deleted": len(dependent_ids),
+        "memories_deleted": len(purge_ids),
+        "space_links_deleted": len(affected_space_link_rows),
+        "temporal_references_relinked": len(temporal_repairs),
+        "core_sections_scrubbed": len(affected_core_rows),
+        "core_history_scrubbed": len(affected_core_history_rows),
+        "decision_logs_scrubbed": len(affected_decision_log_rows),
+    }
+    affected_core_sections = [
+        {
+            "id": str(row["id"]),
+            "section": str(row["section"]),
+            "version": int(row["version"] or 1),
+            "active": int(row["archived"] or 0) == 0,
+        }
+        for row in affected_core_rows
+    ]
+    fingerprint_payload = {
+        "version": 1,
+        "user_id": user_id,
+        "requested_memory_ids": requested_ids,
+        "memories": [_purge_memory_fingerprint_row(row) for row in affected_memory_rows],
+        "space_links": [
+            [str(row["memory_id"]), str(row["space_id"]), str(row["created_at"] or "")]
+            for row in affected_space_link_rows
+        ],
+        "core_sections": [_purge_core_fingerprint_row(row) for row in affected_core_rows],
+        "core_history": [
+            _purge_core_history_fingerprint_row(row)
+            for row in affected_core_history_rows
+        ],
+        "decision_logs": [
+            _purge_decision_log_fingerprint_row(row)
+            for row in affected_decision_log_rows
+        ],
+        "temporal_repairs": temporal_repairs,
+        "effects": effects,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return _BatchPurgeSnapshot(
+        requested_memory_ids=requested_ids,
+        purge_memory_ids=purge_ids,
+        dependent_memory_ids=dependent_ids,
+        affected_core_memory_sections=affected_core_sections,
+        fingerprint=fingerprint,
+        effects=effects,
+        affected_memory_rows=affected_memory_rows,
+        affected_core_rows=affected_core_rows,
+        affected_core_history_rows=affected_core_history_rows,
+        affected_decision_log_rows=affected_decision_log_rows,
+        temporal_repairs=temporal_repairs,
+    )
+
+
+def _purge_relevant_decision_log_rows(
+    connection: sqlite3.Connection,
+    *,
+    user_id: str,
+    affected_ids: set[str],
+    affected_conversation_ids: set[str],
+    sensitive_fragments: set[str],
+) -> list[sqlite3.Row]:
+    prefilter = _decision_log_scrub_prefilter(
+        affected_conversation_ids=affected_conversation_ids,
+        fragments=sensitive_fragments,
+    )
+    if prefilter is None:
+        rows = connection.execute(
+            """
+            SELECT id, conversation_id, candidate_json, reason, decision, created_at
+            FROM memory_decision_logs
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            f"""
+            SELECT id, conversation_id, candidate_json, reason, decision, created_at
+            FROM memory_decision_logs
+            WHERE user_id = ? AND ({prefilter[0]})
+            """,
+            (user_id, *prefilter[1]),
+        ).fetchall()
+    relevant = [
+        row
+        for row in rows
+        if (
+            _decision_log_references_memory_ids(str(row["candidate_json"] or ""), affected_ids)
+            or (
+                row["conversation_id"]
+                and str(row["conversation_id"]) in affected_conversation_ids
+            )
+            or _decision_log_contains_fragments(
+                candidate_json=str(row["candidate_json"] or ""),
+                reason=str(row["reason"] or ""),
+                fragments=sensitive_fragments,
+            )
+        )
+    ]
+    relevant.sort(key=lambda row: str(row["id"]))
+    return relevant
+
+
+def _purged_temporal_reference_plan(
+    rows: list[sqlite3.Row],
+    *,
+    affected_ids: set[str],
+) -> list[tuple[str, str | None, str | None]]:
+    links = {
+        str(row["id"]): (
+            str(row["supersedes"]) if row["supersedes"] else None,
+            str(row["superseded_by"]) if row["superseded_by"] else None,
+        )
+        for row in rows
+    }
+
+    def follow(start_id: str | None, *, index: int, survivor_id: str) -> str | None:
+        current = start_id
+        visited: set[str] = set()
+        while current in affected_ids:
+            if current in visited:
+                return None
+            visited.add(current)
+            current_links = links.get(current)
+            if current_links is None:
+                return None
+            current = current_links[index]
+        if current is None or current == survivor_id or current not in links:
+            return None
+        return current
+
+    repairs: list[tuple[str, str | None, str | None]] = []
+    for row in rows:
+        memory_id = str(row["id"])
+        if memory_id in affected_ids:
+            continue
+        previous_id = str(row["supersedes"]) if row["supersedes"] else None
+        next_id = str(row["superseded_by"]) if row["superseded_by"] else None
+        repaired_previous = (
+            follow(previous_id, index=0, survivor_id=memory_id)
+            if previous_id in affected_ids
+            else previous_id
+        )
+        repaired_next = (
+            follow(next_id, index=1, survivor_id=memory_id)
+            if next_id in affected_ids
+            else next_id
+        )
+        if repaired_previous != previous_id or repaired_next != next_id:
+            repairs.append((memory_id, repaired_previous, repaired_next))
+    repairs.sort(key=lambda item: item[0])
+    return repairs
+
+
+def _purge_memory_fingerprint_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "archived": int(row["archived"] or 0),
+        "archived_at": row["archived_at"],
+        "revision": int(row["revision"] or 1),
+        "updated_at": row["updated_at"],
+        "origin": row["origin"],
+        "type": row["type"],
+        "sensitivity": row["sensitivity"],
+        "evidence_memory_ids": sorted(_json_string_list(row["evidence_memory_ids_json"])),
+        "source_conversation_id": row["source_conversation_id"],
+        "supersedes": row["supersedes"],
+        "superseded_by": row["superseded_by"],
+        "content_sha256": _purge_text_sha256(row["content"]),
+        "source_message_sha256": _purge_text_sha256(row["source_message"]),
+    }
+
+
+def _purge_core_fingerprint_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "section": str(row["section"]),
+        "version": int(row["version"] or 1),
+        "revision": int(row["revision"] or 1),
+        "archived": int(row["archived"] or 0),
+        "updated_at": row["updated_at"],
+        "evidence_memory_ids": sorted(_json_string_list(row["evidence_memory_ids_json"])),
+        "content_sha256": _purge_text_sha256(row["content"]),
+    }
+
+
+def _purge_core_history_fingerprint_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "core_memory_section_id": row["core_memory_section_id"],
+        "section": row["section"],
+        "version": row["version"],
+        "updated_at": row["updated_at"],
+        "replaced_at": row["replaced_at"],
+        "evidence_memory_ids": sorted(_json_string_list(row["evidence_memory_ids_json"])),
+        "content_sha256": _purge_text_sha256(row["content"]),
+    }
+
+
+def _purge_decision_log_fingerprint_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "conversation_id": row["conversation_id"],
+        "decision": row["decision"],
+        "created_at": row["created_at"],
+        "candidate_sha256": _purge_text_sha256(row["candidate_json"]),
+        "reason_sha256": _purge_text_sha256(row["reason"]),
+    }
+
+
+def _purge_text_sha256(value: object) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _apply_batch_purge_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    user_id: str,
+    snapshot: _BatchPurgeSnapshot,
+    purged_at: str,
+) -> dict[str, int]:
+    temporal_references_relinked = 0
+    for memory_id, supersedes, superseded_by in snapshot.temporal_repairs:
+        cursor = connection.execute(
+            """
+            UPDATE memories
+            SET supersedes = ?, superseded_by = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (supersedes, superseded_by, purged_at, memory_id, user_id),
+        )
+        temporal_references_relinked += max(0, int(cursor.rowcount))
+
+    core_sections_scrubbed = 0
+    for row in snapshot.affected_core_rows:
+        cursor = connection.execute(
+            """
+            UPDATE core_memory_sections
+            SET content = ?, evidence_memory_ids_json = '[]', archived = 1, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            ("[redacted: purged evidence]", purged_at, row["id"], user_id),
+        )
+        core_sections_scrubbed += max(0, int(cursor.rowcount))
+
+    core_history_scrubbed = 0
+    for row in snapshot.affected_core_history_rows:
+        cursor = connection.execute(
+            """
+            UPDATE core_memory_section_history
+            SET content = ?, evidence_memory_ids_json = '[]', updated_at = ?, replaced_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                "[redacted: purged evidence]",
+                purged_at,
+                purged_at,
+                row["id"],
+                user_id,
+            ),
+        )
+        core_history_scrubbed += max(0, int(cursor.rowcount))
+
+    replacement = json.dumps(
+        {
+            "source": "purged_memory_history",
+            "memory_ids": snapshot.requested_memory_ids,
+            "redacted": True,
+            "purged_at": purged_at,
+        },
+        ensure_ascii=False,
+    )
+    decision_logs_scrubbed = 0
+    for row in snapshot.affected_decision_log_rows:
+        cursor = connection.execute(
+            """
+            UPDATE memory_decision_logs
+            SET candidate_json = ?, reason = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (replacement, "历史记录因永久删除已脱敏", row["id"], user_id),
+        )
+        decision_logs_scrubbed += max(0, int(cursor.rowcount))
+
+    space_links_deleted = 0
+    memories_deleted = 0
+    for offset in range(0, len(snapshot.purge_memory_ids), 500):
+        batch = snapshot.purge_memory_ids[offset : offset + 500]
+        placeholders = ", ".join("?" for _ in batch)
+        link_cursor = connection.execute(
+            f"""
+            DELETE FROM memory_space_links
+            WHERE user_id = ? AND memory_id IN ({placeholders})
+            """,
+            (user_id, *batch),
+        )
+        space_links_deleted += max(0, int(link_cursor.rowcount))
+        memory_cursor = connection.execute(
+            f"""
+            DELETE FROM memories
+            WHERE user_id = ? AND id IN ({placeholders})
+            """,
+            (user_id, *batch),
+        )
+        memories_deleted += max(0, int(memory_cursor.rowcount))
+
+    effects = {
+        "requested_memories_deleted": len(snapshot.requested_memory_ids),
+        "dependent_memories_deleted": len(snapshot.dependent_memory_ids),
+        "memories_deleted": memories_deleted,
+        "space_links_deleted": space_links_deleted,
+        "temporal_references_relinked": temporal_references_relinked,
+        "core_sections_scrubbed": core_sections_scrubbed,
+        "core_history_scrubbed": core_history_scrubbed,
+        "decision_logs_scrubbed": decision_logs_scrubbed,
+    }
+    if effects != snapshot.effects:
+        raise RuntimeError("Batch purge effects drifted inside the locked transaction.")
+    return effects
+
+
+def _insert_batch_purge_audit(
+    connection: sqlite3.Connection,
+    *,
+    user_id: str,
+    snapshot: _BatchPurgeSnapshot,
+    effects: dict[str, int],
+    fingerprint: str,
+    purged_at: str,
+    call_source: str,
+) -> DecisionLog:
+    log = DecisionLog(
+        id=new_memory_id(),
+        user_id=user_id,
+        conversation_id=None,
+        candidate_json=json.dumps(
+            {
+                "source": "permanent_purge_batch",
+                "requested_memory_ids": snapshot.requested_memory_ids,
+                "purged_memory_ids": snapshot.purge_memory_ids,
+                "affected_core_sections": snapshot.affected_core_memory_sections,
+                "fingerprint": fingerprint,
+                "effects": effects,
+                "purged_at": purged_at,
+                "call_source": call_source,
+            },
+            ensure_ascii=False,
+        ),
+        decision="purge",
+        reason="批量永久删除回收站记忆",
+        created_at=purged_at,
+    )
+    connection.execute(
+        """
+        INSERT INTO memory_decision_logs (
+            id, user_id, conversation_id, candidate_json, decision, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            log.id,
+            log.user_id,
+            log.conversation_id,
+            log.candidate_json,
+            log.decision,
+            log.reason,
+            log.created_at,
+        ),
+    )
+    connection.execute(
+        """
+        DELETE FROM memory_decision_logs
+        WHERE user_id = ?
+          AND id NOT IN (
+              SELECT id FROM memory_decision_logs
+              WHERE user_id = ?
+              ORDER BY created_at DESC, rowid DESC
+              LIMIT ?
+          )
+        """,
+        (user_id, user_id, _DECISION_LOG_RETENTION_LIMIT),
+    )
+    return log
 
 
 def _derived_memory_dependency_closure(
@@ -5174,8 +6960,9 @@ def _earliest_datetime_text(values: list[str]) -> str | None:
 # Schema migrations (PRAGMA user_version)
 #
 # 每次启动只执行尚未应用的版本。v1 汇总了历史遗留的一次性修复；v2
-# 为向量增加显式空间标识，且故意不回填旧向量。新增 schema 变更时继续
-# 追加严格递增的版本。
+# 为向量增加显式空间标识，且故意不回填旧向量；v3 增加持久化
+# revision，并在建立 Core Memory 单活跃唯一索引前合并历史重复行；v4
+# 增加跨 worker/进程重试仍有效、且不保存正文的聊天副作用 claim。
 
 
 def _memory_migration_v1(connection: sqlite3.Connection) -> None:
@@ -5190,7 +6977,46 @@ def _memory_migration_v2(connection: sqlite3.Connection) -> None:
     MemoryStore._ensure_memories_embedding_space_column(connection)
 
 
+def _memory_migration_v3(connection: sqlite3.Connection) -> None:
+    MemoryStore._ensure_revision_columns(connection)
+    MemoryStore._merge_duplicate_active_core_sections(connection)
+    core_columns = connection.execute(
+        "PRAGMA table_info(core_memory_sections)"
+    ).fetchall()
+    if core_columns:
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_core_memory_user_section_active
+            ON core_memory_sections(user_id, section)
+            WHERE archived = 0
+            """
+        )
+
+
+def _memory_migration_v4(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_side_effect_claims (
+            kind TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (kind, key_hash)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_side_effect_claims_expiry
+        ON chat_side_effect_claims(expires_at)
+        """
+    )
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
     (2, _memory_migration_v2),
+    (3, _memory_migration_v3),
+    (4, _memory_migration_v4),
 ]

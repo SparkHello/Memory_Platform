@@ -4,8 +4,10 @@ from io import BytesIO
 import zipfile
 
 import pytest
+from pypdf import PdfWriter
 
-from app.knowledge.parsing import parse_knowledge_file
+import app.knowledge.parsing as parsing
+from app.knowledge.parsing import KnowledgeFileParseError, parse_knowledge_file
 from app.knowledge.store import KnowledgeValidationError
 
 
@@ -126,6 +128,56 @@ def test_docx_table_cell_count_limit_rejects_amplification() -> None:
             _zip_bytes({"word/document.xml": document}),
             filename="huge-table.docx",
         )
+
+
+def _blank_pdf_bytes(page_count: int) -> bytes:
+    writer = PdfWriter()
+    for _ in range(page_count):
+        writer.add_blank_page(width=72, height=72)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def test_pdf_worker_rejects_page_amplification_and_scanned_documents() -> None:
+    with pytest.raises(KnowledgeFileParseError) as page_error:
+        parse_knowledge_file(_blank_pdf_bytes(1001), filename="too-many-pages.pdf")
+    assert page_error.value.code == "knowledge_pdf_page_limit"
+
+    with pytest.raises(KnowledgeFileParseError) as no_text_error:
+        parse_knowledge_file(_blank_pdf_bytes(1), filename="scan.pdf")
+    assert no_text_error.value.code == "knowledge_pdf_no_text"
+    assert "OCR" in str(no_text_error.value)
+
+
+def test_pdf_worker_has_wall_timeout_and_single_concurrency_gate(monkeypatch) -> None:
+    monkeypatch.setattr(parsing, "_PDF_WALL_SECONDS", 0.001)
+    with pytest.raises(KnowledgeFileParseError) as timeout_error:
+        parse_knowledge_file(_pdf_bytes("timeout"), filename="timeout.pdf")
+    assert timeout_error.value.code == "knowledge_pdf_wall_timeout"
+
+    assert parsing._PDF_PARSE_SLOTS.acquire(blocking=False)
+    try:
+        with pytest.raises(KnowledgeFileParseError) as busy_error:
+            parse_knowledge_file(_pdf_bytes("busy"), filename="busy.pdf")
+        assert busy_error.value.code == "knowledge_pdf_busy"
+    finally:
+        parsing._PDF_PARSE_SLOTS.release()
+
+
+def test_pdf_import_returns_stable_safe_error_code(client, auth_headers) -> None:
+    response = client.post(
+        "/knowledge/import",
+        params={"filename": "malicious.pdf"},
+        headers={**auth_headers, "Content-Type": "application/pdf"},
+        content=b"%PDF-1.4\nmalformed",
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "knowledge_pdf_invalid",
+        "message": "PDF could not be parsed safely",
+    }
 
 
 def test_epub_binary_import_is_searchable_and_keeps_metadata(

@@ -18,6 +18,9 @@ from app.usage.context import model_usage_scope
 
 logger = logging.getLogger(__name__)
 _MAX_RETAINED_RECENT_TURNS = 200
+_MAX_RECENT_TURN_BYTES = 64 * 1024
+_MAX_RECENT_CONTEXT_BYTES = 512 * 1024
+_RECENT_CONTEXT_RENDER_OVERHEAD_BYTES = 1024
 
 
 @dataclass(slots=True)
@@ -202,7 +205,7 @@ async def evolve_recent_context(
         "\n".join(part for part in (user_text, assistant_text) if part)
     )
     turns.append(
-        RecentContextTurn(
+        _bounded_recent_context_turn(
             user=user_text.strip(),
             assistant=assistant_text.strip(),
             sensitivity=turn_sensitivity,
@@ -253,6 +256,10 @@ async def evolve_recent_context(
     # transcript archive. Sensitive turns and failed compactions can otherwise
     # grow the SQLite row without bound.
     turns = turns[-_MAX_RETAINED_RECENT_TURNS:]
+    turns = _bounded_recent_context_state(
+        turns,
+        compressed_summary=compressed_summary,
+    )
     materialized = materialize_recent_context(
         compressed_summary=compressed_summary,
         recent_turns=turns,
@@ -263,6 +270,66 @@ async def evolve_recent_context(
         recent_turns=turns,
         turn_count=turn_count,
     )
+
+
+def _bounded_recent_context_turn(
+    *,
+    user: str,
+    assistant: str,
+    sensitivity: str,
+) -> RecentContextTurn:
+    user_bytes = len(user.encode("utf-8"))
+    assistant_bytes = len(assistant.encode("utf-8"))
+    if user_bytes + assistant_bytes <= _MAX_RECENT_TURN_BYTES:
+        return RecentContextTurn(
+            user=user,
+            assistant=assistant,
+            sensitivity=sensitivity,
+        )
+    half = _MAX_RECENT_TURN_BYTES // 2
+    if user_bytes <= half:
+        user_budget = user_bytes
+        assistant_budget = _MAX_RECENT_TURN_BYTES - user_budget
+    elif assistant_bytes <= half:
+        assistant_budget = assistant_bytes
+        user_budget = _MAX_RECENT_TURN_BYTES - assistant_budget
+    else:
+        user_budget = half
+        assistant_budget = _MAX_RECENT_TURN_BYTES - half
+    return RecentContextTurn(
+        user=_truncate_utf8(user, user_budget),
+        assistant=_truncate_utf8(assistant, assistant_budget),
+        sensitivity=sensitivity,
+    )
+
+
+def _bounded_recent_context_state(
+    turns: list[RecentContextTurn],
+    *,
+    compressed_summary: str,
+) -> list[RecentContextTurn]:
+    available = max(
+        0,
+        _MAX_RECENT_CONTEXT_BYTES
+        - _RECENT_CONTEXT_RENDER_OVERHEAD_BYTES
+        - len(compressed_summary.encode("utf-8")),
+    )
+    retained = list(turns)
+    total = sum(_turn_bytes(turn) for turn in retained)
+    while retained and total > available:
+        total -= _turn_bytes(retained.pop(0))
+    return retained
+
+
+def _turn_bytes(turn: RecentContextTurn) -> int:
+    return len(turn.user.encode("utf-8")) + len(turn.assistant.encode("utf-8"))
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 async def _compact_context(
@@ -280,6 +347,7 @@ async def _compact_context(
         model="memory-context-compactor",
         messages=messages,
         temperature=0.0,
+        max_tokens=2048,
         stream=False,
     )
     try:

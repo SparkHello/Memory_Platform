@@ -160,7 +160,7 @@ async def preview_review_revision(
         model="memory-review-editor",
         messages=messages,
         temperature=0.0,
-        max_tokens=2048,
+        max_tokens=4096,
         response_format={"type": "json_object"},
         stream=False,
     )

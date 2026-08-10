@@ -1,3 +1,6 @@
+import json
+from typing import Any
+
 from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
@@ -14,6 +17,7 @@ from app.usage.context import model_usage_scope
 
 MIN_CORE_CONFIDENCE = 0.75
 MAX_SOURCE_MEMORIES = 80
+_CORE_MEMORY_TOOL_NAME = "submit_core_memory_sections"
 
 
 class CoreMemorySectionCandidate(BaseModel):
@@ -129,18 +133,87 @@ class CoreMemoryConsolidator:
             model="core-memory-consolidator",
             messages=messages,
             temperature=0.0,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
             stream=False,
         )
         with model_usage_scope(user_id=user_id):
             response = await self.llm_client.create_chat_completion(
                 request=request,
                 messages=messages,
+                thinking="enabled",
+                structured_tool=_core_memory_structured_tool(),
             )
         try:
-            content = response["choices"][0]["message"]["content"]
+            message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
             return ""
-        return content if isinstance(content, str) else ""
+        return _core_memory_raw_output(message)
+
+
+def _core_memory_structured_tool() -> dict[str, Any]:
+    return {
+        "name": _CORE_MEMORY_TOOL_NAME,
+        "description": "提交仅由已保存长期记忆支持的核心记忆分区。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "section": {
+                                "type": "string",
+                                "enum": [
+                                    "profile",
+                                    "preferences",
+                                    "relationships",
+                                    "routines",
+                                    "goals",
+                                    "communication",
+                                ],
+                            },
+                            "content": {"type": "string"},
+                            "evidence_memory_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                        },
+                        "required": [
+                            "section",
+                            "content",
+                            "evidence_memory_ids",
+                            "confidence",
+                        ],
+                    },
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["sections"],
+        },
+    }
+
+
+def _core_memory_raw_output(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict) or function.get("name") != _CORE_MEMORY_TOOL_NAME:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            return arguments
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
 
 
 def _select_source_memories(memories: list[MemoryRecord]) -> list[MemoryRecord]:

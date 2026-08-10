@@ -61,6 +61,139 @@ def test_report_and_export_rest_endpoints(client, auth_headers, memory_store: Me
     assert "Memory Export" in export_markdown_response.text
 
 
+def test_selection_export_is_exact_user_scoped_and_sanitizes_references(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    selected_space = memory_store.upsert_memory_space(
+        user_id="default", name="Selected Space"
+    )
+    unused_space = memory_store.upsert_memory_space(
+        user_id="default", name="UNSELECTED-SPACE-CANARY"
+    )
+    selected_source = memory_store.create_memory(
+        user_id="default",
+        content="SELECTED-SOURCE",
+        space_ids=[selected_space.id],
+    )
+    unselected = memory_store.create_memory(
+        user_id="default",
+        content="UNSELECTED-MEMORY-CANARY",
+        space_ids=[unused_space.id],
+    )
+    selected_dependent = memory_store.create_memory(
+        user_id="default",
+        content="SELECTED-DEPENDENT",
+        evidence_memory_ids=[selected_source.id, unselected.id],
+        space_ids=[selected_space.id],
+    )
+    selected_deleted = memory_store.create_memory(
+        user_id="default", content="SELECTED-DELETED"
+    )
+    assert memory_store.archive_memory(
+        memory_id=selected_deleted.id, user_id="default"
+    )
+    with memory_store._connect() as connection:
+        connection.execute(
+            "UPDATE memories SET supersedes = ? WHERE id = ?",
+            (unselected.id, selected_dependent.id),
+        )
+    memory_store.upsert_core_memory_section(
+        user_id="default",
+        section="profile",
+        content="CORE-CANARY",
+        evidence_memory_ids=[unselected.id],
+        confidence=0.9,
+    )
+    memory_store.upsert_recent_context_summary(
+        user_id="default",
+        conversation_id="selection-test",
+        summary="RECENT-CONTEXT-CANARY",
+    )
+    memory_store.create_decision_log(
+        user_id="default",
+        conversation_id=None,
+        candidate_json='{"canary":"DECISION-LOG-CANARY"}',
+        decision="create",
+        reason="selection export isolation test",
+    )
+    other_user = memory_store.create_memory(
+        user_id="other-user", content="OTHER-USER-CANARY"
+    )
+
+    response = client.post(
+        "/memories/export/selection",
+        headers=auth_headers,
+        json={
+            "memory_ids": [
+                selected_dependent.id,
+                selected_source.id,
+                selected_deleted.id,
+            ]
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert [item["id"] for item in payload["memories"]] == [
+        selected_dependent.id,
+        selected_source.id,
+    ]
+    assert [item["id"] for item in payload["deleted_memories"]] == [
+        selected_deleted.id
+    ]
+    dependent = payload["memories"][0]
+    assert dependent["evidence_memory_ids"] == [selected_source.id]
+    assert dependent["supersedes"] is None
+    assert payload["selection_contract"] == {
+        "requested_count": 3,
+        "exported_count": 3,
+        "sanitized_reference_count": 2,
+    }
+    assert [space["id"] for space in payload["memory_spaces"]] == [selected_space.id]
+    for partition in (
+        "core_memory_sections",
+        "core_memory_section_history",
+        "recent_context_summaries",
+        "conversation_branch_nodes",
+        "decision_logs",
+    ):
+        assert payload[partition] == []
+    serialized = response.text
+    for canary in (
+        unselected.content,
+        "UNSELECTED-SPACE-CANARY",
+        "CORE-CANARY",
+        "RECENT-CONTEXT-CANARY",
+        "DECISION-LOG-CANARY",
+        other_user.content,
+    ):
+        assert canary not in serialized
+
+    stale = client.post(
+        "/memories/export/selection",
+        headers=auth_headers,
+        json={"memory_ids": [selected_source.id, other_user.id]},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "memory_selection_stale"
+
+
+def test_selection_export_rejects_duplicate_ids(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+) -> None:
+    memory = memory_store.create_memory(user_id="default", content="duplicate")
+    response = client.post(
+        "/memories/export/selection",
+        headers=auth_headers,
+        json={"memory_ids": [memory.id, memory.id]},
+    )
+    assert response.status_code == 422
+
+
 def test_memory_export_includes_rows_beyond_legacy_ten_thousand_limit(
     memory_store: MemoryStore,
 ) -> None:
