@@ -17,11 +17,11 @@ from pydantic import ValidationError
 from model_gateway.config_store import (
     ConfigError,
     GatewayPaths,
+    commit_control_plane,
     initialize,
     load_config,
     read_secrets,
-    set_secret,
-    write_config,
+    source_revision,
 )
 from model_gateway.models import (
     AuthConfig,
@@ -30,6 +30,7 @@ from model_gateway.models import (
     ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
+    derive_embedding_space,
     GatewayConfig,
     PricingConfig,
     PricingTier,
@@ -150,10 +151,7 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
     if kind_choice not in {"1", "2"}:
         raise ValueError("模型类型只能选择 1 或 2")
     kind = "embedding" if kind_choice == "2" else "chat"
-    author = _prompt(
-        f"模型作者的英文简称 [{connection.channel_operator}]：",
-        connection.channel_operator,
-    )
+    author = _prompt("模型作者的英文简称（不确定请保留 unknown）[unknown]：", "unknown")
     capabilities = Capabilities(streaming=kind == "chat")
     reasoning_default = "inherit"
     dimensions: int | None = None
@@ -177,9 +175,12 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
             reasoning_default = "enabled"
     else:
         dimensions = _positive_int(_required("向量维度（例如 1024）："), "向量维度")
-        embedding_space = _required(
-            "向量空间名称（以后换模型或维度时必须使用新名称）："
+        embedding_space = derive_embedding_space(
+            connection,
+            upstream_model,
+            dimensions,
         )
+        print(f"已自动生成向量空间 ID：{embedding_space}")
 
     deployment_id = _unique_id(
         _slug_id(f"{connection_id}-{upstream_model}"),
@@ -214,9 +215,16 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
     if not _confirm("确认保存？", True):
         print("已取消，没有修改设置。")
         return
-    write_config(paths.config, updated)
-    if secret_value is not None:
-        set_secret(paths.secrets, connection.auth.secret_ref, secret_value)
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=updated,
+        secret_updates=(
+            {connection.auth.secret_ref: secret_value}
+            if secret_value is not None
+            else {}
+        ),
+    )
     print("已保存渠道和模型，API Key 不会显示在列表或日志中。")
 
     if kind == "chat":
@@ -282,11 +290,17 @@ def _choose_connection(
     plan_types = {"1": "payg", "2": "subscription", "3": "free_tier", "4": "custom"}
     if plan_choice not in plan_types:
         raise ValueError("套餐只能选择 1、2、3 或 4")
-    print("接口兼容方式：1=标准 OpenAI，2=Kimi，3=DeepSeek，4=MiMo")
+    print("接口兼容方式：1=标准 OpenAI，2=Kimi，3=DeepSeek，4=MiMo，5=百炼 Qwen")
     adapter_choice = _prompt("选择 [1]：", "1")
-    adapters = {"1": "generic", "2": "kimi", "3": "deepseek", "4": "mimo"}
+    adapters = {
+        "1": "generic",
+        "2": "kimi",
+        "3": "deepseek",
+        "4": "mimo",
+        "5": "dashscope_openai",
+    }
     if adapter_choice not in adapters:
-        raise ValueError("兼容方式只能选择 1、2、3 或 4")
+        raise ValueError("兼容方式只能选择 1、2、3、4 或 5")
     connection_id = _unique_id(_slug_id(f"{operator}-account"), config.connections)
     from model_gateway import cli as cli_module
 
@@ -397,7 +411,11 @@ def _assign_deployment_to_routes(
             max_attempts=1,
         ).model_dump(mode="python")
     payload["routes"] = routes
-    write_config(paths.config, GatewayConfig.model_validate(payload))
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=GatewayConfig.model_validate(payload),
+    )
     print("已安排用途：" + "、".join(PURPOSE_LABELS[item] for item in selected))
 
 
@@ -409,9 +427,14 @@ def _write_route(paths: GatewayPaths, route_id: str, targets: list[str]) -> None
         kind=config.deployments[targets[0]].kind,
         targets=targets,
         max_attempts=min(3, len(targets)),
+        fallback_scope="any_channel" if len(targets) > 1 else "none",
     ).model_dump(mode="python")
     payload["routes"] = routes
-    write_config(paths.config, GatewayConfig.model_validate(payload))
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=GatewayConfig.model_validate(payload),
+    )
 
 
 def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> None:
@@ -449,13 +472,20 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
         secret_ref=secret_ref,
         allowed_routes=["memory.*", "knowledge.*"],
         allow_direct_deployments=False,
+        allow_legacy_weak_secret=(
+            existing.allow_legacy_weak_secret if existing is not None else False
+        ),
     ).model_dump(mode="python")
     payload["clients"] = clients
     updated = GatewayConfig.model_validate(payload)
     secret_values = read_secrets(paths.secrets)
     client_key = secret_values.get(secret_ref) or secrets.token_urlsafe(32)
-    write_config(paths.config, updated)
-    set_secret(paths.secrets, secret_ref, client_key)
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=updated,
+        secret_updates={secret_ref: client_key},
+    )
 
     if not _gateway_healthy(paths, updated):
         print("正在启动模型服务……")
@@ -659,7 +689,11 @@ def _record_price(paths: GatewayPaths) -> None:
     updated_deployment["pricing"] = pricing_id
     deployments[deployment_id] = updated_deployment
     payload["deployments"] = deployments
-    write_config(paths.config, GatewayConfig.model_validate(payload))
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=GatewayConfig.model_validate(payload),
+    )
     print("官方价格已经保存；过去的用量价格快照不会被改写。")
 
 
@@ -791,3 +825,4 @@ def _positive_int(value: str, label: str) -> int:
     if parsed <= 0:
         raise ValueError(f"{label}必须是正整数")
     return parsed
+    commit_control_plane,

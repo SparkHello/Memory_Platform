@@ -64,7 +64,11 @@ async def test_live_check_sends_minimum_chat_and_embedding_requests(
             }
             return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
         assert request.url.path == "/v1/embeddings"
-        assert payload == {"model": "author/embed-v1", "input": ["ping"]}
+        assert payload == {
+            "model": "author/embed-v1",
+            "input": ["ping"],
+            "dimensions": 4,
+        }
         return httpx.Response(200, json={"data": [{"embedding": [0.0, 0.0, 0.0, 0.0]}]})
 
     report = await check_health(
@@ -79,6 +83,40 @@ async def test_live_check_sends_minimum_chat_and_embedding_requests(
     assert report.mode == "live"
     assert report.connections[0].status == "live_ok"
     assert {item.status for item in report.connections[0].deployments} == {"live_ok"}
+
+
+@pytest.mark.asyncio
+async def test_live_embedding_check_validates_every_returned_vector(
+    gateway_config: GatewayConfig,
+) -> None:
+    gateway_config.deployments = {
+        "embed-official": gateway_config.deployments["embed-official"]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["dimensions"] == 4
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"embedding": [0.0, 0.0, 0.0, 0.0]},
+                    {"embedding": [0.0, 0.0, 0.0]},
+                ]
+            },
+        )
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        live=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    deployment = report.connections[0].deployments[0]
+    assert deployment.status == "dimension_mismatch"
+    assert deployment.level == "error"
 
 
 @pytest.mark.asyncio
@@ -137,6 +175,40 @@ async def test_discovery_auth_failure_does_not_include_provider_body(
 
 
 @pytest.mark.asyncio
+async def test_discovery_response_limit_stops_before_later_chunks(
+    gateway_config: GatewayConfig,
+) -> None:
+    yielded: list[int] = []
+
+    class CountingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunks = [
+                b"a" * (1024 * 1024),
+                b"b" * (1024 * 1024 + 1),
+                b"SECRET",
+            ]
+            for index, chunk in enumerate(chunks):
+                yielded.append(index)
+                yield chunk
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=CountingStream())
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert report.connections[0].status == "invalid_response"
+    assert yielded == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_health_probe_does_not_follow_redirect_with_credential(
     gateway_config: GatewayConfig,
 ) -> None:
@@ -185,3 +257,23 @@ async def test_live_chat_check_rejects_unstructured_http_200(
     assert by_id["chat-official"].level == "error"
     assert by_id["embed-official"].status == "live_ok"
     assert report.connections[0].status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_discovery_response_size_is_bounded(
+    gateway_config: GatewayConfig,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * (2 * 1024 * 1024 + 1))
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        transport=httpx.MockTransport(handler),
+    )
+
+    connection = report.connections[0]
+    assert connection.status == "invalid_response"
+    assert connection.level == "error"
+    assert "安全上限" in connection.detail

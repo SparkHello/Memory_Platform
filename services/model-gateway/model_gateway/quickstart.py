@@ -10,12 +10,23 @@ from typing import Any
 
 import httpx
 
+from model_gateway.auth import (
+    client_token_bytes,
+    provider_secret_header_value,
+    validate_secret_domains,
+)
 from model_gateway.config_store import (
     GatewayPaths,
+    commit_control_plane,
     load_config,
     read_secrets,
-    set_secret,
-    write_config,
+    source_revision,
+)
+from model_gateway.http_safety import (
+    MAX_DISCOVERY_RESPONSE_BYTES,
+    bounded_model_ids,
+    require_safe_destination_sync,
+    upstream_url,
 )
 from model_gateway.models import (
     AuthConfig,
@@ -24,6 +35,7 @@ from model_gateway.models import (
     ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
+    derive_embedding_space,
     GatewayConfig,
     RequestTransform,
     RouteConfig,
@@ -83,11 +95,11 @@ CHANNEL_PRESETS: dict[str, ChannelPreset] = {
         label="阿里云百炼 / DashScope 北京区",
         channel_operator="dashscope",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        adapter="generic",
+        adapter="dashscope_openai",
     ),
 }
 
-_ADAPTERS = ("generic", "kimi", "deepseek", "mimo")
+_ADAPTERS = ("generic", "kimi", "deepseek", "mimo", "dashscope_openai")
 _PLANS = (
     "payg",
     "subscription",
@@ -123,6 +135,7 @@ def discover_model_ids(
     base_url: str,
     api_key: str,
     transport: httpx.BaseTransport | None = None,
+    allowed_private_networks: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Read an OpenAI-compatible model list without inference or redirects."""
 
@@ -131,16 +144,42 @@ def discover_model_ids(
     if not api_key.strip():
         raise QuickstartError("模型发现需要 API Key")
     try:
+        provider_secret_header_value(api_key)
+    except ValueError as exc:
+        raise QuickstartError(str(exc)) from exc
+    try:
+        url = upstream_url(
+            base_url,
+            "/models",
+            allowed_private_networks=allowed_private_networks,
+        )
+        if transport is None:
+            require_safe_destination_sync(
+                url,
+                allowed_private_networks=allowed_private_networks,
+            )
         with httpx.Client(
             transport=transport,
             follow_redirects=False,
             timeout=httpx.Timeout(10.0),
+            trust_env=False,
         ) as client:
-            response = client.get(
-                f"{base_url.rstrip('/')}/models",
+            with client.stream(
+                "GET",
+                url,
                 headers={"Authorization": f"Bearer {api_key.strip()}"},
-            )
-    except httpx.HTTPError as exc:
+            ) as response:
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_DISCOVERY_RESPONSE_BYTES:
+                        raise QuickstartError("渠道 /models 响应超过 2 MiB 安全上限")
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+    except QuickstartError:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
         raise QuickstartError(f"读取 /models 失败：{type(exc).__name__}") from exc
     if 300 <= response.status_code < 400:
         raise QuickstartError("渠道 /models 返回重定向；为避免凭证泄露已拒绝跟随")
@@ -149,8 +188,8 @@ def discover_model_ids(
     if response.status_code != 200:
         raise QuickstartError(f"渠道 /models 返回 HTTP {response.status_code}")
     try:
-        payload = response.json()
-    except ValueError as exc:
+        payload = json.loads(content)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise QuickstartError("渠道 /models 没有返回有效 JSON") from exc
     if isinstance(payload, dict):
         items = payload.get("data", payload.get("models", []))
@@ -160,14 +199,10 @@ def discover_model_ids(
         items = []
     if not isinstance(items, list):
         items = []
-    model_ids: set[str] = set()
-    for item in items:
-        if isinstance(item, str) and item.strip():
-            model_ids.add(item.strip())
-        elif isinstance(item, dict):
-            value = item.get("id") or item.get("model")
-            if isinstance(value, str) and value.strip():
-                model_ids.add(value.strip())
+    try:
+        model_ids = bounded_model_ids(items)
+    except ValueError as exc:
+        raise QuickstartError("渠道 /models 条目过多或模型 ID 格式无效") from exc
     if not model_ids:
         raise QuickstartError("渠道 /models 可访问，但没有解析到模型 ID")
     return tuple(sorted(model_ids))
@@ -253,7 +288,7 @@ def load_quickstart_file(
         )
     if raw_embedding is not None:
         missing_embedding = sorted(
-            name for name in ("model", "dimensions", "space") if name not in embedding
+            name for name in ("model", "dimensions") if name not in embedding
         )
         if missing_embedding:
             raise QuickstartError(
@@ -328,6 +363,10 @@ class QuickstartSpec:
             raise QuickstartError("聊天模型 ID 不能为空")
         if not self.api_key.strip():
             raise QuickstartError("API Key 不能为空")
+        try:
+            provider_secret_header_value(self.api_key)
+        except ValueError as exc:
+            raise QuickstartError(str(exc)) from exc
         unknown = tuple(item for item in self.chat_capabilities if item not in _CHAT_CAPABILITIES)
         if unknown:
             raise QuickstartError("未知能力：" + ", ".join(unknown))
@@ -336,8 +375,6 @@ class QuickstartSpec:
         if self.embedding_model.strip():
             if not self.embedding_dimensions or self.embedding_dimensions < 1:
                 raise QuickstartError("配置向量模型时必须给出正整数维度")
-            if not self.embedding_space.strip():
-                raise QuickstartError("配置向量模型时必须给出向量空间名称")
 
 
 @dataclass(slots=True)
@@ -396,7 +433,7 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     chat_deployment = DeploymentConfig(
         connection=connection_id,
         upstream_model=spec.chat_model.strip(),
-        model_author=(spec.chat_author.strip() or operator),
+        model_author=(spec.chat_author.strip() or "unknown"),
         kind="chat",
         reasoning_default=spec.reasoning_default,
         capabilities=Capabilities(
@@ -427,20 +464,26 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         ).model_dump(mode="python")
 
     embedding_deployment_id = ""
+    resolved_embedding_space = ""
     if spec.embedding_model.strip():
         embedding_deployment_id = _unique_id(
             _slug(f"{connection_id}-{spec.embedding_model}"),
             {**config.deployments, chat_deployment_id: chat_deployment},
         )
+        resolved_embedding_space = spec.embedding_space.strip() or derive_embedding_space(
+            connection,
+            spec.embedding_model.strip(),
+            int(spec.embedding_dimensions),
+        )
         embedding_deployment = DeploymentConfig(
             connection=connection_id,
             upstream_model=spec.embedding_model.strip(),
-            model_author=(spec.embedding_author.strip() or operator),
+            model_author=(spec.embedding_author.strip() or "unknown"),
             kind="embedding",
             capabilities=Capabilities(streaming=False),
             request_transform=RequestTransform(),
             dimensions=spec.embedding_dimensions,
-            embedding_space=spec.embedding_space.strip(),
+            embedding_space=resolved_embedding_space,
         )
         deployments[embedding_deployment_id] = embedding_deployment.model_dump(mode="python")
         routes[EMBEDDING_ROUTE] = RouteConfig(
@@ -468,6 +511,11 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         secret_ref=client_secret_ref,
         allowed_routes=["memory.*", "knowledge.*"],
         allow_direct_deployments=False,
+        allow_legacy_weak_secret=(
+            existing_client.allow_legacy_weak_secret
+            if existing_client is not None
+            else False
+        ),
     ).model_dump(mode="python")
     payload["clients"] = clients
 
@@ -475,9 +523,27 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
 
     # Single validation of the whole relationship graph before the sole write.
     validated = GatewayConfig.model_validate(payload)
-    write_config(paths.config, validated)
-    set_secret(paths.secrets, connection_secret_ref, spec.api_key.strip())
-    set_secret(paths.secrets, client_secret_ref, memory_client_key)
+    client_token_bytes(
+        memory_client_key,
+        allow_legacy_weak=(
+            existing_client.allow_legacy_weak_secret
+            if existing_client is not None
+            else False
+        ),
+    )
+    candidate_secrets = dict(existing_secrets)
+    candidate_secrets[connection_secret_ref] = spec.api_key.strip()
+    candidate_secrets[client_secret_ref] = memory_client_key
+    validate_secret_domains(config=validated, secrets=candidate_secrets)
+    commit_control_plane(
+        paths,
+        expected_revision=source_revision(config, paths.config),
+        config=validated,
+        secret_updates={
+            connection_secret_ref: spec.api_key.strip(),
+            client_secret_ref: memory_client_key,
+        },
+    )
 
     return QuickstartResult(
         connection_id=connection_id,
@@ -485,7 +551,7 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         chat_routes=CHAT_ROUTES,
         memory_client_key=memory_client_key,
         embedding_deployment_id=embedding_deployment_id,
-        embedding_space=spec.embedding_space.strip() if embedding_deployment_id else "",
+        embedding_space=resolved_embedding_space,
         embedding_dimensions=spec.embedding_dimensions if embedding_deployment_id else None,
         created_memory_client=created_memory_client,
     )

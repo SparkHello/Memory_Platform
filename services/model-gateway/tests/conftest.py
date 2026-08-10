@@ -1,13 +1,128 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+import atexit
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
+
+
+_RUNTIME_ENVIRONMENT_EXACT = {
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "MODEL_GATEWAY_CONFIG_PATH",
+    "MODEL_GATEWAY_HOME",
+    "MODEL_GATEWAY_SECRETS_PATH",
+    "MODEL_GATEWAY_USAGE_DATABASE_PATH",
+    "NO_PROXY",
+}
+_RUNTIME_ENVIRONMENT_PREFIXES = (
+    "CLIENT_",
+    "MODEL_GATEWAY_",
+    "PROVIDER_",
+    "UPSTREAM_",
+)
+
+
+def _is_model_runtime_environment(name: str) -> bool:
+    return name in _RUNTIME_ENVIRONMENT_EXACT or name.startswith(
+        _RUNTIME_ENVIRONMENT_PREFIXES
+    )
+
+
+# Pytest imports this file before fixtures can run. Neutralize inherited path
+# overrides first so collection itself cannot open a developer secret store.
+_SESSION_ORIGINAL_ENVIRONMENT = {
+    name: value
+    for name, value in os.environ.items()
+    if _is_model_runtime_environment(name)
+}
+_SESSION_RUNTIME_ROOT = Path(tempfile.mkdtemp(prefix="model-gateway-pytest-session-"))
+os.chmod(_SESSION_RUNTIME_ROOT, 0o700)
+for name in list(os.environ):
+    if _is_model_runtime_environment(name):
+        os.environ.pop(name, None)
+os.environ.update(
+    {
+        "MODEL_GATEWAY_HOME": str(_SESSION_RUNTIME_ROOT / "modelgw-home"),
+        "MODEL_GATEWAY_CONFIG_PATH": str(
+            _SESSION_RUNTIME_ROOT / "modelgw-home" / "config.json"
+        ),
+        # Empty is intentional: an explicit gateway home must use its own
+        # secret store. This also keeps multiprocessing-spawned helpers from
+        # inheriting a parent test's absolute secret path.
+        "MODEL_GATEWAY_SECRETS_PATH": "",
+        "MODEL_GATEWAY_USAGE_DATABASE_PATH": str(
+            _SESSION_RUNTIME_ROOT / "modelgw-home" / "usage.db"
+        ),
+    }
+)
+_SESSION_ENVIRONMENT_RESTORED = False
+
+
+def _restore_session_environment() -> None:
+    global _SESSION_ENVIRONMENT_RESTORED
+    if _SESSION_ENVIRONMENT_RESTORED:
+        return
+    _SESSION_ENVIRONMENT_RESTORED = True
+    for name in list(os.environ):
+        if _is_model_runtime_environment(name):
+            os.environ.pop(name, None)
+    os.environ.update(_SESSION_ORIGINAL_ENVIRONMENT)
+    shutil.rmtree(_SESSION_RUNTIME_ROOT, ignore_errors=True)
+
+
+atexit.register(_restore_session_environment)
 
 import pytest
 
 from model_gateway.auth import AuthenticatedClient
 from model_gateway.config_store import GatewayPaths, gateway_paths, initialize, write_config, write_secrets
 from model_gateway.models import GatewayConfig
+
+
+def pytest_unconfigure(config) -> None:
+    del config
+    _restore_session_environment()
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_runtime(tmp_path: Path) -> Iterator[None]:
+    """Give each test independent Model Gateway paths and secret namespace."""
+
+    original_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if _is_model_runtime_environment(name)
+    }
+    sandbox = pytest.MonkeyPatch()
+    for name in original_environment:
+        sandbox.delenv(name, raising=False)
+
+    model_home = tmp_path / "modelgw-home"
+    sandbox.chdir(tmp_path)
+    sandbox.setenv("MODEL_GATEWAY_HOME", str(model_home))
+    sandbox.setenv("MODEL_GATEWAY_CONFIG_PATH", str(model_home / "config.json"))
+    sandbox.setenv("MODEL_GATEWAY_SECRETS_PATH", "")
+    sandbox.setenv(
+        "MODEL_GATEWAY_USAGE_DATABASE_PATH",
+        str(model_home / "usage.db"),
+    )
+
+    try:
+        yield
+    finally:
+        sandbox.undo()
+        # Direct os.environ writes and a test-local monkeypatch.undo() cannot
+        # escape the independent sandbox's exact restoration.
+        for name in list(os.environ):
+            if _is_model_runtime_environment(name) and name not in original_environment:
+                os.environ.pop(name, None)
+        for name, value in original_environment.items():
+            os.environ[name] = value
 
 
 def config_payload() -> dict[str, Any]:

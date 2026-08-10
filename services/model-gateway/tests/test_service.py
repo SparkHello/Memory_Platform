@@ -41,6 +41,15 @@ def test_admin_configuration_is_filtered_and_never_returns_secrets(gateway_home)
         "memory.embedding",
     }
     assert all("secret_ref" not in connection for connection in payload["connections"])
+    assert all(
+        connection["response_limit_bytes"] == 64 * 1024 * 1024
+        for connection in payload["connections"]
+    )
+    by_deployment = {item["id"]: item for item in payload["deployments"]}
+    assert by_deployment["chat-official"]["pricing"] == "official-chat-2026-08"
+    assert by_deployment["chat-official"]["tool_choice_with_reasoning"] == (
+        "auto_only"
+    )
     assert "official-secret" not in response.text
     assert len(payload["revision"]) == 64
 
@@ -112,6 +121,7 @@ def test_admin_secret_write_is_one_way_and_connection_check_is_discovery_only(
         )
 
     app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    app.state.router.cooldowns.defer("official", 600)
     with TestClient(app) as client:
         updated = client.put(
             "/admin/connections/official/secret",
@@ -129,7 +139,24 @@ def test_admin_secret_write_is_one_way_and_connection_check_is_discovery_only(
         assert checked.json()["mode"] == "discovery"
 
     assert read_secrets(gateway_home.secrets)["UPSTREAM_OFFICIAL"] == "replacement-secret"
-    assert requests == [("GET", "/v1/models")]
+    assert app.state.router.cooldowns.remaining("official") == 0
+    # Candidate validation happens before replacement, then the explicit check
+    # performs a second read-only discovery. Neither request sends inference.
+    assert requests == [("GET", "/v1/models"), ("GET", "/v1/models")]
+
+
+def test_admin_cannot_reuse_local_client_key_as_provider_key(gateway_home) -> None:
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(lambda request: None))
+    with TestClient(app) as client:
+        response = client.put(
+            "/admin/connections/official/secret",
+            headers={"authorization": "Bearer admin-token"},
+            json={"value": "local-client-token"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "model_gateway_secret_domain_conflict"
+    assert read_secrets(gateway_home.secrets)["UPSTREAM_OFFICIAL"] == "official-secret"
 
 
 def test_service_auth_models_proxy_and_metadata_only_usage(gateway_home) -> None:
@@ -178,11 +205,16 @@ def test_service_auth_models_proxy_and_metadata_only_usage(gateway_home) -> None
         assert received[0]["model"] == "author/chat-v1"
 
     assert marker.encode() not in gateway_home.usage_db.read_bytes()
+    assert b"upstream-answer" not in gateway_home.usage_db.read_bytes()
     with sqlite3.connect(gateway_home.usage_db) as connection:
         row = connection.execute(
             "SELECT deployment_id, channel_operator, model_author, response_model, "
             "total_tokens, estimated_cost, cost_complete "
             "FROM usage_events"
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT attempt_index, outcome, failure_class, response_model, "
+            "total_tokens, estimated_cost, cost_complete FROM attempt_events"
         ).fetchone()
     assert row == (
         "chat-official",
@@ -193,6 +225,7 @@ def test_service_auth_models_proxy_and_metadata_only_usage(gateway_home) -> None
         "0.000009",
         1,
     )
+    assert attempt == (1, "success", "none", "actual-model", 7, "0.000009", 1)
 
 
 def test_service_rejects_wrong_route_kind(gateway_home) -> None:
@@ -229,6 +262,112 @@ def test_service_rejects_embedding_dimensions_outside_route_space(gateway_home) 
     assert response.json()["error"]["type"] == (
         "model_gateway_embedding_dimensions_mismatch"
     )
+    assert upstream_calls == 0
+
+
+def test_service_selects_a_target_that_supports_request_capabilities(
+    gateway_home,
+) -> None:
+    config = load_config(gateway_home.config)
+    config.deployments["chat-official"].capabilities.json_schema = False
+    write_config(gateway_home.config, config)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer local-client-token"},
+            json={
+                "model": "memory.chat",
+                "messages": [],
+                "response_format": {"type": "json_schema", "json_schema": {}},
+            },
+        )
+
+    assert response.status_code == 200
+    assert calls == ["reseller.example"]
+    assert response.headers["x-model-gateway-deployment"] == "chat-reseller"
+
+
+def test_service_returns_stable_422_when_capability_is_unavailable(gateway_home) -> None:
+    config = load_config(gateway_home.config)
+    for deployment in config.deployments.values():
+        if deployment.kind == "chat":
+            deployment.capabilities.json_schema = False
+    write_config(gateway_home.config, config)
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer local-client-token"},
+            json={
+                "model": "memory.chat",
+                "messages": [],
+                "response_format": {"type": "json_schema", "json_schema": {}},
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "message": "请求需要当前 route 无法提供的能力：json_schema",
+        "type": "model_gateway_capability_unavailable",
+        "code": "model_gateway_capability_unavailable",
+        "required_capabilities": ["json_schema"],
+    }
+    assert upstream_calls == 0
+
+
+def test_service_rejects_specific_tool_choice_with_reasoning_before_upstream(
+    gateway_home,
+) -> None:
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer local-client-token"},
+            json={
+                "model": "memory.chat",
+                "messages": [],
+                "thinking": {"type": "enabled"},
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "parameters": {}},
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "lookup"},
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "model_gateway_capability_unavailable"
+    )
+    assert response.json()["error"]["required_capabilities"] == [
+        "tool_choice_with_reasoning"
+    ]
     assert upstream_calls == 0
 
 
@@ -290,7 +429,11 @@ def test_service_preserves_complete_sse_bytes_and_records_usage(gateway_home) ->
         row = connection.execute(
             "SELECT complete, response_model, total_tokens FROM usage_events"
         ).fetchone()
+        attempt = connection.execute(
+            "SELECT response_complete, response_model, total_tokens FROM attempt_events"
+        ).fetchone()
     assert row == (1, "actual", 3)
+    assert attempt == (1, "actual", 3)
 
 
 def test_routing_time_affinity_error_uses_stable_protocol_code(gateway_home) -> None:
@@ -516,6 +659,190 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
     ] == "channel-secret"
 
 
+def test_admin_discovers_new_channel_draft_without_persisting_or_leaking(
+    gateway_home,
+    caplog,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.url.path == "/v1/models"
+        assert request.headers["authorization"] == "Bearer draft-provider-key"
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "draft/chat-v1"}, {"id": "draft/embed-v4"}]},
+        )
+
+    config_before = gateway_home.config.read_bytes()
+    secrets_before = gateway_home.secrets.read_bytes()
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        revision = client.get(
+            "/admin/configuration",
+            headers={"authorization": "Bearer admin-token"},
+        ).json()["revision"]
+        discovered = client.post(
+            "/admin/channels/discover",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": revision,
+                "channel_operator": "draft-channel",
+                "base_url": "https://draft.example/v1",
+                "dialect": "generic",
+                "auth_type": "bearer",
+                "candidate_key": "draft-provider-key",
+                "allowed_private_networks": [],
+                "models_endpoint": "/models",
+            },
+        )
+        assert discovered.status_code == 200
+        payload = discovered.json()
+        assert payload["valid"] is True
+        assert payload["persisted"] is False
+        assert payload["revision"] == revision
+        assert payload["candidate"] == {
+            "connection_id": "",
+            "channel_operator": "draft-channel",
+            "base_url": "https://draft.example/v1",
+            "adapter": "generic",
+            "auth_type": "bearer",
+            "allowed_private_networks": [],
+            "models_endpoint": "/models",
+        }
+        assert payload["models"] == [
+            {"id": "draft/chat-v1", "model_author": "unknown", "aliases": []},
+            {"id": "draft/embed-v4", "model_author": "unknown", "aliases": []},
+        ]
+        assert payload["report"]["mode"] == "discovery"
+
+        secret_marker = "URL-CANDIDATE-SECRET"
+        rejected = client.post(
+            "/admin/channels/discover",
+            headers={"authorization": "Bearer admin-token"},
+            json={
+                "revision": revision,
+                "channel_operator": "draft-channel",
+                "base_url": f"https://user:{secret_marker}@draft.example/v1",
+                "candidate_key": "another-draft-key",
+            },
+        )
+        assert rejected.status_code == 400
+        assert secret_marker not in rejected.text
+        assert secret_marker not in caplog.text
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/v1/models")
+    ]
+    assert gateway_home.config.read_bytes() == config_before
+    assert gateway_home.secrets.read_bytes() == secrets_before
+    assert b"draft-provider-key" not in gateway_home.usage_db.read_bytes()
+
+
+def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) -> None:
+    marker = "prompt-and-response-body-must-never-enter-usage-db"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert marker in request.content.decode("utf-8")
+        return httpx.Response(
+            200,
+            json={
+                "id": "provider-request-1",
+                "model": "author/chat-v1",
+                "choices": [{"message": {"content": marker}}],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
+            },
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer local-client-token",
+                "x-model-gateway-correlation-id": "turn:abc-123",
+                "x-model-gateway-operation": "memory.chat.answer",
+                "x-model-gateway-user-tag": "user:opaque-7",
+            },
+            json={
+                "model": "memory.chat",
+                "messages": [{"role": "user", "content": marker}],
+            },
+        )
+        assert response.status_code == 200
+        event_id = response.headers["x-model-gateway-usage-event-id"]
+        assert response.headers["x-model-gateway-correlation-id"] == "turn:abc-123"
+
+        events = client.get(
+            "/v1/usage/events",
+            headers={"authorization": "Bearer local-client-token"},
+            params={"event_id": event_id},
+        )
+        assert events.status_code == 200
+        rows = events.json()["data"]
+        assert len(rows) == 1
+        assert rows[0]["correlation_id"] == "turn:abc-123"
+        assert rows[0]["operation"] == "memory.chat.answer"
+        assert rows[0]["user_tag"] == "user:opaque-7"
+        assert rows[0]["attempt_costs"] == {"USD": "0.000009"}
+        assert rows[0]["unknown_cost_attempts"] == 0
+
+        summary = client.get(
+            "/v1/usage/summary",
+            headers={"authorization": "Bearer local-client-token"},
+            params={
+                "operation": "memory.chat.answer",
+                "user_tag": "user:opaque-7",
+            },
+        )
+        assert summary.status_code == 200
+        assert summary.json()["calls"] == 1
+        assert summary.json()["estimated_costs"] == {"USD": "0.000009"}
+
+        forbidden_metadata = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer desktop-token",
+                "x-model-gateway-operation": "memory.chat.answer",
+            },
+            json={"model": "memory.chat", "messages": []},
+        )
+        assert forbidden_metadata.status_code == 403
+        assert (
+            forbidden_metadata.json()["error"]["type"]
+            == "model_gateway_usage_metadata_forbidden"
+        )
+        invalid_metadata = client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer local-client-token",
+                "x-model-gateway-user-tag": "raw user name",
+            },
+            json={"model": "memory.chat", "messages": []},
+        )
+        assert invalid_metadata.status_code == 400
+
+        forbidden_query = client.get(
+            "/v1/usage/summary",
+            headers={"authorization": "Bearer desktop-token"},
+        )
+        assert forbidden_query.status_code == 403
+        cross_client = client.get(
+            "/v1/usage/events",
+            headers={"authorization": "Bearer local-client-token"},
+            params={"client_id": "desktop"},
+        )
+        assert cross_client.status_code == 400
+
+    usage_files = gateway_home.home.glob("usage.db*")
+    assert marker.encode("utf-8") not in b"".join(path.read_bytes() for path in usage_files)
+
+
 def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
     app = create_app(
         paths=gateway_home,
@@ -625,6 +952,6 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
 
     config = load_config(gateway_home.config)
     deployment = config.deployments["official-author-chat-v2"]
-    assert deployment.model_author == "official-vendor"
+    assert deployment.model_author == "unknown"
     assert config.routes["memory.chat"].targets == ["official-author-chat-v2"]
     assert config.routes["knowledge.fast"].max_attempts == 1

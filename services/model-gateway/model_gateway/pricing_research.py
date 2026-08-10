@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from model_gateway.auth import provider_secret_header_value
+from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     ConnectionConfig,
     DeploymentConfig,
@@ -71,6 +73,34 @@ class ResearchCallMetadata:
     usage: dict[str, Any] | None = None
     response_model: str = ""
     request_id: str = ""
+    outcome: str = ""
+    failure_class: str = ""
+    request_sent: bool = True
+    response_complete: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not self.outcome:
+            object.__setattr__(
+                self,
+                "outcome",
+                "success" if 200 <= self.status_code < 300 else "http_error",
+            )
+        if not self.failure_class:
+            object.__setattr__(
+                self,
+                "failure_class",
+                (
+                    "none"
+                    if 200 <= self.status_code < 300
+                    else _research_http_failure_class(self.status_code)
+                ),
+            )
+        if self.response_complete is None:
+            object.__setattr__(
+                self,
+                "response_complete",
+                200 <= self.status_code < 300,
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +109,10 @@ class ResearchCallMetadata:
             "usage": dict(self.usage) if self.usage is not None else None,
             "response_model": self.response_model,
             "request_id": self.request_id,
+            "outcome": self.outcome,
+            "failure_class": self.failure_class,
+            "request_sent": self.request_sent,
+            "response_complete": self.response_complete,
         }
 
 
@@ -346,6 +380,7 @@ async def fetch_visible_text(
     client_args: dict[str, Any] = {
         "timeout": httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0),
         "follow_redirects": False,
+        "trust_env": False,
         "headers": {
             "Accept": "text/html, text/plain;q=0.9",
             "Accept-Encoding": "identity",
@@ -491,27 +526,39 @@ async def _call_research_deployment(
         "Accept-Encoding": "identity",
     }
     secret = secrets[connection.auth.secret_ref]
+    provider_secret_header_value(secret)
     if connection.auth.type == "x-api-key":
         headers["X-Api-Key"] = secret
     else:
         headers["Authorization"] = f"Bearer {secret}"
     client_args: dict[str, Any] = {
         "timeout": httpx.Timeout(
-            connect=min(connection.timeout_seconds, 30.0),
-            read=connection.timeout_seconds,
-            write=connection.timeout_seconds,
-            pool=min(connection.timeout_seconds, 30.0),
+            connect=connection.connect_timeout_seconds,
+            read=connection.read_timeout_seconds,
+            write=connection.write_timeout_seconds,
+            pool=connection.pool_timeout_seconds,
         ),
         "follow_redirects": False,
+        "trust_env": False,
     }
     if transport is not None:
         client_args["transport"] = transport
+    url = upstream_url(
+        connection.base_url,
+        connection.chat_endpoint,
+        allowed_private_networks=connection.allowed_private_networks,
+    )
+    if transport is None:
+        await require_safe_destination(
+            url,
+            allowed_private_networks=connection.allowed_private_networks,
+        )
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(**client_args) as client:
             async with client.stream(
                 "POST",
-                f"{connection.base_url}{connection.chat_endpoint}",
+                url,
                 headers=headers,
                 json=forwarded,
             ) as response:
@@ -521,6 +568,7 @@ async def _call_research_deployment(
                         ResearchCallMetadata(
                             status_code=response.status_code,
                             latency_ms=_elapsed_ms(started),
+                            failure_class="http_redirect",
                         ),
                     )
                 if not response.is_success:
@@ -529,6 +577,9 @@ async def _call_research_deployment(
                         ResearchCallMetadata(
                             status_code=response.status_code,
                             latency_ms=_elapsed_ms(started),
+                            failure_class=_research_http_failure_class(
+                                response.status_code
+                            ),
                         ),
                     )
                 chunks: list[bytes] = []
@@ -541,6 +592,9 @@ async def _call_research_deployment(
                             ResearchCallMetadata(
                                 status_code=response.status_code,
                                 latency_ms=_elapsed_ms(started),
+                                outcome="ambiguous_failure",
+                                failure_class="response_too_large",
+                                response_complete=False,
                             ),
                         )
                     chunks.append(chunk)
@@ -548,9 +602,16 @@ async def _call_research_deployment(
     except PricingResearchCallError:
         raise
     except httpx.HTTPError as exc:
+        request_sent, outcome, failure_class = _research_network_failure(exc)
         raise PricingResearchCallError(
             f"research deployment 网络调用失败：{type(exc).__name__}",
-            ResearchCallMetadata(status_code=502, latency_ms=_elapsed_ms(started)),
+            ResearchCallMetadata(
+                status_code=502,
+                latency_ms=_elapsed_ms(started),
+                outcome=outcome,
+                failure_class=failure_class,
+                request_sent=request_sent,
+            ),
         ) from exc
     metadata = _research_metadata(raw, response.status_code, _elapsed_ms(started))
     try:
@@ -725,7 +786,11 @@ def _research_metadata(
             usage = _metadata_only_usage(raw_usage)
         raw_model = payload.get("model")
         if isinstance(raw_model, str):
-            response_model = _safe_metadata_text(raw_model, max_length=300, allow_slash=True)
+            response_model = _safe_metadata_text(
+                raw_model,
+                max_length=300,
+                allow_slash=True,
+            )
         raw_request_id = payload.get("request_id") or payload.get("id")
         if isinstance(raw_request_id, str):
             request_id = _safe_metadata_text(
@@ -737,7 +802,45 @@ def _research_metadata(
         usage=usage,
         response_model=response_model,
         request_id=request_id,
+        outcome="success",
+        failure_class="none",
+        request_sent=True,
+        response_complete=True,
     )
+
+
+def _research_http_failure_class(status_code: int) -> str:
+    if status_code == 401:
+        return "http_auth"
+    if status_code == 402:
+        return "http_billing"
+    if status_code == 429:
+        return "http_rate_limit"
+    if 300 <= status_code < 400:
+        return "http_redirect"
+    if status_code >= 500:
+        return "http_server"
+    return "http_other"
+
+
+def _research_network_failure(exc: httpx.HTTPError) -> tuple[bool, str, str]:
+    if isinstance(exc, httpx.ConnectTimeout):
+        return False, "connect_failure", "connect_timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return False, "connect_failure", "connect_error"
+    if isinstance(exc, httpx.PoolTimeout):
+        return False, "connect_failure", "pool_timeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return True, "ambiguous_failure", "read_timeout"
+    if isinstance(exc, httpx.WriteTimeout):
+        return True, "ambiguous_failure", "write_timeout"
+    if isinstance(exc, httpx.ReadError):
+        return True, "ambiguous_failure", "read_error"
+    if isinstance(exc, httpx.WriteError):
+        return True, "ambiguous_failure", "write_error"
+    if isinstance(exc, httpx.ProtocolError):
+        return True, "ambiguous_failure", "protocol_error"
+    return True, "ambiguous_failure", "other_network"
 
 
 def _elapsed_ms(started: float) -> int:

@@ -8,10 +8,10 @@
 
 配置分为五层，再附加独立的价格目录：
 
-- `server`：本地监听地址、端口和请求体上限；
+- `server`：本地监听地址、端口、请求体上限和磁盘软/硬保留量；
 - `client`：调用网关的本地应用身份、Bearer key 与 route 权限；
 - `connection`：真实渠道账号、Base URL、上游密钥引用、套餐范围和 adapter；
-- `deployment`：该 connection 上的精确上游模型 ID、能力和推理默认值；
+- `deployment`：该 connection 上的精确上游模型 ID、能力、推理默认值和可选渠道 profile；
 - `route`：业务功能名与有序 fallback deployments；
 - `pricing`：绑定 deployment 的官方价格快照，不用相似模型或第三方聚合价代替。
 
@@ -93,7 +93,7 @@ Windows 会创建用户级 `modelgw.cmd` 并提示需要加入用户 `Path` 的�
 
 下面的 `PROVIDER_NAME`、`PROVIDER_HTTPS_BASE_URL` 和 `UPSTREAM_MODEL_ID` 都是待替换的占位符，不是可直接调用的真实配置。命令不会包含或回显任何真实 API Key。
 
-先创建 My_Memory 的本地客户端身份；`--set-secret` 会用无回显提示读取你自行生成并保存到密码管理器的本地 Bearer key：
+先创建 My_Memory 的本地客户端身份；`--set-secret` 会用无回显提示读取你自行生成并保存到密码管理器的本地 Bearer key。该 key 至少 32 字节且只含 URL-safe 字符，推荐用 `secrets.token_urlsafe(32)` 生成：
 
 ```bash
 modelgw client add memory-gateway \
@@ -103,7 +103,7 @@ modelgw client add memory-gateway \
   --set-secret
 ```
 
-再按供应商官方文档填写连接。普通 OpenAI-compatible 渠道使用 `generic`；只有确实需要已实现的推理参数兼容规则时才选 `kimi`、`deepseek` 或 `mimo`：
+再按供应商官方文档填写连接。普通 OpenAI-compatible 渠道使用 `generic`；只有确实需要已实现的推理参数兼容规则时才选 `kimi`、`deepseek`、`mimo` 或百炼 Qwen 使用的 `dashscope_openai`。后者把通用推理开关转换成 DashScope 的 `enable_thinking`，不会依赖用户手写 request transform：
 
 ```bash
 modelgw connection add provider-account \
@@ -129,6 +129,8 @@ modelgw doctor
 modelgw start
 modelgw status
 ```
+
+从 schema v1 升级的短 client key 只作为显式兼容项继续可用，`modelgw doctor` 会警告对应 client ID。用 `modelgw secret set CLIENT_ID` 轮换后，兼容标记会与新 key 一起原子清除；新建 client 不接受短口令。
 
 这里刻意没有填写价格。只有从该 deployment 对应渠道的官方价格页核对币种、计价单位、分档和生效时间后，才运行 `modelgw pricing set ...`；没有明确价格时保持未配置，不猜成免费。
 
@@ -162,6 +164,8 @@ modelgw logs --lines 100
 modelgw logs -f
 modelgw stop
 ```
+
+持久化配置与 `start` 始终只允许回环监听。仅双容器私有网络入口可显式运行 `modelgw serve --host 0.0.0.0 --container-network`；不要把该容器端口发布到宿主机或公网。
 
 后台状态、日志和配置都属于同一个用户配置目录。`stop` 只会停止由该目录的 `modelgw start` 创建且身份匹配的进程；超时后只有显式 `--force` 才会强制终止。完整说明见[运行与检查](docs/operations.md)。
 
@@ -219,7 +223,7 @@ memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<exact-embedding-space>'
 ## 客户端 API
 
 - `GET /health`、`GET /healthz`：进程和配置热加载状态；
-- `GET /readyz`：本地就绪状态；
+- `GET /readyz`：至少有一个带有效本地 key 的 backend/interactive client 能使用一条命中有效 provider key 的 enabled route，配置最近一次 reload 成功，且 config/secrets/usage 存储可写并高于软保留量，才返回 200；不发 provider 请求，失败只返回 `disk_low` / `disk_unavailable` 等安全 reason code；
 - `GET /v1/models`：当前 client 可使用的 route；
 - `POST /v1/chat/completions`；
 - `POST /v1/embeddings`。
@@ -231,8 +235,14 @@ memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<exact-embedding-space>'
 - `PUT /admin/routes`：仅 admin，revision 未变化且完整 `GatewayConfig` 校验通过后原子应用，服务自动热加载；
 - `PUT /admin/connections/{id}/secret`：仅 admin，单向替换 connection 引用的渠道密钥，响应永不回显；
 - `POST /admin/connections/{id}/check`：仅 admin，只执行 discovery `/models` 检查，不发起推理。
+- `POST /admin/channels/discover`：既可检查已有 connection 的候选 key，也可提交尚未落盘的 flat channel draft（渠道、Base URL、adapter/dialect、鉴权与私网声明）做一次只读 discovery；绝不落盘；
+- `POST /admin/channel-bundles/validate`：完整校验 connection、候选 secret、deployments、pricing 和 route operations，但不写入；
+- `POST /admin/channel-bundles/apply`：再次 discovery 后按 revision CAS 一次提交；route operation 支持 `keep`（默认）、`prepend`、`append`、`replace`；
+- `PATCH /admin/connections/{id}`、`PATCH /admin/deployments/{id}`：启用或禁用对象；`DELETE /admin/{connections|deployments|pricing}/{id}` 只删除未引用对象。
 
-统一运行栈安装（`memgw stack install`、`scripts/setup.sh`、容器首启）会自动创建 `memory-console-admin` 身份并生成、打印一次 admin key。需要手工重建或重设时：
+这些写入口与 CLI 使用同一跨进程锁和崩溃恢复事务。渠道 key 替换会先验证候选 key；失败返回非 2xx，旧 key 与配置保持不变。admin 配置视图会显示未被 route 引用的对象，非 admin 仍只看到授权 route 可达的脱敏子图。
+
+统一运行栈安装（`memgw stack install`、`scripts/setup.sh`、容器首启）会自动创建 `memory-console-admin` 身份，并将新 admin key 只写入宿主私有凭据目录中的 `0600` 文件；终端与服务日志仅报告文件路径，不回显密钥。需要手工重建或重设时：
 
 ```bash
 modelgw client add memory-console-admin \
@@ -266,16 +276,23 @@ X-Model-Gateway-Reasoning-Origin-Deployment: chat-primary
 ## 透明转发与用量
 
 - 请求只替换上游 `model`、鉴权，以及 adapter/deployment 明确声明的兼容参数；未知 JSON 字段继续保留；
+- 请求声明的流式、工具、并行工具、多模态、推理和 JSON 输出能力会在发送前过滤 deployment；无兼容目标时返回稳定 422；推理开启时默认只允许省略/`none`/`auto` 的 `tool_choice`，`required` 或具体函数对象会在付费调用前被拒绝，adapter 不静默改写；
 - 成功上游响应正文和 SSE chunk 按原始字节转发；
 - 流式请求只在下游收到首字节前 fallback，开始输出后不拼接另一家响应；
+- 只有连接建立失败会自动切换；读/写超时可能已经计费，网关不会自动重发；
 - 上游重定向不会携带凭据跟随；
-- `usage.db` 只记录身份、路由、状态、Token、耗时和价格快照，不保存正文；
-- 缺 usage、官方价格或某类单价时，费用保持不完整。
+- `usage.db` 用 `usage_events` 记录逻辑请求、用 `attempt_events` 记录每次真实上游发送的有限元数据与逐渠道费用；受信 backend 可附加 correlation/operation/opaque user tag 并查询中央事实，不保存正文或上游错误原文；
+- 401/402/429 按 connection 熔断，结构化模型不存在和连续 5xx 按 deployment 熔断，并在每个 attempt 前复查；
+- 上游 URL、敏感转发 Header、环境代理、discovery 数量和响应字节都有统一安全边界；私有或 RFC 2544 映射地址必须显式声明最小允许 CIDR，默认拒绝；
+- 缺 usage、官方价格或某类单价时，费用保持不完整；embedding 只要求输入 Token 与输入单价。
+- 原始 usage 保留 90 天后滚入日汇总，日汇总保留 365 天；`modelgw usage prune --vacuum` 可在低峰期回收空间。
+- 付费上游发送前会为逐 attempt ledger 保留磁盘空间；低于硬保留量时返回 `507 model_gateway_insufficient_storage`、`attempts=0`，不会先调用 provider。上游已调用后才发生的罕见写盘竞态优先返回原上游结果，将 ledger Header 标为 `incomplete`，并令服务至少一次 not-ready。
 - `pricing research` 只接受官方 HTTPS 可见文本且不跟随 redirect；精确模型、币种、单位或单价缺少逐字证据时结果保持 `unknown`。
 
 ```bash
 modelgw usage summary --days 30
 modelgw --json usage summary --days 30
+modelgw usage prune
 ```
 
 ## 为什么不直接使用 LiteLLM

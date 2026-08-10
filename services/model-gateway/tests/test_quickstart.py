@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import httpx
+import pytest
 
 from model_gateway.cli import main
 from model_gateway.config_store import (
@@ -96,6 +97,27 @@ def test_apply_quickstart_configures_embedding_route_when_requested(tmp_path: Pa
     assert deployment.embedding_space == "deepseek-embed-v1"
 
 
+def test_apply_quickstart_derives_embedding_space_when_ordinary_setup_omits_it(
+    tmp_path: Path,
+) -> None:
+    paths = gateway_paths(tmp_path / "gateway-home")
+    initialize(paths)
+
+    result = apply_quickstart(
+        paths,
+        _base_spec(
+            embedding_model="text-embed-v4",
+            embedding_dimensions=1024,
+        ),
+    )
+
+    deployment = load_config(paths.config).deployments[
+        result.embedding_deployment_id
+    ]
+    assert deployment.embedding_space == result.embedding_space
+    assert deployment.embedding_space.startswith("mgw-embedding-v1-1024-")
+
+
 def test_apply_quickstart_reuses_existing_memory_client_key(tmp_path: Path) -> None:
     # Simulate a prior `stack install`: the backend client and its synced key
     # already exist. Quickstart must not diverge from that key.
@@ -121,12 +143,13 @@ def test_apply_quickstart_reuses_existing_memory_client_key(tmp_path: Path) -> N
     )
     config = load_config(paths.config)
     synced_ref = config.clients["memory-gateway"].secret_ref
-    set_secret(paths.secrets, synced_ref, "already-synced-backend-key")
+    synced_key = "already_synced_backend_key_0123456789_ABC"
+    set_secret(paths.secrets, synced_ref, synced_key)
 
     result = apply_quickstart(paths, _base_spec())
 
     assert result.created_memory_client is False
-    assert result.memory_client_key == "already-synced-backend-key"
+    assert result.memory_client_key == synced_key
 
 
 def test_apply_quickstart_rejects_incomplete_embedding_spec(tmp_path: Path) -> None:
@@ -138,7 +161,7 @@ def test_apply_quickstart_rejects_incomplete_embedding_spec(tmp_path: Path) -> N
     except QuickstartError:
         pass
     else:  # pragma: no cover - explicit failure path
-        raise AssertionError("缺少维度/空间的向量配置应当被拒绝")
+        raise AssertionError("缺少维度的向量配置应当被拒绝")
 
 
 def test_quickstart_requires_explicit_permission_to_replace_existing_routes(
@@ -347,6 +370,79 @@ def test_model_discovery_reads_models_without_following_redirects() -> None:
         assert "重定向" in str(exc)
     else:  # pragma: no cover - explicit failure path
         raise AssertionError("模型发现不得携带凭证跟随重定向")
+
+
+def test_model_discovery_caps_body_count_and_identifier_shape() -> None:
+    def oversized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * (2 * 1024 * 1024 + 1))
+
+    with pytest.raises(QuickstartError, match="2 MiB"):
+        discover_model_ids(
+            base_url="https://provider.example/v1",
+            api_key="stdin-sensitive-key",
+            transport=httpx.MockTransport(oversized),
+        )
+
+    yielded: list[int] = []
+
+    class CountingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for index, chunk in enumerate(
+                [b"a" * (1024 * 1024), b"b" * (1024 * 1024 + 1), b"SECRET"]
+            ):
+                yielded.append(index)
+                yield chunk
+
+        def close(self) -> None:
+            return None
+
+    def chunked_oversized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=CountingStream())
+
+    with pytest.raises(QuickstartError, match="2 MiB"):
+        discover_model_ids(
+            base_url="https://provider.example/v1",
+            api_key="stdin-sensitive-key",
+            transport=httpx.MockTransport(chunked_oversized),
+        )
+    assert yielded == [0, 1]
+
+    def at_limit(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": f"model-{index}"} for index in range(1_000)]},
+        )
+
+    assert len(
+        discover_model_ids(
+            base_url="https://provider.example/v1",
+            api_key="stdin-sensitive-key",
+            transport=httpx.MockTransport(at_limit),
+        )
+    ) == 1_000
+
+    def too_many(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": f"model-{index}"} for index in range(1_001)]},
+        )
+
+    with pytest.raises(QuickstartError, match="条目过多"):
+        discover_model_ids(
+            base_url="https://provider.example/v1",
+            api_key="stdin-sensitive-key",
+            transport=httpx.MockTransport(too_many),
+        )
+
+    def invalid_ids(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "模型\nsecret"}]})
+
+    with pytest.raises(QuickstartError, match="没有解析到模型 ID"):
+        discover_model_ids(
+            base_url="https://provider.example/v1",
+            api_key="stdin-sensitive-key",
+            transport=httpx.MockTransport(invalid_ids),
+        )
 
 
 def test_discover_cli_is_machine_readable_and_does_not_write_config(

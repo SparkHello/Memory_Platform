@@ -23,15 +23,22 @@ from typing import Any, Iterable, Mapping, Sequence
 import httpx
 from pydantic import ValidationError
 
+from model_gateway.auth import (
+    client_token_bytes,
+    provider_secret_header_value,
+    validate_secret_domains,
+)
 from model_gateway.config_store import (
+    ConfigConflict,
     ConfigError,
     GatewayPaths,
+    commit_control_plane,
+    configuration_revision,
     gateway_paths,
     initialize,
     load_config,
     read_secrets,
-    set_secret,
-    write_config,
+    source_revision,
 )
 from model_gateway.models import (
     AuthConfig,
@@ -40,6 +47,7 @@ from model_gateway.models import (
     ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
+    derive_embedding_space,
     GatewayConfig,
     PricingConfig,
     PricingTier,
@@ -55,7 +63,7 @@ from model_gateway.pricing_research import (
     research_pricing,
 )
 from model_gateway.routing import RouteTarget
-from model_gateway.usage import UsageCapture, UsageStore
+from model_gateway.usage import AttemptTrace, UsageCapture, UsageStore
 
 
 class CLIError(RuntimeError):
@@ -95,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="以 JSON 输出适合脚本消费的结果",
     )
-    parser.add_argument("--version", action="version", version="modelgw 0.1.0")
+    parser.add_argument("--version", action="version", version="modelgw 0.2.0")
     commands = parser.add_subparsers(dest="command")
 
     menu_parser = commands.add_parser(
@@ -165,7 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_parser.add_argument("--base-url", default="", help="官方 OpenAI 兼容 API 地址（HTTPS）")
     quickstart_parser.add_argument("--chat-model", default="", help="供应商页面显示的精确聊天模型 ID")
     quickstart_parser.add_argument(
-        "--adapter", default="", choices=["generic", "kimi", "deepseek", "mimo"]
+        "--adapter",
+        default="",
+        choices=["generic", "kimi", "deepseek", "mimo", "dashscope_openai"],
     )
     quickstart_parser.add_argument(
         "--plan",
@@ -227,8 +237,16 @@ def build_parser() -> argparse.ArgumentParser:
         aliases=["run"],
         help="在前台启动本地网关（run 为别名）",
     )
-    serve_parser.add_argument("--host", help="覆盖监听地址（仅允许回环地址）")
+    serve_parser.add_argument(
+        "--host",
+        help="覆盖监听地址（默认仅允许回环；容器例外需同时给出安全开关）",
+    )
     serve_parser.add_argument("--port", type=int, help="覆盖监听端口")
+    serve_parser.add_argument(
+        "--container-network",
+        action="store_true",
+        help="仅允许本次前台进程精确监听 0.0.0.0，供未发布端口的私有容器网络使用",
+    )
     serve_parser.add_argument(
         "--log-level",
         default="info",
@@ -354,7 +372,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--auth-type", default="bearer", choices=["bearer", "x-api-key"]
     )
     connection_add.add_argument(
-        "--adapter", default="generic", choices=["generic", "kimi", "deepseek", "mimo"]
+        "--adapter",
+        default="generic",
+        choices=["generic", "kimi", "deepseek", "mimo", "dashscope_openai"],
     )
     connection_add.add_argument(
         "--plan",
@@ -386,7 +406,22 @@ def build_parser() -> argparse.ArgumentParser:
     connection_add.add_argument(
         "--forward-header", action="append", default=[], help="允许转发的客户端 Header；可重复"
     )
-    connection_add.add_argument("--timeout", type=float, default=300.0)
+    connection_add.add_argument(
+        "--allow-private-network",
+        action="append",
+        default=[],
+        help="显式允许的最小私网 CIDR；可重复",
+    )
+    connection_add.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="兼容总超时；分项参数未给出时使用",
+    )
+    connection_add.add_argument("--connect-timeout", type=float)
+    connection_add.add_argument("--read-timeout", type=float)
+    connection_add.add_argument("--write-timeout", type=float)
+    connection_add.add_argument("--pool-timeout", type=float)
     connection_add.add_argument("--cooldown", type=float, default=300.0)
     connection_add.add_argument("--disabled", action="store_true")
     connection_add.add_argument("--replace", action="store_true")
@@ -419,13 +454,25 @@ def build_parser() -> argparse.ArgumentParser:
     deployment_add.add_argument("--connection", required=True)
     deployment_add.add_argument("--model", "--upstream-model", dest="upstream_model", required=True)
     deployment_add.add_argument("--kind", default="chat", choices=["chat", "embedding"])
-    deployment_add.add_argument("--author", help="模型作者；省略时使用 connection 的渠道名")
+    deployment_add.add_argument("--author", help="模型作者；省略时记录为 unknown")
     deployment_add.add_argument("--family", default="")
+    deployment_add.add_argument(
+        "--adapter-profile",
+        default="inherit",
+        choices=["inherit", "dashscope_deepseek_v4"],
+        help="deployment 级参数兼容规则；默认继承 connection adapter",
+    )
     deployment_add.add_argument(
         "--reasoning-default",
         default="inherit",
         choices=["inherit", "enabled", "disabled"],
         help="客户端未显式指定 reasoning 时的 deployment 默认值",
+    )
+    deployment_add.add_argument(
+        "--tool-choice-with-reasoning",
+        default="auto_only",
+        choices=["any", "auto_only", "none"],
+        help="推理开启时允许的 tool_choice；安全默认仅 auto/none",
     )
     deployment_add.add_argument(
         "--capability",
@@ -494,6 +541,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="所有目标必须满足的能力；可重复",
     )
     route_set.add_argument("--max-attempts", type=int, default=3)
+    route_set.add_argument(
+        "--fallback-scope",
+        choices=["none", "same_channel", "any_channel"],
+        default="none",
+        help="失败后的兜底边界；默认 none，不自动换目标",
+    )
     route_set.add_argument("--disabled", action="store_true")
     route_set.set_defaults(handler=_cmd_route_set)
     route_list = route_commands.add_parser("list", help="列出功能路由")
@@ -617,7 +670,17 @@ def build_parser() -> argparse.ArgumentParser:
     usage_commands = usage_parser.add_subparsers(dest="usage_command", required=True)
     usage_summary = usage_commands.add_parser("summary", help="汇总最近用量")
     usage_summary.add_argument("--days", type=int, default=30)
+    usage_summary.add_argument("--client", dest="client_id", default="")
+    usage_summary.add_argument("--operation", default="")
+    usage_summary.add_argument("--user-tag", default="")
     usage_summary.set_defaults(handler=_cmd_usage_summary)
+    usage_prune = usage_commands.add_parser(
+        "prune", help="把 90 天前原始事件汇总为日统计并执行保留策略"
+    )
+    usage_prune.add_argument(
+        "--vacuum", action="store_true", help="清理后回收 SQLite 空闲页；可能短暂锁库"
+    )
+    usage_prune.set_defaults(handler=_cmd_usage_prune)
 
     install_parser = commands.add_parser("install-path", help="把 modelgw 安装到用户 PATH 目录")
     install_parser.add_argument("--target-dir", help="目标目录，默认 ~/.local/bin")
@@ -960,7 +1023,6 @@ def _quickstart_prompt(args: argparse.Namespace) -> Any:
             if not raw_dimensions.isdecimal() or int(raw_dimensions) < 1:
                 raise CLIError("向量维度必须是正整数")
             embedding_dimensions = int(raw_dimensions)
-            embedding_space = input("向量空间名称（换模型或维度时必须换名）：").strip()
     return QuickstartSpec(
         channel_operator=channel,
         base_url=base_url,
@@ -984,11 +1046,25 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     paths = _paths(args)
     initialize(paths)
     config = load_config(paths.config)
-    server = ServerConfig(
-        host=args.host if args.host is not None else config.server.host,
-        port=args.port if args.port is not None else config.server.port,
-        body_limit_bytes=config.server.body_limit_bytes,
-    )
+    requested_host = args.host if args.host is not None else config.server.host
+    if args.container_network:
+        if requested_host != "0.0.0.0":
+            raise CLIError("--container-network 必须与 --host 0.0.0.0 同时使用")
+        server = ServerConfig(
+            host="127.0.0.1",
+            port=args.port if args.port is not None else config.server.port,
+            body_limit_bytes=config.server.body_limit_bytes,
+            disk_soft_reserve_bytes=config.server.disk_soft_reserve_bytes,
+            disk_hard_reserve_bytes=config.server.disk_hard_reserve_bytes,
+        ).model_copy(update={"host": "0.0.0.0"})
+    else:
+        server = ServerConfig(
+            host=requested_host,
+            port=args.port if args.port is not None else config.server.port,
+            body_limit_bytes=config.server.body_limit_bytes,
+            disk_soft_reserve_bytes=config.server.disk_soft_reserve_bytes,
+            disk_hard_reserve_bytes=config.server.disk_hard_reserve_bytes,
+        )
     if args.json:
         raise CLIError("serve 不能与 --json 一起使用")
     from model_gateway.service import create_app
@@ -1015,6 +1091,8 @@ def _cmd_start(args: argparse.Namespace) -> int:
         host=args.host or config.server.host,
         port=args.port or config.server.port,
         body_limit_bytes=config.server.body_limit_bytes,
+        disk_soft_reserve_bytes=config.server.disk_soft_reserve_bytes,
+        disk_hard_reserve_bytes=config.server.disk_hard_reserve_bytes,
     )
     existing = _read_state(paths)
     if existing and _state_process_matches(existing, paths):
@@ -1252,6 +1330,94 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "每个已配置 client 使用独立密钥",
                 )
             )
+        legacy_weak_clients: list[str] = []
+        invalid_client_secrets: list[str] = []
+        for client_id, client in config.clients.items():
+            value = secret_values.get(client.secret_ref, "")
+            if not value:
+                continue
+            try:
+                client_token_bytes(value)
+            except ValueError:
+                if client.allow_legacy_weak_secret:
+                    try:
+                        client_token_bytes(value, allow_legacy_weak=True)
+                    except ValueError:
+                        invalid_client_secrets.append(client_id)
+                    else:
+                        legacy_weak_clients.append(client_id)
+                else:
+                    invalid_client_secrets.append(client_id)
+        if invalid_client_secrets:
+            checks.append(
+                _check(
+                    "client_secret_strength",
+                    "error",
+                    "以下 client 的密钥格式或强度无效："
+                    + ", ".join(sorted(invalid_client_secrets)),
+                )
+            )
+        elif legacy_weak_clients:
+            checks.append(
+                _check(
+                    "client_secret_strength",
+                    "warning",
+                    "以下 schema-v1 client 暂时使用旧弱密钥；请用 secret set 轮换："
+                    + ", ".join(sorted(legacy_weak_clients)),
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "client_secret_strength",
+                    "ok",
+                    "所有已配置 client 均使用至少 32 字节的 URL-safe token",
+                )
+            )
+        try:
+            validate_secret_domains(config=config, secrets=secret_values)
+        except ValueError:
+            checks.append(
+                _check(
+                    "secret_domain_isolation",
+                    "error",
+                    "client 密钥格式、唯一性或与上游连接密钥的隔离无效",
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "secret_domain_isolation",
+                    "ok",
+                    "client 与上游连接密钥权限域已隔离",
+                )
+            )
+        invalid_provider_secrets: list[str] = []
+        for connection_id, connection in config.connections.items():
+            value = secret_values.get(connection.auth.secret_ref, "")
+            if not value:
+                continue
+            try:
+                provider_secret_header_value(value)
+            except ValueError:
+                invalid_provider_secrets.append(connection_id)
+        if invalid_provider_secrets:
+            checks.append(
+                _check(
+                    "provider_secret_format",
+                    "error",
+                    "以下 connection 的密钥不能安全放入 HTTP Header："
+                    + ", ".join(sorted(invalid_provider_secrets)),
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "provider_secret_format",
+                    "ok",
+                    "已配置的上游连接密钥均可安全放入 HTTP Header",
+                )
+            )
         if not config.routes:
             checks.append(_check("routes", "warning", "尚未配置功能路由"))
         else:
@@ -1304,13 +1470,46 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
         value = getpass.getpass(f"{secret_ref} API Key：")
     if not value:
         raise CLIError("密钥不能为空")
-    set_secret(paths.secrets, secret_ref, value)
+    candidate_secrets = read_secrets(paths.secrets)
+    candidate_secrets[secret_ref] = value
+    referenced_clients = [
+        client_id
+        for client_id, client in config.clients.items()
+        if client.secret_ref == secret_ref
+    ]
+    if referenced_clients:
+        try:
+            client_token_bytes(value)
+        except ValueError as exc:
+            raise CLIError(str(exc)) from exc
+    candidate_config = config
+    if any(
+        config.clients[client_id].allow_legacy_weak_secret
+        for client_id in referenced_clients
+    ):
+        candidate_payload = config.model_dump(mode="python")
+        for client_id in referenced_clients:
+            candidate_payload["clients"][client_id]["allow_legacy_weak_secret"] = False
+        candidate_config = GatewayConfig.model_validate(candidate_payload)
+    if any(
+        connection.auth.secret_ref == secret_ref
+        for connection in config.connections.values()
+    ):
+        try:
+            provider_secret_header_value(value)
+        except ValueError as exc:
+            raise CLIError(str(exc)) from exc
+    try:
+        validate_secret_domains(config=candidate_config, secrets=candidate_secrets)
+    except ValueError as exc:
+        raise CLIError(str(exc)) from exc
     payload: dict[str, Any] = {"saved": True, "secret_ref": secret_ref, "checks": []}
     connections = [
         connection_id
         for connection_id, connection in config.connections.items()
         if connection.auth.secret_ref == secret_ref
     ]
+    results: list[ProbeResult] = []
     if not args.json:
         print(f"已安全保存 {secret_ref}；密钥值不会回显，也不会写入项目 .env。")
         if connections and not args.no_check:
@@ -1322,13 +1521,24 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
         results = asyncio.run(
             _run_probes(
                 config=config,
-                secret_values=read_secrets(paths.secrets),
+                secret_values=candidate_secrets,
                 connection_ids=connections,
                 live=args.live,
                 client_kind="interactive" if args.as_interactive else "backend",
             )
         )
         payload["checks"] = [_probe_dict(result) for result in results]
+        if _probe_summary(results)["failed"]:
+            raise CLIError("候选渠道密钥检查失败；原密钥保持不变")
+    try:
+        commit_control_plane(
+            paths,
+            expected_revision=source_revision(config, paths.config),
+            config=candidate_config if candidate_config is not config else None,
+            secret_updates={secret_ref: value},
+        )
+    except ConfigConflict as exc:
+        raise CLIError("配置已被其他进程修改，请重试") from exc
     if args.json:
         _json(payload)
     else:
@@ -1378,7 +1588,14 @@ def _cmd_secret_delete(args: argparse.Namespace) -> int:
     config = load_config(paths.config)
     secret_ref = _resolve_secret_ref(config, args.name)
     existed = secret_ref in read_secrets(paths.secrets)
-    set_secret(paths.secrets, secret_ref, None)
+    try:
+        commit_control_plane(
+            paths,
+            expected_revision=source_revision(config, paths.config),
+            secret_updates={secret_ref: None},
+        )
+    except ConfigConflict as exc:
+        raise CLIError("配置已被其他进程修改，请重试") from exc
     payload = {"deleted": existed, "secret_ref": secret_ref}
     if args.json:
         _json(payload)
@@ -1408,12 +1625,27 @@ def _cmd_client_add(args: argparse.Namespace) -> int:
         allow_direct_deployments=args.allow_direct_deployments,
         enabled=not args.disabled,
     )
-    _replace_config_item(paths, config, "clients", client_id, client)
+    config = _replace_config_item(paths, config, "clients", client_id, client)
     if args.set_secret:
         value = getpass.getpass(f"{secret_ref} 本地客户端 API Key：")
         if not value:
             raise CLIError("客户端密钥不能为空；client 配置已保存，可稍后运行 secret set")
-        set_secret(paths.secrets, secret_ref, value)
+        try:
+            client_token_bytes(value)
+            candidate_secrets = read_secrets(paths.secrets)
+            candidate_secrets[secret_ref] = value
+            validate_secret_domains(config=config, secrets=candidate_secrets)
+        except ValueError as exc:
+            raise CLIError(str(exc)) from exc
+        refreshed = load_config(paths.config)
+        try:
+            commit_control_plane(
+                paths,
+                expected_revision=source_revision(refreshed, paths.config),
+                secret_updates={secret_ref: value},
+            )
+        except ConfigConflict as exc:
+            raise CLIError("配置已被其他进程修改，请重试") from exc
     payload = {
         "client_id": client_id,
         "secret_ref": secret_ref,
@@ -1494,6 +1726,7 @@ def _cmd_connection_add(args: argparse.Namespace) -> int:
     connection = ConnectionConfig(
         channel_operator=args.channel_operator,
         adapter=args.adapter,
+        allowed_private_networks=args.allow_private_network,
         base_url=args.base_url,
         auth=AuthConfig(type=args.auth_type, secret_ref=secret_ref),
         billing_plan=BillingPlan(type=args.billing_type, name=args.plan_name),
@@ -1502,7 +1735,34 @@ def _cmd_connection_add(args: argparse.Namespace) -> int:
         chat_endpoint=args.chat_endpoint,
         embeddings_endpoint=args.embeddings_endpoint,
         forward_headers=_split_values(args.forward_header),
-        timeout_seconds=args.timeout,
+        connect_timeout_seconds=(
+            args.connect_timeout
+            if args.connect_timeout is not None
+            else min(args.timeout, 30.0)
+            if args.timeout is not None
+            else 10.0
+        ),
+        read_timeout_seconds=(
+            args.read_timeout
+            if args.read_timeout is not None
+            else args.timeout
+            if args.timeout is not None
+            else 120.0
+        ),
+        write_timeout_seconds=(
+            args.write_timeout
+            if args.write_timeout is not None
+            else args.timeout
+            if args.timeout is not None
+            else 60.0
+        ),
+        pool_timeout_seconds=(
+            args.pool_timeout
+            if args.pool_timeout is not None
+            else args.timeout
+            if args.timeout is not None
+            else 10.0
+        ),
         rate_limit_cooldown_seconds=args.cooldown,
         enabled=not args.disabled,
     )
@@ -1537,6 +1797,11 @@ def _cmd_connection_list(args: argparse.Namespace) -> int:
             "billing_plan": connection.billing_plan.model_dump(mode="json"),
             "usage_scope": connection.usage_scope,
             "models_endpoint": connection.models_endpoint,
+            "allowed_private_networks": list(connection.allowed_private_networks),
+            "connect_timeout_seconds": connection.connect_timeout_seconds,
+            "read_timeout_seconds": connection.read_timeout_seconds,
+            "write_timeout_seconds": connection.write_timeout_seconds,
+            "pool_timeout_seconds": connection.pool_timeout_seconds,
             "secret_ref": connection.auth.secret_ref,
             "secret_configured": bool(secret_values.get(connection.auth.secret_ref)),
             "enabled": connection.enabled,
@@ -1642,17 +1907,28 @@ def _cmd_deployment_add(args: argparse.Namespace) -> int:
         set_if_missing=_parse_json_assignments(args.set_if_missing),
         force=_parse_json_assignments(args.force_param),
     )
+    embedding_space = args.embedding_space.strip()
+    if args.kind == "embedding" and not embedding_space:
+        if args.dimensions is None:
+            raise CLIError("embedding deployment 必须声明 --dimensions")
+        embedding_space = derive_embedding_space(
+            connection,
+            args.upstream_model,
+            args.dimensions,
+        )
     deployment = DeploymentConfig(
         connection=args.connection,
         upstream_model=args.upstream_model,
-        model_author=args.author or connection.channel_operator,
+        model_author=args.author or "unknown",
         model_family=args.family,
         kind=args.kind,
+        adapter_profile=args.adapter_profile,
         reasoning_default=args.reasoning_default,
+        tool_choice_with_reasoning=args.tool_choice_with_reasoning,
         capabilities=capabilities,
         request_transform=transform,
         dimensions=args.dimensions,
-        embedding_space=args.embedding_space,
+        embedding_space=embedding_space,
         pricing=args.pricing,
         enabled=not args.disabled,
     )
@@ -1695,6 +1971,7 @@ def _cmd_deployment_list(args: argparse.Namespace) -> int:
                 "UPSTREAM_MODEL",
                 "KIND",
                 "REASONING_DEFAULT",
+                "REASONING_TOOL_CHOICE",
                 "CAPABILITIES",
                 "ENABLED",
             ],
@@ -1705,6 +1982,7 @@ def _cmd_deployment_list(args: argparse.Namespace) -> int:
                     item["upstream_model"],
                     item["kind"],
                     item["reasoning_default"],
+                    item["tool_choice_with_reasoning"],
                     ",".join(item["enabled_capabilities"]) or "-",
                     _yes_no(item["enabled"]),
                 ]
@@ -1751,6 +2029,7 @@ def _cmd_route_set(args: argparse.Namespace) -> int:
         kind=args.kind or inferred_kind,
         targets=targets,
         required_capabilities=list(dict.fromkeys(args.require)),
+        fallback_scope=args.fallback_scope,
         max_attempts=args.max_attempts,
         enabled=not args.disabled,
     )
@@ -1775,12 +2054,21 @@ def _cmd_route_list(args: argparse.Namespace) -> int:
         _json(records)
     else:
         _table(
-            ["ROUTE", "KIND", "ORDERED_TARGETS", "REQUIRES", "ATTEMPTS", "ENABLED"],
+            [
+                "ROUTE",
+                "KIND",
+                "ORDERED_TARGETS",
+                "FALLBACK_SCOPE",
+                "REQUIRES",
+                "ATTEMPTS",
+                "ENABLED",
+            ],
             [
                 [
                     item["id"],
                     item["kind"],
                     " > ".join(item["targets"]),
+                    item["fallback_scope"],
                     ",".join(item["required_capabilities"]) or "-",
                     item["max_attempts"],
                     _yes_no(item["enabled"]),
@@ -1854,7 +2142,7 @@ def _cmd_pricing_set(args: argparse.Namespace) -> int:
             deployments[deployment_id] = deployment
         payload["deployments"] = deployments
     validated = GatewayConfig.model_validate(payload)
-    write_config(paths.config, validated)
+    _commit_config(paths, config, validated)
 
     record = {"pricing_id": pricing_id, **pricing.model_dump(mode="json")}
     record["bound_deployments"] = deployment_ids
@@ -1989,7 +2277,7 @@ def _apply_researched_pricing(
     deployments[target_deployment_id] = target
     payload["deployments"] = deployments
     validated = GatewayConfig.model_validate(payload)
-    write_config(paths.config, validated)
+    _commit_config(paths, config, validated)
 
 
 def _record_pricing_research_usage(
@@ -2041,6 +2329,23 @@ def _record_pricing_research_usage(
         capture=capture,
         pricing_id=pricing_id,
         pricing=pricing,
+        attempt_traces=(
+            AttemptTrace(
+                attempt_index=1,
+                target=target,
+                status_code=metadata.status_code,
+                latency_ms=metadata.latency_ms,
+                outcome=metadata.outcome,
+                failure_class=metadata.failure_class,
+                request_sent=metadata.request_sent,
+                billable_unknown=(
+                    metadata.request_sent and metadata.outcome != "success"
+                ),
+                response_complete=bool(metadata.response_complete),
+                capture=capture,
+            ),
+        ),
+        pricing_catalog=config.pricing,
     )
 
 
@@ -2152,7 +2457,12 @@ def _cmd_usage_summary(args: argparse.Namespace) -> int:
     initialize(paths)
     store = UsageStore(paths.usage_db)
     store.init_db()
-    summary = store.summary(days=args.days)
+    summary = store.summary(
+        days=args.days,
+        client_id=args.client_id,
+        operation=args.operation,
+        user_tag=args.user_tag,
+    )
     if args.json:
         _json(summary)
     else:
@@ -2167,6 +2477,14 @@ def _cmd_usage_summary(args: argparse.Namespace) -> int:
             print(
                 "可计费金额："
                 + "，".join(f"{currency} {amount}" for currency, amount in costs.items())
+            )
+        attempts = summary.get("attempts", {})
+        if int(attempts.get("recorded", 0)):
+            print(
+                f"上游 attempts：{attempts['recorded']} 次；"
+                f"{attempts['known_cost_attempts']} 次费用已知，"
+                f"{attempts['unknown_cost_attempts']} 次已发送但费用未知，"
+                f"{attempts['not_sent_attempts']} 次在发送前失败。"
             )
         incomplete_cost_calls = int(summary.get("incomplete_cost_calls", 0))
         if incomplete_cost_calls:
@@ -2194,6 +2512,24 @@ def _cmd_usage_summary(args: argparse.Namespace) -> int:
                 for row in summary["deployments"]
             ],
         )
+    return 0
+
+
+def _cmd_usage_prune(args: argparse.Namespace) -> int:
+    paths = _paths(args)
+    initialize(paths)
+    store = UsageStore(paths.usage_db)
+    store.init_db()
+    result = store.prune(vacuum=bool(args.vacuum))
+    if args.json:
+        _json(result)
+    else:
+        print(
+            f"已汇总并清理 {result['raw_events_pruned']} 条原始事件；"
+            f"删除 {result['daily_usage_deleted']} 条过期日统计。"
+        )
+        if result["vacuumed"]:
+            print("SQLite 空闲页已回收。")
     return 0
 
 
@@ -2386,8 +2722,7 @@ def _replace_config_item(
     collection[item_id] = item.model_dump(mode="python")
     payload[collection_name] = collection
     validated = GatewayConfig.model_validate(payload)
-    write_config(paths.config, validated)
-    return validated
+    return _commit_config(paths, config, validated)
 
 
 def _remove_config_item(
@@ -2403,8 +2738,22 @@ def _remove_config_item(
     del collection[item_id]
     payload[collection_name] = collection
     validated = GatewayConfig.model_validate(payload)
-    write_config(paths.config, validated)
-    return validated
+    return _commit_config(paths, config, validated)
+
+
+def _commit_config(
+    paths: GatewayPaths,
+    base: GatewayConfig,
+    candidate: GatewayConfig,
+) -> GatewayConfig:
+    try:
+        return commit_control_plane(
+            paths,
+            expected_revision=source_revision(base, paths.config),
+            config=candidate,
+        ).config
+    except ConfigConflict as exc:
+        raise CLIError("配置已被其他进程修改，请重试") from exc
 
 
 def _print_removed(args: argparse.Namespace, kind: str, item_id: str) -> int:
@@ -2538,14 +2887,18 @@ async def _probe_connection(
         return [ProbeResult(connection_id, "not_configured", "缺少上游 API Key")]
     headers = _provider_auth_headers(connection.auth.type, secret)
     timeout = httpx.Timeout(
-        connect=min(connection.timeout_seconds, 15.0),
-        read=min(connection.timeout_seconds, 30.0),
-        write=min(connection.timeout_seconds, 30.0),
-        pool=min(connection.timeout_seconds, 15.0),
+        connect=min(connection.connect_timeout_seconds, 15.0),
+        read=min(connection.read_timeout_seconds, 30.0),
+        write=min(connection.write_timeout_seconds, 30.0),
+        pool=min(connection.pool_timeout_seconds, 15.0),
     )
     model_ids: frozenset[str] = frozenset()
     results: list[ProbeResult] = []
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
         if connection.models_endpoint is None:
             results.append(
                 ProbeResult(connection_id, "unsupported", "未配置 models_endpoint，无法免费探测")
@@ -2873,3 +3226,5 @@ def _clean_error(exc: BaseException) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    commit_control_plane,
+    configuration_revision,

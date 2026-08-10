@@ -17,8 +17,21 @@ from model_gateway.config_store import (
     write_config,
     write_secrets,
 )
-from model_gateway.auth import AuthenticationError, authenticate_client
-from model_gateway.models import ConnectionConfig, GatewayConfig, RequestTransform
+from model_gateway.auth import (
+    AuthenticationError,
+    authenticate_client,
+    client_token_bytes,
+    validate_secret_domains,
+)
+from model_gateway.http_safety import require_safe_destination_sync
+from model_gateway.models import (
+    ConnectionConfig,
+    DeploymentConfig,
+    GatewayConfig,
+    PricingConfig,
+    RequestTransform,
+    derive_embedding_space,
+)
 
 from conftest import config_payload
 
@@ -50,6 +63,28 @@ def test_embedding_route_cannot_mix_vector_spaces() -> None:
         GatewayConfig.model_validate(payload)
 
 
+def test_dashscope_deepseek_v4_profile_is_explicit_and_model_scoped() -> None:
+    deployment = DeploymentConfig.model_validate(
+        {
+            "connection": "dashscope",
+            "upstream_model": "deepseek-v4-pro",
+            "model_author": "deepseek",
+            "adapter_profile": "dashscope_deepseek_v4",
+        }
+    )
+    assert deployment.adapter_profile == "dashscope_deepseek_v4"
+
+    with pytest.raises(ValidationError, match="只允许显式绑定"):
+        DeploymentConfig.model_validate(
+            {
+                "connection": "dashscope",
+                "upstream_model": "qwen-plus",
+                "model_author": "qwen",
+                "adapter_profile": "dashscope_deepseek_v4",
+            }
+        )
+
+
 @pytest.mark.parametrize("group", ["set_if_missing", "force"])
 def test_embedding_transform_cannot_contradict_declared_dimensions(group: str) -> None:
     payload = config_payload()
@@ -74,6 +109,81 @@ def test_per_token_pricing_requires_official_source() -> None:
         GatewayConfig.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "http://official.example/pricing",
+        "https://user:SECRET@official.example/pricing",
+        "https://official.example/pricing?token=SECRET",
+        "https://official.example/pricing#SECRET",
+        "https://official.example:99999/pricing",
+        "https://official.example/pricing\n",
+    ],
+)
+def test_pricing_source_url_rejects_credential_bearing_or_ambiguous_urls(
+    source_url: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        PricingConfig(mode="unknown", source_url=source_url)
+
+
+def test_v2_connection_defaults_are_bounded_but_v1_migration_is_compatible() -> None:
+    connection = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor",
+            "base_url": "https://vendor.example/v1",
+            "auth": {"secret_ref": "UPSTREAM"},
+        }
+    )
+    assert (
+        connection.connect_timeout_seconds,
+        connection.read_timeout_seconds,
+        connection.write_timeout_seconds,
+        connection.pool_timeout_seconds,
+    ) == (10.0, 120.0, 60.0, 10.0)
+    assert connection.response_limit_bytes == 16 * 1024 * 1024
+
+    legacy = config_payload()
+    legacy["schema_version"] = 1
+    migrated = GatewayConfig.model_validate(legacy)
+    assert migrated.connections["official"].read_timeout_seconds == 300.0
+    assert migrated.connections["official"].response_limit_bytes == 64 * 1024 * 1024
+    assert migrated.clients["memory-gateway"].allow_legacy_weak_secret is True
+    assert migrated.deployments["chat-official"].tool_choice_with_reasoning == (
+        "auto_only"
+    )
+
+
+def test_derived_embedding_space_is_stable_and_never_crosses_identity() -> None:
+    first = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor-a",
+            "base_url": "https://API.Example:443/v1/",
+            "auth": {"secret_ref": "UPSTREAM_A"},
+        }
+    )
+    same_origin = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor-a",
+            "base_url": "https://api.example/another-path",
+            "auth": {"secret_ref": "UPSTREAM_B"},
+        }
+    )
+    other_channel = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor-b",
+            "base_url": "https://api.example/v1",
+            "auth": {"secret_ref": "UPSTREAM_C"},
+        }
+    )
+    baseline = derive_embedding_space(first, "embed-v4", 1024)
+    assert baseline == derive_embedding_space(same_origin, "embed-v4", 1024)
+    assert baseline != derive_embedding_space(other_channel, "embed-v4", 1024)
+    assert baseline != derive_embedding_space(first, "embed-v4.1", 1024)
+    assert baseline != derive_embedding_space(first, "embed-v4", 1536)
+    assert baseline.isascii() and " " not in baseline
+
+
 def test_config_is_atomic_private_and_backed_up(tmp_path: Path) -> None:
     paths = gateway_paths(tmp_path / "home")
     initialize(paths)
@@ -82,7 +192,7 @@ def test_config_is_atomic_private_and_backed_up(tmp_path: Path) -> None:
     write_config(paths.config, config)
 
     assert load_config(paths.config) == config
-    assert json.loads(paths.config.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(paths.config.read_text(encoding="utf-8"))["schema_version"] == 2
     assert stat.S_IMODE(paths.config.stat().st_mode) == 0o600
     assert paths.config.with_suffix(".json.bak").exists()
 
@@ -122,7 +232,16 @@ def test_disabled_models_endpoint_survives_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "header", ["Authorization", "Cookie", "X-Model-Gateway-Require-Deployment"]
+    "header",
+    [
+        "Authorization",
+        "Cookie",
+        "Proxy-Authorization",
+        "X-Api-Key",
+        "Api-Key",
+        "Transfer-Encoding",
+        "X-Model-Gateway-Require-Deployment",
+    ],
 )
 def test_connection_cannot_forward_sensitive_local_headers(header: str) -> None:
     with pytest.raises(ValidationError, match="禁止转发"):
@@ -145,6 +264,144 @@ def test_connection_url_cannot_embed_credentials() -> None:
                 "auth": {"secret_ref": "UPSTREAM"},
             }
         )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://vendor.example/v1?token=x",
+        "https://vendor.example/v1#fragment",
+        "https://vendor.example:99999/v1",
+        "https://vendor.example/v1\n",
+        "https:\\vendor.example\\v1",
+        "https://vendor.example/a/../b",
+        "https://vendor.example/%2e%2e/private",
+        "https://vendor.example/a%2fb",
+        "https://vendor.example/a%5Cb",
+        "https://vendor.example/%00private",
+        "https://vendor.example/%252e%252e/private",
+        "https://vendor.example/%zz/private",
+    ],
+)
+def test_connection_url_rejects_ambiguous_or_unsafe_components(base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        ConnectionConfig.model_validate(
+            {
+                "channel_operator": "vendor",
+                "base_url": base_url,
+                "auth": {"secret_ref": "UPSTREAM"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/a/../models",
+        "/%2e%2e/models",
+        "/a%2fmodels",
+        "/a%5cmodels",
+        "/%0d%0aheader",
+        "/%252fmodels",
+    ],
+)
+def test_connection_endpoints_reject_normalization_ambiguity(endpoint: str) -> None:
+    with pytest.raises(ValidationError):
+        ConnectionConfig.model_validate(
+            {
+                "channel_operator": "vendor",
+                "base_url": "https://vendor.example/compatible-mode/v1",
+                "models_endpoint": endpoint,
+                "auth": {"secret_ref": "UPSTREAM"},
+            }
+        )
+
+
+def test_legitimate_nested_compatible_mode_path_remains_valid() -> None:
+    connection = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "vendor",
+            "base_url": "https://vendor.example/compatible-mode/v1",
+            "models_endpoint": "/models",
+            "auth": {"secret_ref": "UPSTREAM"},
+        }
+    )
+    assert connection.base_url.endswith("/compatible-mode/v1")
+
+
+def test_private_upstream_requires_explicit_cidr() -> None:
+    payload = {
+        "channel_operator": "lan-provider",
+        "base_url": "http://192.168.50.20:8000/v1",
+        "auth": {"secret_ref": "UPSTREAM"},
+    }
+    with pytest.raises(ValidationError, match="allowed_private_networks"):
+        ConnectionConfig.model_validate(payload)
+
+    payload["allowed_private_networks"] = ["192.168.50.0/24"]
+    connection = ConnectionConfig.model_validate(payload)
+    assert connection.base_url == "http://192.168.50.20:8000/v1"
+
+    ipv6 = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "lan-v6",
+            "allowed_private_networks": ["fd00:1234::/48"],
+            "base_url": "http://[fd00:1234::20]:8000/v1",
+            "auth": {"secret_ref": "UPSTREAM_V6"},
+        }
+    )
+    assert ipv6.base_url.startswith("http://[fd00:1234::20]")
+
+
+def test_https_hostname_cannot_resolve_to_implicit_private_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def private_dns(host: str, port: int, **kwargs):
+        return [(2, 1, 6, "", ("192.168.50.20", port))]
+
+    monkeypatch.setattr("socket.getaddrinfo", private_dns)
+    with pytest.raises(ValueError, match="未显式允许"):
+        require_safe_destination_sync("https://provider.example/v1/models")
+
+    require_safe_destination_sync(
+        "https://provider.example/v1/models",
+        allowed_private_networks=("192.168.50.0/24",),
+    )
+
+
+def test_rfc2544_mapping_requires_an_explicit_narrow_cidr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def benchmark_dns(host: str, port: int, **kwargs):
+        return [(2, 1, 6, "", ("198.18.0.77", port))]
+
+    monkeypatch.setattr("socket.getaddrinfo", benchmark_dns)
+    with pytest.raises(ValueError, match="未显式允许"):
+        require_safe_destination_sync("https://provider.example/v1/models")
+
+    require_safe_destination_sync(
+        "https://provider.example/v1/models",
+        allowed_private_networks=("198.18.0.77/32",),
+    )
+
+    with pytest.raises(ValidationError, match="RFC 2544"):
+        ConnectionConfig.model_validate(
+            {
+                "channel_operator": "sandbox-provider",
+                "base_url": "https://provider.example/v1",
+                "allowed_private_networks": ["198.18.0.0/24"],
+                "auth": {"secret_ref": "UPSTREAM_SANDBOX"},
+            }
+        )
+
+
+def test_client_and_connection_secret_refs_are_disjoint() -> None:
+    payload = config_payload()
+    payload["connections"]["official"]["auth"]["secret_ref"] = (
+        "CLIENT_MEMORY_GATEWAY"
+    )
+    with pytest.raises(ValidationError, match="权限域混淆"):
+        GatewayConfig.model_validate(payload)
 
 
 def test_secret_round_trip_never_interpolates_environment_syntax(tmp_path: Path) -> None:
@@ -174,6 +431,71 @@ def test_duplicate_client_secret_values_fail_closed() -> None:
                 "CLIENT_MEMORY_GATEWAY": "duplicate-value",
                 "CLIENT_DESKTOP": "duplicate-value",
             },
+        )
+
+
+def test_provider_and_client_secret_values_fail_closed() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    with pytest.raises(AuthenticationError, match="上游连接密钥配置冲突"):
+        authenticate_client(
+            "Bearer same-value",
+            config=config,
+            secrets={
+                "CLIENT_MEMORY_GATEWAY": "same-value",
+                "UPSTREAM_OFFICIAL": "same-value",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "short-token",
+        "a" * 32 + "!",
+        "a" * 64,
+        "contains space but is definitely long enough",
+    ],
+)
+def test_schema_v2_client_tokens_require_strong_url_safe_format(token: str) -> None:
+    with pytest.raises(ValueError, match="客户端密钥"):
+        client_token_bytes(token)
+
+
+def test_schema_v1_weak_client_token_is_an_explicit_migration_only() -> None:
+    payload = config_payload()
+    payload["schema_version"] = 1
+    migrated = GatewayConfig.model_validate(payload)
+    weak = "old-local-key"
+
+    validate_secret_domains(
+        config=migrated,
+        secrets={"CLIENT_MEMORY_GATEWAY": weak},
+    )
+    authenticated = authenticate_client(
+        f"Bearer {weak}",
+        config=migrated,
+        secrets={"CLIENT_MEMORY_GATEWAY": weak},
+    )
+    assert authenticated.id == "memory-gateway"
+
+    v2_payload = migrated.model_dump(mode="python")
+    v2_payload["clients"]["memory-gateway"]["allow_legacy_weak_secret"] = False
+    strict = GatewayConfig.model_validate(v2_payload)
+    with pytest.raises(ValueError, match="至少 32 字节"):
+        validate_secret_domains(
+            config=strict,
+            secrets={"CLIENT_MEMORY_GATEWAY": weak},
+        )
+
+
+@pytest.mark.parametrize("token", ["contains space", "非ASCII", "tab\ttoken"])
+def test_client_token_must_be_printable_ascii(token: str) -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    with pytest.raises(AuthenticationError, match="可打印 ASCII"):
+        authenticate_client(
+            f"Bearer {token}",
+            config=config,
+            secrets={"CLIENT_MEMORY_GATEWAY": token},
         )
 
 

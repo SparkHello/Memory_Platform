@@ -15,8 +15,100 @@ from model_gateway.cli import main
 from model_gateway.config_store import gateway_paths, load_config, read_secrets
 
 
+STRONG_LOCAL_TOKEN = "local_sensitive_token_0123456789_ABCDEFG"
+STRONG_DUPLICATE_TOKEN = "duplicate_sensitive_token_0123456789_XYZ"
+
+
 def run_cli(home: Path, *arguments: str) -> int:
     return main(["--home", str(home), *arguments])
+
+
+def test_cli_can_set_deployment_adapter_profile(tmp_path: Path, capsys) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    assert (
+        run_cli(
+            home,
+            "connection",
+            "add",
+            "dashscope",
+            "--vendor",
+            "dashscope",
+            "--base-url",
+            "https://workspace.example/compatible-mode/v1",
+        )
+        == 0
+    )
+    assert (
+        run_cli(
+            home,
+            "deployment",
+            "add",
+            "deepseek-v4-flash",
+            "--connection",
+            "dashscope",
+            "--model",
+            "deepseek-v4-flash",
+            "--author",
+            "deepseek",
+            "--adapter-profile",
+            "dashscope_deepseek_v4",
+            "--tool-choice-with-reasoning",
+            "none",
+            "--capability",
+            "reasoning",
+        )
+        == 0
+    )
+
+    deployment = load_config(home / "config.json").deployments[
+        "deepseek-v4-flash"
+    ]
+    assert deployment.adapter_profile == "dashscope_deepseek_v4"
+    assert deployment.tool_choice_with_reasoning == "none"
+    capsys.readouterr()
+
+
+def test_cli_derives_embedding_space_when_not_explicitly_overridden(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    assert (
+        run_cli(
+            home,
+            "connection",
+            "add",
+            "vector-channel",
+            "--vendor",
+            "vector-vendor",
+            "--base-url",
+            "https://vector.example/v1",
+        )
+        == 0
+    )
+    assert (
+        run_cli(
+            home,
+            "deployment",
+            "add",
+            "embed-v4",
+            "--connection",
+            "vector-channel",
+            "--model",
+            "embed-v4",
+            "--kind",
+            "embedding",
+            "--dimensions",
+            "1024",
+        )
+        == 0
+    )
+
+    deployment = load_config(home / "config.json").deployments["embed-v4"]
+    assert deployment.embedding_space.startswith("mgw-embedding-v1-1024-")
+    capsys.readouterr()
 
 
 def test_cli_builds_complete_config_without_echoing_secrets(
@@ -32,7 +124,7 @@ def test_cli_builds_complete_config_without_echoing_secrets(
             "set",
             "memory-gateway",
             "--value",
-            "local-sensitive-token",
+            STRONG_LOCAL_TOKEN,
             "--no-check",
         )
         == 0
@@ -121,7 +213,7 @@ def test_cli_builds_complete_config_without_echoing_secrets(
     assert run_cli(home, "doctor") == 0
 
     output = capsys.readouterr().out
-    assert "local-sensitive-token" not in output
+    assert STRONG_LOCAL_TOKEN not in output
     assert "upstream-sensitive-token" not in output
     paths = gateway_paths(home)
     config = load_config(paths.config)
@@ -129,7 +221,7 @@ def test_cli_builds_complete_config_without_echoing_secrets(
     assert config.deployments["deepseek-chat-official"].reasoning_default == "enabled"
     assert config.deployments["deepseek-chat-official"].pricing == "deepseek-chat-2026-08"
     secrets = read_secrets(paths.secrets)
-    assert secrets[config.clients["memory-gateway"].secret_ref] == "local-sensitive-token"
+    assert secrets[config.clients["memory-gateway"].secret_ref] == STRONG_LOCAL_TOKEN
 
 
 def test_cli_background_start_status_and_stop(tmp_path: Path, capsys) -> None:
@@ -208,28 +300,157 @@ def test_doctor_rejects_duplicate_client_secrets_without_echoing_them(
     assert run_cli(home, "init") == 0
     assert run_cli(home, "client", "add", "memory-gateway", "--kind", "backend") == 0
     assert run_cli(home, "client", "add", "memory-console-admin", "--kind", "admin") == 0
-    for client_id in ("memory-gateway", "memory-console-admin"):
-        assert (
-            run_cli(
-                home,
-                "secret",
-                "set",
-                client_id,
-                "--value",
-                "duplicate-sensitive-token",
-                "--no-check",
-            )
-            == 0
+    assert (
+        run_cli(
+            home,
+            "secret",
+            "set",
+            "memory-gateway",
+            "--value",
+            STRONG_DUPLICATE_TOKEN,
+            "--no-check",
         )
+        == 0
+    )
+    assert (
+        run_cli(
+            home,
+            "secret",
+            "set",
+            "memory-console-admin",
+            "--value",
+            STRONG_DUPLICATE_TOKEN,
+            "--no-check",
+        )
+        == 2
+    )
 
-    assert run_cli(home, "doctor") == 1
+    assert run_cli(home, "doctor") == 0
 
     output = capsys.readouterr()
     combined = output.out + output.err
-    assert "client_secret_uniqueness" in combined
-    assert "memory-console-admin" in combined
-    assert "memory-gateway" in combined
-    assert "duplicate-sensitive-token" not in combined
+    assert "密钥配置冲突" in combined
+    assert STRONG_DUPLICATE_TOKEN not in combined
+
+
+def test_client_secret_set_rejects_weak_v2_value(tmp_path: Path, capsys) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    assert run_cli(home, "client", "add", "memory-gateway") == 0
+
+    assert (
+        run_cli(
+            home,
+            "secret",
+            "set",
+            "memory-gateway",
+            "--value",
+            "short-password",
+            "--no-check",
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert "short-password" not in (captured.out + captured.err)
+    assert read_secrets(gateway_paths(home).secrets) == {}
+
+
+def test_doctor_warns_for_migrated_weak_client_and_rotation_clears_override(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from model_gateway.config_store import write_config, write_secrets
+
+    home = tmp_path / "gateway-home"
+    paths = gateway_paths(home)
+    assert run_cli(home, "init") == 0
+    legacy_payload = {
+        "schema_version": 1,
+        "clients": {
+            "memory-gateway": {
+                "kind": "backend",
+                "secret_ref": "CLIENT_MEMORY_GATEWAY",
+                "allowed_routes": ["memory.*"],
+            }
+        },
+    }
+    write_config(paths.config, legacy_payload)
+    weak = "legacy-weak-value"
+    write_secrets(paths.secrets, {"CLIENT_MEMORY_GATEWAY": weak})
+
+    assert run_cli(home, "doctor") == 0
+    doctor_output = capsys.readouterr().out
+    assert "schema-v1 client 暂时使用旧弱密钥" in doctor_output
+    assert "memory-gateway" in doctor_output
+    assert weak not in doctor_output
+
+    assert (
+        run_cli(
+            home,
+            "secret",
+            "set",
+            "memory-gateway",
+            "--value",
+            STRONG_LOCAL_TOKEN,
+            "--no-check",
+        )
+        == 0
+    )
+    config = load_config(paths.config)
+    assert config.clients["memory-gateway"].allow_legacy_weak_secret is False
+    assert read_secrets(paths.secrets)["CLIENT_MEMORY_GATEWAY"] == STRONG_LOCAL_TOKEN
+
+
+def test_serve_container_network_requires_exact_explicit_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    captured: dict[str, object] = {}
+
+    def fake_run(app, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    assert (
+        run_cli(
+            home,
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--container-network",
+            "--no-access-log",
+        )
+        == 0
+    )
+    assert captured["host"] == "0.0.0.0"
+    assert captured["access_log"] is False
+    capsys.readouterr()
+
+
+def test_non_loopback_serve_is_rejected_without_container_flag(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+
+    assert run_cli(home, "serve", "--host", "0.0.0.0") == 2
+    assert run_cli(home, "serve", "--container-network") == 2
+    assert (
+        run_cli(
+            home,
+            "serve",
+            "--host",
+            "192.168.1.10",
+            "--container-network",
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert "--container-network" in captured.err or "回环地址" in captured.err
 
 
 def test_cli_accepts_ordered_multi_tier_pricing(tmp_path: Path) -> None:

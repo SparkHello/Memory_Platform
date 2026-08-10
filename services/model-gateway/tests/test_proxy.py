@@ -153,6 +153,231 @@ async def test_fallback_on_rate_limit_before_response(
     assert result.attempts == 2
     assert result.headers["x-model-gateway-attempts"] == "2"
     assert router.cooldowns.remaining("official") > 599
+    assert len(result.attempt_traces) == 2
+    assert result.attempt_traces[0].failure_class == "http_rate_limit"
+    assert result.attempt_traces[0].request_sent is True
+    assert result.attempt_traces[1].outcome == "success"
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_can_fallback_before_request_is_sent(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "official.example":
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        return httpx.Response(200, content=b'{"id":"fallback"}')
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 200
+    assert result.attempts == 2
+    assert calls == ["official.example", "reseller.example"]
+    assert result.attempt_traces[0].failure_class == "connect_timeout"
+    assert result.attempt_traces[0].request_sent is False
+
+
+@pytest.mark.asyncio
+async def test_connection_breaker_is_rechecked_before_each_attempt(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.deployments["chat-reseller"].connection = "official"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["model"])
+        return httpx.Response(401, json={"error": {"code": "invalid_api_key"}})
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a"},
+        request_headers={},
+    )
+
+    assert result.status_code == 401
+    assert calls == ["author/chat-v1"]
+    assert router.runtime_health.remaining_target("official", "chat-reseller") > 0
+
+
+@pytest.mark.asyncio
+async def test_model_not_found_breaker_is_deployment_scoped(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.deployments["chat-reseller"].connection = "official"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        return httpx.Response(
+            400,
+            json={"error": {"code": "model_not_found", "message": "private"}},
+        )
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a"},
+        request_headers={},
+    )
+
+    assert result.status_code == 400
+    assert calls == ["author/chat-v1"]
+    assert router.runtime_health.remaining_target("official", "chat-official") > 0
+    assert router.runtime_health.remaining_target("official", "chat-reseller") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 402, 404])
+async def test_auth_billing_and_plain_not_found_never_replay_to_next_target(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+    status_code: int,
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(status_code, json={"error": {"code": "rejected"}})
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == status_code
+    assert result.attempts == 1
+    assert calls == ["official.example"]
+
+
+@pytest.mark.asyncio
+async def test_provider_response_is_capped_without_fallback(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.connections["official"].response_limit_bytes = 1024
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(200, content=b"x" * 1025)
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 502
+    assert calls == ["official.example"]
+    assert result.attempt_traces[0].failure_class == "response_too_large"
+
+
+@pytest.mark.asyncio
+async def test_non_stream_response_limit_stops_reading_upstream_immediately(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.connections["official"].response_limit_bytes = 1024
+    stream = ChunkStream([b"a" * 700, b"b" * 700, b"SECRET"])
+    yielded = 0
+    original_chunks = stream.chunks
+
+    class CountingAsyncStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal yielded
+            for chunk in original_chunks:
+                yielded += 1
+                yield chunk
+
+        async def aclose(self) -> None:
+            return None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=CountingAsyncStream())
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 502
+    assert yielded == 2
+    assert b"SECRET" not in result.content
+    await proxy.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.WriteTimeout])
+async def test_ambiguous_timeout_does_not_fallback_and_risk_double_billing(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+    error_type: type[httpx.TimeoutException],
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        raise error_type("ambiguous timeout", request=request)
+
+    router = Router()
+    result = await RawOpenAIProxy(
+        router=router,
+        transport=httpx.MockTransport(handler),
+    ).complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 502
+    assert result.target is not None
+    assert result.target.deployment_id == "chat-official"
+    assert result.headers["x-model-gateway-deployment"] == "chat-official"
+    assert json.loads(result.content)["error"]["code"] == (
+        "model_gateway_ambiguous_upstream_error"
+    )
+    assert calls == ["official.example"]
 
 
 @pytest.mark.asyncio
@@ -228,7 +453,7 @@ async def test_redirect_never_forwards_credentials_or_location_to_local_client(
         secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
         request_headers={},
     )
-    assert calls == ["official.example", "reseller.example"]
+    assert calls == ["official.example"]
     assert result.status_code == 502
     assert "location" not in result.headers
     assert b"attacker.example" not in result.content
@@ -300,7 +525,38 @@ async def test_stream_does_not_failover_after_first_byte(
 
 
 @pytest.mark.asyncio
-async def test_stream_can_fail_over_until_first_non_empty_downstream_byte(
+async def test_stream_enforces_cumulative_response_limit(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.connections["official"].response_limit_bytes = 1024
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=ChunkStream([b"a" * 600, b"b" * 600]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+    assert not isinstance(result, ProxyHTTPResult)
+    with pytest.raises(httpx.ReadError):
+        _ = [chunk async for chunk in result.aiter_raw()]
+    assert result.active_trace.failure_class == "response_too_large"
+    assert result.active_trace.billable_unknown is True
+    await result.aclose()
+    await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_read_failure_before_first_byte_does_not_risk_double_billing(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
@@ -331,14 +587,12 @@ async def test_stream_can_fail_over_until_first_non_empty_downstream_byte(
         request_headers={},
     )
 
-    assert not isinstance(result, ProxyHTTPResult)
-    try:
-        assert b"".join([chunk async for chunk in result.aiter_raw()]) == (
-            b"data: fallback\n\n"
-        )
-    finally:
-        await result.aclose()
-    assert calls == ["official.example", "reseller.example"]
+    assert isinstance(result, ProxyHTTPResult)
+    assert result.status_code == 502
+    assert json.loads(result.content)["error"]["code"] == (
+        "model_gateway_ambiguous_upstream_error"
+    )
+    assert calls == ["official.example"]
 
 
 @pytest.mark.asyncio
@@ -379,8 +633,18 @@ async def test_embedding_response_declares_vector_identity(
     backend_client: AuthenticatedClient,
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content)["model"] == "author/embed-v1"
-        return httpx.Response(200, content=b'{"data":[{"embedding":[0,1,2,3]}]}')
+        assert json.loads(request.content) == {
+            "model": "author/embed-v1",
+            "input": ["hello", "world"],
+            "dimensions": 4,
+        }
+        return httpx.Response(
+            200,
+            content=(
+                b'{"data":[{"embedding":[0,1,2,3]},'
+                b'{"embedding":[4,5,6,7]}]}'
+            ),
+        )
 
     router = Router()
     route = router.resolve(
@@ -393,9 +657,81 @@ async def test_embedding_response_declares_vector_identity(
         router=router, transport=httpx.MockTransport(handler)
     ).complete(
         route=route,
-        payload={"model": "memory.embedding", "input": ["hello"]},
+        payload={
+            "model": "memory.embedding",
+            "input": ["hello", "world"],
+            "dimensions": 999,
+        },
         secrets={"UPSTREAM_OFFICIAL": "a"},
         request_headers={},
     )
     assert result.headers["x-model-gateway-embedding-space"] == "author.embed-v1:4"
     assert result.headers["x-model-gateway-embedding-dimensions"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_embedding_response_rejects_any_wrong_vector_before_attribution(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    marker = "provider-private-marker"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"embedding": [0, 1, 2, 3]},
+                    {"embedding": [0, 1, 2]},
+                ],
+                "private": marker,
+            },
+        )
+
+    router = Router()
+    route = router.resolve(
+        requested_model="memory.embedding",
+        kind="embedding",
+        client=backend_client,
+        config=gateway_config,
+    )
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.complete(
+        route=route,
+        payload={"model": "memory.embedding", "input": ["a", "b"]},
+        secrets={"UPSTREAM_OFFICIAL": "a"},
+        request_headers={},
+    )
+
+    assert result.status_code == 502
+    assert result.attempt_traces[0].failure_class == "invalid_embedding_response"
+    assert "x-model-gateway-embedding-space" not in result.headers
+    assert marker.encode() not in result.content
+    await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_proxy_reuses_async_client_until_service_shutdown(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": []})
+
+    router = Router()
+    route = resolved_chat(gateway_config, backend_client, router)
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    for _ in range(2):
+        result = await proxy.complete(
+            route=route,
+            payload={"model": "memory.chat", "messages": []},
+            secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+            request_headers={},
+        )
+        assert result.status_code == 200
+    assert len(proxy._clients) == 1
+    pooled = next(iter(proxy._clients.values()))
+    assert not pooled.is_closed
+    await proxy.aclose()
+    assert pooled.is_closed
+    assert proxy._clients == {}

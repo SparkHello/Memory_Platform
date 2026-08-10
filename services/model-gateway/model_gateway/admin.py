@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-from hashlib import sha256
-from pathlib import Path
 import re
 from typing import Any, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
-from model_gateway.auth import AuthenticatedClient
+from model_gateway.auth import AuthenticatedClient, provider_secret_header_value
+from model_gateway.config_store import configuration_revision
 from model_gateway.models import (
     AuthConfig,
     BillingPlan,
     Capabilities,
     ConnectionConfig,
     DeploymentConfig,
+    derive_embedding_space,
     GatewayConfig,
+    PricingConfig,
     RequestTransform,
     RouteConfig,
     StrictModel,
@@ -61,13 +62,19 @@ class RouteUpdateRequest(StrictModel):
 
 class SecretUpdateRequest(StrictModel):
     value: str = Field(min_length=1, max_length=65536)
+    revision: str = ""
 
     @field_validator("value")
     @classmethod
     def safe_secret(cls, value: str) -> str:
         if any(character in value for character in "\r\n\x00"):
             raise ValueError("密钥不能包含换行或 NUL 字符")
-        return value
+        return provider_secret_header_value(value)
+
+    @field_validator("revision")
+    @classmethod
+    def valid_optional_revision(cls, value: str) -> str:
+        return _valid_revision(value) if value.strip() else ""
 
 
 def _valid_revision(value: str) -> str:
@@ -82,7 +89,9 @@ class ConnectionCreateRequest(StrictModel):
 
     revision: str
     channel_operator: str
-    adapter: Literal["generic", "kimi", "deepseek", "mimo"] = "generic"
+    adapter: Literal[
+        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
+    ] = "generic"
     base_url: str
     plan: Literal[
         "payg",
@@ -105,7 +114,9 @@ class DeploymentDraft(StrictModel):
     upstream_model: str
     model_author: str = ""
     kind: Literal["chat", "embedding"] = "chat"
+    adapter_profile: Literal["inherit", "dashscope_deepseek_v4"] = "inherit"
     reasoning_default: Literal["inherit", "enabled", "disabled"] = "inherit"
+    tool_choice_with_reasoning: Literal["any", "auto_only", "none"] = "auto_only"
     capabilities: Capabilities = Field(default_factory=Capabilities)
     dimensions: int | None = Field(default=None, ge=1, le=65536)
     embedding_space: str = ""
@@ -118,6 +129,7 @@ class RouteAssignment(StrictModel):
     kind: Literal["chat", "embedding"] = "chat"
     targets: list[str] = Field(min_length=1)
     max_attempts: int = Field(default=1, ge=1, le=20)
+    fallback_scope: Literal["none", "same_channel", "any_channel"] = "none"
     enabled: bool = True
 
     @field_validator("id")
@@ -159,8 +171,180 @@ class DeploymentApplyRequest(StrictModel):
         return validate_id(value, "connection")
 
 
-def configuration_revision(path: Path) -> str:
-    return sha256(path.read_bytes()).hexdigest()
+class CandidateDiscoverRequest(StrictModel):
+    revision: str
+    connection: str = ""
+    value: str = Field(default="", max_length=65536)
+    candidate_key: str = Field(default="", max_length=65536)
+    channel_operator: str = ""
+    base_url: str = ""
+    adapter: Literal[
+        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
+    ] = "generic"
+    dialect: Literal[
+        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
+    ] | None = None
+    auth_type: Literal["bearer", "x-api-key"] = "bearer"
+    allowed_private_networks: list[str] = Field(default_factory=list)
+    models_endpoint: str | None = "/models"
+
+    @field_validator("revision")
+    @classmethod
+    def valid_revision(cls, value: str) -> str:
+        return _valid_revision(value)
+
+    @field_validator("connection")
+    @classmethod
+    def valid_connection(cls, value: str) -> str:
+        return validate_id(value, "connection") if value.strip() else ""
+
+    @field_validator("value", "candidate_key")
+    @classmethod
+    def safe_secret(cls, value: str) -> str:
+        return provider_secret_header_value(value) if value else ""
+
+    @model_validator(mode="after")
+    def existing_or_draft(self) -> "CandidateDiscoverRequest":
+        if bool(self.value) == bool(self.candidate_key):
+            raise ValueError("必须且只能提供 candidate_key")
+        if not self.connection and (
+            not self.channel_operator.strip() or not self.base_url.strip()
+        ):
+            raise ValueError("新渠道 discovery 需要 channel_operator 和 base_url")
+        return self
+
+    @property
+    def secret_value(self) -> str:
+        return self.candidate_key or self.value
+
+    @property
+    def adapter_value(self) -> str:
+        # ``dialect`` is the control-plane wording used by the Web Console;
+        # ``adapter`` remains a backwards-compatible API spelling.
+        return self.dialect or self.adapter
+
+
+class RevisionRequest(StrictModel):
+    revision: str
+
+    @field_validator("revision")
+    @classmethod
+    def valid_revision(cls, value: str) -> str:
+        return _valid_revision(value)
+
+
+class EnabledUpdateRequest(RevisionRequest):
+    enabled: bool
+
+
+class BundleConnectionDraft(StrictModel):
+    id: str = ""
+    channel_operator: str
+    adapter: Literal[
+        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
+    ] = "generic"
+    base_url: str
+    secret: str = Field(min_length=1, max_length=65536)
+    auth_type: Literal["bearer", "x-api-key"] = "bearer"
+    plan: Literal[
+        "payg",
+        "subscription",
+        "free_tier",
+        "token_plan",
+        "coding_plan",
+        "direct_tool_only",
+        "custom",
+    ] = "payg"
+    usage_scope: Literal["backend_allowed", "interactive_only", "disabled"] = (
+        "backend_allowed"
+    )
+    allowed_private_networks: list[str] = Field(default_factory=list)
+    connect_timeout_seconds: float = Field(default=10.0, ge=0.1, le=3600.0)
+    read_timeout_seconds: float = Field(default=120.0, ge=0.1, le=3600.0)
+    write_timeout_seconds: float = Field(default=60.0, ge=0.1, le=3600.0)
+    pool_timeout_seconds: float = Field(default=10.0, ge=0.1, le=3600.0)
+    response_limit_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1024,
+        le=256 * 1024 * 1024,
+    )
+    enabled: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def valid_optional_id(cls, value: str) -> str:
+        return validate_id(value, "connection") if value.strip() else ""
+
+    @field_validator("secret")
+    @classmethod
+    def safe_secret(cls, value: str) -> str:
+        return provider_secret_header_value(value)
+
+
+class BundleDeploymentDraft(DeploymentDraft):
+    id: str = ""
+    pricing: str | None = None
+    enabled: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def valid_optional_id(cls, value: str) -> str:
+        return validate_id(value, "deployment") if value.strip() else ""
+
+
+class BundlePricingDraft(StrictModel):
+    id: str
+    value: PricingConfig
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str) -> str:
+        return validate_id(value, "pricing")
+
+
+class BundleRouteOperation(StrictModel):
+    id: str
+    operation: Literal["keep", "prepend", "append", "replace"] = "keep"
+    kind: Literal["chat", "embedding"] = "chat"
+    targets: list[str] = Field(default_factory=list)
+    max_attempts: int = Field(default=1, ge=1, le=20)
+    fallback_scope: Literal["none", "same_channel", "any_channel"] = "none"
+    enabled: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str) -> str:
+        return validate_id(value, "route")
+
+    @model_validator(mode="after")
+    def targets_match_operation(self) -> "BundleRouteOperation":
+        if self.operation != "keep" and not self.targets:
+            raise ValueError("非 keep route operation 至少需要一个 target")
+        return self
+
+
+class BundleApplyRequest(StrictModel):
+    revision: str
+    connection: BundleConnectionDraft
+    deployments: list[BundleDeploymentDraft] = Field(default_factory=list)
+    pricing: list[BundlePricingDraft] = Field(default_factory=list)
+    routes: list[BundleRouteOperation] = Field(default_factory=list)
+
+    @field_validator("revision")
+    @classmethod
+    def valid_revision(cls, value: str) -> str:
+        return _valid_revision(value)
+
+    @model_validator(mode="after")
+    def unique_ids(self) -> "BundleApplyRequest":
+        for label, values in (
+            ("deployment", [item.id for item in self.deployments if item.id]),
+            ("pricing", [item.id for item in self.pricing]),
+            ("route", [item.id for item in self.routes]),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"bundle 含重复 {label} ID")
+        return self
 
 
 def public_configuration(
@@ -179,19 +363,25 @@ def public_configuration(
             if client.config.allows_route(route_id)
         }
 
-    deployment_ids = {
-        deployment_id
-        for route in visible_routes.values()
-        for deployment_id in route.targets
-    }
+    deployment_ids = (
+        set(config.deployments)
+        if client.config.kind == "admin"
+        else {
+            deployment_id
+            for route in visible_routes.values()
+            for deployment_id in route.targets
+        }
+    )
     visible_deployments = {
         deployment_id: config.deployments[deployment_id]
         for deployment_id in deployment_ids
         if deployment_id in config.deployments
     }
-    connection_ids = {
-        deployment.connection for deployment in visible_deployments.values()
-    }
+    connection_ids = (
+        set(config.connections)
+        if client.config.kind == "admin"
+        else {deployment.connection for deployment in visible_deployments.values()}
+    )
 
     connections = []
     for connection_id, connection in config.connections.items():
@@ -204,6 +394,12 @@ def public_configuration(
                 "base_url": connection.base_url,
                 "adapter": connection.adapter,
                 "usage_scope": connection.usage_scope,
+                "allowed_private_networks": list(connection.allowed_private_networks),
+                "connect_timeout_seconds": connection.connect_timeout_seconds,
+                "read_timeout_seconds": connection.read_timeout_seconds,
+                "write_timeout_seconds": connection.write_timeout_seconds,
+                "pool_timeout_seconds": connection.pool_timeout_seconds,
+                "response_limit_bytes": connection.response_limit_bytes,
                 "enabled": connection.enabled,
                 "configured": bool(secrets.get(connection.auth.secret_ref, "")),
             }
@@ -221,9 +417,13 @@ def public_configuration(
                 "model_author": deployment.model_author,
                 "model_family": deployment.model_family,
                 "kind": deployment.kind,
+                "adapter_profile": deployment.adapter_profile,
+                "reasoning_default": deployment.reasoning_default,
+                "tool_choice_with_reasoning": deployment.tool_choice_with_reasoning,
                 "capabilities": deployment.capabilities.model_dump(mode="json"),
                 "dimensions": deployment.dimensions,
                 "embedding_space": deployment.embedding_space,
+                "pricing": deployment.pricing,
                 "enabled": deployment.enabled,
             }
         )
@@ -235,17 +435,24 @@ def public_configuration(
             "targets": list(route.targets),
             "required_capabilities": list(route.required_capabilities),
             "max_attempts": route.max_attempts,
+            "fallback_scope": route.fallback_scope,
             "enabled": route.enabled,
         }
         for route_id, route in visible_routes.items()
     ]
-    return {
+    result = {
         "revision": revision,
         "admin_required": True,
         "connections": connections,
         "deployments": deployments,
         "routes": routes,
     }
+    if client.config.kind == "admin":
+        result["pricing"] = [
+            {"id": pricing_id, **pricing.model_dump(mode="json", exclude_none=False)}
+            for pricing_id, pricing in config.pricing.items()
+        ]
+    return result
 
 
 def route_candidate(
@@ -341,13 +548,26 @@ def deployment_candidate(
         deployment = DeploymentConfig(
             connection=request.connection,
             upstream_model=draft.upstream_model,
-            model_author=(draft.model_author.strip() or connection.channel_operator),
+            model_author=(draft.model_author.strip() or "unknown"),
             kind=draft.kind,
+            adapter_profile=draft.adapter_profile,
             reasoning_default=draft.reasoning_default,
+            tool_choice_with_reasoning=draft.tool_choice_with_reasoning,
             capabilities=draft.capabilities,
             request_transform=RequestTransform(),
             dimensions=draft.dimensions,
-            embedding_space=draft.embedding_space,
+            embedding_space=(
+                draft.embedding_space.strip()
+                or (
+                    derive_embedding_space(
+                        connection,
+                        draft.upstream_model,
+                        int(draft.dimensions),
+                    )
+                    if draft.kind == "embedding" and draft.dimensions is not None
+                    else ""
+                )
+            ),
         )
         deployments[deployment_id] = deployment.model_dump(mode="python")
         deployment_ids.append(deployment_id)
@@ -373,6 +593,7 @@ def deployment_candidate(
                 kind=assignment.kind,
                 targets=targets,
                 max_attempts=assignment.max_attempts,
+                fallback_scope=assignment.fallback_scope,
                 enabled=assignment.enabled,
             ).model_dump(mode="python")
             changed.append(assignment.id)
@@ -391,9 +612,273 @@ def deployment_candidate(
         routes[assignment.id] = {
             **routes[assignment.id],
             "targets": targets,
+            "max_attempts": assignment.max_attempts,
+            "fallback_scope": assignment.fallback_scope,
             "enabled": assignment.enabled,
         }
     payload["routes"] = routes
 
     candidate = GatewayConfig.model_validate(payload)
     return candidate, deployment_ids, changed, warnings
+
+
+def bundle_candidate(
+    config: GatewayConfig,
+    request: BundleApplyRequest,
+) -> tuple[GatewayConfig, str, str, list[str], list[str]]:
+    """Build one fully validated v2 graph without persisting its candidate key."""
+
+    payload = config.model_dump(mode="python", exclude_none=False)
+    operator = request.connection.channel_operator.strip().lower()
+    connection_id = request.connection.id or _unique_id(
+        _slug(f"{operator}-account"), config.connections
+    )
+    existing_connection = config.connections.get(connection_id)
+    secret_ref = (
+        existing_connection.auth.secret_ref
+        if existing_connection is not None
+        else _default_secret_ref("CONNECTION", connection_id)
+    )
+    connection_payload = (
+        existing_connection.model_dump(mode="python", exclude_none=False)
+        if existing_connection is not None
+        else {}
+    )
+    supplied = request.connection.model_fields_set
+
+    def selected(name: str, new_value: Any, old_value: Any) -> Any:
+        if existing_connection is not None and name not in supplied:
+            return old_value
+        return new_value
+
+    candidate_connection = ConnectionConfig(
+            channel_operator=operator,
+            adapter=selected(
+                "adapter", request.connection.adapter, existing_connection.adapter
+                if existing_connection is not None else request.connection.adapter
+            ),
+            allowed_private_networks=selected(
+                "allowed_private_networks",
+                request.connection.allowed_private_networks,
+                existing_connection.allowed_private_networks
+                if existing_connection is not None
+                else request.connection.allowed_private_networks,
+            ),
+            base_url=request.connection.base_url,
+            auth=AuthConfig(
+                type=selected(
+                    "auth_type",
+                    request.connection.auth_type,
+                    existing_connection.auth.type
+                    if existing_connection is not None
+                    else request.connection.auth_type,
+                ),
+                secret_ref=secret_ref,
+            ),
+            models_endpoint=(
+                existing_connection.models_endpoint
+                if existing_connection is not None
+                else "/models"
+            ),
+            chat_endpoint=(
+                existing_connection.chat_endpoint
+                if existing_connection is not None
+                else "/chat/completions"
+            ),
+            embeddings_endpoint=(
+                existing_connection.embeddings_endpoint
+                if existing_connection is not None
+                else "/embeddings"
+            ),
+            forward_headers=(
+                existing_connection.forward_headers
+                if existing_connection is not None
+                else []
+            ),
+            billing_plan=BillingPlan(
+                type=selected(
+                    "plan",
+                    request.connection.plan,
+                    existing_connection.billing_plan.type
+                    if existing_connection is not None
+                    else request.connection.plan,
+                )
+            ),
+            usage_scope=selected(
+                "usage_scope",
+                request.connection.usage_scope,
+                existing_connection.usage_scope
+                if existing_connection is not None
+                else request.connection.usage_scope,
+            ),
+            connect_timeout_seconds=selected(
+                "connect_timeout_seconds",
+                request.connection.connect_timeout_seconds,
+                existing_connection.connect_timeout_seconds
+                if existing_connection is not None
+                else request.connection.connect_timeout_seconds,
+            ),
+            read_timeout_seconds=selected(
+                "read_timeout_seconds",
+                request.connection.read_timeout_seconds,
+                existing_connection.read_timeout_seconds
+                if existing_connection is not None
+                else request.connection.read_timeout_seconds,
+            ),
+            write_timeout_seconds=selected(
+                "write_timeout_seconds",
+                request.connection.write_timeout_seconds,
+                existing_connection.write_timeout_seconds
+                if existing_connection is not None
+                else request.connection.write_timeout_seconds,
+            ),
+            pool_timeout_seconds=selected(
+                "pool_timeout_seconds",
+                request.connection.pool_timeout_seconds,
+                existing_connection.pool_timeout_seconds
+                if existing_connection is not None
+                else request.connection.pool_timeout_seconds,
+            ),
+            response_limit_bytes=selected(
+                "response_limit_bytes",
+                request.connection.response_limit_bytes,
+                existing_connection.response_limit_bytes
+                if existing_connection is not None
+                else request.connection.response_limit_bytes,
+            ),
+            rate_limit_cooldown_seconds=(
+                existing_connection.rate_limit_cooldown_seconds
+                if existing_connection is not None
+                else 300.0
+            ),
+            enabled=selected(
+                "enabled",
+                request.connection.enabled,
+                existing_connection.enabled
+                if existing_connection is not None
+                else request.connection.enabled,
+            ),
+        )
+    connection_payload.update(
+        candidate_connection.model_dump(mode="python", exclude_none=False)
+    )
+    payload["connections"] = {
+        **payload["connections"],
+        connection_id: connection_payload,
+    }
+
+    pricing_records = dict(payload["pricing"])
+    for draft in request.pricing:
+        pricing_records[draft.id] = draft.value.model_dump(
+            mode="python", exclude_none=False
+        )
+    payload["pricing"] = pricing_records
+
+    deployments = dict(payload["deployments"])
+    deployment_ids: list[str] = []
+    for draft in request.deployments:
+        deployment_id = draft.id or _unique_id(
+            _slug(f"{connection_id}-{draft.upstream_model}"), deployments
+        )
+        current = config.deployments.get(deployment_id)
+        if current is not None and current.connection != connection_id:
+            raise ValueError(
+                f"deployment {deployment_id} 属于其他 connection，不能在 bundle 中接管"
+            )
+        derived_space = (
+            derive_embedding_space(
+                candidate_connection,
+                draft.upstream_model,
+                int(draft.dimensions),
+            )
+            if draft.kind == "embedding" and draft.dimensions is not None
+            else ""
+        )
+        unchanged_embedding_identity = bool(
+            current is not None
+            and current.kind == "embedding"
+            and draft.kind == "embedding"
+            and current.upstream_model == draft.upstream_model
+            and current.dimensions == draft.dimensions
+            and config.connections[current.connection].channel_operator
+            == candidate_connection.channel_operator
+            and config.connections[current.connection].base_url
+            == candidate_connection.base_url
+        )
+        deployment = DeploymentConfig(
+            connection=connection_id,
+            upstream_model=draft.upstream_model,
+            model_author=(draft.model_author.strip() or "unknown"),
+            model_family=current.model_family if current is not None else "",
+            kind=draft.kind,
+            adapter_profile=draft.adapter_profile,
+            reasoning_default=draft.reasoning_default,
+            tool_choice_with_reasoning=draft.tool_choice_with_reasoning,
+            capabilities=draft.capabilities,
+            request_transform=(
+                current.request_transform if current is not None else RequestTransform()
+            ),
+            dimensions=draft.dimensions,
+            embedding_space=(
+                draft.embedding_space.strip()
+                or (
+                    current.embedding_space
+                    if unchanged_embedding_identity and current is not None
+                    else derived_space
+                )
+            ),
+            pricing=draft.pricing,
+            enabled=draft.enabled,
+        )
+        deployments[deployment_id] = deployment.model_dump(
+            mode="python", exclude_none=False
+        )
+        deployment_ids.append(deployment_id)
+    payload["deployments"] = deployments
+
+    def resolve_target(target: str) -> str:
+        match = re.fullmatch(r"\$(\d+)", target)
+        if match is not None:
+            index = int(match.group(1))
+            if index >= len(deployment_ids):
+                raise ValueError(f"route target 引用了不存在的部署占位：{target}")
+            return deployment_ids[index]
+        return validate_id(target, "deployment")
+
+    routes = dict(payload["routes"])
+    changed_routes: list[str] = []
+    for operation in request.routes:
+        if operation.operation == "keep":
+            continue
+        added = [resolve_target(target) for target in operation.targets]
+        existing = config.routes.get(operation.id)
+        if existing is not None and existing.kind != operation.kind:
+            raise ValueError(
+                f"route {operation.id} 已存在且 kind 为 {existing.kind}"
+            )
+        current_targets = list(existing.targets) if existing is not None else []
+        if operation.operation == "prepend":
+            targets = _ordered_unique([*added, *current_targets])
+        elif operation.operation == "append":
+            targets = _ordered_unique([*current_targets, *added])
+        else:
+            targets = _ordered_unique(added)
+        required = (
+            list(existing.required_capabilities) if existing is not None else []
+        )
+        routes[operation.id] = RouteConfig(
+            kind=operation.kind,
+            targets=targets,
+            required_capabilities=required,
+            max_attempts=operation.max_attempts,
+            fallback_scope=operation.fallback_scope,
+            enabled=operation.enabled,
+        ).model_dump(mode="python", exclude_none=False)
+        changed_routes.append(operation.id)
+    payload["routes"] = routes
+    candidate = GatewayConfig.model_validate(payload)
+    return candidate, connection_id, secret_ref, deployment_ids, changed_routes
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))

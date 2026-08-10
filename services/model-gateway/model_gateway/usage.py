@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any
+from typing import Any, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from model_gateway.routing import RouteTarget
@@ -16,6 +16,27 @@ from model_gateway.models import PricingConfig, PricingTier
 
 
 _INIT_LOCK = threading.Lock()
+RAW_RETENTION_DAYS = 90
+DAILY_RETENTION_DAYS = 365
+USAGE_TAG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
+
+
+@dataclass(frozen=True, slots=True)
+class UsageMetadata:
+    correlation_id: str = ""
+    operation: str = ""
+    user_tag: str = ""
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("correlation_id", self.correlation_id),
+            ("operation", self.operation),
+            ("user_tag", self.user_tag),
+        ):
+            if value and not USAGE_TAG_PATTERN.fullmatch(value):
+                raise ValueError(
+                    f"{label} 必须是 1-120 字符的无空白 opaque ASCII ID"
+                )
 
 
 @dataclass(slots=True)
@@ -84,6 +105,65 @@ class UsageCapture:
             )
 
 
+ATTEMPT_OUTCOMES = frozenset(
+    {"success", "http_error", "connect_failure", "ambiguous_failure"}
+)
+ATTEMPT_FAILURE_CLASSES = frozenset(
+    {
+        "none",
+        "connect_error",
+        "connect_timeout",
+        "pool_timeout",
+        "read_timeout",
+        "write_timeout",
+        "read_error",
+        "write_error",
+        "protocol_error",
+        "empty_stream",
+        "response_too_large",
+        "invalid_embedding_response",
+        "http_auth",
+        "http_billing",
+        "http_model_not_found",
+        "http_rate_limit",
+        "http_server",
+        "http_redirect",
+        "http_other",
+        "other_network",
+    }
+)
+
+
+@dataclass(slots=True)
+class AttemptTrace:
+    """Metadata-only trace for one actual upstream HTTP send.
+
+    The type deliberately has no field for request/response bodies or exception
+    text. ``failure_class`` and ``outcome`` are finite labels so provider error
+    prose cannot accidentally enter the ledger.
+    """
+
+    attempt_index: int
+    target: RouteTarget
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    status_code: int | None = None
+    latency_ms: int = 0
+    outcome: str = "connect_failure"
+    failure_class: str = "other_network"
+    request_sent: bool = False
+    billable_unknown: bool = False
+    response_complete: bool = False
+    capture: UsageCapture = field(default_factory=UsageCapture)
+
+    def __post_init__(self) -> None:
+        if self.attempt_index < 1:
+            raise ValueError("attempt_index 必须从 1 开始")
+        if self.outcome not in ATTEMPT_OUTCOMES:
+            raise ValueError("未知 attempt outcome")
+        if self.failure_class not in ATTEMPT_FAILURE_CLASSES:
+            raise ValueError("未知 attempt failure_class")
+
+
 class UsageStore:
     """Metadata-only usage storage. Request and response bodies are never accepted."""
 
@@ -102,6 +182,9 @@ class UsageStore:
                     client_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     route_id TEXT NOT NULL,
+                    correlation_id TEXT NOT NULL DEFAULT '',
+                    operation TEXT NOT NULL DEFAULT '',
+                    user_tag TEXT NOT NULL DEFAULT '',
                     deployment_id TEXT NOT NULL,
                     connection_id TEXT NOT NULL,
                     channel_operator TEXT NOT NULL,
@@ -127,11 +210,164 @@ class UsageStore:
             )
             self._ensure_columns(connection)
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attempt_events (
+                    id TEXT PRIMARY KEY,
+                    usage_event_id TEXT NOT NULL,
+                    attempt_index INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    connection_id TEXT NOT NULL,
+                    channel_operator TEXT NOT NULL,
+                    model_author TEXT NOT NULL,
+                    upstream_model TEXT NOT NULL,
+                    response_model TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    status_code INTEGER,
+                    latency_ms INTEGER NOT NULL,
+                    outcome TEXT NOT NULL,
+                    failure_class TEXT NOT NULL,
+                    request_sent INTEGER NOT NULL,
+                    billable_unknown INTEGER NOT NULL,
+                    response_complete INTEGER NOT NULL,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    pricing_id TEXT NOT NULL,
+                    pricing_snapshot TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    estimated_cost TEXT NOT NULL,
+                    cost_complete INTEGER NOT NULL,
+                    UNIQUE(usage_event_id, attempt_index),
+                    FOREIGN KEY(usage_event_id) REFERENCES usage_events(id)
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at DESC)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_client ON usage_events(client_id, created_at DESC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_correlation "
+                "ON usage_events(client_id, correlation_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_operation_tag "
+                "ON usage_events(client_id, operation, user_tag, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attempt_created "
+                "ON attempt_events(created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attempt_usage "
+                "ON attempt_events(usage_event_id, attempt_index)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_daily (
+                    day TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    connection_id TEXT NOT NULL,
+                    channel_operator TEXT NOT NULL,
+                    model_author TEXT NOT NULL,
+                    upstream_model TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    user_tag TEXT NOT NULL,
+                    calls INTEGER NOT NULL,
+                    complete_calls INTEGER NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    incomplete_cost_calls INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        day, client_id, kind, route_id, deployment_id,
+                        connection_id, channel_operator, model_author,
+                        upstream_model, operation, user_tag
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cost_daily (
+                    day TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    user_tag TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    estimated_cost TEXT NOT NULL,
+                    known_attempts INTEGER NOT NULL,
+                    unknown_attempts INTEGER NOT NULL,
+                    not_sent_attempts INTEGER NOT NULL,
+                    PRIMARY KEY (day, client_id, operation, user_tag, currency)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_daily_lookup "
+                "ON usage_daily(client_id, operation, user_tag, day DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cost_daily_lookup "
+                "ON cost_daily(client_id, operation, user_tag, day DESC)"
+            )
+        self.prune(vacuum=False)
+
+    def probe_writable(self) -> None:
+        """Verify that the ledger can acquire a writer transaction.
+
+        The transaction is rolled back without changing logical data.  Opening
+        the database file itself is checked separately by the storage monitor;
+        this catches SQLite-level read-only, corruption and writer failures.
+        """
+
+        with sqlite3.connect(
+            self.path,
+            timeout=0.1,
+            factory=_ClosingSQLiteConnection,
+        ) as connection:
+            connection.execute("PRAGMA busy_timeout=100")
+            result = connection.execute("PRAGMA quick_check(1)").fetchone()
+            if result is None or str(result[0]).lower() != "ok":
+                raise sqlite3.DatabaseError("usage ledger integrity check failed")
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            required = {
+                "usage_events",
+                "attempt_events",
+                "usage_daily",
+                "cost_daily",
+            }
+            if not required.issubset(tables):
+                raise sqlite3.DatabaseError("usage ledger schema is incomplete")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if (
+                    isinstance(code, int)
+                    and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                ) or "locked" in str(exc).casefold():
+                    # A concurrent short writer proves neither disk exhaustion
+                    # nor a read-only ledger. The real record path retains its
+                    # normal 30-second busy timeout.
+                    return
+                raise
+            connection.rollback()
 
     def record(
         self,
@@ -147,9 +383,13 @@ class UsageStore:
         capture: UsageCapture,
         pricing_id: str = "",
         pricing: PricingConfig | None = None,
+        attempt_traces: Sequence[AttemptTrace] = (),
+        pricing_catalog: Mapping[str, PricingConfig] | None = None,
+        metadata: UsageMetadata | None = None,
     ) -> str:
+        usage_metadata = metadata or UsageMetadata()
         usage = _parse_usage(capture.usage)
-        estimated_cost, cost_complete = estimate_cost(usage, pricing)
+        estimated_cost, cost_complete = estimate_cost(usage, pricing, kind=kind)
         pricing_snapshot = (
             pricing.model_dump_json(exclude_none=True) if pricing is not None else ""
         )
@@ -159,13 +399,14 @@ class UsageStore:
                 """
                 INSERT INTO usage_events (
                     id, created_at, client_id, kind, route_id,
+                    correlation_id, operation, user_tag,
                     deployment_id, connection_id, channel_operator, model_author,
                     upstream_model,
                     response_model, status_code, latency_ms, attempts, complete,
                     input_tokens, cached_input_tokens, output_tokens, total_tokens,
                     request_id, pricing_id, pricing_snapshot, currency,
                     estimated_cost, cost_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -173,6 +414,9 @@ class UsageStore:
                     client_id[:120],
                     "embedding" if kind == "embedding" else "chat",
                     route_id[:120],
+                    usage_metadata.correlation_id,
+                    usage_metadata.operation,
+                    usage_metadata.user_tag,
                     target.deployment_id[:120] if target else "",
                     target.connection_id[:120] if target else "",
                     target.connection.channel_operator[:120] if target else "",
@@ -195,72 +439,624 @@ class UsageStore:
                     int(cost_complete),
                 ),
             )
+            for trace in attempt_traces:
+                self._record_attempt(
+                    connection,
+                    usage_event_id=event_id,
+                    client_id=client_id,
+                    kind=kind,
+                    route_id=route_id,
+                    trace=trace,
+                    pricing_catalog=pricing_catalog or {},
+                )
         return event_id
 
-    def summary(self, *, days: int = 30) -> dict[str, Any]:
-        since = datetime.now(UTC) - timedelta(days=max(1, days))
+    @staticmethod
+    def _record_attempt(
+        connection: sqlite3.Connection,
+        *,
+        usage_event_id: str,
+        client_id: str,
+        kind: str,
+        route_id: str,
+        trace: AttemptTrace,
+        pricing_catalog: Mapping[str, PricingConfig],
+    ) -> None:
+        if trace.outcome not in ATTEMPT_OUTCOMES:
+            raise ValueError("未知 attempt outcome")
+        if trace.failure_class not in ATTEMPT_FAILURE_CLASSES:
+            raise ValueError("未知 attempt failure_class")
+        target = trace.target
+        usage = _parse_usage(trace.capture.usage)
+        pricing_id = target.deployment.pricing or ""
+        pricing = pricing_catalog.get(pricing_id) if pricing_id else None
+        if not trace.request_sent:
+            estimated_cost: Decimal | None = Decimal("0")
+            cost_complete = True
+        else:
+            estimated_cost, cost_complete = estimate_cost(
+                usage,
+                pricing,
+                kind="embedding" if kind == "embedding" else "chat",
+            )
+        pricing_snapshot = (
+            pricing.model_dump_json(exclude_none=True) if pricing is not None else ""
+        )
+        connection.execute(
+            """
+            INSERT INTO attempt_events (
+                id, usage_event_id, attempt_index, created_at, client_id, kind,
+                route_id, deployment_id, connection_id, channel_operator,
+                model_author, upstream_model, response_model, request_id,
+                status_code, latency_ms, outcome, failure_class, request_sent,
+                billable_unknown, response_complete, input_tokens,
+                cached_input_tokens, output_tokens, total_tokens, pricing_id,
+                pricing_snapshot, currency, estimated_cost, cost_complete
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"att_{uuid4().hex}",
+                usage_event_id,
+                trace.attempt_index,
+                trace.created_at,
+                client_id[:120],
+                "embedding" if kind == "embedding" else "chat",
+                route_id[:120],
+                target.deployment_id[:120],
+                target.connection_id[:120],
+                target.connection.channel_operator[:120],
+                target.deployment.model_author[:300],
+                target.deployment.upstream_model[:300],
+                trace.capture.response_model[:300],
+                trace.capture.request_id[:300],
+                trace.status_code,
+                max(0, int(trace.latency_ms)),
+                trace.outcome,
+                trace.failure_class,
+                int(trace.request_sent),
+                int(trace.billable_unknown or (trace.request_sent and not cost_complete)),
+                int(trace.response_complete),
+                usage["input_tokens"],
+                usage["cached_input_tokens"],
+                usage["output_tokens"],
+                usage["total_tokens"],
+                pricing_id[:120],
+                pricing_snapshot,
+                pricing.currency if pricing is not None else "",
+                str(estimated_cost) if estimated_cost is not None else "",
+                int(cost_complete),
+            ),
+        )
+
+    def summary(
+        self,
+        *,
+        days: int = 30,
+        client_id: str = "",
+        operation: str = "",
+        user_tag: str = "",
+    ) -> dict[str, Any]:
+        selected_days = min(DAILY_RETENTION_DAYS, max(1, int(days)))
+        metadata = UsageMetadata(operation=operation, user_tag=user_tag)
+        if client_id and not USAGE_TAG_PATTERN.fullmatch(client_id):
+            raise ValueError("client_id 格式无效")
+        since = datetime.now(UTC) - timedelta(days=selected_days)
+        raw_where, raw_parameters = _usage_filters(
+            since=since.isoformat(),
+            client_id=client_id,
+            operation=metadata.operation,
+            user_tag=metadata.user_tag,
+        )
+        daily_where, daily_parameters = _daily_filters(
+            since=since.date().isoformat(),
+            client_id=client_id,
+            operation=metadata.operation,
+            user_tag=metadata.user_tag,
+        )
         with self._connect() as connection:
             totals = connection.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS calls,
                        SUM(CASE WHEN complete = 1 THEN 1 ELSE 0 END) AS complete_calls,
                        SUM(COALESCE(input_tokens, 0)) AS input_tokens,
                        SUM(COALESCE(output_tokens, 0)) AS output_tokens,
-                       SUM(COALESCE(total_tokens, 0)) AS total_tokens
-                FROM usage_events WHERE created_at >= ?
+                       SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                       SUM(CASE WHEN status_code BETWEEN 200 AND 299
+                                     AND cost_complete = 0 THEN 1 ELSE 0 END)
+                           AS incomplete_cost_calls
+                FROM usage_events WHERE {raw_where}
                 """,
-                (since.isoformat(),),
+                raw_parameters,
+            ).fetchone()
+            daily_totals = connection.execute(
+                f"""
+                SELECT SUM(calls) AS calls, SUM(complete_calls) AS complete_calls,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(total_tokens) AS total_tokens,
+                       SUM(incomplete_cost_calls) AS incomplete_cost_calls
+                FROM usage_daily WHERE {daily_where}
+                """,
+                daily_parameters,
             ).fetchone()
             rows = connection.execute(
-                """
+                f"""
                 SELECT deployment_id, connection_id, channel_operator, model_author,
-                       upstream_model,
-                       COUNT(*) AS calls, SUM(COALESCE(total_tokens, 0)) AS total_tokens
-                FROM usage_events WHERE created_at >= ?
+                       upstream_model, COUNT(*) AS calls,
+                       SUM(COALESCE(total_tokens, 0)) AS total_tokens
+                FROM usage_events WHERE {raw_where}
                 GROUP BY deployment_id, connection_id, channel_operator, model_author,
                          upstream_model
-                ORDER BY calls DESC
                 """,
-                (since.isoformat(),),
+                raw_parameters,
             ).fetchall()
-            cost_rows = connection.execute(
-                """
-                SELECT currency, estimated_cost, cost_complete, status_code
-                FROM usage_events
-                WHERE created_at >= ?
+            daily_rows = connection.execute(
+                f"""
+                SELECT deployment_id, connection_id, channel_operator, model_author,
+                       upstream_model, SUM(calls) AS calls,
+                       SUM(total_tokens) AS total_tokens
+                FROM usage_daily WHERE {daily_where}
+                GROUP BY deployment_id, connection_id, channel_operator, model_author,
+                         upstream_model
                 """,
-                (since.isoformat(),),
+                daily_parameters,
             ).fetchall()
+            legacy_cost_rows = connection.execute(
+                f"""
+                SELECT u.currency, u.estimated_cost, u.cost_complete
+                FROM usage_events AS u
+                WHERE {_alias_where(raw_where, 'u')}
+                  AND u.attempts > 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM attempt_events AS a
+                    WHERE a.usage_event_id = u.id
+                  )
+                """,
+                raw_parameters,
+            ).fetchall()
+            attempt_rows = connection.execute(
+                f"""
+                SELECT a.currency, a.estimated_cost, a.cost_complete,
+                       a.request_sent, a.billable_unknown
+                FROM attempt_events AS a
+                JOIN usage_events AS u ON u.id = a.usage_event_id
+                WHERE {_alias_where(raw_where, 'u')}
+                """,
+                raw_parameters,
+            ).fetchall()
+            daily_cost_rows = connection.execute(
+                f"""
+                SELECT currency, estimated_cost, known_attempts,
+                       unknown_attempts, not_sent_attempts
+                FROM cost_daily WHERE {daily_where}
+                """,
+                daily_parameters,
+            ).fetchall()
+
         costs: dict[str, Decimal] = {}
-        incomplete_cost_calls = 0
-        for row in cost_rows:
-            if 200 <= int(row["status_code"] or 0) < 300 and not row["cost_complete"]:
-                incomplete_cost_calls += 1
-            if not row["estimated_cost"] or not row["cost_complete"]:
-                continue
+        for row in legacy_cost_rows:
+            value = _decimal_or_none(row["estimated_cost"])
             currency = str(row["currency"] or "")
-            try:
-                value = Decimal(str(row["estimated_cost"]))
-            except Exception:
-                continue
-            costs[currency] = costs.get(currency, Decimal("0")) + value
+            if row["cost_complete"] and value is not None and currency:
+                costs[currency] = costs.get(currency, Decimal("0")) + value
+        currency_attempts: dict[str, dict[str, Any]] = {}
+        known_attempts = 0
+        unknown_attempts = 0
+        not_sent_attempts = 0
+        for row in attempt_rows:
+            currency = str(row["currency"] or "") or "UNPRICED"
+            bucket = _currency_bucket(currency_attempts, currency)
+            if not row["request_sent"]:
+                not_sent_attempts += 1
+            value = _decimal_or_none(row["estimated_cost"])
+            if row["cost_complete"] and value is not None:
+                known_attempts += 1
+                bucket["known_attempts"] += 1
+                bucket["estimated_cost"] += value
+                if currency != "UNPRICED":
+                    costs[currency] = costs.get(currency, Decimal("0")) + value
+            elif row["request_sent"] or row["billable_unknown"]:
+                unknown_attempts += 1
+                bucket["unknown_attempts"] += 1
+        for row in daily_cost_rows:
+            currency = str(row["currency"] or "UNPRICED")
+            bucket = _currency_bucket(currency_attempts, currency)
+            value = _decimal_or_none(row["estimated_cost"]) or Decimal("0")
+            known = int(row["known_attempts"] or 0)
+            unknown = int(row["unknown_attempts"] or 0)
+            not_sent = int(row["not_sent_attempts"] or 0)
+            known_attempts += known
+            unknown_attempts += unknown
+            not_sent_attempts += not_sent
+            bucket["known_attempts"] += known
+            bucket["unknown_attempts"] += unknown
+            bucket["estimated_cost"] += value
+            if currency != "UNPRICED":
+                costs[currency] = costs.get(currency, Decimal("0")) + value
+
+        deployments: dict[tuple[str, ...], dict[str, Any]] = {}
+        for row in [*rows, *daily_rows]:
+            key = tuple(
+                str(row[name] or "")
+                for name in (
+                    "deployment_id",
+                    "connection_id",
+                    "channel_operator",
+                    "model_author",
+                    "upstream_model",
+                )
+            )
+            bucket = deployments.setdefault(
+                key,
+                {
+                    "deployment_id": key[0],
+                    "connection_id": key[1],
+                    "channel_operator": key[2],
+                    "model_author": key[3],
+                    "upstream_model": key[4],
+                    "calls": 0,
+                    "total_tokens": 0,
+                },
+            )
+            bucket["calls"] += int(row["calls"] or 0)
+            bucket["total_tokens"] += int(row["total_tokens"] or 0)
+
+        def combined(name: str) -> int:
+            return int(totals[name] or 0) + int(daily_totals[name] or 0)
+
         return {
-            "days": max(1, days),
-            "calls": int(totals["calls"] or 0),
-            "complete_calls": int(totals["complete_calls"] or 0),
-            "input_tokens": int(totals["input_tokens"] or 0),
-            "output_tokens": int(totals["output_tokens"] or 0),
-            "total_tokens": int(totals["total_tokens"] or 0),
-            "estimated_costs": {
-                currency: str(value) for currency, value in sorted(costs.items()) if currency
+            "days": selected_days,
+            "filters": {
+                "client_id": client_id,
+                "operation": metadata.operation,
+                "user_tag": metadata.user_tag,
             },
-            "incomplete_cost_calls": incomplete_cost_calls,
-            "deployments": [dict(row) for row in rows],
+            "calls": combined("calls"),
+            "complete_calls": combined("complete_calls"),
+            "input_tokens": combined("input_tokens"),
+            "output_tokens": combined("output_tokens"),
+            "total_tokens": combined("total_tokens"),
+            "estimated_costs": {
+                currency: str(value)
+                for currency, value in sorted(costs.items())
+                if currency
+            },
+            "incomplete_cost_calls": combined("incomplete_cost_calls"),
+            "attempts": {
+                "recorded": len(attempt_rows)
+                + sum(
+                    int(row["known_attempts"] or 0)
+                    + int(row["unknown_attempts"] or 0)
+                    for row in daily_cost_rows
+                ),
+                "known_cost_attempts": known_attempts,
+                "unknown_cost_attempts": unknown_attempts,
+                "not_sent_attempts": not_sent_attempts,
+                "legacy_logical_events_without_attempts": len(legacy_cost_rows),
+                "by_currency": {
+                    currency: {
+                        "known_attempts": values["known_attempts"],
+                        "unknown_attempts": values["unknown_attempts"],
+                        "estimated_cost": str(values["estimated_cost"]),
+                    }
+                    for currency, values in sorted(currency_attempts.items())
+                },
+            },
+            "deployments": sorted(
+                deployments.values(), key=lambda row: (-row["calls"], row["deployment_id"])
+            ),
+            "retention": {
+                "raw_days": RAW_RETENTION_DAYS,
+                "daily_days": DAILY_RETENTION_DAYS,
+            },
+        }
+
+    def events(
+        self,
+        *,
+        client_id: str = "",
+        event_id: str = "",
+        correlation_id: str = "",
+        operation: str = "",
+        user_tag: str = "",
+        days: int = RAW_RETENTION_DAYS,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        metadata = UsageMetadata(
+            correlation_id=correlation_id,
+            operation=operation,
+            user_tag=user_tag,
+        )
+        for label, value in (("client_id", client_id), ("event_id", event_id)):
+            if value and not USAGE_TAG_PATTERN.fullmatch(value):
+                raise ValueError(f"{label} 格式无效")
+        since = datetime.now(UTC) - timedelta(
+            days=min(RAW_RETENTION_DAYS, max(1, int(days)))
+        )
+        clauses = ["created_at >= ?"]
+        parameters: list[Any] = [since.isoformat()]
+        for name, value in (
+            ("id", event_id),
+            ("client_id", client_id),
+            ("correlation_id", metadata.correlation_id),
+            ("operation", metadata.operation),
+            ("user_tag", metadata.user_tag),
+        ):
+            if value:
+                clauses.append(f"{name} = ?")
+                parameters.append(value)
+        parameters.append(min(500, max(1, int(limit))))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, created_at, client_id, kind, route_id,
+                       correlation_id, operation, user_tag, deployment_id,
+                       connection_id, channel_operator, model_author,
+                       upstream_model, response_model, status_code, latency_ms,
+                       attempts, complete, input_tokens, cached_input_tokens,
+                       output_tokens, total_tokens, request_id, pricing_id,
+                       currency, estimated_cost, cost_complete
+                FROM usage_events
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            attempt_rows = (
+                connection.execute(
+                    f"""
+                    SELECT usage_event_id, currency, estimated_cost,
+                           cost_complete, request_sent, billable_unknown
+                    FROM attempt_events
+                    WHERE usage_event_id IN ({','.join('?' for _ in rows)})
+                    ORDER BY usage_event_id, attempt_index
+                    """,
+                    [str(row["id"]) for row in rows],
+                ).fetchall()
+                if rows
+                else []
+            )
+        attempts_by_event: dict[str, list[sqlite3.Row]] = {}
+        for attempt in attempt_rows:
+            attempts_by_event.setdefault(str(attempt["usage_event_id"]), []).append(
+                attempt
+            )
+        result: list[dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            attempts = attempts_by_event.get(str(raw["id"]), [])
+            costs: dict[str, Decimal] = {}
+            unknown = 0
+            if attempts:
+                for attempt in attempts:
+                    currency = str(attempt["currency"] or "") or "UNPRICED"
+                    value = _decimal_or_none(attempt["estimated_cost"])
+                    if attempt["cost_complete"] and value is not None:
+                        if currency != "UNPRICED":
+                            costs[currency] = costs.get(currency, Decimal("0")) + value
+                    elif attempt["request_sent"] or attempt["billable_unknown"]:
+                        unknown += 1
+            else:
+                currency = str(raw["currency"] or "")
+                value = _decimal_or_none(raw["estimated_cost"])
+                if raw["cost_complete"] and value is not None and currency:
+                    costs[currency] = value
+                elif int(raw["attempts"] or 0) > 0:
+                    unknown = 1
+            row["attempt_costs"] = {
+                currency: str(value) for currency, value in sorted(costs.items())
+            }
+            row["unknown_cost_attempts"] = unknown
+            result.append(row)
+        return result
+
+    def prune(
+        self,
+        *,
+        raw_days: int = RAW_RETENTION_DAYS,
+        daily_days: int = DAILY_RETENTION_DAYS,
+        vacuum: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, int | bool]:
+        selected_raw_days = max(1, int(raw_days))
+        selected_daily_days = max(selected_raw_days, int(daily_days))
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        raw_cutoff = current - timedelta(days=selected_raw_days)
+        daily_cutoff = (current - timedelta(days=selected_daily_days)).date().isoformat()
+        logical_groups: dict[tuple[str, ...], dict[str, int]] = {}
+        cost_groups: dict[tuple[str, ...], dict[str, Any]] = {}
+        with self._connect() as connection:
+            # Select, roll up and delete must be one writer transaction. Without
+            # this lock, two gateway processes starting together could both
+            # aggregate the same raw rows before either one deletes them.
+            connection.execute("BEGIN IMMEDIATE")
+            old_events = connection.execute(
+                "SELECT * FROM usage_events WHERE created_at < ? ORDER BY created_at",
+                (raw_cutoff.isoformat(),),
+            ).fetchall()
+            if old_events:
+                attempt_rows = connection.execute(
+                    """
+                    SELECT a.*, u.client_id AS logical_client_id,
+                           u.operation AS logical_operation,
+                           u.user_tag AS logical_user_tag,
+                           u.created_at AS logical_created_at
+                    FROM attempt_events AS a
+                    JOIN usage_events AS u ON u.id = a.usage_event_id
+                    WHERE u.created_at < ?
+                    """,
+                    (raw_cutoff.isoformat(),),
+                ).fetchall()
+                event_attempt_ids = {
+                    str(row["usage_event_id"]) for row in attempt_rows
+                }
+                for row in old_events:
+                    day = str(row["created_at"])[:10]
+                    key = (
+                        day,
+                        str(row["client_id"]),
+                        str(row["kind"]),
+                        str(row["route_id"]),
+                        str(row["deployment_id"]),
+                        str(row["connection_id"]),
+                        str(row["channel_operator"]),
+                        str(row["model_author"]),
+                        str(row["upstream_model"]),
+                        str(row["operation"]),
+                        str(row["user_tag"]),
+                    )
+                    bucket = logical_groups.setdefault(
+                        key,
+                        {
+                            "calls": 0,
+                            "complete_calls": 0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "incomplete_cost_calls": 0,
+                        },
+                    )
+                    bucket["calls"] += 1
+                    bucket["complete_calls"] += int(bool(row["complete"]))
+                    bucket["input_tokens"] += int(row["input_tokens"] or 0)
+                    bucket["output_tokens"] += int(row["output_tokens"] or 0)
+                    bucket["total_tokens"] += int(row["total_tokens"] or 0)
+                    bucket["incomplete_cost_calls"] += int(
+                        200 <= int(row["status_code"] or 0) < 300
+                        and not row["cost_complete"]
+                    )
+                    if (
+                        str(row["id"]) not in event_attempt_ids
+                        and int(row["attempts"] or 0) > 0
+                    ):
+                        currency = str(row["currency"] or "") or "UNPRICED"
+                        cost_key = (
+                            day,
+                            str(row["client_id"]),
+                            str(row["operation"]),
+                            str(row["user_tag"]),
+                            currency,
+                        )
+                        cost_bucket = _cost_bucket(cost_groups, cost_key)
+                        value = _decimal_or_none(row["estimated_cost"])
+                        if row["cost_complete"] and value is not None:
+                            cost_bucket["estimated_cost"] += value
+                            cost_bucket["known_attempts"] += 1
+                        else:
+                            cost_bucket["unknown_attempts"] += 1
+                for row in attempt_rows:
+                    currency = str(row["currency"] or "") or "UNPRICED"
+                    cost_key = (
+                        str(row["logical_created_at"])[:10],
+                        str(row["logical_client_id"]),
+                        str(row["logical_operation"]),
+                        str(row["logical_user_tag"]),
+                        currency,
+                    )
+                    cost_bucket = _cost_bucket(cost_groups, cost_key)
+                    if not row["request_sent"]:
+                        cost_bucket["not_sent_attempts"] += 1
+                    value = _decimal_or_none(row["estimated_cost"])
+                    if row["cost_complete"] and value is not None:
+                        cost_bucket["estimated_cost"] += value
+                        cost_bucket["known_attempts"] += 1
+                    elif row["request_sent"] or row["billable_unknown"]:
+                        cost_bucket["unknown_attempts"] += 1
+
+                for key, values in logical_groups.items():
+                    connection.execute(
+                        """
+                        INSERT INTO usage_daily (
+                            day, client_id, kind, route_id, deployment_id,
+                            connection_id, channel_operator, model_author,
+                            upstream_model, operation, user_tag, calls,
+                            complete_calls, input_tokens, output_tokens,
+                            total_tokens, incomplete_cost_calls
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT DO UPDATE SET
+                            calls = calls + excluded.calls,
+                            complete_calls = complete_calls + excluded.complete_calls,
+                            input_tokens = input_tokens + excluded.input_tokens,
+                            output_tokens = output_tokens + excluded.output_tokens,
+                            total_tokens = total_tokens + excluded.total_tokens,
+                            incomplete_cost_calls = incomplete_cost_calls
+                                + excluded.incomplete_cost_calls
+                        """,
+                        (*key, *values.values()),
+                    )
+                for key, values in cost_groups.items():
+                    existing = connection.execute(
+                        """
+                        SELECT estimated_cost, known_attempts, unknown_attempts,
+                               not_sent_attempts
+                        FROM cost_daily
+                        WHERE day = ? AND client_id = ? AND operation = ?
+                          AND user_tag = ? AND currency = ?
+                        """,
+                        key,
+                    ).fetchone()
+                    previous_cost = (
+                        _decimal_or_none(existing["estimated_cost"])
+                        if existing is not None
+                        else None
+                    ) or Decimal("0")
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO cost_daily (
+                            day, client_id, operation, user_tag, currency,
+                            estimated_cost, known_attempts, unknown_attempts,
+                            not_sent_attempts
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            *key,
+                            str(previous_cost + values["estimated_cost"]),
+                            int(values["known_attempts"])
+                            + int(existing["known_attempts"] if existing else 0),
+                            int(values["unknown_attempts"])
+                            + int(existing["unknown_attempts"] if existing else 0),
+                            int(values["not_sent_attempts"])
+                            + int(existing["not_sent_attempts"] if existing else 0),
+                        ),
+                    )
+                connection.execute(
+                    """
+                    DELETE FROM attempt_events WHERE usage_event_id IN (
+                        SELECT id FROM usage_events WHERE created_at < ?
+                    )
+                    """,
+                    (raw_cutoff.isoformat(),),
+                )
+                connection.execute(
+                    "DELETE FROM usage_events WHERE created_at < ?",
+                    (raw_cutoff.isoformat(),),
+                )
+            daily_usage_deleted = connection.execute(
+                "DELETE FROM usage_daily WHERE day < ?", (daily_cutoff,)
+            ).rowcount
+            daily_cost_deleted = connection.execute(
+                "DELETE FROM cost_daily WHERE day < ?", (daily_cutoff,)
+            ).rowcount
+        if vacuum:
+            with self._connect() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                connection.execute("VACUUM")
+        return {
+            "raw_events_pruned": len(old_events),
+            "daily_usage_deleted": max(0, int(daily_usage_deleted)),
+            "daily_cost_deleted": max(0, int(daily_cost_deleted)),
+            "vacuumed": bool(vacuum),
         }
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, factory=_ClosingSQLiteConnection)
+        connection = sqlite3.connect(
+            self.path,
+            timeout=30.0,
+            factory=_ClosingSQLiteConnection,
+        )
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     @staticmethod
@@ -270,6 +1066,9 @@ class UsageStore:
         }
         definitions = {
             "model_author": "TEXT NOT NULL DEFAULT ''",
+            "correlation_id": "TEXT NOT NULL DEFAULT ''",
+            "operation": "TEXT NOT NULL DEFAULT ''",
+            "user_tag": "TEXT NOT NULL DEFAULT ''",
             "pricing_id": "TEXT NOT NULL DEFAULT ''",
             "pricing_snapshot": "TEXT NOT NULL DEFAULT ''",
             "currency": "TEXT NOT NULL DEFAULT ''",
@@ -291,6 +1090,81 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc, traceback)
         finally:
             self.close()
+
+
+def _usage_filters(
+    *, since: str, client_id: str, operation: str, user_tag: str
+) -> tuple[str, tuple[Any, ...]]:
+    clauses = ["created_at >= ?"]
+    parameters: list[Any] = [since]
+    for name, value in (
+        ("client_id", client_id),
+        ("operation", operation),
+        ("user_tag", user_tag),
+    ):
+        if value:
+            clauses.append(f"{name} = ?")
+            parameters.append(value)
+    return " AND ".join(clauses), tuple(parameters)
+
+
+def _daily_filters(
+    *, since: str, client_id: str, operation: str, user_tag: str
+) -> tuple[str, tuple[Any, ...]]:
+    clauses = ["day >= ?"]
+    parameters: list[Any] = [since]
+    for name, value in (
+        ("client_id", client_id),
+        ("operation", operation),
+        ("user_tag", user_tag),
+    ):
+        if value:
+            clauses.append(f"{name} = ?")
+            parameters.append(value)
+    return " AND ".join(clauses), tuple(parameters)
+
+
+def _alias_where(where: str, alias: str) -> str:
+    result = where
+    for name in ("created_at", "client_id", "operation", "user_tag"):
+        result = re.sub(rf"\b{name}\b", f"{alias}.{name}", result)
+    return result
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _currency_bucket(
+    values: dict[str, dict[str, Any]], currency: str
+) -> dict[str, Any]:
+    return values.setdefault(
+        currency,
+        {
+            "known_attempts": 0,
+            "unknown_attempts": 0,
+            "estimated_cost": Decimal("0"),
+        },
+    )
+
+
+def _cost_bucket(
+    values: dict[tuple[str, ...], dict[str, Any]], key: tuple[str, ...]
+) -> dict[str, Any]:
+    return values.setdefault(
+        key,
+        {
+            "estimated_cost": Decimal("0"),
+            "known_attempts": 0,
+            "unknown_attempts": 0,
+            "not_sent_attempts": 0,
+        },
+    )
 
 
 def _parse_usage(raw: dict[str, Any] | None) -> dict[str, int | None]:
@@ -320,6 +1194,8 @@ def _parse_usage(raw: dict[str, Any] | None) -> dict[str, int | None]:
 def estimate_cost(
     usage: dict[str, int | None],
     pricing: PricingConfig | None,
+    *,
+    kind: Literal["chat", "embedding"] = "chat",
 ) -> tuple[Decimal | None, bool]:
     """Return an auditable estimate; missing usage/rates stay explicitly incomplete."""
 
@@ -353,6 +1229,9 @@ def estimate_cost(
             total += Decimal(input_tokens) * tier.input / unit
     else:
         complete = False
+
+    if kind == "embedding":
+        return total, complete
 
     if output_tokens is None:
         complete = False

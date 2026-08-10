@@ -94,7 +94,7 @@ modelgw stop --timeout 10 --force
 
 - `modelgw status`：本地后台进程和 `/health`；
 - `modelgw check`：上游 connection 与 deployment；
-- `GET /readyz`：服务能否读取有效配置；
+- `GET /readyz`：服务能否读取有效配置、使用已配置 route，并确认 config/secrets/usage 存储可写且高于软保留量；磁盘失败只返回 `disk_low` 或 `disk_unavailable`，不暴露路径和字节数；
 - `GET /v1/models`：经本地 client 鉴权后可用的业务 routes。
 
 ## 免费 discovery 检查
@@ -162,9 +162,13 @@ modelgw check \
 modelgw usage summary
 modelgw usage summary --days 7
 modelgw --json usage summary --days 30
+modelgw usage prune
+modelgw usage prune --vacuum
 ```
 
 汇总只读取元数据事件：实际 deployment/connection/model、状态、耗时、attempts、provider 返回的 usage 和调用时价格快照。数据库不保存请求或响应正文。
+
+原始事件默认保留 90 天并滚入按日汇总，日汇总保留 365 天。服务启动会执行轻量 prune；`usage prune` 可手工触发，`--vacuum` 还会在低峰期回收 SQLite 空闲页。rollup 使用 SQLite writer transaction，多进程同时触发也不会重复计数。
 
 缺失明确 usage、官方 pricing 或必要单价的成功调用会保留为费用不完整；CLI 不猜测 Token，也不把未知价格当成零。
 

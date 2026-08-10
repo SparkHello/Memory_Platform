@@ -1,6 +1,6 @@
 # 配置标准
 
-`config.json` 是网关的可审计标准文档。写入前会用 `GatewayConfig` 校验完整关系图，再原子替换并保留备份；服务热加载新配置失败时继续使用上一份有效快照，并在 `/health` 的 `reload_error` 中报告问题。
+`config.json` 是网关的可审计标准文档。当前新写入格式为 `schema_version=2`；v1 会在内存中兼容迁移，下一次受控写入才落为 v2。所有 CLI/Web 写入共用跨进程文件锁、revision CAS 和不含密钥值的崩溃恢复日志；渠道 bundle 先验证候选 key，再按 secret-first/config-last 提交。服务热加载新配置失败时继续使用上一份有效快照，并在 `/health` 的 `reload_error` 中报告问题。
 
 密钥不属于 `config.json`。配置只保存 `secret_ref`，实际值在权限为 `0600` 的 `secrets.env` 中，由 `modelgw secret` 管理。
 
@@ -27,13 +27,15 @@ modelgw --json schema
 | `service-state.json` | `modelgw start` 管理的后台进程身份 |
 | `model-gateway.log` | 后台进程日志 |
 
+`.control-plane.lock` 与 `.control-plane-journal.json` 是控制面内部文件；后者只在未完成事务中短暂存在。进程在 secret/config 任一替换阶段崩溃时，下次初始化会把两者一起恢复到提交前版本。
+
 使用全局 `--home DIR` 可以隔离另一套配置，例如测试环境；同一次操作的配置、状态、日志和用量都会落在该目录中。
 
 ## 五层对象与独立 pricing
 
 ### server
 
-本地监听设置，包括 `host`、`port` 和请求体上限。当前安全模式只允许 `127.0.0.1`、`localhost` 或 `::1`，不会直接绑定局域网地址。命令行的 `run/start --host/--port` 只覆盖本次启动，不改写配置文件。
+本地监听设置，包括 `host`、`port`、请求体上限和磁盘软/硬保留量。`disk_soft_reserve_bytes` / `disk_hard_reserve_bytes` 默认 64/16 MiB；小于 1 GiB 的测试或设备卷会按卷容量自动下调，单项设为 `0` 可关闭相应阈值。低于软阈值时 `/readyz` 返回安全的 `disk_low`；任何付费上游发送前都会确认 metadata-only ledger 写入后仍高于硬阈值，否则以 attempts=0 返回 507。持久化配置和后台 `start` 只允许 `127.0.0.1`、`localhost` 或 `::1`。双容器部署可让前台进程显式使用 `serve --host 0.0.0.0 --container-network`；这个例外不写入配置、不能换成其他非回环地址，也不应把 2030 端口发布到宿主机或公网。
 
 ### client
 
@@ -45,7 +47,7 @@ modelgw --json schema
 - `allowed_routes`：允许的 route glob；
 - `allow_direct_deployments`：是否允许请求 `deployment:<id>`，默认关闭。
 
-本地 client key 与任何上游 key 完全分离。推荐让 My_Memory 只拥有所需路由：
+本地 client key 与任何上游 key 完全分离：两类对象不能复用 `secret_ref` 或实际密钥值。新建/轮换的 client key 必须至少 32 字节，且只含 URL-safe 字符（字母、数字、`_`、`-`）；推荐使用 `secrets.token_urlsafe(32)` 生成，不要使用口令或供应商 API Key。推荐让 My_Memory 只拥有所需路由：
 
 ```bash
 modelgw client add memory-gateway \
@@ -56,6 +58,8 @@ modelgw client add memory-gateway \
 ```
 
 `--set-secret` 使用无回显输入。也可以先添加，再运行 `modelgw secret set memory-gateway`。
+
+schema v1 升级时，原有短 client key 会以显式 `allow_legacy_weak_secret=true` 兼容到完成轮换为止；`modelgw doctor` 只报告对应 client ID，不显示密钥。执行 `modelgw secret set CLIENT_ID` 写入合格新 token 后，会把兼容标记与密钥一起原子更新。schema v2 新 client 不使用隐式弱密钥回退。
 
 ### connection
 
@@ -68,9 +72,11 @@ modelgw client add memory-gateway \
 - `auth.type` 和 `auth.secret_ref`；
 - `billing_plan` 与 `usage_scope`；
 - `adapter`；
-- 允许透传的请求 Header 白名单、超时和 429 冷却时间。
+- 允许透传的请求 Header 白名单、`connect/read/write/pool` 四项超时、响应字节上限和 429 冷却时间。
 
-远程 Base URL 必须使用 HTTPS；HTTP 仅允许本机回环地址。代理不跟随上游 HTTP redirect，避免把凭据带到另一个 origin。
+远程 Base URL 必须使用 HTTPS；HTTP 默认仅允许本机回环地址。需要调用私有 IP 上游时，必须在 `allowed_private_networks` 写入最小 CIDR 后才允许该地址；RFC 2544 `198.18.0.0/15` 仅为显式沙箱/透明 egress 映射兼容，仍默认拒绝，通常只能配置实际解析地址的单个 `/32`。userinfo、query、fragment、异常端口、控制字符、dot segment、编码后的结构分隔符和危险鉴权/逐跳转发 Header 都会被拒绝。代理不继承环境 HTTP 代理，也不跟随上游 redirect，避免把凭据带到另一个 origin。v2 新 connection 的 connect/read/write/pool 默认分别为 10/120/60/10 秒，非流响应和流式累计响应上限默认 16 MiB；从 v1 迁移的显式旧超时与 64 MiB 上限保留原语义。discovery 另有 2 MiB、1,000 个模型和可打印模型 ID 上限。数据面会复用按超时配置分组的 `AsyncClient` 连接池，服务关闭时统一释放。
+
+运行时熔断按故障作用域处理：401/402/429 暂停整个 connection；结构化 `model_not_found` 只暂停对应 deployment；连续三次 5xx 才短暂暂停该 deployment。每次真正发送前都会重新检查，渠道密钥轮换成功后会立即清除该 connection 的旧熔断。
 
 套餐类型为 `payg`、`subscription`、`free_tier`、`token_plan`、`coding_plan` 或 `custom`。其中 `token_plan` 和 `coding_plan` 不能配置为 `backend_allowed`，CLI 默认把它们设为 `interactive_only`。这条限制同时存在于：
 
@@ -87,12 +93,27 @@ modelgw client add memory-gateway \
 - `upstream_model`、模型作者和家族；
 - `chat` 或 `embedding`；
 - streaming/tools/reasoning/multimodal/JSON 等能力；
+- 可选的 deployment 级 `adapter_profile`；
 - `reasoning_default`；
+- 推理开启时允许的 `tool_choice` 策略；
 - 可选请求变换；
 - embedding 向量空间和维度；
 - 可选 pricing 引用。
 
 能力字段是路由校验所用的声明，不会自动让 provider 获得该能力。填写前应以实际账号端点和官方文档为准。
+
+`adapter_profile` 默认为 `inherit`，继续使用 connection 的 adapter。当前唯一的显式
+deployment profile 是 `dashscope_deepseek_v4`，只接受 `deepseek-v4-flash*` 和
+`deepseek-v4-pro*`：它把通用 `thinking.type` 转成百炼 OpenAI-compatible 接口使用的
+`enable_thinking`，保留该系列合法的 `low` / `medium` / `high` / `xhigh` / `max`
+`reasoning_effort`，也不会删除工具请求的 `tool_choice`。该 profile 必须显式配置；网关
+不会仅凭模型名称猜测渠道协议。
+
+百炼托管的 Qwen connection 应显式使用 `adapter=dashscope_openai`。该 connection
+adapter 把 Memory Gateway 的通用 `reasoning_effort=none|high` 转换为顶层
+`enable_thinking=false|true`，并移除 Qwen 接口不使用的通用 effort 字段。百炼托管
+DeepSeek V4 仍须在 deployment 上额外声明 `dashscope_deepseek_v4`，以保留该系列
+官方支持的 effort 等级；deployment profile 优先于 connection adapter。
 
 `reasoning_default` 有三个值：
 
@@ -102,9 +123,13 @@ modelgw client add memory-gateway \
 
 客户端显式 `thinking.type` 优先，其次是显式 `reasoning_effort`，最后才使用 `reasoning_default`。`generic` adapter 不解释这些字段，因而也不会根据 `reasoning_default` 猜测 provider 参数。
 
+`tool_choice_with_reasoning` 在 provider 请求发出前校验推理与工具选择的组合，默认 `auto_only`：允许省略、`none` 或 `auto`，拒绝 `required` 和具体函数对象。`any` 明确允许全部选择；`none` 只允许省略或显式 `none`，连 `auto` 也拒绝。客户端显式关闭推理时不应用该限制。这个策略用于表达实际账号/模型端点的协议能力；adapter 不会为了让请求“看起来成功”而静默删除或改写 `tool_choice`。
+
 请求变换按 `remove`、`set_if_missing`、`force` 声明，并在 adapter 之后执行；它可用于某个账号或模型版本的已知差异，但不能触碰核心字段 `model`、`messages` 或 `input`。
 
-Embedding deployment 必须声明 `embedding_space` 和 `dimensions`。同一 embedding route 的所有 targets 必须两者完全一致；配置校验会阻止跨向量空间 fallback。客户端若显式发送 `dimensions`，它必须与 route 声明完全相同，否则请求会在到达上游前被拒绝；deployment transform 也不能强制改成另一维度。
+Embedding deployment 最终必须具有 `embedding_space` 和 `dimensions`。普通 quickstart、终端菜单、CLI deployment add 和管理 bundle 只需给出精确上游模型 ID 与维度；未显式覆盖时，网关按规范化渠道运营方、URL origin、精确模型 ID 和维度生成稳定、可打印且不跨渠道碰撞的空间 ID。`embedding_space` 显式值保留给确认过向量兼容性的专家迁移场景。
+
+同一 embedding route 的所有 targets 必须让 `embedding_space` 和 `dimensions` 完全一致；配置校验会阻止跨向量空间 fallback。无论客户端是否携带或试图篡改 `dimensions`，代理发送上游前都会强制使用 deployment 声明值。成功非流响应只有在每一条 vector 长度都通过验证后才会返回空间归因 Header；任一长度不符会返回安全的 502，不把错误向量交给调用方。
 
 ### route
 
@@ -113,12 +138,25 @@ Embedding deployment 必须声明 `embedding_space` 和 `dimensions`。同一 em
 ```bash
 modelgw route set memory.chat chat-primary chat-secondary chat-tertiary \
   --kind chat \
+  --fallback-scope any_channel \
   --max-attempts 3
 ```
 
-targets 从左到右尝试。可用多个 `--require` 要求所有 deployment 声明相应能力，例如 `tools`、`reasoning` 或 `json_schema`。Model Gateway 使用明确 deployment ID，不把 `M`、`K`、`D` 解释成供应商缩写。
+targets 从左到右排列，但 v2 新 route 的 `fallback_scope` 默认是 `none`，只使用第一目标；这避免用户仅因填写了多个模型就意外跨渠道计费。显式选择 `same_channel` 才在同一渠道内兜底，选择 `any_channel` 才允许跨渠道；v1 多目标 route 会迁移成 `any_channel` 以保持既有行为。可用多个 `--require` 要求所有 deployment 声明相应能力，例如 `tools`、`reasoning` 或 `json_schema`。Model Gateway 使用明确 deployment ID，不把 `M`、`K`、`D` 解释成供应商缩写。
 
 普通 fallback 只处理 provider/连接层失败；流式响应只能在首个上游成功流返回首字节之前切换。一旦开始向客户端发送 SSE，后续中断不会拼接另一 deployment 的输出。
+
+每个请求还会从 `stream`、`tools`、`parallel_tool_calls`、多模态消息、推理控制和
+`response_format` 推导运行时能力要求，并在 route targets 中只保留声明满足要求的
+deployment。没有任何目标能满足时返回稳定的
+`422 model_gateway_capability_unavailable`，不会把明显不兼容的请求先发给上游。
+
+自动 fallback 只把连接建立失败视为“请求确定尚未发出”。读超时、写超时、已收到
+成功响应头但首个流字节前中断等情况可能已经产生计费，因此返回
+`502 model_gateway_ambiguous_upstream_error`，不自动向下一 deployment 重发。HTTP 只对明确
+的 408、429 和 5xx 自动 fallback；401/402、redirect、404 及结构化 model-not-found 仅更新
+对应 breaker 并原样返回，绝不把同一正文静默重发给另一目标。HTTP 400 正文也不再按自由
+文本猜测“模型不存在”。
 
 ### pricing
 
@@ -133,6 +171,8 @@ pricing 是与 deployment 绑定的独立审计记录，而不是模型作者的
 - 需要时用多个 `--tier` 表达按输入 Token 上限递增的分档。
 
 不要从相似模型、搜索摘要或第三方聚合站复制价格。文档不提供任何“当前价格”示例；请先从实际 deployment 的官方价格页核对，再按 `modelgw pricing set --help` 录入。
+
+`source_url` 必须是用户人工确认过的官方 HTTPS 地址，且不能包含 userinfo、query、fragment、外围空白、控制字符或异常端口；网关不维护“官方域名白名单”，页面归属仍由用户确认。这样可避免把 URL 中的 token 扩散到价格快照、usage 或备份。
 
 缺少官方价格、上游 usage 或某类必要单价时，费用保持不完整，不显示成免费。每次成功调用保存当时的 pricing 快照；以后改价不会重写历史金额。
 
@@ -176,10 +216,14 @@ adapter 是少量、显式的 OpenAI-compatible 参数兼容规则，不是完�
 | --- | --- |
 | `generic` | 不解释推理参数；保留客户端字段，仅应用通用 model/auth 与 deployment transform |
 | `kimi` | 在已支持的 Kimi 模型上转换 thinking/reasoning 控制，并处理工具轮次需要的推理字段 |
-| `deepseek` | 转换 thinking/reasoning effort；在已知不兼容的“推理 + tools”组合中调整 `tool_choice` |
+| `deepseek` | 转换 thinking/reasoning effort；不删除或改写 `tool_choice` |
 | `mimo` | 转换 thinking 控制，并补足工具历史需要的 `reasoning_content` 形状 |
 
 命名 adapter 只处理代码中已经明确实现的规则。模型 ID、provider 行为或官方协议改变后，应先更新契约测试，不能依名称猜测。
+
+Kimi adapter 会区分官方开放平台模型与 Kimi Code 套餐模型：`k3` / `k3-256k` 使用
+原生 `reasoning_effort`（Code 端点默认 `high`），`kimi-for-coding*` 按 K2.7 Code 的
+thinking 形状处理。不要把这些套餐模型开放给 backend client。
 
 示例只展示结构，不代表任何真实模型当前可用：
 
@@ -196,6 +240,19 @@ modelgw deployment add chat-primary \
   --capability reasoning \
   --capability tools \
   --reasoning-default enabled
+```
+
+百炼托管 DeepSeek V4 的显式 profile 示例：
+
+```bash
+modelgw deployment add deepseek-v4-flash \
+  --connection dashscope-payg \
+  --model deepseek-v4-flash \
+  --author deepseek \
+  --adapter-profile dashscope_deepseek_v4 \
+  --tool-choice-with-reasoning auto_only \
+  --capability reasoning \
+  --capability tools
 ```
 
 ## My_Memory 推荐路由
@@ -226,12 +283,15 @@ modelgw route set knowledge.pro knowledge-pro-primary
 modelgw route set memory.embedding embedding-primary --kind embedding
 ```
 
+上述含两个 targets 的命令在 v2 默认只启用第一项；确实需要自动兜底时，请逐条显式追加 `--fallback-scope same_channel` 或 `--fallback-scope any_channel`，不要让示例替你决定是否跨渠道计费。
+
 这只是推荐的功能边界，不指定供应商，也不声称任何模型适合某项工作。路由顺序、能力要求和价格必须以你的实际 deployments 为准。
 
 对于 `memory.embedding`：
 
 - 所有 fallback deployment 必须使用同一 `embedding_space` 和 `dimensions`；
 - 请求中的 `dimensions` 若存在，必须与 route 声明完全一致；
+- 网关无条件把 deployment 的 `dimensions` 写入上游请求，并验证返回的每一条向量；
 - 响应 Header 会返回实际 `X-Model-Gateway-Embedding-Space` 和 `X-Model-Gateway-Embedding-Dimensions`；
 - My_Memory 应把实际向量空间身份与缓存/数据库记录绑定，不能按 route 首项猜测。
 

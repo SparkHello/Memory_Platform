@@ -3,11 +3,19 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
+import json
 from typing import Any, Literal, Mapping
 
 import httpx
 
 from model_gateway.adapters import apply_connection_adapter
+from model_gateway.auth import provider_secret_header_value
+from model_gateway.http_safety import (
+    MAX_DISCOVERY_RESPONSE_BYTES,
+    bounded_model_ids,
+    require_safe_destination,
+    upstream_url,
+)
 from model_gateway.models import (
     RESTRICTED_PLAN_TYPES,
     ConnectionConfig,
@@ -21,6 +29,10 @@ HealthLevel = Literal["ok", "warning", "error", "skipped"]
 
 class HealthCheckError(ValueError):
     """Raised when a requested health-check target does not exist."""
+
+
+class HealthResponseTooLarge(ValueError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,12 +278,34 @@ async def _check_discovery(
         )
 
     try:
-        async with _client(connection, timeout_seconds, transport) as client:
-            response = await client.get(
-                f"{connection.base_url}{connection.models_endpoint}",
-                headers=_auth_headers(connection, secret),
+        url = upstream_url(
+            connection.base_url,
+            connection.models_endpoint,
+            allowed_private_networks=connection.allowed_private_networks,
+        )
+        if transport is None:
+            await require_safe_destination(
+                url,
+                allowed_private_networks=connection.allowed_private_networks,
             )
-    except httpx.HTTPError:
+        async with _client(connection, timeout_seconds, transport) as client:
+            async with client.stream(
+                "GET",
+                url,
+                headers=_auth_headers(connection, secret),
+            ) as response:
+                content = (
+                    await _bounded_response(
+                        response,
+                        min(
+                            connection.response_limit_bytes,
+                            MAX_DISCOVERY_RESPONSE_BYTES,
+                        ),
+                    )
+                    if response.is_success
+                    else b""
+                )
+    except (httpx.HTTPError, OSError):
         return _uniform_result(
             connection_id,
             connection,
@@ -279,6 +313,15 @@ async def _check_discovery(
             status="network_error",
             level="error",
             detail="无法连接 provider 的 models endpoint",
+        )
+    except (HealthResponseTooLarge, ValueError):
+        return _uniform_result(
+            connection_id,
+            connection,
+            deployments,
+            status="invalid_response",
+            level="error",
+            detail="provider 的 models 响应超过安全上限或 URL 无效",
         )
 
     if not response.is_success:
@@ -293,7 +336,7 @@ async def _check_discovery(
             http_status=response.status_code,
         )
 
-    model_ids, parseable = _extract_model_ids(response)
+    model_ids, parseable = _extract_model_ids(content)
     if not parseable:
         return _uniform_result(
             connection_id,
@@ -385,6 +428,7 @@ async def _check_live(
                     deployment_id=deployment_id,
                     deployment=deployment,
                     secret=secret,
+                    validate_destination=transport is None,
                 )
                 for deployment_id, deployment in enabled
             ]
@@ -419,6 +463,7 @@ async def _check_live_deployment(
     deployment_id: str,
     deployment: DeploymentConfig,
     secret: str,
+    validate_destination: bool,
 ) -> DeploymentHealth:
     endpoint = (
         connection.chat_endpoint
@@ -438,19 +483,48 @@ async def _check_live_deployment(
         payload.setdefault(name, deepcopy(value))
     for name, value in transform.force.items():
         payload[name] = deepcopy(value)
+    if deployment.kind == "embedding":
+        payload["dimensions"] = deployment.dimensions
     try:
-        response = await client.post(
-            f"{connection.base_url}{endpoint}",
+        url = upstream_url(
+            connection.base_url,
+            endpoint,
+            allowed_private_networks=connection.allowed_private_networks,
+        )
+        if validate_destination:
+            await require_safe_destination(
+                url,
+                allowed_private_networks=connection.allowed_private_networks,
+            )
+        async with client.stream(
+            "POST",
+            url,
             headers=_auth_headers(connection, secret),
             json=payload,
-        )
-    except httpx.HTTPError:
+        ) as response:
+            content = (
+                await _bounded_response(
+                    response,
+                    connection.response_limit_bytes,
+                )
+                if response.is_success
+                else b""
+            )
+    except (httpx.HTTPError, OSError):
         return _deployment_result(
             deployment_id,
             deployment,
             status="network_error",
             level="error",
             detail="最小真实请求无法连接 provider",
+        )
+    except (HealthResponseTooLarge, ValueError):
+        return _deployment_result(
+            deployment_id,
+            deployment,
+            status="invalid_response",
+            level="error",
+            detail="真实请求响应超过安全上限或 URL 无效",
         )
 
     if not response.is_success:
@@ -465,7 +539,7 @@ async def _check_live_deployment(
         )
 
     if deployment.kind == "chat":
-        if not _is_chat_completion_response(response):
+        if not _is_chat_completion_response(content):
             return _deployment_result(
                 deployment_id,
                 deployment,
@@ -475,8 +549,8 @@ async def _check_live_deployment(
                 http_status=response.status_code,
             )
     else:
-        dimension = _extract_embedding_dimension(response)
-        if dimension is None:
+        dimensions = _extract_embedding_dimensions(content)
+        if dimensions is None:
             return _deployment_result(
                 deployment_id,
                 deployment,
@@ -485,14 +559,14 @@ async def _check_live_deployment(
                 detail="真实请求成功，但响应中没有可验证的 embedding 向量",
                 http_status=response.status_code,
             )
-        if dimension != deployment.dimensions:
+        if any(dimension != deployment.dimensions for dimension in dimensions):
             return _deployment_result(
                 deployment_id,
                 deployment,
                 status="dimension_mismatch",
                 level="error",
                 detail=(
-                    f"真实请求返回 {dimension} 维向量，与配置的 "
+                    f"真实请求含非 {deployment.dimensions} 维向量，与配置的 "
                     f"{deployment.dimensions} 维不一致"
                 ),
                 http_status=response.status_code,
@@ -519,6 +593,7 @@ def _minimal_payload(deployment: DeploymentConfig) -> dict[str, Any]:
         payload = {
             "model": deployment.upstream_model,
             "input": ["ping"],
+            "dimensions": deployment.dimensions,
         }
     return payload
 
@@ -528,11 +603,20 @@ def _client(
     timeout_seconds: float,
     transport: httpx.AsyncBaseTransport | None,
 ) -> httpx.AsyncClient:
-    timeout = min(timeout_seconds, connection.timeout_seconds)
+    connect_timeout = min(timeout_seconds, connection.connect_timeout_seconds)
+    read_timeout = min(timeout_seconds, connection.read_timeout_seconds)
+    write_timeout = min(timeout_seconds, connection.write_timeout_seconds)
+    pool_timeout = min(timeout_seconds, connection.pool_timeout_seconds)
     arguments: dict[str, Any] = {
         # A health probe must not carry an upstream credential to another host.
         "follow_redirects": False,
-        "timeout": httpx.Timeout(timeout),
+        "trust_env": False,
+        "timeout": httpx.Timeout(
+            connect=connect_timeout,
+            read=read_timeout,
+            write=write_timeout,
+            pool=pool_timeout,
+        ),
     }
     if transport is not None:
         arguments["transport"] = transport
@@ -540,6 +624,7 @@ def _client(
 
 
 def _auth_headers(connection: ConnectionConfig, secret: str) -> dict[str, str]:
+    provider_secret_header_value(secret)
     headers = {"Accept": "application/json"}
     if connection.auth.type == "bearer":
         headers["Authorization"] = f"Bearer {secret}"
@@ -548,9 +633,9 @@ def _auth_headers(connection: ConnectionConfig, secret: str) -> dict[str, str]:
     return headers
 
 
-def _extract_model_ids(response: httpx.Response) -> tuple[set[str], bool]:
+def _extract_model_ids(content: bytes) -> tuple[set[str], bool]:
     try:
-        payload = response.json()
+        payload = json.loads(content)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return set(), False
 
@@ -564,39 +649,47 @@ def _extract_model_ids(response: httpx.Response) -> tuple[set[str], bool]:
     else:
         return set(), False
 
-    model_ids: set[str] = set()
-    for item in candidates:
-        if isinstance(item, str) and item.strip():
-            model_ids.add(item.strip())
-            continue
-        if not isinstance(item, dict):
-            continue
-        value = item.get("id") or item.get("model") or item.get("name")
-        if isinstance(value, str) and value.strip():
-            model_ids.add(value.strip())
-    return model_ids, True
-
-
-def _extract_embedding_dimension(response: httpx.Response) -> int | None:
     try:
-        payload = response.json()
+        return bounded_model_ids(candidates), True
+    except ValueError:
+        return set(), False
+
+
+def _extract_embedding_dimensions(content: bytes) -> list[int] | None:
+    try:
+        payload = json.loads(content)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return None
     data = payload["data"]
-    if not data or not isinstance(data[0], dict):
+    if not data:
         return None
-    embedding = data[0].get("embedding")
-    return len(embedding) if isinstance(embedding, list) else None
+    dimensions: list[int] = []
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+            return None
+        dimensions.append(len(item["embedding"]))
+    return dimensions
 
 
-def _is_chat_completion_response(response: httpx.Response) -> bool:
+def _is_chat_completion_response(content: bytes) -> bool:
     try:
-        payload = response.json()
+        payload = json.loads(content)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
     return isinstance(payload, dict) and isinstance(payload.get("choices"), list)
+
+
+async def _bounded_response(response: httpx.Response, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > limit:
+            raise HealthResponseTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _http_failure(
