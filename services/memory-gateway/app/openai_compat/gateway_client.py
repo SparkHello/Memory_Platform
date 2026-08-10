@@ -11,7 +11,16 @@ from fastapi import HTTPException, status
 import httpx
 
 from app.config import Settings
+from app.llm.model_gateway import (
+    MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER,
+    ModelGatewayProtocolError,
+    parse_model_gateway_metadata,
+    validate_model_gateway_metadata,
+)
 from app.llm.protocol import apply_reasoning_compatibility, should_fail_over
+from app.llm.runtime import resolve_model_runtime
 from app.llm.routing import (
     GLOBAL_PROVIDER_COOLDOWNS,
     LLMProvider,
@@ -19,6 +28,7 @@ from app.llm.routing import (
     retry_after_seconds,
 )
 from app.providers.catalog import providers_for_route
+from app.usage.attribution import model_gateway_usage_headers
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +44,22 @@ _PASSTHROUGH_RESPONSE_HEADERS = {
     "openai-processing-ms",
     "openai-version",
 }
+_MODEL_GATEWAY_RESPONSE_HEADERS = {
+    "x-model-gateway-route",
+    "x-model-gateway-deployment",
+    "x-model-gateway-connection",
+    "x-model-gateway-channel-operator",
+    "x-model-gateway-model-author",
+    "x-model-gateway-vendor",
+    "x-model-gateway-upstream-model",
+    "x-model-gateway-attempts",
+    "x-model-gateway-pricing",
+    "x-model-gateway-embedding-space",
+    "x-model-gateway-embedding-dimensions",
+    "x-model-gateway-usage-event-id",
+    "x-model-gateway-correlation-id",
+    "x-model-gateway-usage-ledger-status",
+}
 
 
 def is_auto_model_id(model: str) -> bool:
@@ -46,6 +72,20 @@ class GatewayHTTPResult:
     status_code: int
     headers: dict[str, str]
     provider: Any
+
+
+@dataclass(frozen=True, slots=True)
+class CentralGatewayProvider:
+    """Validated central attribution exposed to chat finalization and usage."""
+
+    code: str
+    base_url: str
+    model: str
+    deployment_id: str
+    connection_id: str
+    vendor: str
+    model_author: str
+    route: str
 
 
 class GatewayUpstreamHTTPError(RuntimeError):
@@ -75,11 +115,15 @@ class GatewayUpstreamStream:
         client: httpx.AsyncClient,
         response: httpx.Response,
         provider: Any,
+        include_model_gateway_headers: bool = False,
     ) -> None:
         self.client = client
         self.response = response
         self.provider = provider
-        self.headers = passthrough_response_headers(response)
+        self.headers = passthrough_response_headers(
+            response,
+            include_model_gateway=include_model_gateway_headers,
+        )
         self._closed = False
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
@@ -112,11 +156,16 @@ class OpenAIChatGatewayClient:
         wall_clock: Any = time.time,
     ) -> None:
         self.settings = settings
+        self.runtime = resolve_model_runtime(settings)
         self.transport = transport
         self.cooldowns = cooldowns or GLOBAL_PROVIDER_COOLDOWNS
         self._wall_clock = wall_clock
 
     def list_models(self) -> list[str]:
+        runtime = self.runtime
+        if runtime.is_central:
+            route = runtime.route_for("chat")
+            return [AUTO_MODEL_ID, route]
         ordered = providers_for_route(self.settings, "chat")
         if not ordered:
             return []
@@ -129,6 +178,12 @@ class OpenAIChatGatewayClient:
         *,
         preferred_provider_code: str | None = None,
     ) -> GatewayHTTPResult:
+        runtime = self.runtime
+        if runtime.is_central:
+            return await self._complete_via_model_gateway(
+                payload,
+                preferred_deployment=preferred_provider_code,
+            )
         providers = self._providers_for_model(
             str(payload.get("model") or ""),
             preferred_provider_code=preferred_provider_code,
@@ -169,9 +224,18 @@ class OpenAIChatGatewayClient:
             except GatewayUpstreamHTTPError:
                 raise
             except httpx.HTTPError as exc:
+                if not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    raise HTTPException(
+                        status_code=(
+                            status.HTTP_504_GATEWAY_TIMEOUT
+                            if isinstance(exc, httpx.TimeoutException)
+                            else status.HTTP_502_BAD_GATEWAY
+                        ),
+                        detail="聊天网关上游请求失败；为避免重复计费，未自动重发",
+                    ) from exc
                 last_network_error = exc
                 logger.warning(
-                    "聊天网关上游网络失败，尝试下一 provider。provider=%s error=%s",
+                    "聊天网关上游建连失败，尝试下一 provider。provider=%s error=%s",
                     provider.code,
                     type(exc).__name__,
                 )
@@ -192,6 +256,12 @@ class OpenAIChatGatewayClient:
         *,
         preferred_provider_code: str | None = None,
     ) -> GatewayUpstreamStream:
+        runtime = self.runtime
+        if runtime.is_central:
+            return await self._open_model_gateway_stream(
+                payload,
+                preferred_deployment=preferred_provider_code,
+            )
         providers = self._providers_for_model(
             str(payload.get("model") or ""),
             preferred_provider_code=preferred_provider_code,
@@ -219,9 +289,18 @@ class OpenAIChatGatewayClient:
                 await client.aclose()
                 if not isinstance(exc, httpx.HTTPError):
                     raise
+                if not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    raise HTTPException(
+                        status_code=(
+                            status.HTTP_504_GATEWAY_TIMEOUT
+                            if isinstance(exc, httpx.TimeoutException)
+                            else status.HTTP_502_BAD_GATEWAY
+                        ),
+                        detail="聊天网关流式上游请求失败；为避免重复计费，未自动重发",
+                    ) from exc
                 last_network_error = exc
                 logger.warning(
-                    "聊天网关流式上游连接失败，尝试下一 provider。provider=%s error=%s",
+                    "聊天网关流式上游建连失败，尝试下一 provider。provider=%s error=%s",
                     provider.code,
                     type(exc).__name__,
                 )
@@ -236,7 +315,7 @@ class OpenAIChatGatewayClient:
                         await response.aclose()
                     finally:
                         await client.aclose()
-                    last_http_error = GatewayUpstreamHTTPError(
+                    raise GatewayUpstreamHTTPError(
                         status_code=status.HTTP_502_BAD_GATEWAY,
                         content=openai_error_payload(
                             message=(
@@ -249,7 +328,6 @@ class OpenAIChatGatewayClient:
                             "content-type": "application/json; charset=utf-8"
                         },
                     )
-                    continue
                 return GatewayUpstreamStream(
                     client=client,
                     response=response,
@@ -259,14 +337,14 @@ class OpenAIChatGatewayClient:
             try:
                 content = await response.aread()
             except httpx.HTTPError as exc:
-                last_network_error = exc
-                logger.warning(
-                    "聊天网关读取上游流式错误体失败，尝试下一 provider。"
-                    "provider=%s error=%s",
-                    provider.code,
-                    type(exc).__name__,
-                )
-                continue
+                raise HTTPException(
+                    status_code=(
+                        status.HTTP_504_GATEWAY_TIMEOUT
+                        if isinstance(exc, httpx.TimeoutException)
+                        else status.HTTP_502_BAD_GATEWAY
+                    ),
+                    detail="聊天网关读取上游错误失败；为避免重复计费，未自动重发",
+                ) from exc
             finally:
                 await response.aclose()
                 await client.aclose()
@@ -289,6 +367,218 @@ class OpenAIChatGatewayClient:
                 "聊天网关连接流式上游失败"
                 + (f"：{last_network_error}" if last_network_error else "")
             ),
+        )
+
+    async def _complete_via_model_gateway(
+        self,
+        payload: dict[str, Any],
+        *,
+        preferred_deployment: str | None,
+    ) -> GatewayHTTPResult:
+        route = self._central_chat_route(payload)
+        forwarded = self._central_payload(payload, route=route, stream=False)
+        affinity = (preferred_deployment or "").strip()
+        response = await self._post_central(forwarded, affinity=affinity)
+        if not response.is_success:
+            raise GatewayUpstreamHTTPError(
+                status_code=response.status_code,
+                content=response.content,
+                headers=passthrough_response_headers(
+                    response,
+                    include_model_gateway=True,
+                ),
+            )
+        provider = self._central_provider(
+            response,
+            expected_route=route,
+            expected_deployment=affinity,
+        )
+        return GatewayHTTPResult(
+            content=response.content,
+            status_code=response.status_code,
+            headers=passthrough_response_headers(
+                response,
+                include_model_gateway=True,
+            ),
+            provider=provider,
+        )
+
+    async def _open_model_gateway_stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        preferred_deployment: str | None,
+    ) -> GatewayUpstreamStream:
+        route = self._central_chat_route(payload)
+        forwarded = self._central_payload(payload, route=route, stream=True)
+        affinity = (preferred_deployment or "").strip()
+
+        client = self._new_client(stream=True)
+        try:
+            request = client.build_request(
+                "POST",
+                self._central_chat_url(),
+                json=forwarded,
+                headers=self._central_headers(affinity=affinity),
+            )
+            response = await client.send(request, stream=True)
+        except BaseException as exc:
+            await client.aclose()
+            if not isinstance(exc, httpx.HTTPError):
+                raise
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="调用中央模型网关失败",
+            ) from exc
+
+        if response.is_success:
+            content_type = response.headers.get("Content-Type", "").lower()
+            if content_type and not content_type.startswith(
+                ("text/event-stream", "text/plain")
+            ):
+                await response.aclose()
+                await client.aclose()
+                raise GatewayUpstreamHTTPError(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    content=openai_error_payload(
+                        message=(
+                            "中央模型网关在 stream=true 时没有返回 SSE；"
+                            f"收到 Content-Type {content_type}"
+                        ),
+                        code="upstream_stream_protocol_error",
+                    ),
+                    headers={"content-type": "application/json; charset=utf-8"},
+                )
+            try:
+                provider = self._central_provider(
+                    response,
+                    expected_route=route,
+                    expected_deployment=affinity,
+                )
+            except GatewayUpstreamHTTPError:
+                await response.aclose()
+                await client.aclose()
+                raise
+            return GatewayUpstreamStream(
+                client=client,
+                response=response,
+                provider=provider,
+                include_model_gateway_headers=True,
+            )
+
+        try:
+            content = await response.aread()
+        finally:
+            await response.aclose()
+            await client.aclose()
+        raise GatewayUpstreamHTTPError(
+            status_code=response.status_code,
+            content=content,
+            headers=passthrough_response_headers(
+                response,
+                include_model_gateway=True,
+            ),
+        )
+
+    async def _post_central(
+        self,
+        payload: dict[str, Any],
+        *,
+        affinity: str,
+    ) -> httpx.Response:
+        try:
+            async with self._new_client() as client:
+                return await client.post(
+                    self._central_chat_url(),
+                    json=payload,
+                    headers=self._central_headers(affinity=affinity),
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="调用中央模型网关失败",
+            ) from exc
+
+    def _central_chat_route(self, payload: dict[str, Any]) -> str:
+        runtime = self.runtime
+        route = runtime.route_for("chat")
+        requested = str(payload.get("model") or "").strip()
+        if not requested:
+            raise HTTPException(status_code=422, detail="model 不能为空")
+        if requested not in {AUTO_MODEL_ID, route}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"聊天网关未配置模型：{requested}",
+            )
+        return route
+
+    @staticmethod
+    def _central_payload(
+        payload: dict[str, Any],
+        *,
+        route: str,
+        stream: bool,
+    ) -> dict[str, Any]:
+        forwarded = deepcopy(payload)
+        forwarded.pop("conversation_id", None)
+        forwarded["model"] = route
+        forwarded["stream"] = stream
+        return forwarded
+
+    def _central_chat_url(self) -> str:
+        runtime = self.runtime
+        return f"{runtime.base_url}/chat/completions"
+
+    def _central_headers(self, *, affinity: str) -> dict[str, str]:
+        runtime = self.runtime
+        headers = {
+            "Authorization": f"Bearer {runtime.api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json, text/event-stream",
+            **model_gateway_usage_headers(
+                signing_secret=self.settings.gateway_signing_secret,
+                operation="chat_completion",
+            ),
+        }
+        if affinity:
+            headers[MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER] = affinity
+            headers[MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER] = affinity
+            headers[MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER] = affinity
+        return headers
+
+    def _central_provider(
+        self,
+        response: httpx.Response,
+        *,
+        expected_route: str,
+        expected_deployment: str,
+    ) -> CentralGatewayProvider:
+        metadata = parse_model_gateway_metadata(response.headers)
+        try:
+            validate_model_gateway_metadata(
+                metadata,
+                expected_route=expected_route,
+                expected_deployment=expected_deployment,
+            )
+        except ModelGatewayProtocolError as exc:
+            raise GatewayUpstreamHTTPError(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content=openai_error_payload(
+                    message=str(exc),
+                    code="model_gateway_protocol_error",
+                ),
+                headers={"content-type": "application/json; charset=utf-8"},
+            ) from exc
+        runtime = self.runtime
+        return CentralGatewayProvider(
+            code="",
+            base_url=runtime.base_url,
+            model=metadata.upstream_model,
+            deployment_id=metadata.deployment_id,
+            connection_id=metadata.connection_id,
+            vendor=metadata.channel_operator,
+            model_author=metadata.model_author,
+            route=metadata.route,
         )
 
     def _providers_for_model(
@@ -405,6 +695,9 @@ class OpenAIChatGatewayClient:
             # Never replay a bearer credential to a redirect target. Provider
             # and central-gateway base URLs must already be canonical.
             "follow_redirects": False,
+            # Bearer credentials must never be handed to an ambient
+            # HTTP(S)_PROXY inherited by the service process.
+            "trust_env": False,
         }
         if self.transport is not None:
             kwargs["transport"] = self.transport
@@ -441,11 +734,18 @@ class OpenAIChatGatewayClient:
         self.cooldowns.defer(provider, seconds)
 
 
-def passthrough_response_headers(response: httpx.Response) -> dict[str, str]:
+def passthrough_response_headers(
+    response: httpx.Response,
+    *,
+    include_model_gateway: bool = False,
+) -> dict[str, str]:
+    allowed = set(_PASSTHROUGH_RESPONSE_HEADERS)
+    if include_model_gateway:
+        allowed.update(_MODEL_GATEWAY_RESPONSE_HEADERS)
     return {
         name: value
         for name, value in response.headers.items()
-        if name.lower() in _PASSTHROUGH_RESPONSE_HEADERS
+        if name.lower() in allowed
     }
 
 

@@ -50,7 +50,10 @@ def check_model_catalog(
     results: list[ModelProbeResult] = []
     client_kwargs: dict[str, Any] = {
         "timeout": timeout_seconds,
-        "follow_redirects": True,
+        # Provider credentials must never be inherited by a workstation proxy
+        # or replayed to a redirect target during discovery/live checks.
+        "follow_redirects": False,
+        "trust_env": False,
     }
     if transport is not None:
         client_kwargs["transport"] = transport

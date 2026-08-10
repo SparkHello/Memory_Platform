@@ -14,6 +14,7 @@ from app.memory.search import (
     embedding_space_id_for,
 )
 from app.usage.context import model_usage_scope
+from app.disk_capacity import DiskCapacityError, is_storage_exhausted
 
 
 class KnowledgeEmbeddingIndexer:
@@ -143,6 +144,23 @@ class KnowledgeEmbeddingIndexer:
                 )
             )
         except Exception as exc:
+            if is_storage_exhausted(exc):
+                try:
+                    await anyio.to_thread.run_sync(
+                        partial(
+                            self.store.set_version_embedding_status,
+                            user_id=user_id,
+                            version_ref=version_ref,
+                            status="failed",
+                            model=model,
+                            embedding_space_id=embedding_space_id,
+                            error="insufficient storage",
+                        )
+                    )
+                except Exception as status_exc:
+                    if not is_storage_exhausted(status_exc):
+                        raise
+                raise DiskCapacityError("knowledge index storage exhausted") from exc
             await anyio.to_thread.run_sync(
                 partial(
                     self.store.set_version_embedding_status,

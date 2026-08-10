@@ -10,8 +10,8 @@ Model Gateway control endpoint when it is loopback or HTTPS.
 from __future__ import annotations
 
 import os
-from ipaddress import ip_address
-from typing import Annotated, Any
+from ipaddress import ip_address, ip_network
+from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Header
@@ -20,6 +20,11 @@ import httpx
 
 from app.api.deps import get_settings, require_api_key
 from app.config import Settings
+from app.llm.runtime import (
+    ModelRuntime,
+    ModelRuntimeConfigurationError,
+    resolve_model_runtime,
+)
 from app.providers.catalog import (
     ROUTE_NAMES,
     ProviderConfigError,
@@ -59,16 +64,28 @@ REQUIRED_CHAT_ROUTES: tuple[str, ...] = (
     "knowledge.pro",
 )
 
+_PRIVATE_MODEL_GATEWAY_NETWORKS = (
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("fc00::/7"),
+)
+
 
 @router.get("/status")
 async def providers_status(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
-    payload = (
-        await _model_gateway_status(settings)
-        if settings.model_gateway_enabled
-        else _direct_provider_status(settings)
-    )
+    try:
+        model_runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError as exc:
+        payload = _invalid_runtime_status(str(exc))
+    else:
+        payload = (
+            await _model_gateway_status(settings, model_runtime)
+            if model_runtime.is_central
+            else _direct_provider_status(settings, model_runtime)
+        )
     return {**payload, "setup": _setup_summary(payload)}
 
 
@@ -90,6 +107,137 @@ async def check_provider_admin_key(
     if response.status_code < 300:
         return JSONResponse({"valid": True})
     return response
+
+
+@router.get("/admin/configuration")
+async def provider_admin_configuration(
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    """Return the full redacted graph only after an explicit admin unlock."""
+
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="GET",
+        path="/admin/configuration",
+        payload=None,
+    )
+
+
+@router.post("/channels/discover")
+async def discover_provider_channel(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/channels/discover",
+        payload=payload,
+    )
+
+
+@router.post("/channel-bundles/validate")
+async def validate_provider_channel_bundle(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/channel-bundles/validate",
+        payload=payload,
+    )
+
+
+@router.post("/channel-bundles/apply")
+async def apply_provider_channel_bundle(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/channel-bundles/apply",
+        payload=payload,
+    )
+
+
+@router.patch("/connections/{connection_id}")
+async def update_provider_connection(
+    connection_id: str,
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="PATCH",
+        path=f"/admin/connections/{quote(connection_id, safe='')}",
+        payload=payload,
+    )
+
+
+@router.patch("/deployments/{deployment_id}")
+async def update_provider_deployment(
+    deployment_id: str,
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="PATCH",
+        path=f"/admin/deployments/{quote(deployment_id, safe='')}",
+        payload=payload,
+    )
+
+
+@router.delete("/{collection}/{item_id}")
+async def delete_provider_object(
+    collection: Literal["connections", "deployments", "pricing"],
+    item_id: str,
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="DELETE",
+        path=f"/admin/{collection}/{quote(item_id, safe='')}",
+        payload=payload,
+    )
 
 
 @router.post("/routes/validate")
@@ -201,10 +349,15 @@ async def check_provider_connection(
     )
 
 
-async def _model_gateway_status(settings: Settings) -> dict[str, Any]:
+async def _model_gateway_status(
+    settings: Settings,
+    model_runtime: ModelRuntime,
+) -> dict[str, Any]:
     runtime = {
         "model_gateway_enabled": True,
-        "model_gateway_base_url": settings.model_gateway_base_url,
+        "model_runtime": "central",
+        "model_gateway_base_url": model_runtime.base_url,
+        "required_chat_routes": _required_model_routes(model_runtime),
         "chat_source": "model_gateway",
         "knowledge_source": "model_gateway",
         "providers_path": "",
@@ -215,13 +368,14 @@ async def _model_gateway_status(settings: Settings) -> dict[str, Any]:
             settings=settings,
             method="GET",
             path="/admin/configuration",
-            api_key=settings.model_gateway_api_key,
+            api_key=model_runtime.api_key,
             payload=None,
+            base_url=model_runtime.base_url,
         )
     except httpx.HTTPError as exc:
         return {
             "runtime": runtime,
-            "embedding": _settings_embedding_status(settings),
+            "embedding": _runtime_embedding_status(model_runtime),
             "providers": [],
             "routes": [],
             "control": None,
@@ -234,7 +388,7 @@ async def _model_gateway_status(settings: Settings) -> dict[str, Any]:
         detail, _ = _remote_error(response)
         return {
             "runtime": runtime,
-            "embedding": _settings_embedding_status(settings),
+            "embedding": _runtime_embedding_status(model_runtime),
             "providers": [],
             "routes": [],
             "control": None,
@@ -245,7 +399,7 @@ async def _model_gateway_status(settings: Settings) -> dict[str, Any]:
     except ValueError:
         return {
             "runtime": runtime,
-            "embedding": _settings_embedding_status(settings),
+            "embedding": _runtime_embedding_status(model_runtime),
             "providers": [],
             "routes": [],
             "control": None,
@@ -254,19 +408,19 @@ async def _model_gateway_status(settings: Settings) -> dict[str, Any]:
     if not isinstance(control, dict):
         return {
             "runtime": runtime,
-            "embedding": _settings_embedding_status(settings),
+            "embedding": _runtime_embedding_status(model_runtime),
             "providers": [],
             "routes": [],
             "control": None,
             "config_error": "独立 Model Gateway 配置接口返回格式无效",
         }
-    return _status_from_control(settings, runtime, control)
+    return _status_from_control(runtime, control, model_runtime)
 
 
 def _status_from_control(
-    settings: Settings,
     runtime: dict[str, Any],
     control: dict[str, Any],
+    model_runtime: ModelRuntime,
 ) -> dict[str, Any]:
     raw_connections = control.get("connections")
     raw_deployments = control.get("deployments")
@@ -355,22 +509,33 @@ def _status_from_control(
             }
         )
 
-    embedding = _settings_embedding_status(settings)
+    embedding = _runtime_embedding_status(model_runtime)
     embedding_route = next(
-        (route for route in routes if isinstance(route, dict) and route.get("kind") == "embedding"),
+        (
+            route
+            for route in routes
+            if isinstance(route, dict)
+            and route.get("kind") == "embedding"
+            and route.get("id") == model_runtime.embedding.model
+        ),
         None,
     )
     if embedding_route and embedding_route.get("targets"):
         deployment = deployment_by_id.get(str(embedding_route["targets"][0]))
         if deployment:
             embedding = {
+                **embedding,
                 "model": str(deployment.get("upstream_model") or embedding_route.get("id") or ""),
-                "base_url": settings.model_gateway_base_url,
-                "dimensions": int(deployment.get("dimensions") or settings.embedding_dimensions),
-                "configured": bool(
-                    connection_by_id.get(str(deployment.get("connection") or ""), {}).get(
-                        "configured"
-                    )
+                "base_url": model_runtime.base_url,
+                "dimensions": int(
+                    deployment.get("dimensions")
+                    or model_runtime.embedding.dimensions
+                ),
+                "configured": model_runtime.embedding.enabled
+                and bool(
+                    connection_by_id.get(
+                        str(deployment.get("connection") or ""), {}
+                    ).get("configured")
                 ),
             }
 
@@ -384,7 +549,10 @@ def _status_from_control(
     }
 
 
-def _direct_provider_status(settings: Settings) -> dict[str, Any]:
+def _direct_provider_status(
+    settings: Settings,
+    model_runtime: ModelRuntime,
+) -> dict[str, Any]:
     try:
         definitions = load_providers(settings.providers_path)
         routes = load_routes(settings.routes_path)
@@ -436,13 +604,15 @@ def _direct_provider_status(settings: Settings) -> dict[str, Any]:
     return {
         "runtime": {
             "model_gateway_enabled": False,
+            "model_runtime": "direct",
             "model_gateway_base_url": "",
+            "required_chat_routes": list(REQUIRED_CHAT_ROUTES),
             "chat_source": "legacy_direct",
             "knowledge_source": "provider_catalog",
             "providers_path": settings.providers_path,
             "routes_path": settings.routes_path,
         },
-        "embedding": _settings_embedding_status(settings),
+        "embedding": _runtime_embedding_status(model_runtime),
         "providers": providers,
         "routes": route_views,
         "control": None,
@@ -450,12 +620,42 @@ def _direct_provider_status(settings: Settings) -> dict[str, Any]:
     }
 
 
-def _settings_embedding_status(settings: Settings) -> dict[str, Any]:
+def _runtime_embedding_status(model_runtime: ModelRuntime) -> dict[str, Any]:
+    embedding = model_runtime.embedding
     return {
-        "model": settings.embedding_model,
-        "base_url": settings.embedding_base_url,
-        "dimensions": settings.embedding_dimensions,
-        "configured": bool(settings.embedding_api_key.strip()),
+        "model": embedding.model,
+        "base_url": embedding.base_url,
+        "dimensions": embedding.dimensions,
+        "configured": embedding.enabled,
+        "space_id": embedding.space_id,
+        "model_gateway_mode": embedding.model_gateway_mode,
+    }
+
+
+def _invalid_runtime_status(error: str) -> dict[str, Any]:
+    return {
+        "runtime": {
+            "model_gateway_enabled": False,
+            "model_runtime": "invalid",
+            "model_gateway_base_url": "",
+            "required_chat_routes": list(REQUIRED_CHAT_ROUTES),
+            "chat_source": "unavailable",
+            "knowledge_source": "unavailable",
+            "providers_path": "",
+            "routes_path": "",
+        },
+        "embedding": {
+            "model": "",
+            "base_url": "",
+            "dimensions": 0,
+            "configured": False,
+            "space_id": "",
+            "model_gateway_mode": False,
+        },
+        "providers": [],
+        "routes": [],
+        "control": None,
+        "config_error": error,
     }
 
 
@@ -470,14 +670,20 @@ def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(routes, list)
         else {}
     )
+    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    configured_required = runtime.get("required_chat_routes")
+    required_routes = (
+        [str(item) for item in configured_required if str(item)]
+        if isinstance(configured_required, list)
+        else list(REQUIRED_CHAT_ROUTES)
+    )
     usable = [
         route_id
-        for route_id in REQUIRED_CHAT_ROUTES
+        for route_id in required_routes
         if bool(route_by_id.get(route_id, {}).get("usable"))
     ]
-    missing = [route_id for route_id in REQUIRED_CHAT_ROUTES if route_id not in usable]
+    missing = [route_id for route_id in required_routes if route_id not in usable]
     config_error = str(payload.get("config_error") or "")
-    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
     model_gateway_connected = bool(runtime.get("model_gateway_enabled"))
     if config_error:
         state = "configuration_error"
@@ -490,14 +696,29 @@ def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
         next_action = "connect_client"
     return {
         "state": state,
-        "service_ready": True,
+        "service_ready": not config_error,
         "model_gateway_connected": model_gateway_connected,
         "chat_ready": not missing and not config_error,
-        "required_chat_routes": list(REQUIRED_CHAT_ROUTES),
+        "required_chat_routes": required_routes,
         "usable_chat_routes": usable,
         "missing_chat_routes": missing,
         "next_action": next_action,
     }
+
+
+def _required_model_routes(model_runtime: ModelRuntime) -> list[str]:
+    operations = (
+        "chat",
+        "memory.extract",
+        "memory.compact",
+        "memory.core",
+        "memory.review",
+        "knowledge.fast",
+        "knowledge.pro",
+    )
+    return list(
+        dict.fromkeys(model_runtime.route_for(operation) for operation in operations)
+    )
 
 
 async def _proxy_admin_request(
@@ -508,7 +729,14 @@ async def _proxy_admin_request(
     path: str,
     payload: dict[str, Any] | None,
 ) -> JSONResponse:
-    if not settings.model_gateway_enabled:
+    try:
+        model_runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc)},
+        )
+    if not model_runtime.is_central:
         return JSONResponse(
             status_code=409,
             content={"detail": "当前未启用独立 Model Gateway，不能从此页面写入配置"},
@@ -519,13 +747,17 @@ async def _proxy_admin_request(
             status_code=401,
             content={"detail": "请输入 Model Gateway admin 客户端密钥后再执行配置操作"},
         )
-    if not _admin_transport_is_safe(settings.model_gateway_base_url):
+    if not _admin_transport_is_safe(
+        model_runtime.base_url,
+        allow_private_http=settings.model_gateway_allow_private_http,
+    ):
         return JSONResponse(
             status_code=409,
             content={
                 "detail": (
                     "为避免管理密钥明文出站，远程 Model Gateway 配置写入必须使用 HTTPS；"
-                    "HTTP 只允许 localhost 或回环地址"
+                    "HTTP 只允许 localhost/回环地址；隔离 Docker 私网需显式开启 "
+                    "MODEL_GATEWAY_ALLOW_PRIVATE_HTTP"
                 )
             },
         )
@@ -536,6 +768,7 @@ async def _proxy_admin_request(
             path=path,
             api_key=normalized_key,
             payload=payload,
+            base_url=model_runtime.base_url,
         )
     except httpx.HTTPError as exc:
         return JSONResponse(
@@ -570,10 +803,11 @@ async def _model_gateway_control_request(
     path: str,
     api_key: str,
     payload: dict[str, Any] | None,
+    base_url: str = "",
 ) -> httpx.Response:
-    base_url = settings.model_gateway_base_url.rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
+    normalized_base_url = (base_url or settings.model_gateway_base_url).rstrip("/")
+    if normalized_base_url.endswith("/v1"):
+        normalized_base_url = normalized_base_url[:-3]
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
@@ -581,16 +815,23 @@ async def _model_gateway_control_request(
     async with httpx.AsyncClient(
         timeout=min(float(settings.request_timeout_seconds), 30.0),
         follow_redirects=False,
+        trust_env=False,
     ) as client:
+        request_kwargs: dict[str, Any] = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
         return await client.request(
             method,
-            f"{base_url}{path}",
-            headers=headers,
-            json=payload,
+            f"{normalized_base_url}{path}",
+            **request_kwargs,
         )
 
 
-def _admin_transport_is_safe(base_url: str) -> bool:
+def _admin_transport_is_safe(
+    base_url: str,
+    *,
+    allow_private_http: bool = False,
+) -> bool:
     parsed = urlsplit(base_url)
     if parsed.scheme.lower() == "https":
         return True
@@ -600,9 +841,14 @@ def _admin_transport_is_safe(base_url: str) -> bool:
     if hostname == "localhost":
         return True
     try:
-        return ip_address(hostname).is_loopback
+        address = ip_address(hostname)
     except ValueError:
-        return False
+        return allow_private_http and hostname == "model-gateway"
+    if address.is_loopback:
+        return True
+    return allow_private_http and any(
+        address in network for network in _PRIVATE_MODEL_GATEWAY_NETWORKS
+    )
 
 
 def _remote_error(response: httpx.Response) -> tuple[str, str]:

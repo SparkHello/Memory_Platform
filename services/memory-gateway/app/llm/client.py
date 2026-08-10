@@ -10,10 +10,10 @@ import httpx
 from app.config import Settings
 from app.llm.model_gateway import (
     ModelGatewayProtocolError,
-    model_gateway_model_for_operation,
     parse_model_gateway_metadata,
     validate_model_gateway_metadata,
 )
+from app.llm.runtime import ModelRuntime, resolve_model_runtime
 from app.llm.routing import (
     GLOBAL_PROVIDER_COOLDOWNS,
     LLMProvider,
@@ -24,6 +24,7 @@ from app.llm.routing import (
 from app.model_catalog import legacy_provider_map, providers_for_operation
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.recorder import UsageRecorder
+from app.usage.attribution import model_gateway_usage_headers
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +53,14 @@ class OpenAICompatibleClient:
         thinking: Literal["enabled", "disabled"] = "enabled",
         structured_tool: dict[str, Any] | None = None,
     ) -> dict:
-        if self.settings.model_gateway_enabled:
+        runtime = resolve_model_runtime(self.settings)
+        if runtime.is_central:
             return await self._create_via_model_gateway(
                 request=request,
                 messages=messages,
                 thinking=thinking,
                 structured_tool=structured_tool,
+                runtime=runtime,
             )
 
         providers = providers_for_operation(self.settings, request.model)
@@ -150,9 +153,10 @@ class OpenAICompatibleClient:
         messages: list[dict[str, str]],
         thinking: Literal["enabled", "disabled"],
         structured_tool: dict[str, Any] | None,
+        runtime: ModelRuntime,
     ) -> dict:
         try:
-            model = model_gateway_model_for_operation(self.settings, request.model)
+            model = runtime.route_for(request.model)
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -175,15 +179,28 @@ class OpenAICompatibleClient:
         if structured_tool is not None:
             payload.pop("response_format", None)
             payload["tools"] = [{"type": "function", "function": structured_tool}]
-            payload["tool_choice"] = {
-                "type": "function",
-                "function": {"name": structured_tool["name"]},
-            }
+            # DashScope Qwen/DeepSeek and current Kimi coding models reject a
+            # *specific* forced function while reasoning is enabled.  Keep
+            # reasoning for review-quality work, but intentionally request
+            # automatic selection; the caller accepts either tool arguments or
+            # JSON content.  With reasoning disabled we can retain the strict
+            # single-function contract.
+            payload["tool_choice"] = (
+                "auto"
+                if thinking == "enabled"
+                else {
+                    "type": "function",
+                    "function": {"name": structured_tool["name"]},
+                }
+            )
 
         started_at = time.monotonic()
         try:
             async with asyncio.timeout(self.settings.request_timeout_seconds):
-                response = await self._post_model_gateway(payload=payload)
+                response = await self._post_model_gateway(
+                    payload=payload,
+                    runtime=runtime,
+                )
         except (TimeoutError, httpx.TimeoutException) as exc:
             logger.warning(
                 "中央模型网关调用达到总超时。elapsed_seconds=%.2f",
@@ -244,36 +261,27 @@ class OpenAICompatibleClient:
                 detail="中央模型网关返回了无法解析的 JSON",
             ) from exc
 
-        if self.usage_recorder is not None:
-            actual_model = metadata.upstream_model
-            usage_payload = {**data, "model": actual_model}
-            await asyncio.to_thread(
-                self.usage_recorder.record_response,
-                payload=usage_payload,
-                model=actual_model,
-                kind="chat",
-                base_url=self.settings.model_gateway_base_url,
-                provider_override=metadata.channel_operator,
-                use_local_pricing=False,
-                operation=request.model,
-            )
         return data
 
     async def _post_model_gateway(
         self,
         *,
         payload: dict[str, Any],
+        runtime: ModelRuntime,
     ) -> httpx.Response:
-        url = (
-            f"{self.settings.model_gateway_base_url.rstrip('/')}"
-            "/chat/completions"
-        )
+        url = f"{runtime.base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.settings.model_gateway_api_key}",
+            "Authorization": f"Bearer {runtime.api_key}",
             "Content-Type": "application/json; charset=utf-8",
+            **model_gateway_usage_headers(
+                signing_secret=self.settings.gateway_signing_secret,
+                operation=str(payload.get("model") or "memory.task"),
+            ),
         }
         client_kwargs: dict[str, Any] = {
             "timeout": self.settings.request_timeout_seconds,
+            "follow_redirects": False,
+            "trust_env": False,
         }
         if self.transport is not None:
             client_kwargs["transport"] = self.transport
@@ -323,14 +331,20 @@ class OpenAICompatibleClient:
                         provider.model,
                         exc.response.status_code,
                     )
-            except httpx.HTTPError as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = exc
                 logger.warning(
-                    "上游 provider 网络调用失败，尝试下一项。provider=%s model=%s error_type=%s",
+                    "上游 provider 建连失败，尝试下一项。provider=%s model=%s error_type=%s",
                     provider.code,
                     provider.model,
                     type(exc).__name__,
                 )
+            except httpx.HTTPError:
+                # Read/write/pool failures may happen after the provider has
+                # accepted a billable request. Re-sending the private prompt
+                # to another provider would create hidden duplicate cost and
+                # cross-channel disclosure, so preserve the original error.
+                raise
 
         if last_error is not None:
             raise last_error
@@ -349,6 +363,8 @@ class OpenAICompatibleClient:
         }
         client_kwargs: dict[str, Any] = {
             "timeout": self.settings.request_timeout_seconds,
+            "follow_redirects": False,
+            "trust_env": False,
         }
         if self.transport is not None:
             client_kwargs["transport"] = self.transport
@@ -438,21 +454,7 @@ def _uses_tool_for_structured_output(provider: LLMProvider) -> bool:
 
 
 def _should_fail_over(response: httpx.Response) -> bool:
-    if response.status_code in {401, 402, 404, 408, 429} or response.status_code >= 500:
-        return True
-    if response.status_code != 400:
-        return False
-    detail = _safe_error_detail(response).lower()
-    return any(
-        marker in detail
-        for marker in (
-            "invalid model",
-            "invalid temperature",
-            "model not found",
-            "not supported model",
-            "unsupported model",
-        )
-    )
+    return response.status_code in {408, 429} or response.status_code >= 500
 
 
 def _json_from_utf8_bytes(response: httpx.Response) -> dict:

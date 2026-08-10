@@ -13,7 +13,6 @@ to the provider definition.
 """
 
 from __future__ import annotations
-
 from typing import Any, Literal
 
 from app.llm.routing import LLMProvider, ProviderQuirks
@@ -21,14 +20,7 @@ from app.llm.routing import LLMProvider, ProviderQuirks
 
 _DISABLED_EFFORTS = {"none", "disabled", "off"}
 
-_FAILOVER_STATUS_CODES = {401, 402, 404, 408, 429}
-_FAILOVER_400_MARKERS = (
-    "invalid model",
-    "invalid temperature",
-    "model not found",
-    "not supported model",
-    "unsupported model",
-)
+_FAILOVER_STATUS_CODES = {408, 429}
 
 
 def thinking_payload(
@@ -162,13 +154,5 @@ def uses_tool_for_structured_output(provider: LLMProvider) -> bool:
 
 
 def should_fail_over(status_code: int, content: bytes | str) -> bool:
-    if status_code in _FAILOVER_STATUS_CODES or status_code >= 500:
-        return True
-    if status_code != 400:
-        return False
-    detail = (
-        content.decode("utf-8", errors="replace")
-        if isinstance(content, bytes)
-        else str(content)
-    ).lower()
-    return any(marker in detail for marker in _FAILOVER_400_MARKERS)
+    del content
+    return status_code in _FAILOVER_STATUS_CODES or status_code >= 500

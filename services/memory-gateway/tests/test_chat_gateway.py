@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import httpx
 
 from app.api import deps
 from app.api.chat_gateway import (
@@ -14,9 +15,27 @@ from app.api.chat_gateway import (
     _usage_provider_arguments,
     clear_chat_gateway_state,
 )
+from app.config import Settings, get_settings
+from app.llm.model_gateway import (
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+)
 from app.llm.prompts import render_memory_context
 from app.memory.store import MemoryStore
-from app.openai_compat.gateway_client import GatewayUpstreamHTTPError
+from app.openai_compat.gateway_client import (
+    GatewayUpstreamHTTPError,
+    OpenAIChatGatewayClient,
+)
+from app.usage.attribution import (
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
+)
+from app.usage.store import UsageStore
 
 
 class RecordingEmbeddingClient:
@@ -57,6 +76,95 @@ def test_v1_gateway_requires_auth_and_lists_models(
         "memory-auto",
         "test-upstream",
     ]
+
+
+def test_v1_gateway_uses_central_runtime_without_rewriting_extensions(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers["Authorization"]
+        captured["headers"] = dict(request.headers)
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                MODEL_GATEWAY_ROUTE_HEADER: "memory.chat.central",
+                MODEL_GATEWAY_DEPLOYMENT_HEADER: "deployment-central",
+                MODEL_GATEWAY_CONNECTION_HEADER: "connection-central",
+                MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER: "operator-central",
+                MODEL_GATEWAY_MODEL_AUTHOR_HEADER: "author-central",
+                MODEL_GATEWAY_UPSTREAM_MODEL_HEADER: "author-central/model-v1",
+                "X-Model-Gateway-Attempts": "1",
+                "X-Model-Gateway-Usage-Event-Id": "usage-central-1",
+                "X-Model-Gateway-Correlation-Id": "mgc_central_1",
+                "X-Model-Gateway-Usage-Ledger-Status": "recorded",
+            },
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "response_extension": {"preserved": True},
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="test-gateway-key",
+        GATEWAY_SIGNING_SECRET="chat-test-signing-secret-0123456789abcdef",
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-backend-key",
+        MODEL_GATEWAY_CHAT_MODEL="memory.chat.central",
+        UPSTREAM_API_KEY="direct-key-must-not-be-used",
+    )
+    gateway = OpenAIChatGatewayClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+    )
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    client.app.dependency_overrides[deps.get_chat_gateway_client] = lambda: gateway
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            **auth_headers,
+            "X-Memory-Mode": "off",
+            MODEL_GATEWAY_CORRELATION_HEADER: "forged-correlation",
+            MODEL_GATEWAY_OPERATION_HEADER: "forged-operation",
+            MODEL_GATEWAY_USER_TAG_HEADER: "forged-user",
+        },
+        json={
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "request_extension": {"preserved": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response_extension"] == {"preserved": True}
+    assert response.headers[MODEL_GATEWAY_ROUTE_HEADER] == "memory.chat.central"
+    assert response.headers[MODEL_GATEWAY_DEPLOYMENT_HEADER] == "deployment-central"
+    assert response.headers[MODEL_GATEWAY_CONNECTION_HEADER] == "connection-central"
+    assert response.headers[MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER] == "operator-central"
+    assert response.headers[MODEL_GATEWAY_MODEL_AUTHOR_HEADER] == "author-central"
+    assert response.headers[MODEL_GATEWAY_UPSTREAM_MODEL_HEADER] == "author-central/model-v1"
+    assert response.headers["X-Model-Gateway-Attempts"] == "1"
+    assert response.headers["X-Model-Gateway-Usage-Event-Id"] == "usage-central-1"
+    assert response.headers["X-Model-Gateway-Correlation-Id"] == "mgc_central_1"
+    assert response.headers["X-Model-Gateway-Usage-Ledger-Status"] == "recorded"
+    assert captured["authorization"] == "Bearer central-backend-key"
+    assert captured["payload"]["model"] == "memory.chat.central"
+    assert captured["payload"]["request_extension"] == {"preserved": True}
+    assert captured["headers"][MODEL_GATEWAY_OPERATION_HEADER.lower()] == "chat_completion"
+    assert captured["headers"][MODEL_GATEWAY_CORRELATION_HEADER.lower()].startswith("mgc_")
+    assert captured["headers"][MODEL_GATEWAY_USER_TAG_HEADER.lower()].startswith("usr_")
+    assert "forged" not in json.dumps(captured["headers"])
+    assert UsageStore(memory_store.database_path).summary(
+        user_id="default",
+        days=None,
+    )["totals"]["calls"] == 0
 
 
 def test_chat_gateway_rejects_oversized_body_before_forwarding(
@@ -534,21 +642,27 @@ def test_gateway_rejects_overlong_conversation_ids(
         (
             {**auth_headers, "X-Conversation-Id": long_id},
             _chat_body(),
+            400,
         ),
         (
             auth_headers,
             {**_chat_body(), "conversation_id": long_id},
+            422,
         ),
     )
 
-    for headers, body in requests:
+    for headers, body, expected_status in requests:
         response = client.post(
             "/v1/chat/completions",
             headers=headers,
             json=body,
         )
-        assert response.status_code == 400
-        assert "最多支持 200 个字符" in response.json()["error"]["message"]
+        assert response.status_code == expected_status
+        if expected_status == 400:
+            assert "最多支持 200 个字符" in response.json()["error"]["message"]
+        else:
+            assert response.json()["error"]["type"] == "gateway_error"
+            assert response.json()["error"]["code"] == "memory_gateway_http_422"
 
     assert fake_gateway.payloads == []
 
@@ -593,6 +707,49 @@ def test_gateway_matches_persisted_branch_without_client_conversation_id(
     nodes = memory_store.list_conversation_branch_nodes(user_id="default")
     assert len(nodes) == 2
     assert max(node.turn_count for node in nodes) == 2
+
+
+def test_gateway_compacts_eight_turn_matched_branch_without_conversation_id(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+    fake_llm,
+) -> None:
+    visible_history: list[dict[str, str]] = []
+
+    for index in range(1, 9):
+        user_text = f"第 {index} 轮问题"
+        assistant_text = f"第 {index} 轮回答"
+        fake_gateway.response["choices"][0]["message"]["content"] = assistant_text
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth_headers,
+            json={
+                "model": "memory-auto",
+                "messages": [
+                    *visible_history,
+                    {"role": "user", "content": user_text},
+                ],
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["x-memory-branch-state"] == (
+            "root" if index == 1 else "matched"
+        )
+        visible_history.extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ]
+        )
+
+    nodes = memory_store.list_conversation_branch_nodes(user_id="default")
+    latest = max(nodes, key=lambda node: node.turn_count)
+    assert latest.turn_count == 8
+    assert latest.compressed_summary == "较早对话的测试压缩摘要。"
+    assert len(latest.recent_turns) == 2
+    assert fake_llm.context_compaction_calls == 1
 
 
 def test_regenerated_answers_become_sibling_branches(
@@ -1260,6 +1417,59 @@ def test_retried_final_turn_has_idempotent_memory_side_effects(
     assert first.status_code == second.status_code == 200
     assert _usage_count(memory_store, memory.id) == 1
     assert fake_llm.extraction_calls == 1
+
+
+def test_retried_final_turn_remains_idempotent_after_process_cache_loss(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        type="preference",
+        importance=8,
+    )
+    body = _chat_body()
+
+    first = client.post("/v1/chat/completions", headers=auth_headers, json=body)
+    clear_chat_gateway_state()
+    second = client.post("/v1/chat/completions", headers=auth_headers, json=body)
+
+    assert first.status_code == second.status_code == 200
+    assert _usage_count(memory_store, memory.id) == 1
+    assert fake_llm.extraction_calls == 1
+
+
+def test_chat_side_effect_claim_is_shared_between_store_connections(
+    memory_store: MemoryStore,
+) -> None:
+    second_store = MemoryStore(memory_store.database_path)
+
+    assert memory_store.claim_chat_side_effect(
+        kind="ingest",
+        key="same-turn",
+        user_id="default",
+        ttl_seconds=3600,
+    )
+    assert not second_store.claim_chat_side_effect(
+        kind="ingest",
+        key="same-turn",
+        user_id="default",
+        ttl_seconds=3600,
+    )
+    second_store.release_chat_side_effect_claim(
+        kind="ingest",
+        key="same-turn",
+        user_id="default",
+    )
+    assert memory_store.claim_chat_side_effect(
+        kind="ingest",
+        key="same-turn",
+        user_id="default",
+        ttl_seconds=3600,
+    )
 
 
 def test_retryable_ingest_can_retry_the_same_final_turn(

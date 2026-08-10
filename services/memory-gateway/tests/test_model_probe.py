@@ -44,6 +44,45 @@ def test_catalog_probe_checks_models_endpoint_once_per_provider() -> None:
     assert len(requests) == 1
 
 
+def test_catalog_probe_disables_environment_proxy_and_redirects(monkeypatch) -> None:
+    options: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            options.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _url, **_kwargs):
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "mimo-test"}]},
+                request=httpx.Request("GET", "https://provider.example/v1/models"),
+            )
+
+    monkeypatch.setattr("app.model_probe.httpx.Client", FakeClient)
+    settings = Settings(
+        _env_file=None,
+        LLM_MIMO_BASE_URL="https://provider.example/v1",
+        LLM_MIMO_API_KEY="hidden-key",
+    )
+
+    results = check_model_catalog(settings, [_chat_model()])
+
+    assert results[0].status == "available"
+    assert options == [
+        {
+            "timeout": 10.0,
+            "follow_redirects": False,
+            "trust_env": False,
+        }
+    ]
+
+
 def test_catalog_probe_reports_auth_failure_without_exposing_key() -> None:
     settings = Settings(
         _env_file=None,

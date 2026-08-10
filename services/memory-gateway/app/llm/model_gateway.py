@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 from typing import Any
+
+from app.llm.runtime import resolve_model_runtime
 
 
 MODEL_GATEWAY_ROUTE_HEADER = "X-Model-Gateway-Route"
@@ -14,6 +17,13 @@ MODEL_GATEWAY_VENDOR_HEADER = "X-Model-Gateway-Vendor"
 MODEL_GATEWAY_UPSTREAM_MODEL_HEADER = "X-Model-Gateway-Upstream-Model"
 MODEL_GATEWAY_EMBEDDING_SPACE_HEADER = "X-Model-Gateway-Embedding-Space"
 MODEL_GATEWAY_EMBEDDING_DIMENSIONS_HEADER = "X-Model-Gateway-Embedding-Dimensions"
+MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER = (
+    "X-Model-Gateway-Preferred-Deployment"
+)
+MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER = "X-Model-Gateway-Require-Deployment"
+MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER = (
+    "X-Model-Gateway-Reasoning-Origin-Deployment"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +90,7 @@ def validate_model_gateway_metadata(
     expected_route: str,
     expected_embedding_space: str = "",
     expected_embedding_dimensions: int = 0,
+    expected_deployment: str = "",
 ) -> None:
     required_fields = {
         "route": metadata.route,
@@ -103,6 +114,11 @@ def validate_model_gateway_metadata(
         raise ModelGatewayProtocolError(
             "中央模型网关响应 route 与请求模型别名不一致"
         )
+    deployment = expected_deployment.strip()
+    if deployment and metadata.deployment_id != deployment:
+        raise ModelGatewayProtocolError(
+            "中央模型网关响应 deployment 与严格亲和要求不一致"
+        )
     space = " ".join(expected_embedding_space.strip().split())
     if space and metadata.embedding_space_id != space:
         raise ModelGatewayProtocolError(
@@ -117,34 +133,30 @@ def validate_model_gateway_metadata(
         )
 
 
-_OPERATION_MODEL_FIELDS = {
-    "chat": "model_gateway_chat_model",
-    "memory.chat": "model_gateway_chat_model",
-    "memory-extractor": "model_gateway_memory_extract_model",
-    "memory-ingester": "model_gateway_memory_extract_model",
-    "memory.extract": "model_gateway_memory_extract_model",
-    "memory-context-compactor": "model_gateway_memory_compact_model",
-    "memory.compact": "model_gateway_memory_compact_model",
-    "core-memory-consolidator": "model_gateway_memory_core_model",
-    "memory.core": "model_gateway_memory_core_model",
-    "memory-review-editor": "model_gateway_memory_review_model",
-    "memory.review": "model_gateway_memory_review_model",
-    "knowledge.fast": "model_gateway_knowledge_fast_model",
-    "knowledge.pro": "model_gateway_knowledge_pro_model",
-    "embedding": "model_gateway_embedding_model",
-    "memory.embedding": "model_gateway_embedding_model",
-}
-
-
 def model_gateway_model_for_operation(settings: Any, operation: str) -> str:
-    normalized = operation.strip().lower()
-    field_name = _OPERATION_MODEL_FIELDS.get(normalized)
-    if field_name is None:
-        raise ValueError(f"中央模型网关不支持 operation：{operation}")
-    model = str(getattr(settings, field_name, "") or "").strip()
-    if not model:
-        raise ValueError(f"中央模型网关 operation {operation} 没有配置模型别名")
-    return model
+    return resolve_model_runtime(settings).route_for(operation)
+
+
+def is_model_gateway_affinity_unavailable(
+    status_code: int,
+    content: bytes,
+) -> bool:
+    """Match only the central gateway's explicit strict-affinity error."""
+    if status_code != 409:
+        return False
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    return (
+        error.get("code") == "model_gateway_affinity_unavailable"
+        or error.get("type") == "model_gateway_affinity_unavailable"
+    )
 
 
 def _safe_header_value(value: object, *, max_length: int) -> str:

@@ -23,6 +23,11 @@ from app.llm.model_gateway import (
 )
 from app.llm.routing import ProviderCooldowns
 from app.openai_compat.schemas import ChatCompletionRequest
+from app.usage.attribution import (
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
+)
 
 
 @pytest.mark.asyncio
@@ -30,8 +35,10 @@ async def test_upstream_chat_response_uses_json_bytes_without_mojibake(monkeypat
     calls = []
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -92,8 +99,10 @@ async def test_deepseek_chat_enables_thinking_for_structured_tasks(
     calls = []
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -261,8 +270,10 @@ async def test_kimi_k27_uses_cn_endpoint_and_temperature_one() -> None:
 @pytest.mark.asyncio
 async def test_upstream_chat_enforces_total_timeout(monkeypatch) -> None:
     class SlowAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -400,7 +411,10 @@ async def test_shared_llm_priority_routes_memory_tasks_and_cools_down_429_provid
 
 
 @pytest.mark.asyncio
-async def test_provider_configuration_errors_fail_over_to_next_provider() -> None:
+@pytest.mark.parametrize("status_code", [400, 401, 402, 404])
+async def test_provider_configuration_and_auth_errors_do_not_fail_over(
+    status_code: int,
+) -> None:
     calls: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -408,13 +422,8 @@ async def test_provider_configuration_errors_fail_over_to_next_provider() -> Non
         calls.append(payload)
         if payload["model"] == "mimo-v2.5-pro-ultraspeed":
             return httpx.Response(
-                400,
+                status_code,
                 json={"error": {"message": "Not supported model"}},
-            )
-        if payload["model"] == "kimi-k2.7-code-highspeed":
-            return httpx.Response(
-                401,
-                json={"error": {"message": "Invalid Authentication"}},
             )
         return httpx.Response(
             200,
@@ -442,18 +451,50 @@ async def test_provider_configuration_errors_fail_over_to_next_provider() -> Non
         temperature=0.0,
     )
 
-    response = await client.create_chat_completion(
-        request=request,
+    with pytest.raises(HTTPException) as exc_info:
+        await client.create_chat_completion(
+            request=request,
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert exc_info.value.status_code == 502
+    assert [call["model"] for call in calls] == ["mimo-v2.5-pro-ultraspeed"]
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_does_not_resend_to_next_provider() -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content.decode("utf-8"))["model"]
+        calls.append(model)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("possibly billed", request=request)
+        return httpx.Response(200, json={"choices": [], "model": model})
+
+    settings = Settings(
+        _env_file=None,
+        LLM_PROVIDER_PRIORITY="MK",
+        LLM_MIMO_API_KEY="mimo-key",
+        LLM_KIMI_API_KEY="kimi-key",
+    )
+    client = OpenAICompatibleClient(
+        settings=settings,
+        transport=httpx.MockTransport(handler),
+    )
+    request = ChatCompletionRequest(
+        model="memory-review-editor",
         messages=[{"role": "user", "content": "test"}],
     )
 
-    assert [call["model"] for call in calls] == [
-        "mimo-v2.5-pro-ultraspeed",
-        "kimi-k2.7-code-highspeed",
-        "deepseek-v4-flash",
-    ]
-    assert calls[1]["temperature"] == 1.0
-    assert response["model"] == "deepseek-v4-flash"
+    with pytest.raises(HTTPException) as exc_info:
+        await client.create_chat_completion(
+            request=request,
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert exc_info.value.status_code == 504
+    assert calls == ["mimo-v2.5-pro-ultraspeed"]
 
 
 @pytest.mark.asyncio
@@ -521,6 +562,7 @@ async def test_model_gateway_routes_internal_operation_once_without_vendor_rewri
             {
                 "url": str(request.url),
                 "authorization": request.headers.get("Authorization"),
+                "headers": dict(request.headers),
                 "payload": payload,
             }
         )
@@ -545,6 +587,7 @@ async def test_model_gateway_routes_internal_operation_once_without_vendor_rewri
         _env_file=None,
         MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
         MODEL_GATEWAY_API_KEY="central-key",
+        GATEWAY_SIGNING_SECRET="llm-test-signing-secret-0123456789abcdef",
         MODEL_GATEWAY_MEMORY_EXTRACT_MODEL="route.extract",
         MODEL_GATEWAY_MEMORY_COMPACT_MODEL="route.compact",
         MODEL_GATEWAY_MEMORY_CORE_MODEL="route.core",
@@ -577,15 +620,15 @@ async def test_model_gateway_routes_internal_operation_once_without_vendor_rewri
     assert len(calls) == 1
     assert calls[0]["url"] == "http://127.0.0.1:2030/v1/chat/completions"
     assert calls[0]["authorization"] == "Bearer central-key"
+    assert calls[0]["headers"][MODEL_GATEWAY_OPERATION_HEADER.lower()] == expected_model
+    assert calls[0]["headers"][MODEL_GATEWAY_CORRELATION_HEADER.lower()].startswith("mgc_")
+    assert calls[0]["headers"][MODEL_GATEWAY_USER_TAG_HEADER.lower()].startswith("usr_")
     assert calls[0]["payload"]["model"] == expected_model
     assert calls[0]["payload"]["temperature"] == 0.0
     assert calls[0]["payload"]["stream"] is False
     assert calls[0]["payload"]["reasoning_effort"] == "high"
     assert calls[0]["payload"]["tools"][0]["function"]["name"] == "submit_result"
-    assert calls[0]["payload"]["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "submit_result"},
-    }
+    assert calls[0]["payload"]["tool_choice"] == "auto"
     assert "response_format" not in calls[0]["payload"]
 
 
@@ -631,7 +674,7 @@ async def test_model_gateway_does_not_fall_back_to_legacy_provider() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_gateway_usage_uses_actual_upstream_model_header() -> None:
+async def test_model_gateway_usage_is_not_duplicated_in_local_ledger() -> None:
     class CapturingUsageRecorder:
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -681,12 +724,7 @@ async def test_model_gateway_usage_uses_actual_upstream_model_header() -> None:
     )
 
     assert response["model"] == "memory.review"
-    assert recorder.calls[0]["model"] == "deepseek-v4-flash"
-    assert recorder.calls[0]["payload"]["model"] == "deepseek-v4-flash"
-    assert recorder.calls[0]["base_url"] == "http://127.0.0.1:2030/v1"
-    assert recorder.calls[0]["provider_override"] == "deepseek"
-    assert recorder.calls[0]["use_local_pricing"] is False
-    assert recorder.calls[0]["operation"] == "memory-review-editor"
+    assert recorder.calls == []
 
 
 def test_memory_and_knowledge_clients_share_process_cooldown_registry() -> None:

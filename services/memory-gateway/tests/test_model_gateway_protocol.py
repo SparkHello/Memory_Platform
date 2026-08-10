@@ -17,6 +17,7 @@ from app.llm.model_gateway import (
     parse_model_gateway_metadata,
     validate_model_gateway_metadata,
 )
+from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
 
 
 def test_model_gateway_settings_require_base_url_and_key_together() -> None:
@@ -50,12 +51,50 @@ def test_model_gateway_settings_require_base_url_and_key_together() -> None:
 
 
 def test_model_gateway_settings_reject_credential_leaks_and_unsafe_routes() -> None:
-    with pytest.raises(ValidationError, match="HTTPS"):
+    with pytest.raises(ValidationError, match="MODEL_GATEWAY_ALLOW_PRIVATE_HTTP"):
         Settings(
             _env_file=None,
             MODEL_GATEWAY_BASE_URL="http://192.168.1.8:2030/v1",
             MODEL_GATEWAY_API_KEY="local-model-key",
         )
+
+
+def test_model_gateway_private_http_requires_explicit_safe_host_opt_in() -> None:
+    with pytest.raises(ValidationError, match="MODEL_GATEWAY_ALLOW_PRIVATE_HTTP"):
+        Settings(
+            _env_file=None,
+            MODEL_GATEWAY_BASE_URL="http://model-gateway:2030/v1",
+            MODEL_GATEWAY_API_KEY="local-model-key",
+        )
+
+    docker_settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://model-gateway:2030/v1",
+        MODEL_GATEWAY_API_KEY="local-model-key",
+        MODEL_GATEWAY_ALLOW_PRIVATE_HTTP=True,
+    )
+    lan_settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://192.168.10.8:2030/v1",
+        MODEL_GATEWAY_API_KEY="local-model-key",
+        MODEL_GATEWAY_ALLOW_PRIVATE_HTTP=True,
+    )
+    assert docker_settings.model_gateway_base_url == "http://model-gateway:2030/v1"
+    assert lan_settings.model_gateway_base_url == "http://192.168.10.8:2030/v1"
+
+    for unsafe_url in (
+        "http://model-gateway.example:2030/v1",
+        "http://8.8.8.8:2030/v1",
+        "http://model-gateway:2030/v1?key=value",
+        "http://user:secret@model-gateway:2030/v1",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(
+                _env_file=None,
+                MODEL_GATEWAY_BASE_URL=unsafe_url,
+                MODEL_GATEWAY_API_KEY="local-model-key",
+                MODEL_GATEWAY_ALLOW_PRIVATE_HTTP=True,
+            )
     with pytest.raises(ValidationError, match="安全的服务 URL"):
         Settings(
             _env_file=None,
@@ -207,3 +246,68 @@ def test_model_gateway_operation_rejects_unknown_internal_task() -> None:
 
     with pytest.raises(ValueError, match="不支持 operation"):
         model_gateway_model_for_operation(settings, "unknown-internal-task")
+
+
+def test_runtime_resolver_prefers_complete_central_configuration_without_fallback(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-secret",
+        MODEL_GATEWAY_CHAT_MODEL="custom.chat",
+        MODEL_GATEWAY_EMBEDDING_MODEL="custom.embedding",
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="space-v1",
+        EMBEDDING_API_KEY="must-not-be-used",
+        EMBEDDING_MODEL="direct-embedding",
+        EMBEDDING_DIMENSIONS=3,
+        DATABASE_PATH=str(tmp_path / "memory.db"),
+        KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+    )
+
+    runtime = resolve_model_runtime(settings)
+
+    assert runtime.mode == "central"
+    assert runtime.route_for("chat") == "custom.chat"
+    assert runtime.route_for("embedding") == "custom.embedding"
+    assert runtime.embedding.enabled is True
+    assert runtime.embedding.model_gateway_mode is True
+    assert runtime.embedding.base_url == "http://127.0.0.1:2030/v1"
+    assert runtime.embedding.api_key == "central-secret"
+    assert runtime.embedding.space_id == "space-v1"
+    assert "central-secret" not in repr(runtime)
+    assert "must-not-be-used" not in repr(runtime)
+
+
+def test_runtime_resolver_rejects_partial_central_configuration() -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-secret",
+    )
+    settings.model_gateway_api_key = ""
+
+    with pytest.raises(ModelRuntimeConfigurationError, match="必须同时配置"):
+        resolve_model_runtime(settings)
+
+
+def test_runtime_resolver_uses_direct_only_when_central_is_empty(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="",
+        MODEL_GATEWAY_API_KEY="",
+        EMBEDDING_BASE_URL="https://embedding.example.invalid/v1",
+        EMBEDDING_API_KEY="direct-secret",
+        EMBEDDING_MODEL="direct-embedding",
+        EMBEDDING_DIMENSIONS=3,
+        DATABASE_PATH=str(tmp_path / "memory.db"),
+        KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+    )
+
+    runtime = resolve_model_runtime(settings)
+
+    assert runtime.mode == "direct"
+    assert runtime.embedding.enabled is True
+    assert runtime.embedding.model_gateway_mode is False
+    assert runtime.embedding.space_id.startswith("direct-openai-compatible-v1:")
+    assert "direct-secret" not in repr(runtime)

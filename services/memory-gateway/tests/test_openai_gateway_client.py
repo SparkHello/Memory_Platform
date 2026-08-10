@@ -8,10 +8,26 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.llm.model_gateway import (
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+)
 from app.llm.routing import ProviderCooldowns
 from app.openai_compat.gateway_client import (
     GatewayUpstreamHTTPError,
     OpenAIChatGatewayClient,
+)
+from app.usage.attribution import (
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
 )
 
 
@@ -74,6 +90,7 @@ def _provider_settings(
     )
     values = {
         "GATEWAY_API_KEY": "gateway-key",
+        "GATEWAY_SIGNING_SECRET": "gateway-test-signing-secret-0123456789abcdef",
         "PROVIDERS_PATH": str(directory / "providers.json"),
         "ROUTES_PATH": str(directory / "routes.json"),
     }
@@ -101,6 +118,305 @@ def _settings(**overrides) -> Settings:
         ["mimo/mimo-test", "deepseek/deepseek-test"],
         **overrides,
     )
+
+
+def _central_settings(**overrides) -> Settings:
+    values = {
+        "GATEWAY_API_KEY": "gateway-key",
+        "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030/v1",
+        "MODEL_GATEWAY_API_KEY": "central-key",
+        "MODEL_GATEWAY_CHAT_MODEL": "memory.chat.custom",
+        # Deliberately configure a direct provider too: central mode must never
+        # send a transparent chat request to it.
+        "UPSTREAM_API_KEY": "direct-key-must-not-be-used",
+        "UPSTREAM_MODEL": "direct-model",
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def _central_headers(
+    *,
+    route: str = "memory.chat.custom",
+    deployment: str = "chat-primary",
+    content_type: str = "application/json; charset=utf-8",
+) -> dict[str, str]:
+    return {
+        "Content-Type": content_type,
+        MODEL_GATEWAY_ROUTE_HEADER: route,
+        MODEL_GATEWAY_DEPLOYMENT_HEADER: deployment,
+        MODEL_GATEWAY_CONNECTION_HEADER: "official-connection",
+        MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER: "official-channel",
+        MODEL_GATEWAY_MODEL_AUTHOR_HEADER: "model-author",
+        MODEL_GATEWAY_UPSTREAM_MODEL_HEADER: "upstream-chat-model",
+        "X-Model-Gateway-Attempts": "1",
+        "X-Model-Gateway-Pricing": "synthetic-price",
+        "X-Model-Gateway-Usage-Event-Id": "usage-synthetic-1",
+        "X-Model-Gateway-Correlation-Id": "mgc_synthetic",
+        "X-Model-Gateway-Usage-Ledger-Status": "recorded",
+    }
+
+
+@pytest.mark.asyncio
+async def test_central_gateway_preserves_unknown_chat_json_and_validates_attribution() -> None:
+    calls: list[tuple[httpx.Request, dict]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-central",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "vendor_response_extension": {"kept": True},
+            },
+            headers=_central_headers(),
+        )
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    user_content = [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+
+    result = await client.complete(
+        {
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": user_content}],
+            "tools": tools,
+            "request_extension": {"keep": [1, 2, 3]},
+            "conversation_id": "local-only",
+        }
+    )
+
+    assert client.list_models() == ["memory-auto", "memory.chat.custom"]
+    assert len(calls) == 1
+    request, payload = calls[0]
+    assert str(request.url) == "http://127.0.0.1:2030/v1/chat/completions"
+    assert request.headers["authorization"] == "Bearer central-key"
+    assert request.headers[MODEL_GATEWAY_OPERATION_HEADER] == "chat_completion"
+    assert request.headers[MODEL_GATEWAY_CORRELATION_HEADER].startswith("mgc_")
+    assert request.headers[MODEL_GATEWAY_USER_TAG_HEADER].startswith("usr_")
+    assert "look" not in json.dumps(dict(request.headers))
+    assert payload["model"] == "memory.chat.custom"
+    assert payload["messages"][0]["content"] == user_content
+    assert payload["tools"] == tools
+    assert payload["request_extension"] == {"keep": [1, 2, 3]}
+    assert payload["stream"] is False
+    assert "conversation_id" not in payload
+    assert result.provider.deployment_id == "chat-primary"
+    assert result.provider.connection_id == "official-connection"
+    assert result.provider.model == "upstream-chat-model"
+    assert result.provider.vendor == "official-channel"
+    assert result.headers[MODEL_GATEWAY_ROUTE_HEADER.lower()] == "memory.chat.custom"
+    assert result.headers[MODEL_GATEWAY_DEPLOYMENT_HEADER.lower()] == "chat-primary"
+    assert result.headers[MODEL_GATEWAY_CONNECTION_HEADER.lower()] == "official-connection"
+    assert result.headers[MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER.lower()] == "official-channel"
+    assert result.headers[MODEL_GATEWAY_MODEL_AUTHOR_HEADER.lower()] == "model-author"
+    assert result.headers[MODEL_GATEWAY_UPSTREAM_MODEL_HEADER.lower()] == "upstream-chat-model"
+    assert result.headers["x-model-gateway-attempts"] == "1"
+    assert result.headers["x-model-gateway-usage-event-id"] == "usage-synthetic-1"
+    assert result.headers["x-model-gateway-correlation-id"] == "mgc_synthetic"
+    assert result.headers["x-model-gateway-usage-ledger-status"] == "recorded"
+
+
+@pytest.mark.asyncio
+async def test_central_gateway_stream_is_byte_preserving_and_requires_affinity() -> None:
+    chunks = [
+        b'data: {"choices":[{"delta":{"vendor_field":true,"content":"a"}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    source = _ChunkStream(chunks)
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = dict(request.headers)
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers=_central_headers(
+                deployment="chat-affinity",
+                content_type="text/event-stream",
+            ),
+            stream=source,
+        )
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    stream = await client.open_stream(
+        {
+            "model": "memory.chat.custom",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "unknown_stream_extension": "kept",
+        },
+        preferred_provider_code="chat-affinity",
+    )
+    received = [chunk async for chunk in stream.aiter_bytes()]
+    await stream.aclose()
+
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["x-model-gateway-preferred-deployment"] == "chat-affinity"
+    assert headers["x-model-gateway-require-deployment"] == "chat-affinity"
+    assert headers["x-model-gateway-reasoning-origin-deployment"] == "chat-affinity"
+    assert captured["payload"]["unknown_stream_extension"] == "kept"
+    assert received == chunks
+    assert stream.provider.deployment_id == "chat-affinity"
+    assert stream.headers[MODEL_GATEWAY_ROUTE_HEADER.lower()] == "memory.chat.custom"
+    assert stream.headers[MODEL_GATEWAY_DEPLOYMENT_HEADER.lower()] == "chat-affinity"
+    assert stream.headers["x-model-gateway-attempts"] == "1"
+    assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_central_gateway_preserves_explicit_affinity_rejection() -> None:
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(
+            {
+                "headers": dict(request.headers),
+                "payload": json.loads(request.content),
+            }
+        )
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "code": "model_gateway_affinity_unavailable",
+                    "message": "old deployment unavailable",
+                }
+            },
+        )
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(GatewayUpstreamHTTPError) as exc_info:
+        await client.complete(
+            {
+                "model": "memory-auto",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "tool history",
+                        "reasoning": "private-a",
+                        "reasoning_content": "private-b",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+            preferred_provider_code="chat-old",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert b"model_gateway_affinity_unavailable" in exc_info.value.content
+    assert len(calls) == 1
+    assert calls[0]["headers"][
+        MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER.lower()
+    ] == "chat-old"
+    assert calls[0]["headers"][
+        MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER.lower()
+    ] == "chat-old"
+    assert calls[0]["headers"][
+        MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER.lower()
+    ] == "chat-old"
+    assistant = calls[0]["payload"]["messages"][0]
+    assert assistant["reasoning"] == "private-a"
+    assert assistant["reasoning_content"] == "private-b"
+
+
+@pytest.mark.asyncio
+async def test_central_stream_preserves_explicit_affinity_rejection() -> None:
+    calls: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(
+            {
+                "headers": dict(request.headers),
+                "payload": json.loads(request.content),
+            }
+        )
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "code": "model_gateway_affinity_unavailable",
+                    "message": "old deployment unavailable",
+                }
+            },
+        )
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(GatewayUpstreamHTTPError) as exc_info:
+        await client.open_stream(
+            {
+                "model": "memory-auto",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "tool history",
+                        "reasoning_content": "private-stream-reasoning",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+                "stream": True,
+            },
+            preferred_provider_code="chat-old",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert b"model_gateway_affinity_unavailable" in exc_info.value.content
+    assert len(calls) == 1
+    assert calls[0]["headers"][
+        MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER.lower()
+    ] == "chat-old"
+    assert (
+        calls[0]["payload"]["messages"][0]["reasoning_content"]
+        == "private-stream-reasoning"
+    )
+
+
+@pytest.mark.asyncio
+async def test_central_gateway_rejects_missing_or_wrong_attribution() -> None:
+    responses = [
+        httpx.Response(200, json={"choices": []}),
+        httpx.Response(
+            200,
+            json={"choices": []},
+            headers=_central_headers(route="memory.extract"),
+        ),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    for _ in range(2):
+        with pytest.raises(GatewayUpstreamHTTPError) as error:
+            await client.complete(
+                {
+                    "model": "memory-auto",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+        assert error.value.status_code == 502
+        assert b"model_gateway_protocol_error" in error.value.content
 
 
 @pytest.mark.asyncio
@@ -131,7 +447,12 @@ async def test_gateway_client_preserves_payload_and_fails_over() -> None:
                     }
                 ],
             },
-            headers={"X-Request-Id": "req-1"},
+            headers={
+                "X-Request-Id": "req-1",
+                # A direct provider must not be able to impersonate the
+                # trusted central gateway's attribution contract.
+                "X-Model-Gateway-Route": "spoofed-route",
+            },
         )
 
     transport = httpx.MockTransport(handler)
@@ -177,6 +498,59 @@ async def test_gateway_client_preserves_payload_and_fails_over() -> None:
         "kept"
     )
     assert result.headers["x-request-id"] == "req-1"
+    assert "x-model-gateway-route" not in result.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 402, 404])
+async def test_gateway_client_does_not_fail_over_configuration_or_auth_errors(
+    status_code: int,
+) -> None:
+    hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(str(request.url.host))
+        return httpx.Response(
+            status_code,
+            json={"error": {"code": "model_not_found"}},
+        )
+
+    client = OpenAIChatGatewayClient(
+        _settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+
+    with pytest.raises(GatewayUpstreamHTTPError) as exc_info:
+        await client.complete(
+            {"model": "memory-auto", "messages": [{"role": "user", "content": "x"}]}
+        )
+
+    assert exc_info.value.status_code == status_code
+    assert hosts == ["mimo.invalid"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_does_not_replay_after_read_timeout() -> None:
+    hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(str(request.url.host))
+        raise httpx.ReadTimeout("possibly billed", request=request)
+
+    client = OpenAIChatGatewayClient(
+        _settings(),
+        transport=httpx.MockTransport(handler),
+        cooldowns=ProviderCooldowns(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await client.complete(
+            {"model": "memory-auto", "messages": [{"role": "user", "content": "x"}]}
+        )
+
+    assert exc_info.value.status_code == 504
+    assert hosts == ["mimo.invalid"]
 
 
 @pytest.mark.asyncio
@@ -255,6 +629,8 @@ async def test_gateway_stream_uses_a_longer_read_timeout() -> None:
         assert http_client.timeout.connect == 60
         assert http_client.timeout.read == 600
         assert http_client.timeout.write == 120
+        assert http_client._trust_env is False
+        assert http_client.follow_redirects is False
     finally:
         await http_client.aclose()
 

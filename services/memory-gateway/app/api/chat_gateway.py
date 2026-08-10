@@ -30,6 +30,7 @@ from app.api.deps import (
 )
 from app.config import Settings, get_settings
 from app.llm.client import OpenAICompatibleClient
+from app.llm.runtime import resolve_model_runtime
 from app.llm.prompts import (
     render_core_memory_context,
     render_memory_context,
@@ -60,6 +61,7 @@ from app.openai_compat.streaming import (
     extract_non_stream_tool_trace,
 )
 from app.usage.recorder import UsageRecorder
+from app.usage.context import model_usage_scope
 
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,62 @@ def clear_chat_gateway_state() -> None:
     _TURN_REASONING.clear()
 
 
+def _claim_turn_side_effect(
+    *,
+    cache: _ExpiringState,
+    store: MemoryStore,
+    kind: str,
+    key: str,
+    user_id: str,
+    ttl_seconds: float,
+) -> bool:
+    """Use the in-process cache as a fast path and SQLite as the authority."""
+
+    if not cache.claim(key, ttl_seconds):
+        return False
+    try:
+        claimed = store.claim_chat_side_effect(
+            kind=kind,
+            key=key,
+            user_id=user_id,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception:
+        cache.release(key)
+        logger.exception(
+            "聊天网关无法持久化副作用幂等 claim；为避免重复写入已跳过。kind=%s",
+            kind,
+        )
+        return False
+    if not claimed:
+        # Keep the cheap local negative cache until its TTL expires.  The
+        # persisted row remains the source of truth across other workers.
+        return False
+    return True
+
+
+def _release_turn_side_effect(
+    *,
+    cache: _ExpiringState,
+    store: MemoryStore,
+    kind: str,
+    key: str,
+    user_id: str,
+) -> None:
+    cache.release(key)
+    try:
+        store.release_chat_side_effect_claim(
+            kind=kind,
+            key=key,
+            user_id=user_id,
+        )
+    except Exception:
+        logger.exception(
+            "聊天网关无法释放可重试副作用 claim；将等待 TTL 后再试。kind=%s",
+            kind,
+        )
+
+
 router = APIRouter(
     prefix="/v1",
     tags=["OpenAI-compatible memory gateway"],
@@ -224,7 +282,7 @@ async def chat_completions(
     gateway_client: Annotated[
         OpenAIChatGatewayClient, Depends(get_chat_gateway_client)
     ],
-    usage_recorder: Annotated[UsageRecorder, Depends(get_usage_recorder)],
+    usage_recorder: Annotated[UsageRecorder | None, Depends(get_usage_recorder)],
 ) -> Response:
     try:
         _require_gateway_enabled(settings)
@@ -283,7 +341,8 @@ async def chat_completions(
         user_id=user_id,
         conversation_id=conversation_id,
         strip_unknown=(
-            is_auto_model_id(validated.model) or settings.model_gateway_enabled
+            is_auto_model_id(validated.model)
+            or resolve_model_runtime(settings).is_central
         ),
     )
     context = GatewayTurnContext(text="", memory_ids=[], hit_count=0)
@@ -337,10 +396,11 @@ async def chat_completions(
 
     if validated.stream:
         try:
-            upstream_stream = await gateway_client.open_stream(
-                upstream_payload,
-                preferred_provider_code=preferred_provider_code,
-            )
+            with model_usage_scope(user_id=user_id, operation="chat_completion"):
+                upstream_stream = await gateway_client.open_stream(
+                    upstream_payload,
+                    preferred_provider_code=preferred_provider_code,
+                )
         except GatewayUpstreamHTTPError as exc:
             return _upstream_error_response(exc)
         except HTTPException as exc:
@@ -440,10 +500,11 @@ async def chat_completions(
         )
 
     try:
-        upstream_result = await gateway_client.complete(
-            upstream_payload,
-            preferred_provider_code=preferred_provider_code,
-        )
+        with model_usage_scope(user_id=user_id, operation="chat_completion"):
+            upstream_result = await gateway_client.complete(
+                upstream_payload,
+                preferred_provider_code=preferred_provider_code,
+            )
     except GatewayUpstreamHTTPError as exc:
         return _upstream_error_response(exc)
     except HTTPException as exc:
@@ -484,17 +545,21 @@ async def chat_completions(
     except (UnicodeDecodeError, json.JSONDecodeError):
         upstream_json = {}
 
-    usage_provider = _usage_provider_arguments(upstream_result.provider)
-    await anyio.to_thread.run_sync(
-        partial(
-            usage_recorder.record_response,
-            payload=upstream_json,
-            kind="chat",
-            user_id=user_id,
-            operation="chat_completion",
-            **usage_provider,
+    if (
+        usage_recorder is not None
+        and not _is_central_usage_provider(upstream_result.provider)
+    ):
+        usage_provider = _usage_provider_arguments(upstream_result.provider)
+        await anyio.to_thread.run_sync(
+            partial(
+                usage_recorder.record_response,
+                payload=upstream_json,
+                kind="chat",
+                user_id=user_id,
+                operation="chat_completion",
+                **usage_provider,
+            )
         )
-    )
 
     background = None
     if is_final:
@@ -1299,25 +1364,26 @@ async def _finalize_stream_turn(
     *,
     capture: ChatStreamCapture,
     finalize,
-    usage_recorder: UsageRecorder,
+    usage_recorder: UsageRecorder | None,
     user_id: str,
     provider,
 ) -> None:
-    usage_provider = _usage_provider_arguments(provider)
-    await anyio.to_thread.run_sync(
-        partial(
-            usage_recorder.record_response,
-            payload={
-                "id": capture.response_id,
-                "model": capture.response_model,
-                "usage": capture.usage,
-            },
-            kind="chat",
-            user_id=user_id,
-            operation="chat_completion",
-            **usage_provider,
+    if usage_recorder is not None and not _is_central_usage_provider(provider):
+        usage_provider = _usage_provider_arguments(provider)
+        await anyio.to_thread.run_sync(
+            partial(
+                usage_recorder.record_response,
+                payload={
+                    "id": capture.response_id,
+                    "model": capture.response_model,
+                    "usage": capture.usage,
+                },
+                kind="chat",
+                user_id=user_id,
+                operation="chat_completion",
+                **usage_provider,
+            )
         )
-    )
     if capture.is_final_text_response:
         await finalize(assistant_text=capture.assistant_text)
 
@@ -1337,6 +1403,10 @@ def _usage_provider_arguments(provider: Any) -> dict[str, Any]:
         "provider_override": (vendor or "model-gateway") if deployment_id else "",
         "use_local_pricing": not bool(deployment_id),
     }
+
+
+def _is_central_usage_provider(provider: Any) -> bool:
+    return bool(str(getattr(provider, "deployment_id", "") or "").strip())
 
 
 async def _finalize_turn(
@@ -1361,8 +1431,13 @@ async def _finalize_turn(
     if memory_mode != "read-write":
         return
 
-    if memory_ids and _ACTIVATED_TURNS.claim(
-        key, settings.chat_gateway_turn_ttl_seconds
+    if memory_ids and _claim_turn_side_effect(
+        cache=_ACTIVATED_TURNS,
+        store=store,
+        kind="activate",
+        key=key,
+        user_id=user_id,
+        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
     ):
         try:
             await anyio.to_thread.run_sync(
@@ -1375,7 +1450,13 @@ async def _finalize_turn(
                 )
             )
         except Exception:
-            _ACTIVATED_TURNS.release(key)
+            _release_turn_side_effect(
+                cache=_ACTIVATED_TURNS,
+                store=store,
+                kind="activate",
+                key=key,
+                user_id=user_id,
+            )
             logger.exception("聊天网关记录记忆激活失败；不影响聊天响应。")
 
     extraction_context = safe_extraction_context(
@@ -1401,8 +1482,13 @@ async def _finalize_turn(
         f"{user_id}\0{conversation_id or ''}\0{completed_history_fingerprint}"
     )
     source_conversation_id = conversation_id
-    if completed_history_fingerprint and _RECENT_TURNS.claim(
-        branch_key, settings.chat_gateway_turn_ttl_seconds
+    if completed_history_fingerprint and _claim_turn_side_effect(
+        cache=_RECENT_TURNS,
+        store=store,
+        kind="recent_context",
+        key=branch_key,
+        user_id=user_id,
+        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
     ):
         try:
             draft = await evolve_recent_context(
@@ -1447,7 +1533,13 @@ async def _finalize_turn(
                         )
                     )
         except Exception:
-            _RECENT_TURNS.release(branch_key)
+            _release_turn_side_effect(
+                cache=_RECENT_TURNS,
+                store=store,
+                kind="recent_context",
+                key=branch_key,
+                user_id=user_id,
+            )
             logger.exception("聊天网关更新分支上下文失败；不影响聊天响应。")
     elif completed_history_fingerprint and source_conversation_id is None:
         try:
@@ -1469,8 +1561,13 @@ async def _finalize_turn(
     ):
         return
     ingest_key = f"{key}\0{assistant_digest}"
-    if not _INGESTED_TURNS.claim(
-        ingest_key, settings.chat_gateway_turn_ttl_seconds
+    if not _claim_turn_side_effect(
+        cache=_INGESTED_TURNS,
+        store=store,
+        kind="ingest",
+        key=ingest_key,
+        user_id=user_id,
+        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
     ):
         return
     try:
@@ -1489,7 +1586,19 @@ async def _finalize_turn(
             source="chat_gateway",
         )
         if result.retryable:
-            _INGESTED_TURNS.release(ingest_key)
+            _release_turn_side_effect(
+                cache=_INGESTED_TURNS,
+                store=store,
+                kind="ingest",
+                key=ingest_key,
+                user_id=user_id,
+            )
     except Exception:
-        _INGESTED_TURNS.release(ingest_key)
+        _release_turn_side_effect(
+            cache=_INGESTED_TURNS,
+            store=store,
+            kind="ingest",
+            key=ingest_key,
+            user_id=user_id,
+        )
         logger.exception("聊天网关后台提取长期记忆失败；不影响聊天响应。")

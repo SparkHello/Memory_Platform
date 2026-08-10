@@ -206,6 +206,14 @@ def test_structured_output_dispatch_and_failover_rules() -> None:
 
     assert should_fail_over(429, b"") is True
     assert should_fail_over(503, b"") is True
-    assert should_fail_over(400, b'{"error":"invalid model"}') is True
+    assert not should_fail_over(
+        400,
+        b'{"error":{"code":"model_not_found","message":"invalid model"}}',
+    )
+    assert should_fail_over(400, b'{"error":"invalid model"}') is False
+    assert should_fail_over(
+        400,
+        b'{"error":{"message":"the prompt says model not found"}}',
+    ) is False
     assert should_fail_over(400, b'{"error":"context too long"}') is False
     assert should_fail_over(403, b"") is False

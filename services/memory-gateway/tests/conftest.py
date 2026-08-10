@@ -1,13 +1,149 @@
 ﻿from collections.abc import Iterator
+import atexit
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
+import tempfile
+
+
+_RUNTIME_ENVIRONMENT_EXACT = {
+    "ALLOW_SENSITIVE_EGRESS",
+    "ALL_PROXY",
+    "AUTH_DATABASE_PATH",
+    "DATABASE_PATH",
+    "EVAL_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "KNOWLEDGE_DATABASE_PATH",
+    "MEMGW_HOME",
+    "MEMGW_PROJECT_ROOT",
+    "MEMGW_SETTINGS_PATH",
+    "MEMORY_CONSOLE_ADMIN_KEY",
+    "MODEL_CATALOG_PATH",
+    "MODEL_GATEWAY_CONFIG_PATH",
+    "MODEL_GATEWAY_HOME",
+    "MODEL_GATEWAY_SECRETS_PATH",
+    "MODEL_GATEWAY_USAGE_DATABASE_PATH",
+    "MODEL_ROUTES_PATH",
+    "NO_PROXY",
+    "PRICING_CATALOG_PATH",
+    "PROVIDERS_PATH",
+    "ROUTES_PATH",
+    "USAGE_DATABASE_PATH",
+}
+_RUNTIME_ENVIRONMENT_PREFIXES = (
+    "EMBEDDING_",
+    "GATEWAY_",
+    "KNOWLEDGE_AGENT_",
+    "LLM_",
+    "MEMGW_",
+    "MODEL_GATEWAY_",
+    "PROVIDER_",
+    "UPSTREAM_",
+)
+
+
+def _is_memory_runtime_environment(name: str) -> bool:
+    return name in _RUNTIME_ENVIRONMENT_EXACT or name.startswith(
+        _RUNTIME_ENVIRONMENT_PREFIXES
+    )
+
+
+_SESSION_ORIGINAL_ENVIRONMENT = {
+    name: value
+    for name, value in os.environ.items()
+    if _is_memory_runtime_environment(name)
+}
+_SESSION_RUNTIME_ROOT = Path(
+    tempfile.mkdtemp(prefix="memory-platform-pytest-session-")
+)
+os.chmod(_SESSION_RUNTIME_ROOT, 0o700)
+_SESSION_MEMORY_HOME = _SESSION_RUNTIME_ROOT / "memgw-home"
+_SESSION_MODEL_HOME = _SESSION_RUNTIME_ROOT / "modelgw-home"
+_SESSION_SETTINGS = _SESSION_RUNTIME_ROOT / "memory-secrets" / "settings.env"
+for directory in (
+    _SESSION_MEMORY_HOME,
+    _SESSION_MODEL_HOME,
+    _SESSION_SETTINGS.parent,
+    _SESSION_RUNTIME_ROOT / "model-secrets",
+):
+    directory.mkdir(mode=0o700)
+settings_descriptor = os.open(
+    _SESSION_SETTINGS,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    os.write(
+        settings_descriptor,
+        (
+            "GATEWAY_SIGNING_SECRET='pytest-only-signing-secret-32-bytes-minimum'\n"
+            "GATEWAY_LEGACY_API_KEY_ENABLED='true'\n"
+        ).encode("ascii"),
+    )
+    os.fsync(settings_descriptor)
+finally:
+    os.close(settings_descriptor)
+if stat.S_IMODE(_SESSION_SETTINGS.stat().st_mode) != 0o600:
+    raise RuntimeError("pytest session settings mode is unsafe")
+for name in list(os.environ):
+    if _is_memory_runtime_environment(name):
+        os.environ.pop(name, None)
+os.environ.update(
+    {
+        "MEMGW_HOME": str(_SESSION_MEMORY_HOME),
+        "MEMGW_SETTINGS_PATH": str(_SESSION_SETTINGS),
+        "MEMGW_PROJECT_ROOT": str(Path(__file__).resolve().parents[1]),
+        "MODEL_GATEWAY_HOME": str(_SESSION_MODEL_HOME),
+        "MODEL_GATEWAY_CONFIG_PATH": str(_SESSION_MODEL_HOME / "config.json"),
+        "MODEL_GATEWAY_SECRETS_PATH": str(
+            _SESSION_RUNTIME_ROOT / "model-secrets" / "secrets.env"
+        ),
+        "DATABASE_PATH": str(_SESSION_RUNTIME_ROOT / "memory.db"),
+        "AUTH_DATABASE_PATH": str(_SESSION_RUNTIME_ROOT / "auth.db"),
+        "KNOWLEDGE_DATABASE_PATH": str(_SESSION_RUNTIME_ROOT / "knowledge.db"),
+        "EVAL_DIR": str(_SESSION_RUNTIME_ROOT / "eval"),
+        "GATEWAY_API_KEY": "",
+        "MODEL_GATEWAY_API_KEY": "",
+        "UPSTREAM_API_KEY": "",
+        "EMBEDDING_API_KEY": "",
+        "MODEL_GATEWAY_BASE_URL": "",
+        "KNOWLEDGE_AGENT_EGRESS_POLICY": "none",
+        "ALLOW_SENSITIVE_EGRESS": "false",
+    }
+)
+_SESSION_ENVIRONMENT_RESTORED = False
+
+
+def _restore_session_environment() -> None:
+    global _SESSION_ENVIRONMENT_RESTORED
+    if _SESSION_ENVIRONMENT_RESTORED:
+        return
+    _SESSION_ENVIRONMENT_RESTORED = True
+    for name in list(os.environ):
+        if _is_memory_runtime_environment(name):
+            os.environ.pop(name, None)
+    os.environ.update(_SESSION_ORIGINAL_ENVIRONMENT)
+    shutil.rmtree(_SESSION_RUNTIME_ROOT, ignore_errors=True)
+
+
+atexit.register(_restore_session_environment)
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import Settings, get_settings
+
+# Test processes must never consult the repository's gitignored ``.env``.
+# Keep the production class untouched outside pytest and preserve every other
+# pydantic-settings source and precedence rule.
+_ORIGINAL_SETTINGS_MODEL_CONFIG = dict(Settings.model_config)
+Settings.model_config = {**Settings.model_config, "env_file": None}
+
 from app.api import deps
 from app.api.chat_gateway import clear_chat_gateway_state
-from app.config import get_settings
 from app.knowledge.store import KnowledgeStore
 from app.llm.routing import LLMProvider
 from app.main import create_app
@@ -17,6 +153,95 @@ from app.openai_compat.gateway_client import GatewayHTTPResult
 from app.openai_compat.gateway_client import GatewayUpstreamHTTPError
 
 
+def pytest_unconfigure(config) -> None:
+    del config
+    Settings.model_config = _ORIGINAL_SETTINGS_MODEL_CONFIG
+    _restore_session_environment()
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_runtime(tmp_path) -> Iterator[None]:
+    """Keep every test away from developer secrets and repository state.
+
+    Settings also reads the local ``.env`` file, while the provider catalog
+    resolves ``PROVIDER_*_API_KEY`` directly from ``os.environ``. Explicit
+    empty environment values therefore form the test boundary: no test may
+    accidentally discover a real provider or initialize the default databases.
+    """
+
+    original_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if _is_memory_runtime_environment(name)
+    }
+    sandbox = pytest.MonkeyPatch()
+    for name in original_environment:
+        sandbox.setenv(name, "")
+
+    memory_home = tmp_path / "memgw-home"
+    model_home = tmp_path / "modelgw-home"
+    model_secrets = tmp_path / "model-secrets" / "secrets.env"
+    controlled = {
+        "MEMGW_HOME": str(memory_home),
+        # Settings remains in normal environment mode so explicit per-test
+        # monkeypatch overrides retain their real precedence semantics. Its
+        # pytest-only model config disables only the repository ``.env``.
+        "MEMGW_SETTINGS_PATH": "",
+        "MEMGW_PROJECT_ROOT": str(Path(__file__).resolve().parents[1]),
+        "MODEL_GATEWAY_HOME": str(model_home),
+        "MODEL_GATEWAY_CONFIG_PATH": str(model_home / "config.json"),
+        "MODEL_GATEWAY_SECRETS_PATH": str(model_secrets),
+        "MODEL_GATEWAY_USAGE_DATABASE_PATH": str(model_home / "usage.db"),
+        "DATABASE_PATH": str(tmp_path / "runtime-memory.db"),
+        "AUTH_DATABASE_PATH": str(tmp_path / "runtime-auth.db"),
+        "KNOWLEDGE_DATABASE_PATH": str(tmp_path / "runtime-knowledge.db"),
+        "USAGE_DATABASE_PATH": str(tmp_path / "runtime-usage.db"),
+        "EVAL_DIR": str(tmp_path / "eval"),
+        "MODEL_CATALOG_PATH": "",
+        "MODEL_ROUTES_PATH": "",
+        "PROVIDERS_PATH": "",
+        "ROUTES_PATH": "",
+        "PRICING_CATALOG_PATH": "",
+        "ALLOW_SENSITIVE_EGRESS": "false",
+        "KNOWLEDGE_AGENT_EGRESS_POLICY": "none",
+        "GATEWAY_SIGNING_SECRET": "pytest-only-signing-secret-32-bytes-minimum",
+        "GATEWAY_LEGACY_API_KEY_ENABLED": "true",
+        "MODEL_GATEWAY_BASE_URL": "",
+    }
+    for name in (
+        "GATEWAY_API_KEY",
+        "UPSTREAM_API_KEY",
+        "MODEL_GATEWAY_API_KEY",
+        "EMBEDDING_API_KEY",
+        "LLM_DEEPSEEK_API_KEY",
+        "LLM_MIMO_API_KEY",
+        "LLM_KIMI_API_KEY",
+        "KNOWLEDGE_AGENT_API_KEY",
+        "KNOWLEDGE_AGENT_MIMO_API_KEY",
+        "KNOWLEDGE_AGENT_KIMI_API_KEY",
+        "MEMORY_CONSOLE_ADMIN_KEY",
+    ):
+        controlled[name] = ""
+    for name, value in controlled.items():
+        sandbox.setenv(name, value)
+
+    get_settings.cache_clear()
+
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
+        sandbox.undo()
+        # Direct os.environ writes and a test-local monkeypatch.undo() cannot
+        # escape this independent sandbox's exact teardown restoration.
+        for name in list(os.environ):
+            if _is_memory_runtime_environment(name) and name not in original_environment:
+                os.environ.pop(name, None)
+        for name, value in original_environment.items():
+            os.environ[name] = value
+        get_settings.cache_clear()
+
+
 class FakeLLMClient:
     """伪装普通聊天、记忆提取、核心记忆整理三类上游调用。"""
 
@@ -24,9 +249,16 @@ class FakeLLMClient:
         self.messages: list[dict] = []
         self.extraction_messages: list[dict] = []
         self.extraction_calls = 0
+        self.extraction_request = None
+        self.extraction_thinking: str | None = None
         self.core_messages: list[dict] = []
+        self.core_request = None
+        self.core_thinking: str | None = None
+        self.core_structured_tool: dict | None = None
+        self.core_tool_arguments: str | None = None
         self.context_compaction_messages: list[dict] = []
         self.context_compaction_calls = 0
+        self.context_compaction_request = None
         self.context_compaction_content = json.dumps(
             {"summary": "较早对话的测试压缩摘要。"},
             ensure_ascii=False,
@@ -83,6 +315,7 @@ class FakeLLMClient:
         if self._is_context_compaction_call(messages):
             self.context_compaction_calls += 1
             self.context_compaction_messages = messages
+            self.context_compaction_request = request
             return {
                 "id": "chatcmpl-context-compaction",
                 "object": "chat.completion",
@@ -102,6 +335,8 @@ class FakeLLMClient:
         if self._is_extraction_call(messages):
             self.extraction_calls += 1
             self.extraction_messages = messages
+            self.extraction_request = request
+            self.extraction_thinking = thinking
             return {
                 "id": "chatcmpl-extraction",
                 "object": "chat.completion",
@@ -117,6 +352,24 @@ class FakeLLMClient:
             }
         if self._is_core_consolidation_call(messages):
             self.core_messages = messages
+            self.core_request = request
+            self.core_thinking = thinking
+            self.core_structured_tool = structured_tool
+            message = {"role": "assistant", "content": self.core_content}
+            if self.core_tool_arguments is not None:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "submit_core_memory_sections",
+                                "arguments": self.core_tool_arguments,
+                            },
+                        }
+                    ],
+                }
             return {
                 "id": "chatcmpl-core-memory",
                 "object": "chat.completion",
@@ -125,7 +378,7 @@ class FakeLLMClient:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": self.core_content},
+                        "message": message,
                         "finish_reason": "stop",
                     }
                 ],
@@ -333,6 +586,10 @@ def client(
     # Multi-user fixtures explicitly exercise the legacy migration mode.
     monkeypatch.setenv("GATEWAY_ALLOW_USER_ID_HEADER", "true")
     monkeypatch.setenv("DATABASE_PATH", memory_store.database_path)
+    monkeypatch.setenv(
+        "AUTH_DATABASE_PATH",
+        str(Path(memory_store.database_path).with_name("auth.db")),
+    )
     monkeypatch.setenv(
         "KNOWLEDGE_DATABASE_PATH",
         knowledge_store.database_path,

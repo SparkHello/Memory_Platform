@@ -35,6 +35,9 @@ ASSUMPTION_MARKERS = (
 
 MIN_IMPORTANCE = 6  # 默认回退值
 MIN_CONFIDENCE = 0.8  # 默认回退值
+_MAX_BATCH_SOURCE_CHARS = 65_536
+_MAX_BATCH_TOTAL_INPUT_CHARS = 131_072
+_MAX_BATCH_CANDIDATES = 100
 
 _TYPE_THRESHOLDS: dict[str, tuple[int, float]] = {
     "episodic": (6, 0.80),
@@ -408,6 +411,11 @@ class LLMMemoryExtractor:
         self.user_id = user_id
 
     async def extract(self, *, user_message: str, assistant_message: str) -> ExtractionOutcome:
+        if (
+            len(user_message) > _MAX_BATCH_SOURCE_CHARS
+            or len(user_message) + len(assistant_message) > _MAX_BATCH_TOTAL_INPUT_CHARS
+        ):
+            return ExtractionOutcome(reason="提取输入超过资源边界")
         try:
             raw_output = await self._call_llm(
                 user_message=user_message,
@@ -475,6 +483,25 @@ class LLMMemoryExtractor:
         conversation_context: str | None = None,
         context_quote_source: str | None = None,
     ) -> ExtractionBatchOutcome:
+        total_input_chars = sum(
+            len(value or "")
+            for value in (
+                source_text,
+                assistant_message,
+                conversation_context,
+                context_quote_source,
+            )
+        )
+        if (
+            len(source_text) > _MAX_BATCH_SOURCE_CHARS
+            or total_input_chars > _MAX_BATCH_TOTAL_INPUT_CHARS
+        ):
+            return ExtractionBatchOutcome(
+                outcomes=[],
+                reason="批量提取输入超过资源边界",
+                reason_code="invalid_model_output",
+                error_code="extraction_input_too_large",
+            )
         try:
             raw_output = await self._call_llm_many(
                 source_text=source_text,
@@ -506,6 +533,14 @@ class LLMMemoryExtractor:
             )
 
         candidate_data = _candidate_payloads_from_data(data)
+        if len(candidate_data) > _MAX_BATCH_CANDIDATES:
+            return ExtractionBatchOutcome(
+                outcomes=[],
+                reason="提取模型返回的候选条数超过 100 条限制",
+                reason_code="invalid_model_output",
+                error_code="too_many_extraction_candidates",
+                raw_output=raw_output[:500],
+            )
         if not candidate_data:
             return ExtractionBatchOutcome(
                 outcomes=[],
@@ -593,12 +628,14 @@ class LLMMemoryExtractor:
             model="memory-extractor",
             messages=messages,
             temperature=0.0,
+            max_tokens=2048,
             stream=False,
         )
         with model_usage_scope(user_id=self.user_id):
             response = await self.llm_client.create_chat_completion(
                 request=request,
                 messages=messages,
+                thinking="disabled",
             )
         try:
             content = response["choices"][0]["message"]["content"]
@@ -622,12 +659,14 @@ class LLMMemoryExtractor:
             model="memory-ingester",
             messages=messages,
             temperature=0.0,
+            max_tokens=8192,
             stream=False,
         )
         with model_usage_scope(user_id=self.user_id):
             response = await self.llm_client.create_chat_completion(
                 request=request,
                 messages=messages,
+                thinking="disabled",
             )
         try:
             content = response["choices"][0]["message"]["content"]

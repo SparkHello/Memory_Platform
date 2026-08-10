@@ -1,8 +1,18 @@
 import pytest
 
-from app.api.deps import get_embedding_client
+from app.api.deps import (
+    embedding_runtime_enabled,
+    get_embedding_client,
+    get_knowledge_search_agent,
+)
 from app.config import Settings, get_settings
 from app.memory.search import NullEmbeddingClient, OpenAICompatibleEmbeddingClient
+from app.usage.attribution import (
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
+)
+from app.usage.context import model_usage_scope
 
 
 def test_embedding_client_uses_embedding_config_only(monkeypatch) -> None:
@@ -33,6 +43,67 @@ def test_embedding_client_falls_back_without_embedding_api_key(monkeypatch) -> N
     client = get_embedding_client(get_settings())
 
     assert isinstance(client, NullEmbeddingClient)
+
+
+def test_embedding_client_uses_central_runtime_and_never_direct_fallback(tmp_path) -> None:
+    common = {
+        "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030/v1",
+        "MODEL_GATEWAY_API_KEY": "central-key",
+        "MODEL_GATEWAY_EMBEDDING_MODEL": "memory.embedding.custom",
+        "EMBEDDING_API_KEY": "direct-key-must-not-be-used",
+        "EMBEDDING_MODEL": "direct-model",
+        "EMBEDDING_DIMENSIONS": 3,
+        "DATABASE_PATH": str(tmp_path / "memory.db"),
+        "KNOWLEDGE_DATABASE_PATH": str(tmp_path / "knowledge.db"),
+    }
+    configured = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="space-v1",
+        **common,
+    )
+    missing_space = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="",
+        **common,
+    )
+
+    client = get_embedding_client(configured)
+
+    assert isinstance(client, OpenAICompatibleEmbeddingClient)
+    assert client.base_url == "http://127.0.0.1:2030/v1"
+    assert client.api_key == "central-key"
+    assert client.model == "memory.embedding.custom"
+    assert client.expected_space_id == "space-v1"
+    assert client.embedding_space_id == "space-v1"
+    assert client.model_gateway_mode is True
+    assert embedding_runtime_enabled(configured) is True
+    assert isinstance(get_embedding_client(missing_space), NullEmbeddingClient)
+    assert embedding_runtime_enabled(missing_space) is False
+
+
+def test_knowledge_agent_uses_same_central_runtime_and_ignores_direct_routes(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL="knowledge.fast.custom",
+        MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL="knowledge.pro.custom",
+        LLM_DEEPSEEK_API_KEY="direct-key-must-not-be-used",
+        DATABASE_PATH=str(tmp_path / "memory.db"),
+        KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+    )
+
+    agent = get_knowledge_search_agent(object(), settings)
+
+    assert agent.config.fast_providers == []
+    assert agent.config.pro_provider is None
+    assert agent.config.model_runtime is not None
+    assert agent.config.model_runtime.is_central is True
+    assert agent.config.flash_model == "knowledge.fast.custom"
+    assert agent.config.pro_model == "knowledge.pro.custom"
+    assert "central-key" not in repr(agent.config)
 
 
 def test_direct_embedding_uses_stable_local_space_without_key_material(tmp_path) -> None:
@@ -77,6 +148,30 @@ def test_direct_embedding_uses_stable_local_space_without_key_material(tmp_path)
     assert "first-key" not in original.embedding_space_id
 
 
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "http://provider.example/v1",
+        "https://user:secret@provider.example/v1",
+        "https://provider.example/v1?token=secret",
+        "https://provider.example/v1#fragment",
+        "https://provider.example:99999/v1",
+        "https://provider.example/v1\n",
+    ],
+)
+def test_legacy_direct_provider_urls_reject_plaintext_or_embedded_credentials(
+    unsafe_url: str,
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, EMBEDDING_BASE_URL=unsafe_url)
+
+
+def test_legacy_direct_provider_allows_loopback_http_only() -> None:
+    settings = Settings(_env_file=None, EMBEDDING_BASE_URL="http://127.0.0.1:11434/v1/")
+
+    assert settings.embedding_base_url == "http://127.0.0.1:11434/v1"
+
+
 @pytest.mark.asyncio
 async def test_embedding_request_uses_openai_compatible_payload(monkeypatch) -> None:
     calls = []
@@ -91,8 +186,10 @@ async def test_embedding_request_uses_openai_compatible_payload(monkeypatch) -> 
             return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -142,8 +239,10 @@ async def test_embedding_rejects_unexpected_model_gateway_space(monkeypatch) -> 
             return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -168,6 +267,8 @@ async def test_embedding_rejects_unexpected_model_gateway_space(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> None:
+    captured_headers: list[dict[str, str]] = []
+    local_usage_calls: list[dict] = []
     responses = [
         {"X-Model-Gateway-Embedding-Space": "memory-embed-v1"},
         {
@@ -194,8 +295,10 @@ async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> 
             return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
@@ -204,6 +307,7 @@ async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> 
             return None
 
         async def post(self, url: str, *, json: dict, headers: dict):
+            captured_headers.append(headers)
             return FakeResponse(responses.pop(0))
 
     monkeypatch.setattr("app.memory.search.httpx.AsyncClient", FakeAsyncClient)
@@ -214,10 +318,28 @@ async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> 
         dimensions=3,
         expected_space_id="memory-embed-v1",
         model_gateway_mode=True,
+        usage_hmac_secret="embedding-test-signing-secret-0123456789abcdef",
+        usage_recorder=type(
+            "Recorder",
+            (),
+            {"record_response": lambda _self, **kwargs: local_usage_calls.append(kwargs)},
+        )(),
     )
 
     assert await client.embed("第一次") is None
-    assert await client.embed("第二次") == [0.1, 0.2, 0.3]
+    with model_usage_scope(user_id="alice", operation="knowledge_index"):
+        assert await client.embed("第二次") == [0.1, 0.2, 0.3]
+    assert captured_headers[0][MODEL_GATEWAY_OPERATION_HEADER] == "memory.embedding"
+    assert captured_headers[1][MODEL_GATEWAY_OPERATION_HEADER] == "knowledge_index"
+    assert all(
+        headers[MODEL_GATEWAY_CORRELATION_HEADER].startswith("mgc_")
+        for headers in captured_headers
+    )
+    assert all(
+        headers[MODEL_GATEWAY_USER_TAG_HEADER].startswith("usr_")
+        for headers in captured_headers
+    )
+    assert local_usage_calls == []
 
 
 @pytest.mark.asyncio
@@ -232,8 +354,10 @@ async def test_embedding_rejects_vector_with_wrong_length(monkeypatch) -> None:
             return {"data": [{"embedding": [0.1, 0.2]}]}
 
     class FakeAsyncClient:
-        def __init__(self, *, timeout: float):
+        def __init__(self, *, timeout: float, follow_redirects: bool, trust_env: bool):
             self.timeout = timeout
+            assert follow_redirects is False
+            assert trust_env is False
 
         async def __aenter__(self):
             return self
