@@ -7,14 +7,16 @@ import {
   KeyRound,
   LockKeyhole,
   Plus,
+  Power,
   PlugZap,
   RefreshCcw,
   Save,
   ShieldCheck,
+  Trash2,
   TriangleAlert,
   XCircle
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
@@ -25,6 +27,7 @@ import type {
   ModelGatewayConnectionInfo,
   ModelGatewayControlSnapshot,
   ModelGatewayDeploymentInfo,
+  ModelGatewayPricingInfo,
   ModelGatewayRouteDraft,
   ModelGatewayRouteInfo,
   ProviderInfo,
@@ -90,10 +93,12 @@ function useUnsavedChangesGuard(dirty: boolean, message: string, confirm: Confir
 
 export function ProvidersPage({
   api,
-  initialSetup = false
+  initialSetup = false,
+  expertMode = false
 }: {
   api: MemoryApi;
   initialSetup?: boolean;
+  expertMode?: boolean;
 }) {
   const [status, setStatus] = useState<ProvidersStatus | null>(null);
   const [drafts, setDrafts] = useState<ModelGatewayRouteDraft[]>([]);
@@ -128,6 +133,19 @@ export function ProvidersPage({
       } finally {
         setLoading(false);
       }
+    },
+    [api]
+  );
+
+  const loadAdminControl = useCallback(
+    async (key: string, preserveDrafts = false) => {
+      const control = await api.providerAdminConfiguration(key);
+      setStatus((current) => (current ? { ...current, control } : current));
+      if (!preserveDrafts) {
+        setDrafts(routeDrafts(control));
+        setValidatedSignature("");
+      }
+      return control;
     },
     [api]
   );
@@ -208,6 +226,7 @@ export function ProvidersPage({
         adminKey.trim()
       );
       await load(undefined, false);
+      await loadAdminControl(adminKey.trim(), false);
       setFeedback({
         tone: "success",
         message: `已应用 ${result.changed_routes.length} 条用途路由，Model Gateway 已热加载，无需重启。`
@@ -235,6 +254,7 @@ export function ProvidersPage({
       await api.updateProviderSecret(connection.id, value, adminKey.trim());
       setSecretValues((current) => ({ ...current, [connection.id]: "" }));
       await load(undefined, true);
+      await loadAdminControl(adminKey.trim(), true);
       setFeedback({
         tone: "success",
         message: `${connection.channel_operator} 的密钥已替换。密钥值未被页面读取或保存。`
@@ -268,14 +288,91 @@ export function ProvidersPage({
     setFeedback(null);
     try {
       await api.checkProviderAdminKey(adminKey.trim());
+      const fullControl = await loadAdminControl(adminKey.trim(), false);
       setAdminCheck("valid");
       setFeedback({ tone: "success", message: "管理密钥验证成功，可以继续配置模型。" });
-      if (initialSetup && (status?.control?.connections.length || 0) === 0) {
+      if (initialSetup && fullControl.connections.length === 0) {
         setWizardOpen(true);
       }
     } catch (cause) {
       setAdminCheck("invalid");
       setFeedback({ tone: "error", message: errorMessage(cause) });
+    }
+  };
+
+  const refreshAll = async (preserveDrafts = false) => {
+    await load(undefined, preserveDrafts);
+    if (hasAdminKey) {
+      await loadAdminControl(adminKey.trim(), preserveDrafts);
+    }
+  };
+
+  const setObjectEnabled = async (
+    collection: "connections" | "deployments",
+    id: string,
+    enabled: boolean
+  ) => {
+    if (!status?.control || !hasAdminKey || busyAction) return;
+    if (!enabled) {
+      const confirmed = await confirm({
+        title: `禁用 ${id}？`,
+        message: "如果它正在被用途路由引用，相关聊天、记忆或检索任务可能立即不可用。",
+        confirmLabel: "确认禁用",
+        cancelLabel: "取消",
+        tone: "warning"
+      });
+      if (!confirmed) return;
+    }
+    setBusyAction(`object:${collection}:${id}`);
+    setFeedback(null);
+    try {
+      await api.setProviderObjectEnabled(
+        collection,
+        id,
+        status.control.revision,
+        enabled,
+        adminKey.trim()
+      );
+      await refreshAll(false);
+      setFeedback({
+        tone: "success",
+        message: `${id} 已${enabled ? "启用" : "禁用"}，配置已热加载。`
+      });
+    } catch (cause) {
+      setFeedback({ tone: "error", message: errorMessage(cause) });
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  const deleteObject = async (
+    collection: "connections" | "deployments" | "pricing",
+    id: string
+  ) => {
+    if (!status?.control || !hasAdminKey || busyAction) return;
+    const confirmed = await confirm({
+      title: `删除未引用对象 ${id}？`,
+      message: "删除后无法从控制台恢复。服务端会再次检查引用关系和 revision；仍被引用时不会删除。",
+      confirmLabel: "删除对象",
+      cancelLabel: "取消",
+      tone: "danger"
+    });
+    if (!confirmed) return;
+    setBusyAction(`delete:${collection}:${id}`);
+    setFeedback(null);
+    try {
+      await api.deleteProviderObject(
+        collection,
+        id,
+        status.control.revision,
+        adminKey.trim()
+      );
+      await refreshAll(false);
+      setFeedback({ tone: "success", message: `${id} 已删除。` });
+    } catch (cause) {
+      setFeedback({ tone: "error", message: errorMessage(cause) });
+    } finally {
+      setBusyAction("");
     }
   };
 
@@ -301,7 +398,11 @@ export function ProvidersPage({
             <button
               type="button"
               className="secondary-button"
-              onClick={() => void load(undefined, false)}
+              onClick={() => {
+                void refreshAll(false).catch((cause) => {
+                  setFeedback({ tone: "error", message: errorMessage(cause) });
+                });
+              }}
               disabled={loading || Boolean(busyAction)}
             >
               <RefreshCcw size={16} aria-hidden />
@@ -390,21 +491,38 @@ export function ProvidersPage({
                   adminKey={adminKey}
                   control={status.control}
                   onClose={() => setWizardOpen(false)}
-                  onCompleted={() => load(undefined, false)}
-                />
+                onCompleted={() => refreshAll(false)}
+              />
               )}
-              <details className="panel provider-advanced-panel">
-                <summary>高级设置：用途与故障切换顺序</summary>
-                <p className="muted">
-                  普通使用无需修改。添加备用模型、调整优先顺序或修复已有配置时再展开。
-                </p>
-                <RoutesEditor
-                  control={status.control}
-                  drafts={drafts}
-                  onMove={moveTarget}
-                  onToggle={toggleRoute}
-                />
-              </details>
+              {expertMode ? (
+                <>
+                  <details className="panel provider-advanced-panel">
+                    <summary>高级设置：用途与故障切换顺序</summary>
+                    <p className="muted">
+                      添加备用模型、调整优先顺序或修复已有配置时再展开。
+                    </p>
+                    <RoutesEditor
+                      control={status.control}
+                      drafts={drafts}
+                      onMove={moveTarget}
+                      onToggle={toggleRoute}
+                    />
+                  </details>
+                  {hasAdminKey && (
+                    <ObjectManager
+                      control={status.control}
+                      busyAction={busyAction}
+                      onSetEnabled={(collection, id, enabled) => void setObjectEnabled(collection, id, enabled)}
+                      onDelete={(collection, id) => void deleteObject(collection, id)}
+                    />
+                  )}
+                </>
+              ) : (
+                <div className="provider-feedback" role="note">
+                  <ShieldCheck size={18} aria-hidden />
+                  <span>故障切换顺序、底层 deployment 和未引用对象管理已收进本机专家模式；日常添加渠道无需开启。</span>
+                </div>
+              )}
             </>
           ) : (
             <ReadOnlyDirectStatus status={status} />
@@ -480,13 +598,13 @@ function AdminAccess({
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>
         <p>
-          首次运行 <code>memgw stack install</code>（含 <code>scripts/setup.sh</code> 和容器首启）时会自动生成并打印一次；请从当时的终端或容器日志中查找。
+          Docker 首次安装只把它写入安装目录的 <code>credentials/admin.key</code> 私有文件；不会写入容器日志或环境变量。
         </p>
         <p>丢失后只能换一枚新的；旧密钥会立即失效：</p>
         <p>Docker：在安装目录（默认 memory-platform）打开终端后运行：</p>
-        <code>docker compose -f docker-compose.user.yml exec memory-platform modelgw secret set memory-console-admin</code>
+        <code>docker compose -f docker-compose.user.yml exec model-gateway modelgw secret set memory-console-admin --stdin</code>
         <p>源码安装：</p>
-        <code>services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin</code>
+        <code>services/memory-gateway/.venv/bin/modelgw secret set memory-console-admin --stdin</code>
       </details>
     </section>
   );
@@ -671,6 +789,189 @@ function ConnectionCheckResult({ result }: { result: ModelGatewayConnectionCheck
       {check.level === "ok" ? <CheckCircle2 size={15} aria-hidden /> : <TriangleAlert size={15} aria-hidden />}
       <span>{check.detail}</span>
     </div>
+  );
+}
+
+function ObjectManager({
+  control,
+  busyAction,
+  onSetEnabled,
+  onDelete
+}: {
+  control: ModelGatewayControlSnapshot;
+  busyAction: string;
+  onSetEnabled: (
+    collection: "connections" | "deployments",
+    id: string,
+    enabled: boolean
+  ) => void;
+  onDelete: (
+    collection: "connections" | "deployments" | "pricing",
+    id: string
+  ) => void;
+}) {
+  const connectionReferences = useMemo(() => {
+    const references = new Map<string, string[]>();
+    for (const deployment of control.deployments) {
+      const list = references.get(deployment.connection) || [];
+      list.push(`deployment:${deployment.id}`);
+      references.set(deployment.connection, list);
+    }
+    return references;
+  }, [control.deployments]);
+  const deploymentReferences = useMemo(() => {
+    const references = new Map<string, string[]>();
+    for (const route of control.routes) {
+      for (const target of route.targets) {
+        const list = references.get(target) || [];
+        list.push(`route:${route.id}`);
+        references.set(target, list);
+      }
+    }
+    return references;
+  }, [control.routes]);
+  const pricingReferences = useMemo(() => {
+    const references = new Map<string, string[]>();
+    for (const deployment of control.deployments) {
+      if (!deployment.pricing) continue;
+      const list = references.get(deployment.pricing) || [];
+      list.push(`deployment:${deployment.id}`);
+      references.set(deployment.pricing, list);
+    }
+    return references;
+  }, [control.deployments]);
+  const pricing = control.pricing || [];
+
+  return (
+    <details className="panel provider-advanced-panel provider-object-manager">
+      <summary>专家模式：底层对象管理</summary>
+      <p className="muted">
+        这里展示 admin 视图中的全部对象，包括未被 route 引用的候选项。只能删除未引用对象；服务端会用 revision CAS 再次核验。
+      </p>
+      <div className="provider-object-groups">
+        <ObjectGroup title="Connections" count={control.connections.length}>
+          {control.connections.map((connection) => (
+            <ObjectRow
+              key={connection.id}
+              id={connection.id}
+              detail={`${connection.channel_operator} · ${connection.usage_scope}`}
+              enabled={connection.enabled}
+              references={connectionReferences.get(connection.id) || []}
+              busy={busyAction.endsWith(`connections:${connection.id}`)}
+              onSetEnabled={(enabled) => onSetEnabled("connections", connection.id, enabled)}
+              onDelete={() => onDelete("connections", connection.id)}
+            />
+          ))}
+        </ObjectGroup>
+        <ObjectGroup title="Deployments" count={control.deployments.length}>
+          {control.deployments.map((deployment) => (
+            <ObjectRow
+              key={deployment.id}
+              id={deployment.id}
+              detail={`${deployment.kind} · ${deployment.upstream_model} · author ${deployment.model_author || "unknown"}`}
+              enabled={deployment.enabled}
+              references={deploymentReferences.get(deployment.id) || []}
+              busy={busyAction.endsWith(`deployments:${deployment.id}`)}
+              onSetEnabled={(enabled) => onSetEnabled("deployments", deployment.id, enabled)}
+              onDelete={() => onDelete("deployments", deployment.id)}
+            />
+          ))}
+        </ObjectGroup>
+        <ObjectGroup title="Pricing" count={pricing.length}>
+          {pricing.map((item) => (
+            <PricingObjectRow
+              key={item.id}
+              item={item}
+              references={pricingReferences.get(item.id) || []}
+              busy={busyAction === `delete:pricing:${item.id}`}
+              onDelete={() => onDelete("pricing", item.id)}
+            />
+          ))}
+        </ObjectGroup>
+      </div>
+    </details>
+  );
+}
+
+function ObjectGroup({
+  title,
+  count,
+  children
+}: {
+  title: string;
+  count: number;
+  children: ReactNode;
+}) {
+  return (
+    <section className="provider-object-group">
+      <header><h3>{title}</h3><span>{count}</span></header>
+      {count ? <div className="provider-object-list">{children}</div> : <p>暂无对象</p>}
+    </section>
+  );
+}
+
+function ObjectRow({
+  id,
+  detail,
+  enabled,
+  references,
+  busy,
+  onSetEnabled,
+  onDelete
+}: {
+  id: string;
+  detail: string;
+  enabled: boolean;
+  references: string[];
+  busy: boolean;
+  onSetEnabled: (enabled: boolean) => void;
+  onDelete: () => void;
+}) {
+  const referenced = references.length > 0;
+  return (
+    <article className="provider-object-row">
+      <div>
+        <code>{id}</code>
+        <p>{detail}</p>
+        <small>{referenced ? `引用：${references.join("、")}` : "未引用，可安全删除"}</small>
+      </div>
+      <div className="provider-object-actions">
+        <button type="button" className="secondary-button" onClick={() => onSetEnabled(!enabled)} disabled={busy}>
+          <Power size={15} aria-hidden />{enabled ? "禁用" : "启用"}
+        </button>
+        <button type="button" className="danger-button" onClick={onDelete} disabled={referenced || busy} title={referenced ? "仍被引用，不能删除" : "删除未引用对象"}>
+          <Trash2 size={15} aria-hidden />删除
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function PricingObjectRow({
+  item,
+  references,
+  busy,
+  onDelete
+}: {
+  item: ModelGatewayPricingInfo;
+  references: string[];
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const referenced = references.length > 0;
+  return (
+    <article className="provider-object-row">
+      <div>
+        <code>{item.id}</code>
+        <p>{item.mode} · {item.currency} / {item.unit_tokens.toLocaleString()} tokens</p>
+        <small>{referenced ? `引用：${references.join("、")}` : "未引用，可安全删除"}</small>
+      </div>
+      <div className="provider-object-actions">
+        <button type="button" className="danger-button" onClick={onDelete} disabled={referenced || busy} title={referenced ? "仍被引用，不能删除" : "删除未引用价格记录"}>
+          <Trash2 size={15} aria-hidden />删除
+        </button>
+      </div>
+    </article>
   );
 }
 

@@ -13,7 +13,7 @@ import {
   X
 } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import type { MemoryExport, MemoryRecord, MemorySpace } from "../../types";
+import type { MemoryPurgePreviewResult, MemoryRecord, MemorySpace } from "../../types";
 import { badge } from "../../components/Badge";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { FilterSelect, RangeFields } from "../../components/FormControls";
@@ -304,31 +304,47 @@ export function MemoriesPage({
   };
 
   const bulkPurge = async () => {
-    const ok = await confirm({
-      title: "永久删除所选记忆",
-      message: `将永久删除已选的 ${selectedIds.size} 条记忆。此操作无法撤销，建议先导出备份。`,
-      confirmLabel: "永久删除",
-      tone: "danger"
-    });
-    if (!ok) return;
-    await runBulk((id) => api.purgeDeletedMemory(id), (done) => `已永久删除 ${done} 条记忆`);
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    setBulkBusy(true);
+    try {
+      const preview = await api.previewDeletedMemoriesPurge(ids);
+      const ok = await confirm({
+        title: "核对永久删除影响",
+        message: <PurgePreviewSummary preview={preview} />,
+        confirmLabel: "按以上范围永久删除",
+        cancelLabel: "取消，保留记忆",
+        tone: "danger"
+      });
+      if (!ok) return;
+      const result = await api.commitDeletedMemoriesPurge(
+        preview.requested_memory_ids,
+        preview.fingerprint,
+        preview.preview_token
+      );
+      notify(`已永久删除 ${result.effects.memories_deleted} 条记忆`, "success");
+      if (result.warnings?.length) notify(result.warnings.join("；"), "error");
+      setSelectedIds(new Set());
+      void load(tab);
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setBulkBusy(false);
+    }
   };
 
   const bulkExport = async () => {
     setBulkBusy(true);
     try {
-      const exportData = (await api.exportMemories("json")) as MemoryExport;
-      const chosen = new Set(selectedIds);
-      const filtered: MemoryExport = {
-        ...exportData,
-        memories: (exportData.memories || []).filter((memory) => chosen.has(memory.id))
-      };
+      const exportData = await api.exportSelectedMemories([...selectedIds]);
+      const exportedCount =
+        (exportData.memories?.length || 0) + (exportData.deleted_memories?.length || 0);
       downloadFile(
         `memory-selected-${new Date().toISOString().slice(0, 10)}.json`,
-        JSON.stringify(filtered, null, 2),
+        JSON.stringify(exportData, null, 2),
         "application/json"
       );
-      notify(`已导出 ${filtered.memories?.length || 0} 条所选记忆`, "success");
+      notify(`已导出 ${exportedCount} 条所选记忆`, "success");
     } catch (error) {
       notify(errorMessage(error), "error");
     } finally {
@@ -718,12 +734,30 @@ export function MemoriesPage({
             </div>
             <div className="memory-card-list">
               {pagedMemories.map((memory) => (
-                <button key={memory.id} type="button" onClick={() => openMemory(memory.id)}>
-                  <span className="memory-card-kicker">{badge(memory.type)} {badge(memory.status || "dynamic")}</span>
-                  <strong>{memory.content}</strong>
-                  <span className="memory-card-classification">{classificationSummary(memory, spaces)}</span>
-                  <span className="memory-card-meta"><b>重要度 {memory.importance}</b><span>{dateText(memory.updated_at)}</span></span>
-                </button>
+                <article
+                  className={`memory-card-item ${selectedIds.has(memory.id) ? "selected" : ""}`}
+                  key={memory.id}
+                >
+                  <label className="memory-card-select">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择记忆：${memory.content.slice(0, 24)}（移动端）`}
+                      checked={selectedIds.has(memory.id)}
+                      onChange={() => toggleRowSelection(memory.id)}
+                    />
+                    <span>选择</span>
+                  </label>
+                  <button
+                    className="memory-card-open"
+                    type="button"
+                    onClick={() => openMemory(memory.id)}
+                  >
+                    <span className="memory-card-kicker">{badge(memory.type)} {badge(memory.status || "dynamic")}</span>
+                    <strong>{memory.content}</strong>
+                    <span className="memory-card-classification">{classificationSummary(memory, spaces)}</span>
+                    <span className="memory-card-meta"><b>重要度 {memory.importance}</b><span>{dateText(memory.updated_at)}</span></span>
+                  </button>
+                </article>
               ))}
             </div>
             {pageCount > 1 && (
@@ -741,6 +775,46 @@ export function MemoriesPage({
       </div>
 
       <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
+    </div>
+  );
+}
+
+function PurgePreviewSummary({ preview }: { preview: MemoryPurgePreviewResult }) {
+  const additionalCount = preview.dependent_memory_ids.length;
+  const activeCore = preview.affected_core_memory_sections.filter((section) => section.active);
+  return (
+    <div className="purge-preview-summary">
+      <p>
+        你选择了 <strong>{preview.requested_memory_ids.length}</strong> 条回收站记忆；根据证据依赖，
+        实际将永久删除 <strong>{preview.purge_memory_ids.length}</strong> 条。
+      </p>
+      {additionalCount > 0 && (
+        <details>
+          <summary>额外删除 {additionalCount} 条依赖记忆（展开核对 ID）</summary>
+          <ul>
+            {preview.dependent_memory_ids.map((memoryId) => (
+              <li key={memoryId}><code>{memoryId}</code></li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {activeCore.length > 0 ? (
+        <div className="purge-core-impact" role="alert">
+          <strong>Core 影响</strong>
+          <span>
+            将归档并脱敏 {activeCore.length} 个当前 Core 分区：
+            {activeCore.map((section) => displayText(section.section)).join("、")}。
+          </span>
+        </div>
+      ) : (
+        <p>当前 Core 分区不受影响。</p>
+      )}
+      <ul className="purge-effects-list">
+        <li>Core 历史脱敏：{preview.effects.core_history_scrubbed} 条</li>
+        <li>审计历史脱敏：{preview.effects.decision_logs_scrubbed} 条</li>
+        <li>空间关联清理：{preview.effects.space_links_deleted} 条</li>
+      </ul>
+      <p><strong>此操作无法撤销。</strong> 如果影响范围不符合预期，请取消并先导出备份。</p>
     </div>
   );
 }

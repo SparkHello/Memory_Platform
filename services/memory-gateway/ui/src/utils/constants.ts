@@ -85,7 +85,7 @@ export const CONFIG_KEYS = [
 ];
 
 export const CONFIG_KEY_HINTS: Record<string, string> = {
-  GATEWAY_API_KEY: "服务端 .env 中配置的服务访问密钥；上方「连接设置」需填写相同的值",
+  GATEWAY_API_KEY: "仅供旧安装迁移的 legacy 全权限密钥；全新安装应使用按设备、按用途的 scoped token",
   UPSTREAM_BASE_URL: "上游聊天模型的 OpenAI 兼容接口地址",
   UPSTREAM_API_KEY: "服务端调用上游模型的密钥，只在服务端使用，不会透传给客户端",
   UPSTREAM_MODEL: "记忆提取与整理所使用的模型名称",

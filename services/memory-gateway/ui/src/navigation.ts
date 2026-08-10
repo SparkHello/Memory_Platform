@@ -45,6 +45,16 @@ export const NAV_SECTIONS: NavSection[] = [
   { key: "system", label: "系统", items: ["providers", "settings", "developer"] }
 ];
 
+/**
+ * 默认只展示完成日常任务所需的入口。高级页面继续保留完整 hash 路由，
+ * 因此旧书签和页面内跳转不会因为简洁模式而失效。
+ */
+export const SIMPLE_NAV_SECTIONS: NavSection[] = [
+  { key: "studio", label: "开始", items: ["dashboard"] },
+  { key: "memory", label: "内容", items: ["memories", "knowledge"] },
+  { key: "system", label: "使用", items: ["providers", "reports", "developer"] }
+];
+
 export function sectionForPage(page: PageKey): NavSection {
   return NAV_SECTIONS.find((section) => section.items.includes(page)) || NAV_SECTIONS[0];
 }

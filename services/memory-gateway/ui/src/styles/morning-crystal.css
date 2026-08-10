@@ -230,6 +230,14 @@ button {
   opacity: 1;
 }
 
+.nav-mode-toggle {
+  flex: none;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(16, 35, 31, 0.13);
+  border-radius: 0 0 11px 11px;
+}
+
 .nav-badge {
   flex: none;
   min-width: 20px;
@@ -1311,6 +1319,11 @@ button {
   background: var(--primary-soft);
   color: var(--primary);
   font-weight: 700;
+}
+
+.mobile-mode-toggle {
+  width: 100%;
+  justify-content: center;
 }
 
 @media (max-width: 1180px) {

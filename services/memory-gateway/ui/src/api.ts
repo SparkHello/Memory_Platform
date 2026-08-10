@@ -1,18 +1,29 @@
 import type {
+  AuthTokenCreateResult,
+  AuthTokenListResult,
+  AuthTokenRevokeResult,
   ConnectionSettings,
   ConversationBranchArchiveResult,
   ConversationBranchList,
   ConversationBranchRestoreResult,
   CoreMemoryHistoryItem,
   CoreMemorySection,
+  CoreMemoryUpdatePayload,
+  CoreMemoryUpdateResult,
   DecisionLog,
   MemoryExport,
   ModelUsageSummary,
+  ModelGatewayBundleResult,
+  ModelGatewayChannelDiscoverBody,
+  ModelGatewayChannelDiscoverResult,
+  ModelGatewayChannelBundleBody,
   ModelGatewayConnectionCheck,
   ModelGatewayConnectionCreateBody,
   ModelGatewayConnectionCreateResult,
+  ModelGatewayControlSnapshot,
   ModelGatewayDeploymentApplyBody,
   ModelGatewayDeploymentApplyResult,
+  ModelGatewayObjectMutationResult,
   ModelGatewayRouteChangeResult,
   ModelGatewayRouteDraft,
   ProvidersStatus,
@@ -23,7 +34,9 @@ import type {
   MemoryStatus,
   MemoryRecord,
   MemoryReport,
+  MemoryBatchPurgeResult,
   MemoryPurgeResult,
+  MemoryPurgePreviewResult,
   MemorySearchRecord,
   MemorySourceExplanation,
   MemorySpace,
@@ -135,6 +148,32 @@ export class MemoryApi {
     return this.request("/health", { auth: false, signal });
   }
 
+  async authTokens(signal?: AbortSignal): Promise<AuthTokenListResult> {
+    return this.request("/auth/tokens", { signal });
+  }
+
+  async createAuthToken(
+    name: string,
+    role: "chat" | "mcp",
+    signal?: AbortSignal
+  ): Promise<AuthTokenCreateResult> {
+    return this.request("/auth/tokens", {
+      method: "POST",
+      body: { name, role },
+      signal
+    });
+  }
+
+  async revokeAuthToken(
+    tokenId: string,
+    signal?: AbortSignal
+  ): Promise<AuthTokenRevokeResult> {
+    return this.request(`/auth/tokens/${encodeURIComponent(tokenId)}`, {
+      method: "DELETE",
+      signal
+    });
+  }
+
   async modelUsage(
     range: "7" | "30" | "90" | "all" = "30",
     signal?: AbortSignal
@@ -156,6 +195,92 @@ export class MemoryApi {
   ): Promise<{ valid: boolean }> {
     return this.request("/providers/admin/check", {
       method: "POST",
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async providerAdminConfiguration(
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayControlSnapshot> {
+    return this.request("/providers/admin/configuration", {
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async discoverProviderChannel(
+    body: ModelGatewayChannelDiscoverBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayChannelDiscoverResult> {
+    return this.request("/providers/channels/discover", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal,
+      timeoutMs: 30000,
+      timeoutMessage: "渠道模型发现超时，请确认供应商 API 地址可以访问"
+    });
+  }
+
+  async validateProviderChannelBundle(
+    body: ModelGatewayChannelBundleBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayBundleResult> {
+    return this.request("/providers/channel-bundles/validate", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal,
+      timeoutMs: 30000,
+      timeoutMessage: "渠道配置校验超时，请稍后重试"
+    });
+  }
+
+  async applyProviderChannelBundle(
+    body: ModelGatewayChannelBundleBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayBundleResult> {
+    return this.request("/providers/channel-bundles/apply", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal,
+      timeoutMs: 30000,
+      timeoutMessage: "渠道配置应用超时，请刷新确认是否已经生效"
+    });
+  }
+
+  async setProviderObjectEnabled(
+    collection: "connections" | "deployments",
+    id: string,
+    revision: string,
+    enabled: boolean,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayObjectMutationResult> {
+    return this.request(`/providers/${collection}/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { revision, enabled },
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async deleteProviderObject(
+    collection: "connections" | "deployments" | "pricing",
+    id: string,
+    revision: string,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayObjectMutationResult> {
+    return this.request(`/providers/${collection}/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      body: { revision },
       headers: { "X-Model-Gateway-Admin-Key": adminKey },
       signal
     });
@@ -710,14 +835,43 @@ export class MemoryApi {
     });
   }
 
+  async previewDeletedMemoriesPurge(
+    memoryIds: string[],
+    signal?: AbortSignal
+  ): Promise<MemoryPurgePreviewResult> {
+    return this.request("/memories/deleted/purge/preview", {
+      method: "POST",
+      body: { memory_ids: memoryIds },
+      signal
+    });
+  }
+
+  async commitDeletedMemoriesPurge(
+    memoryIds: string[],
+    fingerprint: string,
+    previewToken: string,
+    signal?: AbortSignal
+  ): Promise<MemoryBatchPurgeResult> {
+    return this.request("/memories/deleted/purge/commit", {
+      method: "POST",
+      body: {
+        memory_ids: memoryIds,
+        fingerprint,
+        preview_token: previewToken
+      },
+      signal
+    });
+  }
+
   async updateMemory(
     memoryId: string,
     payload: MemoryUpdatePayload,
+    expectedRevision: number,
     signal?: AbortSignal
   ): Promise<MemoryUpdateResult> {
     return this.request(`/memories/${encodeURIComponent(memoryId)}`, {
       method: "PATCH",
-      body: payload,
+      body: { ...payload, expected_revision: expectedRevision },
       signal
     });
   }
@@ -725,11 +879,12 @@ export class MemoryApi {
   async updateMemorySpaces(
     memoryId: string,
     payload: MemorySpacesUpdatePayload,
+    expectedRevision: number,
     signal?: AbortSignal
   ): Promise<MemoryUpdateResult> {
     return this.request(`/memories/${encodeURIComponent(memoryId)}/spaces`, {
       method: "PATCH",
-      body: payload,
+      body: { ...payload, expected_revision: expectedRevision },
       signal
     });
   }
@@ -745,6 +900,17 @@ export class MemoryApi {
   async exportMemories(format: "json" | "markdown", signal?: AbortSignal): Promise<MemoryExport | string> {
     return this.request(`/memories/export?format=${format}&include_deleted=true`, {
       text: format === "markdown",
+      signal
+    });
+  }
+
+  async exportSelectedMemories(
+    memoryIds: string[],
+    signal?: AbortSignal
+  ): Promise<MemoryExport> {
+    return this.request("/memories/export/selection", {
+      method: "POST",
+      body: { memory_ids: memoryIds },
       signal
     });
   }
@@ -828,6 +994,30 @@ export class MemoryApi {
   async coreMemory(signal?: AbortSignal): Promise<CoreMemorySection[]> {
     const payload = await this.request<{ data: CoreMemorySection[] }>("/memories/core", { signal });
     return payload.data || [];
+  }
+
+  async getCoreMemorySection(
+    section: CoreMemorySection["section"],
+    signal?: AbortSignal
+  ): Promise<CoreMemorySection> {
+    const payload = await this.request<{ core_memory: CoreMemorySection }>(
+      `/memories/core/${encodeURIComponent(section)}`,
+      { signal }
+    );
+    return payload.core_memory;
+  }
+
+  async updateCoreMemorySection(
+    section: CoreMemorySection["section"],
+    payload: CoreMemoryUpdatePayload,
+    expectedRevision: number,
+    signal?: AbortSignal
+  ): Promise<CoreMemoryUpdateResult> {
+    return this.request(`/memories/core/${encodeURIComponent(section)}`, {
+      method: "PATCH",
+      body: { ...payload, expected_revision: expectedRevision },
+      signal
+    });
   }
 
   async coreHistory(signal?: AbortSignal): Promise<CoreMemoryHistoryItem[]> {

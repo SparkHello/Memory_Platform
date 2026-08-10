@@ -22,13 +22,24 @@ import { DeveloperPage } from "./pages/system/DeveloperPage";
 import { ProvidersPage } from "./pages/system/ProvidersPage";
 import { SettingsPage } from "./pages/system/SettingsPage";
 import { UsagePage } from "./pages/system/UsagePage";
-import { loadSettings, loadTheme, saveSettings, saveTheme, type ThemeMode } from "./storage";
+import {
+  loadSettings,
+  loadTheme,
+  loadUiMode,
+  saveSettings,
+  saveTheme,
+  saveUiMode,
+  type ThemeMode,
+  type UiMode
+} from "./storage";
 import type { ConnectionSettings, KnowledgeStatus, PageKey, ProvidersStatus } from "./types";
 import { errorMessage } from "./utils/format";
+import { scrollWorkspaceToTop } from "./utils/scroll";
 
 export function App() {
   const [settings, setSettings] = useState<ConnectionSettings>(() => loadSettings());
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
+  const [uiMode, setUiMode] = useState<UiMode>(() => loadUiMode());
   const [page, setPage] = useState<PageKey>(() => {
     const saved = loadSettings();
     return parseHash(window.location.hash)?.page ?? (saved.apiKey ? "dashboard" : "settings");
@@ -136,7 +147,12 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
-    document.querySelector(".content-area")?.scrollTo(0, 0);
+    document.documentElement.dataset.uiMode = uiMode;
+    saveUiMode(uiMode);
+  }, [uiMode]);
+
+  useEffect(() => {
+    scrollWorkspaceToTop();
     document.documentElement.dataset.page = activePage;
   }, [activePage, knowledgeId]);
 
@@ -268,8 +284,10 @@ export function App() {
         settings={settings}
         serviceStatus={serviceStatus}
         theme={theme}
+        uiMode={uiMode}
         signals={navSignals}
         onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+        onToggleUiMode={() => setUiMode((current) => (current === "simple" ? "expert" : "simple"))}
         onPageChange={navigateToPage}
         onRefreshService={() => void pingService()}
       >
@@ -319,12 +337,23 @@ export function App() {
         {activePage === "logs" && <DecisionLogsPage api={api} />}
         {activePage === "usage" && <UsagePage api={api} />}
         {activePage === "providers" && (
-          <ProvidersPage api={api} initialSetup={!setupStatus?.chat_ready} />
+          <ProvidersPage
+            api={api}
+            initialSetup={!setupStatus?.chat_ready}
+            expertMode={uiMode === "expert"}
+          />
         )}
         {activePage === "settings" && (
           <SettingsPage settings={settings} onSave={applySettings} notify={notify} />
         )}
-        {activePage === "developer" && <DeveloperPage settings={settings} notify={notify} />}
+        {activePage === "developer" && (
+          <DeveloperPage
+            api={api}
+            settings={settings}
+            notify={notify}
+            confirm={confirm}
+          />
+        )}
       </AppShell>
       {settings.apiKey && memoryId && (
         <MemoryDetailDrawer

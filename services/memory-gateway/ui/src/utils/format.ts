@@ -111,7 +111,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 const STATUS_MESSAGES: Record<number, string> = {
   400: "请求参数有误",
-  401: "访问密钥无效，请在设置中核对 GATEWAY_API_KEY",
+  401: "访问凭证无效，请在设置中核对当前设备的 Console token",
   403: "没有权限执行此操作",
   404: "请求的内容不存在",
   409: "操作冲突，请刷新后重试",

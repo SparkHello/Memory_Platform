@@ -1,6 +1,5 @@
 import {
   Activity,
-  Archive,
   ClipboardCheck,
   Database,
   FileText,
@@ -21,10 +20,11 @@ import {
   X
 } from "lucide-react";
 import { useId, useState, type ReactNode } from "react";
-import { NAV_SECTIONS, PAGE_META, sectionForPage, type SectionKey } from "../navigation";
+import { NAV_SECTIONS, PAGE_META, SIMPLE_NAV_SECTIONS, sectionForPage } from "../navigation";
 import { useDialogA11y } from "../hooks/useDialogA11y";
-import type { ThemeMode } from "../storage";
+import type { ThemeMode, UiMode } from "../storage";
 import type { ConnectionSettings, PageKey } from "../types";
+import { scrollWorkspaceToTop } from "../utils/scroll";
 
 const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   dashboard: Gauge,
@@ -44,14 +44,7 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   developer: Wrench
 };
 
-const SECTION_ICONS: Record<SectionKey, typeof Gauge> = {
-  studio: Gauge,
-  memory: Database,
-  knowledge: LibraryBig,
-  governance: ListChecks,
-  data: Archive,
-  system: SettingsIcon
-};
+const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "providers"];
 
 export type NavBadge = {
   text: string;
@@ -65,8 +58,10 @@ export function AppShell({
   settings,
   serviceStatus,
   theme,
+  uiMode,
   signals = {},
   onToggleTheme,
+  onToggleUiMode,
   onPageChange,
   onRefreshService,
   children
@@ -79,8 +74,10 @@ export function AppShell({
     message: string;
   };
   theme: ThemeMode;
+  uiMode: UiMode;
   signals?: NavSignals;
   onToggleTheme: () => void;
+  onToggleUiMode: () => void;
   onPageChange: (page: PageKey) => void;
   onRefreshService: () => void;
   children: ReactNode;
@@ -89,15 +86,15 @@ export function AppShell({
   const configured = Boolean(settings.apiKey);
   const userId = settings.userId || "default";
   const activeSection = sectionForPage(activePage);
+  const navSections = uiMode === "expert" ? NAV_SECTIONS : SIMPLE_NAV_SECTIONS;
 
   const go = (nextPage: PageKey) => {
     setMoreOpen(false);
+    if (nextPage === activePage) {
+      scrollWorkspaceToTop();
+      return;
+    }
     onPageChange(nextPage);
-  };
-
-  const goSection = (section: (typeof NAV_SECTIONS)[number]) => {
-    if (section.items.includes(activePage)) return;
-    go(section.items[0]);
   };
 
   return (
@@ -120,7 +117,7 @@ export function AppShell({
           </div>
 
           <nav className="nav-list" aria-label="Memory Console">
-            {NAV_SECTIONS.map((section) => (
+            {navSections.map((section) => (
               <div className="nav-group" key={section.key}>
                 <span className="nav-group-label">{section.label}</span>
                 {section.items.map((key) => {
@@ -146,6 +143,16 @@ export function AppShell({
               </div>
             ))}
           </nav>
+          <button
+            className="nav-item nav-mode-toggle"
+            type="button"
+            aria-pressed={uiMode === "expert"}
+            onClick={onToggleUiMode}
+            title={uiMode === "expert" ? "隐藏高级工具，返回常用页面" : "显示评测、日志等高级工具"}
+          >
+            <Wrench size={16} />
+            <span>{uiMode === "expert" ? "返回简洁模式" : "切换到专家模式"}</span>
+          </button>
         </aside>
       )}
 
@@ -207,25 +214,25 @@ export function AppShell({
 
       {configured && (
         <nav className="mobile-bottom-nav" aria-label="移动端导航">
-          {NAV_SECTIONS.slice(0, 4).map((section) => {
-            const Icon = SECTION_ICONS[section.key];
-            const isActive = section.items.includes(activePage);
+          {MOBILE_PRIMARY_PAGES.map((page) => {
+            const Icon = PAGE_ICONS[page];
+            const isActive = activePage === page;
             return (
               <button
-                key={section.key}
+                key={page}
                 type="button"
                 className={isActive ? "active" : ""}
-                onClick={() => goSection(section)}
+                onClick={() => go(page)}
                 aria-current={isActive ? "page" : undefined}
               >
                 <Icon size={19} />
-                <span>{section.label}</span>
+                <span>{PAGE_META[page].shortLabel}</span>
               </button>
             );
           })}
           <button
             type="button"
-            className={["data", "system"].includes(sectionForPage(activePage).key) ? "active" : ""}
+            className={!MOBILE_PRIMARY_PAGES.includes(activePage) ? "active" : ""}
             onClick={() => setMoreOpen(true)}
           >
             <Menu size={19} />
@@ -235,7 +242,13 @@ export function AppShell({
       )}
 
       {configured && moreOpen && (
-        <MobileMoreSheet activePage={activePage} onClose={() => setMoreOpen(false)} onPageChange={go} />
+        <MobileMoreSheet
+          activePage={activePage}
+          uiMode={uiMode}
+          onClose={() => setMoreOpen(false)}
+          onPageChange={go}
+          onToggleUiMode={onToggleUiMode}
+        />
       )}
     </div>
   );
@@ -243,15 +256,20 @@ export function AppShell({
 
 function MobileMoreSheet({
   activePage,
+  uiMode,
   onClose,
-  onPageChange
+  onPageChange,
+  onToggleUiMode
 }: {
   activePage: PageKey;
+  uiMode: UiMode;
   onClose: () => void;
   onPageChange: (page: PageKey) => void;
+  onToggleUiMode: () => void;
 }) {
   const titleId = useId();
   const sheetRef = useDialogA11y<HTMLElement>(onClose);
+  const navSections = uiMode === "expert" ? NAV_SECTIONS : SIMPLE_NAV_SECTIONS;
   return (
     <div className="mobile-more-layer" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
@@ -259,14 +277,14 @@ function MobileMoreSheet({
       <section ref={sheetRef} className="mobile-more-sheet" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <header>
           <div>
-            <span>全部页面</span>
-            <strong id={titleId}>记忆与知识工具</strong>
+            <span>{uiMode === "expert" ? "全部页面" : "常用页面"}</span>
+            <strong id={titleId}>{uiMode === "expert" ? "记忆与知识工具" : "Memory Console"}</strong>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
             <X size={18} />
           </button>
         </header>
-        {NAV_SECTIONS.map((section) => (
+        {navSections.map((section) => (
           <div className="mobile-more-section" key={section.key}>
             <span className="mobile-more-label">{section.label}</span>
             <div className="mobile-more-grid">
@@ -282,6 +300,15 @@ function MobileMoreSheet({
             </div>
           </div>
         ))}
+        <button
+          className="secondary-button mobile-mode-toggle"
+          type="button"
+          aria-pressed={uiMode === "expert"}
+          onClick={onToggleUiMode}
+        >
+          <Wrench size={16} />
+          {uiMode === "expert" ? "返回简洁模式" : "显示专家工具"}
+        </button>
       </section>
     </div>
   );

@@ -77,7 +77,7 @@ export function SettingsPage({
       <PageHeader
         eyebrow={onboarding ? "首次设置 · 第 1 步" : undefined}
         title={onboarding ? "输入客户端访问密钥" : "设置"}
-        subtitle={onboarding ? "粘贴安装完成时显示的 GATEWAY_API_KEY；它只保存在当前浏览器。" : "连接信息与本机偏好。"}
+        subtitle={onboarding ? "粘贴安装器写入 credentials/gateway.key 的初始 Console token；它只保存在当前浏览器。" : "连接信息与本机偏好。"}
       />
       <section className="panel settings-panel">
         <div className="panel-header">
@@ -96,7 +96,7 @@ export function SettingsPage({
               type={showKey ? "text" : "password"}
               value={form.apiKey}
               onChange={(event) => setForm({ ...form, apiKey: event.target.value })}
-              placeholder="GATEWAY_API_KEY"
+              placeholder="mgw_…（迁移旧安装时也可暂用 legacy key）"
             />
             <button
               className="icon-button"
@@ -152,49 +152,34 @@ export function SettingsPage({
         </div>
       </section>
 
-      <section className="panel panel--quiet settings-reference">
-        <div className="panel-header">
+      {!onboarding && (
+        <details className="panel panel--quiet settings-reference settings-reference-details">
+          <summary>高级：运维与旧版直连配置参考</summary>
+          <div className="notice">
+            日常模型配置请使用「模型与路由」，设备 token 请使用「接入信息」。下面内容仅供源码运维或迁移旧版 direct 配置时排障。
+          </div>
           <h2>服务进程管理</h2>
-        </div>
-        <div className="notice">
-          服务必须在运行中才能使用；它以后台进程运行，关闭终端窗口不影响，重启电脑后需要按下面方式恢复。
-        </div>
-        <div className="config-grid">
-          <div className="config-item">
-            <code>scripts/memgw stack status</code>
-            <span>源码安装：在仓库目录查看两个服务的状态；start / stop / restart 控制启停</span>
-          </div>
-          <div className="config-item">
-            <code>docker compose -f docker-compose.user.yml ps</code>
-            <span>Docker 安装：在 compose 文件目录查看状态；start / stop / restart 控制启停</span>
-          </div>
-          <div className="config-item">
-            <code>重启电脑后</code>
-            <span>源码安装重新运行 scripts/memgw stack start；Docker 会随 Docker Desktop 自动启动</span>
-          </div>
-          <div className="config-item">
-            <code>开机自启</code>
-            <span>Docker 用户在 Docker Desktop 设置勾选「登录时启动」即可；源码安装暂不提供开机自启</span>
-          </div>
-        </div>
-      </section>
-
-      <section className="panel panel--quiet settings-reference">
-        <div className="panel-header">
-          <h2>项目配置说明</h2>
-        </div>
-        <div className="notice">
-          当前版本设置页只保存 UI 连接信息；服务端 .env 修改将在后续版本实现。
-        </div>
-        <div className="config-grid">
-          {CONFIG_KEYS.map((key) => (
-            <div className="config-item" key={key}>
-              <code>{key}</code>
-              <span>{CONFIG_KEY_HINTS[key]}</span>
+          <div className="config-grid">
+            <div className="config-item">
+              <code>scripts/memgw stack status</code>
+              <span>源码安装：在仓库目录查看两个服务状态；start / stop / restart 控制启停</span>
             </div>
-          ))}
-        </div>
-      </section>
+            <div className="config-item">
+              <code>docker compose -f docker-compose.user.yml ps</code>
+              <span>Docker 安装：在 compose 文件目录查看状态；Docker Desktop 可设置登录时启动</span>
+            </div>
+          </div>
+          <h2>旧版 direct 环境变量</h2>
+          <div className="config-grid">
+            {CONFIG_KEYS.map((key) => (
+              <div className="config-item" key={key}>
+                <code>{key}</code>
+                <span>{CONFIG_KEY_HINTS[key]}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

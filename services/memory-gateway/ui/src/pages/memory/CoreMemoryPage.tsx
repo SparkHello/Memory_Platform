@@ -81,7 +81,8 @@ export function CoreMemoryPage({
     if (
       !(await confirm({
         title: "重新整理核心记忆",
-        message: "确认重新整理核心记忆？该操作会调用上游模型，并可能更新核心记忆。",
+        message:
+          "确认重新整理核心记忆？该操作会调用上游模型，只保存能通过逐字证据校验的内容；模型可能漏掉部分分区，请在完成后复核结果。",
         tone: "warning",
         confirmLabel: "重新整理"
       }))
@@ -104,7 +105,7 @@ export function CoreMemoryPage({
     <div className="page-stack">
       <PageHeader
         title="核心记忆"
-        subtitle="按分区查看核心记忆和历史版本。"
+        subtitle="按分区查看核心记忆和历史版本；AI 整理会严格校验证据，但仍可能漏项。"
         action={
           <div className="button-row">
             <button className="secondary-button" type="button" onClick={() => setTab("history")}>
@@ -231,5 +232,4 @@ export function CoreMemoryPage({
     </div>
   );
 }
-
 

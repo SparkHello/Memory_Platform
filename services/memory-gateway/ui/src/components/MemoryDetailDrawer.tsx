@@ -250,8 +250,27 @@ export function MemoryDetailDrawer({
     setSavingEdit(true);
     setEditError(null);
     try {
-      const result = await api.updateMemory(memory.id, editDraftToPayload(editDraft));
-      const spacesResult = await api.updateMemorySpaces(memory.id, editDraftToSpacesPayload(editDraft));
+      const result = await api.updateMemory(
+        memory.id,
+        editDraftToPayload(editDraft),
+        memory.revision
+      );
+      if (result.archived) {
+        notify("记忆已移入回收站", "success");
+        setEditing(false);
+        setEditDraft(null);
+        onChanged();
+        onClose();
+        return;
+      }
+      if (!result.memory) {
+        throw new Error("更新记忆的响应缺少 memory 字段");
+      }
+      const spacesResult = await api.updateMemorySpaces(
+        memory.id,
+        editDraftToSpacesPayload(editDraft),
+        result.memory.revision
+      );
       const updated = spacesResult.memory || result.memory;
       setState((current) => ({ ...current, memory: updated }));
       notify("记忆已更新", "success");

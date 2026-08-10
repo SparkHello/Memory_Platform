@@ -95,6 +95,40 @@ export interface ConnectionSettings {
   userId: string;
 }
 
+export type AuthTokenRole = "chat" | "mcp" | "console";
+
+export interface AuthTokenRecord {
+  token_id: string;
+  name: string;
+  user_id: string;
+  role: AuthTokenRole;
+  created_at: string;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+  is_current: boolean;
+  can_revoke: boolean;
+  revoke_block_reason?: "last_active_console_token" | null;
+}
+
+export interface AuthTokenListResult {
+  data: AuthTokenRecord[];
+  current_user_id: string;
+  legacy_key_enabled: boolean;
+  authenticated_with_legacy_key: boolean;
+  allowed_create_roles: Array<"chat" | "mcp">;
+}
+
+export interface AuthTokenCreateResult {
+  token: string;
+  record: AuthTokenRecord;
+}
+
+export interface AuthTokenRevokeResult {
+  revoked: boolean;
+  already_revoked: boolean;
+  record: AuthTokenRecord;
+}
+
 export interface UsageTotals {
   calls: number;
   measured_calls: number;
@@ -163,7 +197,7 @@ export interface UsagePrice {
   as_of: string;
 }
 
-export interface ModelUsageSummary {
+export interface LocalModelUsageSummary {
   range: {
     days?: number | null;
     start?: string | null;
@@ -181,6 +215,50 @@ export interface ModelUsageSummary {
     note: string;
   };
 }
+
+export interface CentralUsageDeployment {
+  deployment_id: string;
+  connection_id: string;
+  channel_operator: string;
+  model_author: string;
+  upstream_model: string;
+  calls: number;
+  total_tokens: number;
+}
+
+export interface CentralModelUsageSummary {
+  days: number;
+  filters: {
+    client_id: string;
+    operation: string;
+    user_tag: string;
+  };
+  calls: number;
+  complete_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_costs: Record<string, string>;
+  incomplete_cost_calls: number;
+  attempts: {
+    recorded: number;
+    known_cost_attempts: number;
+    unknown_cost_attempts: number;
+    not_sent_attempts: number;
+    legacy_logical_events_without_attempts: number;
+    by_currency: Record<
+      string,
+      { known_attempts: number; unknown_attempts: number; estimated_cost: string }
+    >;
+  };
+  deployments: CentralUsageDeployment[];
+  retention: {
+    raw_days: number;
+    daily_days: number;
+  };
+}
+
+export type ModelUsageSummary = LocalModelUsageSummary | CentralModelUsageSummary;
 
 export interface MemoryRecord {
   id: string;
@@ -215,6 +293,7 @@ export interface MemoryRecord {
   updated_at: string;
   archived_at?: string | null;
   archived?: number;
+  revision: number;
   redacted?: boolean;
   redaction_reason?: MemoryRedactionReason;
   redacted_fields?: string[];
@@ -265,7 +344,10 @@ export interface MemorySpaceDetail {
 
 export interface MemoryUpdateResult {
   updated: boolean;
-  memory: MemoryRecord;
+  memory?: MemoryRecord;
+  archived?: boolean;
+  memory_id?: string;
+  revision?: number;
 }
 
 export interface MemoryScoreBreakdown {
@@ -316,6 +398,19 @@ export interface CoreMemorySection {
   version: number;
   created_at: string;
   updated_at: string;
+  revision: number;
+}
+
+export interface CoreMemoryUpdatePayload {
+  content?: string;
+  evidence_memory_ids?: string[];
+  confidence?: number;
+}
+
+export interface CoreMemoryUpdateResult {
+  updated: boolean;
+  action: "create" | "update" | "ignore";
+  core_memory: CoreMemorySection;
 }
 
 export interface CoreMemoryHistoryItem extends CoreMemorySection {
@@ -605,6 +700,48 @@ export interface MemoryPurgeResult {
   affected_core_memory_sections: CoreMemorySection[];
 }
 
+export interface MemoryPurgeEffects {
+  requested_memories_deleted: number;
+  dependent_memories_deleted: number;
+  memories_deleted: number;
+  space_links_deleted: number;
+  temporal_references_relinked: number;
+  core_sections_scrubbed: number;
+  core_history_scrubbed: number;
+  decision_logs_scrubbed: number;
+}
+
+export interface MemoryPurgeCoreImpact {
+  id: string;
+  section: CoreSectionName;
+  version: number;
+  active: boolean;
+}
+
+export interface MemoryPurgePreviewResult {
+  requested_memory_ids: string[];
+  purge_memory_ids: string[];
+  dependent_memory_ids: string[];
+  affected_core_memory_sections: MemoryPurgeCoreImpact[];
+  fingerprint: string;
+  effects: MemoryPurgeEffects;
+  preview_token: string;
+  expires_at: string;
+}
+
+export interface MemoryBatchPurgeResult {
+  purged: boolean;
+  requested_memory_ids: string[];
+  purged_memory_ids: string[];
+  dependent_memory_ids: string[];
+  affected_core_memory_sections: MemoryPurgeCoreImpact[];
+  fingerprint: string;
+  effects: MemoryPurgeEffects;
+  audit_log_id: string;
+  evaluation_cleanup?: Record<string, unknown>;
+  warnings?: string[];
+}
+
 export interface MemoryReportSection {
   section: string;
   title: string;
@@ -650,6 +787,7 @@ export interface RestoreResult {
   invalid: number;
   include_deleted: boolean;
   overwrite: boolean;
+  dry_run: boolean;
 }
 
 export interface MemorySurfaceRecord extends MemoryRecord {
@@ -1032,11 +1170,34 @@ export interface ModelGatewayConnectionInfo {
   id: string;
   channel_operator: string;
   base_url: string;
-  adapter: string;
-  usage_scope: string;
+  adapter: ModelGatewayAdapter;
+  usage_scope: ModelGatewayUsageScope;
+  allowed_private_networks: string[];
+  connect_timeout_seconds: number;
+  read_timeout_seconds: number;
+  write_timeout_seconds: number;
+  pool_timeout_seconds: number;
   enabled: boolean;
   configured: boolean;
 }
+
+export type ModelGatewayAdapter =
+  | "generic"
+  | "kimi"
+  | "deepseek"
+  | "mimo"
+  | "dashscope_openai";
+export type ModelGatewayUsageScope = "backend_allowed" | "interactive_only" | "disabled";
+export type ModelGatewayPlan =
+  | "payg"
+  | "subscription"
+  | "free_tier"
+  | "token_plan"
+  | "coding_plan"
+  | "direct_tool_only"
+  | "custom";
+export type ModelGatewayFallbackScope = "none" | "same_channel" | "any_channel";
+export type ModelGatewayRouteOperation = "keep" | "prepend" | "append" | "replace";
 
 export interface ModelGatewayCapabilities {
   streaming?: boolean;
@@ -1055,9 +1216,11 @@ export interface ModelGatewayDeploymentInfo {
   model_author: string;
   model_family: string;
   kind: "chat" | "embedding";
+  adapter_profile: "inherit" | "dashscope_deepseek_v4";
   capabilities: ModelGatewayCapabilities;
   dimensions: number | null;
   embedding_space: string;
+  pricing?: string | null;
   enabled: boolean;
 }
 
@@ -1067,7 +1230,20 @@ export interface ModelGatewayRouteInfo {
   targets: string[];
   required_capabilities: string[];
   max_attempts: number;
+  fallback_scope: ModelGatewayFallbackScope;
   enabled: boolean;
+}
+
+export interface ModelGatewayPricingInfo {
+  id: string;
+  mode: "per_token" | "subscription" | "free_tier" | "custom" | "unknown";
+  currency: string;
+  unit_tokens: number;
+  tiers: Array<Record<string, unknown>>;
+  source_url: string;
+  effective_from: string;
+  checked_at: string;
+  notes: string;
 }
 
 export interface ModelGatewayControlSnapshot {
@@ -1076,6 +1252,7 @@ export interface ModelGatewayControlSnapshot {
   connections: ModelGatewayConnectionInfo[];
   deployments: ModelGatewayDeploymentInfo[];
   routes: ModelGatewayRouteInfo[];
+  pricing?: ModelGatewayPricingInfo[];
 }
 
 export interface ModelGatewayRouteDraft {
@@ -1107,6 +1284,38 @@ export interface ModelGatewayConnectionCheck {
   }>;
 }
 
+export interface ModelGatewayChannelDiscoverBody {
+  revision: string;
+  candidate_key: string;
+  channel_operator: string;
+  base_url: string;
+  adapter?: ModelGatewayAdapter;
+  auth_type?: "bearer" | "x-api-key";
+  allowed_private_networks?: string[];
+  models_endpoint?: string | null;
+}
+
+export interface ModelGatewayChannelDiscoverResult {
+  valid: boolean;
+  persisted: false;
+  revision: string;
+  candidate: {
+    connection_id: string;
+    channel_operator: string;
+    base_url: string;
+    adapter: ModelGatewayAdapter;
+    auth_type: "bearer" | "x-api-key";
+    allowed_private_networks: string[];
+    models_endpoint: string | null;
+  };
+  models: Array<{
+    id: string;
+    model_author: "unknown" | string;
+    aliases: string[];
+  }>;
+  report: ModelGatewayConnectionCheck;
+}
+
 export interface ModelGatewayConnectionCreateResult {
   valid: boolean;
   applied: boolean;
@@ -1123,21 +1332,71 @@ export interface ModelGatewayConnectionCreateBody {
 }
 
 export interface ModelGatewayDeploymentDraftInput {
+  id?: string;
   upstream_model: string;
   model_author?: string;
   kind: "chat" | "embedding";
+  adapter_profile?: "inherit" | "dashscope_deepseek_v4";
   reasoning_default?: "inherit" | "enabled" | "disabled";
   capabilities?: ModelGatewayCapabilities;
   dimensions?: number | null;
   embedding_space?: string;
+  pricing?: string | null;
+  enabled?: boolean;
 }
 
 export interface ModelGatewayRouteAssignmentInput {
   id: string;
+  operation?: ModelGatewayRouteOperation;
   kind: "chat" | "embedding";
-  targets: string[];
+  targets?: string[];
   max_attempts?: number;
+  fallback_scope?: ModelGatewayFallbackScope;
   enabled?: boolean;
+}
+
+export interface ModelGatewayBundleConnectionInput {
+  id?: string;
+  channel_operator: string;
+  adapter: ModelGatewayAdapter;
+  base_url: string;
+  secret: string;
+  auth_type?: "bearer" | "x-api-key";
+  plan?: ModelGatewayPlan;
+  usage_scope?: ModelGatewayUsageScope;
+  allowed_private_networks?: string[];
+  connect_timeout_seconds?: number;
+  read_timeout_seconds?: number;
+  write_timeout_seconds?: number;
+  pool_timeout_seconds?: number;
+  enabled?: boolean;
+}
+
+export interface ModelGatewayChannelBundleBody {
+  revision: string;
+  connection: ModelGatewayBundleConnectionInput;
+  deployments?: ModelGatewayDeploymentDraftInput[];
+  pricing?: Array<{ id: string; value: Omit<ModelGatewayPricingInfo, "id"> }>;
+  routes?: ModelGatewayRouteAssignmentInput[];
+}
+
+export interface ModelGatewayBundleResult {
+  valid: boolean;
+  applied: boolean;
+  connection_id: string;
+  deployment_ids: string[];
+  changed_routes: string[];
+  revision: string;
+  discovery: ModelGatewayConnectionCheck;
+}
+
+export interface ModelGatewayObjectMutationResult {
+  revision: string;
+  id: string;
+  updated?: boolean;
+  enabled?: boolean;
+  deleted?: boolean;
+  collection?: "connections" | "deployments" | "pricing";
 }
 
 export interface ModelGatewayDeploymentApplyBody {

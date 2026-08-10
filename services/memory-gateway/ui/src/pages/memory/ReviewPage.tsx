@@ -479,7 +479,8 @@ export function ReviewPage({
     if (
       !(await confirm({
         title: "重新整理核心记忆",
-        message: "确认重新整理核心记忆？该操作会调用上游模型，并可能更新核心记忆。",
+        message:
+          "确认重新整理核心记忆？该操作只保存能通过逐字证据校验的内容；模型可能漏掉部分分区，请在完成后复核结果。",
         tone: "warning",
         confirmLabel: "重新整理"
       }))
@@ -1102,4 +1103,3 @@ function reviewRevisionOperationText(operation: string): string {
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
 }
-

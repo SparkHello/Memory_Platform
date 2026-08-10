@@ -1,21 +1,161 @@
-import { Clipboard } from "lucide-react";
-import type { ConnectionSettings } from "../../types";
+import { useCallback, useEffect, useState } from "react";
+import {
+  CheckCircle2,
+  Clipboard,
+  KeyRound,
+  MessageCircle,
+  Plug,
+  RefreshCcw,
+  ShieldAlert,
+  Trash2
+} from "lucide-react";
+import { MemoryApi } from "../../api";
 import { FieldList } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
+import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import type { ConfirmFn } from "../../hooks/useConfirm";
+import type {
+  AuthTokenCreateResult,
+  AuthTokenListResult,
+  AuthTokenRecord,
+  ConnectionSettings
+} from "../../types";
 import { copyText } from "../../utils/files";
-import { joinUrl } from "../../utils/format";
+import { dateText, errorMessage, joinUrl } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
+type DeviceRole = "chat" | "mcp";
+
 export function DeveloperPage({
+  api,
   settings,
-  notify
+  notify,
+  confirm
 }: {
+  api: MemoryApi;
   settings: ConnectionSettings;
   notify: Notify;
+  confirm: ConfirmFn;
 }) {
+  const [tokens, setTokens] = useState<AuthTokenListResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [role, setRole] = useState<DeviceRole>("chat");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [created, setCreated] = useState<AuthTokenCreateResult | null>(null);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+
+  const chatBaseUrl = joinUrl(settings.apiBaseUrl, "/v1");
   const mcpUrl = joinUrl(settings.apiBaseUrl, "/mcp");
-  const headers = `Authorization: Bearer ${settings.apiKey}\nX-User-Id: ${settings.userId}`;
-  // 常用端点的手写摘录，可能与后端漂移，以实际 /health 路由为准。
+
+  const load = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        setTokens(await api.authTokens(signal));
+      } catch (error) {
+        if (signal?.aborted) return;
+        setLoadError(errorMessage(error));
+      } finally {
+        if (!signal?.aborted) setLoading(false);
+      }
+    },
+    [api]
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
+  }, [load]);
+
+  const copy = async (text: string, message = "已复制") => {
+    try {
+      await copyText(text);
+      notify(message, "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
+
+  const createToken = async () => {
+    const normalizedName = name.trim();
+    if (!normalizedName) {
+      setCreateError("请填写能辨认设备或客户端的名称");
+      return;
+    }
+    if (created) {
+      setCreateError("请先保存并关闭上一个一次性 token");
+      return;
+    }
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const result = await api.createAuthToken(normalizedName, role);
+      setCreated(result);
+      setName("");
+      setTokens((current) =>
+        current
+          ? {
+              ...current,
+              data: [
+                ...current.data.filter(
+                  (item) => item.token_id !== result.record.token_id
+                ),
+                result.record
+              ]
+            }
+          : current
+      );
+      notify("设备 token 已创建；离开前请立即复制保存", "success");
+    } catch (error) {
+      setCreateError(errorMessage(error));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const revoke = async (record: AuthTokenRecord) => {
+    const confirmed = await confirm({
+      title: "撤销设备 token",
+      message: (
+        <>
+          确定撤销「{record.name}」吗？该设备下一次请求会立即失去访问权限。
+          {record.is_current && (
+            <strong className="token-current-warning">
+              这是当前浏览器使用的 token；撤销后需要重新登录。
+            </strong>
+          )}
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "撤销 token"
+    });
+    if (!confirmed) return;
+    setRevokingId(record.token_id);
+    try {
+      const result = await api.revokeAuthToken(record.token_id);
+      setTokens((current) =>
+        current
+          ? {
+              ...current,
+              data: current.data.map((item) =>
+                item.token_id === result.record.token_id ? result.record : item
+              )
+            }
+          : current
+      );
+      notify(result.already_revoked ? "该 token 已经撤销" : "设备 token 已撤销", "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setRevokingId(null);
+    }
+  };
+
   const endpoints = [
     "GET /health",
     "GET /memories",
@@ -30,38 +170,274 @@ export function DeveloperPage({
     "GET /knowledge/export"
   ];
 
-  const copy = async (text: string, message = "已复制") => {
-    await copyText(text);
-    notify(message, "success");
-  };
-
   return (
-    <div className="page-stack">
-      <PageHeader title="接入信息" subtitle="MCP、记忆管理与独立知识库的常用 REST 接入信息。" />
-      <section className="panel access-card">
+    <div className="page-stack developer-page">
+      <PageHeader
+        title="客户端接入"
+        subtitle="为每台设备创建最小权限 token，再连接 OpenAI 兼容聊天或 MCP。"
+      />
+
+      {tokens?.legacy_key_enabled && (
+        <section className="notice warning legacy-token-warning" role="status">
+          <ShieldAlert size={18} />
+          <div>
+            <strong>
+              {tokens.authenticated_with_legacy_key
+                ? "当前浏览器仍在使用旧共享访问密钥"
+                : "旧共享访问密钥仍处于启用状态"}
+            </strong>
+            <p>
+              旧 key 同时拥有聊天、MCP 和 Console 权限。请先为各设备迁移到下方 scoped
+              token，再在服务配置中关闭 legacy key。本页只显示迁移状态，绝不会回显旧 key。
+            </p>
+          </div>
+        </section>
+      )}
+
+      <section className="panel access-card token-create-panel">
         <div className="panel-header">
-          <h2>MCP</h2>
+          <div>
+            <h2>创建设备 token</h2>
+            <p className="muted">
+              新 token 固定到当前用户 <code>{tokens?.current_user_id || settings.userId}</code>，
+              不能通过请求头切换用户。
+            </p>
+          </div>
+          <KeyRound size={20} />
+        </div>
+
+        <div className="token-role-guide" aria-label="接入方式说明">
           <button
-            className="secondary-button"
+            className={`token-role-card ${role === "chat" ? "selected" : ""}`}
             type="button"
-            onClick={() => copy(`${mcpUrl}\n${headers}`, "已复制，包含你的 API Key，注意保存")}
+            aria-pressed={role === "chat"}
+            onClick={() => setRole("chat")}
+            disabled={Boolean(created)}
           >
-            <Clipboard size={16} />
-            复制
+            <MessageCircle size={20} />
+            <span>
+              <strong>OpenAI 兼容聊天</strong>
+              <small>默认推荐。Chatbox、RikkaHub、FLIT 等客户端使用 chat token。</small>
+            </span>
+          </button>
+          <button
+            className={`token-role-card ${role === "mcp" ? "selected" : ""}`}
+            type="button"
+            aria-pressed={role === "mcp"}
+            onClick={() => setRole("mcp")}
+            disabled={Boolean(created)}
+          >
+            <Plug size={20} />
+            <span>
+              <strong>MCP 工具接入</strong>
+              <small>仅供支持 Streamable HTTP MCP 的客户端使用 mcp token。</small>
+            </span>
           </button>
         </div>
-        <FieldList entries={[["地址", mcpUrl], ["请求头", headers]]} />
+
+        <div className="token-create-form">
+          <label className="field-block">
+            <span>设备或客户端名称</span>
+            <input
+              value={name}
+              maxLength={100}
+              placeholder={role === "chat" ? "例如：客厅 Mac 的 Chatbox" : "例如：工作电脑的 MCP"}
+              onChange={(event) => setName(event.target.value)}
+              disabled={creating || Boolean(created)}
+            />
+          </label>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => void createToken()}
+            disabled={creating || Boolean(created)}
+          >
+            {creating ? <RefreshCcw className="spin" size={16} /> : <KeyRound size={16} />}
+            {creating ? "创建中" : `创建 ${role} token`}
+          </button>
+        </div>
+        {createError && <p className="form-error" role="alert">{createError}</p>}
+
+        {created && (
+          <div className="one-time-token" role="status" aria-live="polite">
+            <div className="one-time-token-heading">
+              <div>
+                <strong>只显示这一次</strong>
+                <p>服务端只保存哈希。关闭、刷新或离开此页后无法再次查看。</p>
+              </div>
+            </div>
+            <code className="one-time-token-value">{created.token}</code>
+            <div className="button-row">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() =>
+                  void copy(
+                    connectionText(created, chatBaseUrl, mcpUrl),
+                    "接入配置已复制；其中包含一次性 token，请妥善保存"
+                  )
+                }
+              >
+                <Clipboard size={16} />
+                复制完整接入配置
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setCreated(null)}
+              >
+                <CheckCircle2 size={16} />
+                我已保存
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel access-card">
         <div className="panel-header">
-          <h2>REST</h2>
-          <button className="secondary-button" type="button" onClick={() => copy(endpoints.join("\n"))}>
+          <div>
+            <h2>接入参数</h2>
+            <p className="muted">客户端只使用与入口匹配的 token，不要填 Console 登录 token。</p>
+          </div>
+        </div>
+        <div className="integration-guide-grid">
+          <article className="integration-guide-card">
+            <MessageCircle size={19} />
+            <h3>OpenAI 兼容客户端</h3>
+            <FieldList
+              compact
+              entries={[
+                ["Base URL", chatBaseUrl],
+                ["API Key", "使用该设备的 chat token"],
+                ["模型", "memory-auto"]
+              ]}
+            />
+          </article>
+          <article className="integration-guide-card">
+            <Plug size={19} />
+            <h3>Streamable HTTP MCP</h3>
+            <FieldList
+              compact
+              entries={[
+                ["地址", mcpUrl],
+                ["鉴权", "Bearer + 该设备的 mcp token"]
+              ]}
+            />
+          </article>
+        </div>
+      </section>
+
+      <section className="panel access-card">
+        <div className="panel-header">
+          <div>
+            <h2>已创建设备</h2>
+            <p className="muted">这里只显示标识和使用状态，不保存或回显 token 原文。</p>
+          </div>
+          <button
+            className="secondary-button compact"
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+          >
+            <RefreshCcw size={15} className={loading ? "spin" : ""} />
+            刷新
+          </button>
+        </div>
+        {loading && !tokens && <LoadingBlock label="读取设备 token" />}
+        {loadError && <ErrorBlock message={loadError} onRetry={() => void load()} />}
+        {!loading && !loadError && tokens?.data.length === 0 && (
+          <EmptyBlock
+            label="还没有 scoped token"
+            hint="先为聊天客户端创建 chat token，或为 MCP 客户端创建 mcp token。"
+          />
+        )}
+        {tokens && tokens.data.length > 0 && (
+          <div className="device-token-list">
+            {[...tokens.data]
+              .sort((left, right) => right.created_at.localeCompare(left.created_at))
+              .map((record) => (
+                <article
+                  className={`device-token-row ${record.revoked_at ? "revoked" : ""}`}
+                  key={record.token_id}
+                >
+                  <div className="device-token-main">
+                    <strong>{record.name}</strong>
+                    <div className="device-token-tags">
+                      <span className={`token-role-pill role-${record.role}`}>{roleLabel(record.role)}</span>
+                      <span className={`token-status-pill ${record.revoked_at ? "revoked" : "active"}`}>
+                        {record.revoked_at ? "已撤销" : "可用"}
+                      </span>
+                      {record.is_current && <span className="token-status-pill current">当前登录</span>}
+                    </div>
+                    <small>ID {record.token_id}</small>
+                    {record.revoke_block_reason === "last_active_console_token" && (
+                      <small className="token-revoke-blocked" role="status">
+                        这是该用户最后一个可用 Console token。请先在运行主机用
+                        <code>memgw token create --role console</code> 创建备用凭据。
+                      </small>
+                    )}
+                  </div>
+                  <dl className="device-token-meta">
+                    <div>
+                      <dt>最近使用</dt>
+                      <dd>{dateText(record.last_used_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>{record.revoked_at ? "撤销时间" : "创建时间"}</dt>
+                      <dd>{dateText(record.revoked_at || record.created_at)}</dd>
+                    </div>
+                  </dl>
+                  <button
+                    className="danger-button compact"
+                    type="button"
+                    onClick={() => void revoke(record)}
+                    disabled={
+                      record.can_revoke === false ||
+                      Boolean(record.revoked_at) ||
+                      revokingId === record.token_id ||
+                      created?.record.token_id === record.token_id
+                    }
+                    title={
+                      record.revoke_block_reason === "last_active_console_token"
+                        ? "必须保留至少一个可用的 Console token"
+                        : undefined
+                    }
+                  >
+                    {revokingId === record.token_id ? (
+                      <RefreshCcw className="spin" size={15} />
+                    ) : (
+                      <Trash2 size={15} />
+                    )}
+                    {record.revoked_at
+                      ? "已撤销"
+                      : record.revoke_block_reason === "last_active_console_token"
+                        ? "需保留"
+                      : created?.record.token_id === record.token_id
+                        ? "先保存"
+                        : "撤销"}
+                  </button>
+                </article>
+              ))}
+          </div>
+        )}
+      </section>
+
+      <section className="panel access-card">
+        <div className="panel-header">
+          <h2>Console REST</h2>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void copy(endpoints.join("\n"), "常用 Console REST 端点已复制")}
+          >
             <Clipboard size={16} />
             复制端点
           </button>
         </div>
-        <p className="muted">端点为常用摘录，以实际 /health 路由为准。</p>
+        <p className="muted">
+          以下管理接口只接受 Console 登录凭证；chat/mcp token 无法访问。
+        </p>
         <div className="endpoint-list">
           {endpoints.map((endpoint) => (
             <code key={endpoint}>{endpoint}</code>
@@ -73,3 +449,27 @@ export function DeveloperPage({
 }
 
 
+function connectionText(
+  created: AuthTokenCreateResult,
+  chatBaseUrl: string,
+  mcpUrl: string
+): string {
+  if (created.record.role === "chat") {
+    return [
+      `Base URL: ${chatBaseUrl}`,
+      `API Key: ${created.token}`,
+      "Model: memory-auto"
+    ].join("\n");
+  }
+  return [
+    `MCP URL: ${mcpUrl}`,
+    `Authorization: Bearer ${created.token}`
+  ].join("\n");
+}
+
+
+function roleLabel(role: AuthTokenRecord["role"]): string {
+  if (role === "chat") return "聊天";
+  if (role === "mcp") return "MCP";
+  return "Console";
+}

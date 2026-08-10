@@ -1,16 +1,30 @@
 export async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // 局域网 HTTP 页面通常不属于 secure context；即使 Clipboard API
+      // 存在也可能拒绝调用，此时继续使用兼容复制路径。
+    }
   }
+
   const textarea = document.createElement("textarea");
   textarea.value = text;
   textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
   textarea.style.opacity = "0";
+  textarea.setAttribute("readonly", "");
   document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand("copy");
-  document.body.removeChild(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    if (!document.execCommand?.("copy")) {
+      throw new Error("当前浏览器不允许自动复制，请手动选择并复制内容");
+    }
+  } finally {
+    textarea.remove();
+  }
 }
 
 export function downloadFile(filename: string, content: string, type: string) {

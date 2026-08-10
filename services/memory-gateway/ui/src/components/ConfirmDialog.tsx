@@ -32,13 +32,18 @@ export function ConfirmDialog({
         </div>
         <div className="confirm-body">{state.message}</div>
         <div className="drawer-actions end">
-          <button className="ghost-button" type="button" onClick={() => onResolve(false)}>
+          <button
+            className="ghost-button"
+            type="button"
+            data-autofocus={tone === "danger" || tone === "warning" ? true : undefined}
+            onClick={() => onResolve(false)}
+          >
             {state.cancelLabel}
           </button>
           <button
             className={tone === "danger" ? "danger-button" : "primary-button"}
             type="button"
-            data-autofocus
+            data-autofocus={tone === "default" ? true : undefined}
             onClick={() => onResolve(true)}
           >
             {state.confirmLabel}
