@@ -72,10 +72,6 @@ chmod 600 "$MEMORY_SETTINGS_FILE"
     GATEWAY_LEGACY_API_KEY_ENABLED=true \
     MODEL_GATEWAY_API_KEY= \
     MODEL_GATEWAY_BASE_URL= \
-    UPSTREAM_API_KEY= \
-    UPSTREAM_BASE_URL=https://unit-test.invalid/v1 \
-    EMBEDDING_API_KEY= \
-    EMBEDDING_BASE_URL=https://unit-test.invalid/v1 \
     KNOWLEDGE_AGENT_EGRESS_POLICY=none \
     ALLOW_SENSITIVE_EGRESS=false \
     "$PYTHON" -m pytest

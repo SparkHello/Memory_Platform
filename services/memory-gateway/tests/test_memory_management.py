@@ -650,7 +650,7 @@ def test_deleted_memory_purge_reports_eval_cleanup_failure_after_commit(
         raise PermissionError("forced cleanup failure")
 
     monkeypatch.setattr(
-        memories_api_module,
+        memories_api_module.common,
         "delete_user_eval_workspace",
         fail_cleanup,
     )

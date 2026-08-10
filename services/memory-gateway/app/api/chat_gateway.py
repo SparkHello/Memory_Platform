@@ -24,13 +24,11 @@ from app.api.deps import (
     get_llm_client,
     get_memory_search_service,
     get_memory_store,
-    get_usage_recorder,
     get_user_id,
     require_api_key,
 )
 from app.config import Settings, get_settings
 from app.llm.client import OpenAICompatibleClient
-from app.llm.runtime import resolve_model_runtime
 from app.llm.prompts import (
     render_core_memory_context,
     render_memory_context,
@@ -60,7 +58,6 @@ from app.openai_compat.streaming import (
     extract_non_stream_result,
     extract_non_stream_tool_trace,
 )
-from app.usage.recorder import UsageRecorder
 from app.usage.context import model_usage_scope
 
 
@@ -282,7 +279,6 @@ async def chat_completions(
     gateway_client: Annotated[
         OpenAIChatGatewayClient, Depends(get_chat_gateway_client)
     ],
-    usage_recorder: Annotated[UsageRecorder | None, Depends(get_usage_recorder)],
 ) -> Response:
     try:
         _require_gateway_enabled(settings)
@@ -340,10 +336,7 @@ async def chat_completions(
         messages,
         user_id=user_id,
         conversation_id=conversation_id,
-        strip_unknown=(
-            is_auto_model_id(validated.model)
-            or resolve_model_runtime(settings).is_central
-        ),
+        strip_unknown=is_auto_model_id(validated.model),
     )
     context = GatewayTurnContext(text="", memory_ids=[], hit_count=0)
     if memory_mode != "off":
@@ -493,9 +486,6 @@ async def chat_completions(
                 _finalize_stream_turn,
                 capture=capture,
                 finalize=common_finalization,
-                usage_recorder=usage_recorder,
-                user_id=user_id,
-                provider=upstream_stream.provider,
             ),
         )
 
@@ -544,22 +534,6 @@ async def chat_completions(
             upstream_json = {}
     except (UnicodeDecodeError, json.JSONDecodeError):
         upstream_json = {}
-
-    if (
-        usage_recorder is not None
-        and not _is_central_usage_provider(upstream_result.provider)
-    ):
-        usage_provider = _usage_provider_arguments(upstream_result.provider)
-        await anyio.to_thread.run_sync(
-            partial(
-                usage_recorder.record_response,
-                payload=upstream_json,
-                kind="chat",
-                user_id=user_id,
-                operation="chat_completion",
-                **usage_provider,
-            )
-        )
 
     background = None
     if is_final:
@@ -1364,26 +1338,7 @@ async def _finalize_stream_turn(
     *,
     capture: ChatStreamCapture,
     finalize,
-    usage_recorder: UsageRecorder | None,
-    user_id: str,
-    provider,
 ) -> None:
-    if usage_recorder is not None and not _is_central_usage_provider(provider):
-        usage_provider = _usage_provider_arguments(provider)
-        await anyio.to_thread.run_sync(
-            partial(
-                usage_recorder.record_response,
-                payload={
-                    "id": capture.response_id,
-                    "model": capture.response_model,
-                    "usage": capture.usage,
-                },
-                kind="chat",
-                user_id=user_id,
-                operation="chat_completion",
-                **usage_provider,
-            )
-        )
     if capture.is_final_text_response:
         await finalize(assistant_text=capture.assistant_text)
 
@@ -1403,10 +1358,6 @@ def _usage_provider_arguments(provider: Any) -> dict[str, Any]:
         "provider_override": (vendor or "model-gateway") if deployment_id else "",
         "use_local_pricing": not bool(deployment_id),
     }
-
-
-def _is_central_usage_provider(provider: Any) -> bool:
-    return bool(str(getattr(provider, "deployment_id", "") or "").strip())
 
 
 async def _finalize_turn(

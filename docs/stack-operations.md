@@ -264,13 +264,11 @@ scripts/memgw stack restore /safe/path/memory-stack.zip --yes --start
 
 迁移后先把旧目录保留为只读回滚来源，不要让新旧两套服务同时占用相同端口或写同一数据库。确认新栈、Web Console、记忆数量和知识文档正常后，再决定是否归档旧目录。
 
-## direct-provider 兼容模式
+## 模型运行时：仅 Model Gateway
 
-如果暂时不运行独立 Model Gateway，Memory Gateway 仍保留旧的 `UPSTREAM_*`、`LLM_*`、`memgw model`、`memgw route` 和 `memgw pricing` 路径。
+direct-provider 兼容模式已移除：`UPSTREAM_*`、`LLM_*` 配置项与 `memgw model`、`memgw route`、`memgw pricing` 子命令不再可用，这些命令只打印迁移提示并以退出码 2 结束。
 
-新部署推荐使用 Model Gateway。只要 `MODEL_GATEWAY_BASE_URL` 与 `MODEL_GATEWAY_API_KEY` 成对配置，聊天、后台记忆任务、知识代理和 embedding 就只调用稳定 route，不会在中央路由失败时偷偷回退到旧 `.env` provider key。
-
-兼容模式的完整配置见 [Memory Gateway 配置项](../services/memory-gateway/README.md#配置项)。
+`MODEL_GATEWAY_BASE_URL` 与 `MODEL_GATEWAY_API_KEY` 为必配项且必须成对配置：聊天、后台记忆任务、知识代理和 embedding 只调用 Model Gateway 的稳定 route。从 direct-provider 迁移见 [迁移到 Model Gateway](migrate-to-model-gateway.md)；完整配置表见 [Memory Gateway 配置项](../services/memory-gateway/README.md#配置项)。
 
 ## 开发者入口
 

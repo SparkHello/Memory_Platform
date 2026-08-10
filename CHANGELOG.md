@@ -4,6 +4,33 @@
 
 ## Unreleased
 
+### Changed
+
+- Memory Gateway **仅支持 Model Gateway** 作为模型运行时：移除 `UPSTREAM_*` / `LLM_*` direct-provider 聊天、embedding 与 Knowledge Agent 第二实现；未配置中央网关时启动路径与 `/readyz` 失败并给出迁移指引。见 [docs/migrate-to-model-gateway.md](docs/migrate-to-model-gateway.md)。
+- `/v1/chat/completions` 使用显式 route 模型名（非 `memory-auto`）时保留并透传客户端自带的 `reasoning_content`；`memory-auto` 仍剥离无法证明来源的旧推理原文。
+- 默认测试沙箱与 Console 简洁导航继续以双网关金路径为准；高级 UI 仍可通过专家模式显式开启，API 不删减。
+- `Settings` 去掉 direct-provider 死字段（`UPSTREAM_*`、`LLM_*`、本地 model/routes catalog 路径、`pricing_catalog_path`、独立 embedding base/key/model）；`PRICING_CATALOG_PATH` overlay 一并移除，deploy 不再写入；保留中央 `MODEL_GATEWAY_*` 与 `EMBEDDING_DIMENSIONS`。
+- `memgw init` / `cli_config` 不再种子化本地 models/routes 目录，导入 settings 时剥离已退役 direct-provider 环境变量；`CliPaths` 仍保留 legacy 路径供 stack backup。
+- Knowledge Agent 仅通过 `ModelRuntime` 的 `knowledge.fast` / `knowledge.pro` route 调用中央网关。
+- `app/memory/store` 改为 package（对外 `app.memory.store` 契约不变，类方法薄委托）：
+  - `schema.py` / `schema_ensure.py` / `migrations.py` — 建表、列补齐、版本迁移
+  - `crud.py` / `merge.py` — 读写合并
+  - `temporal.py` — 时态链与 time-ripple
+  - `export_import.py` — 导出导入恢复
+  - `purge_ops.py` / `lifecycle_purge.py` — 永久删除
+  - `core_memory.py` / `conversation.py` / `spaces.py` / `digest.py` / `decision_logs.py`
+  - `helpers.py` / `constants.py` / `errors.py`
+  - `_monolith.py` 收束为编排壳（init/connect/side-effect claim + 委托）
+- `/memories` HTTP API 拆为 `app/api/memories/` 包（crud/search/core/conversation/export/graph/review/evaluation/purge/item），URL 不变；`/{memory_id}` 最后注册以免遮蔽静态路径。
+- 离线 legacy 迁移不再依赖 `model_catalog`；本地 models/routes 仅可选拷贝，pricing 仍用于历史模型本地账本展示。
+
+### Removed
+
+- 透明聊天与内部任务对本地 `providers`/`model_catalog` 直连 failover 的运行时路径。
+- Memory 进程内对直连上游的本地用量记账（中央响应改由 Model Gateway 归因；本地 `app/catalog/pricing.json` 仅作已知历史模型展示兜底）。
+- `memgw model` / `route` / `pricing` 与 `memgw secret set/delete mimo|kimi|deepseek|upstream|embedding`：只打印迁移提示并以退出码 2 退出，原实现已删除；模型、路由与价格请改用 `modelgw` 或 Console「模型与路由」。
+- `app/model_probe.py`、`app/model_catalog.py`、`app/providers/`、`app/catalog/models.json` / `routes.json` 及其 schema（**保留** `pricing.json` 供 usage 目录展示）。
+
 ## 0.2.0 - 2026-08-10
 
 ### Added

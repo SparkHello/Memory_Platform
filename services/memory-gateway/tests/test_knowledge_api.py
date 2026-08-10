@@ -346,11 +346,13 @@ def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers)
     assert payload["agent_enabled"] is False
     assert payload["agent_egress_policy"] == "none"
     assert payload["agent_timeout_seconds"] == 25.0
-    assert payload["agent_provider_priority"] == "D"
-    assert payload["agent_configured_providers"] == []
-    assert payload["agent_rate_limit_cooldown_seconds"] == 300.0
-    assert payload["llm_provider_priority"] == "D"
-    assert payload["llm_configured_providers"] == []
-    assert payload["llm_rate_limit_cooldown_seconds"] == 300.0
+    assert payload["model_runtime"] == "central"
+    assert payload["model_gateway_enabled"] is True
+    assert payload["agent_provider_priority"] == "G"
+    assert payload["agent_configured_providers"] == ["G"]
+    assert payload["agent_rate_limit_cooldown_seconds"] == 0.0
+    assert payload["llm_provider_priority"] == "G"
+    assert payload["llm_configured_providers"] == ["G"]
+    assert payload["llm_rate_limit_cooldown_seconds"] == 0.0
     assert payload["max_document_bytes"] == 50 * 1024 * 1024
     assert payload["embedding_batch_size"] == 20

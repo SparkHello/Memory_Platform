@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -9,6 +8,13 @@ from typing import Any, Literal, Mapping
 class ModelRuntimeConfigurationError(ValueError):
     """Model routing configuration is incomplete or internally inconsistent."""
 
+
+MODEL_GATEWAY_REQUIRED_MESSAGE = (
+    "Memory Gateway 仅支持通过 Model Gateway 调用模型。"
+    "请配置 MODEL_GATEWAY_BASE_URL 与 MODEL_GATEWAY_API_KEY，"
+    "并完成 modelgw / scripts/setup.sh 的渠道路由配置。"
+    "旧的 UPSTREAM_* / LLM_* direct-provider 路径已移除。"
+)
 
 _OPERATION_ROUTE_FIELDS = {
     "chat": "model_gateway_chat_model",
@@ -37,20 +43,18 @@ class EmbeddingRuntime:
     model: str
     dimensions: int
     space_id: str
-    model_gateway_mode: bool
+    model_gateway_mode: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class ModelRuntime:
-    """The single resolved source of truth for model consumers.
+    """Resolved Model Gateway credentials and stable route aliases.
 
-    A complete central credential pair selects ``central`` for every operation.
-    Direct-provider settings are considered only when both central fields are
-    empty, so a central outage or an incomplete embedding contract can never
-    leak into legacy provider fallback.
+    Direct-provider fallbacks are intentionally unsupported. Incomplete central
+    credentials fail closed with a migration-oriented error.
     """
 
-    mode: Literal["central", "direct"]
+    mode: Literal["central"]
     base_url: str
     api_key: str = field(repr=False)
     routes: Mapping[str, str]
@@ -58,11 +62,9 @@ class ModelRuntime:
 
     @property
     def is_central(self) -> bool:
-        return self.mode == "central"
+        return True
 
     def route_for(self, operation: str) -> str:
-        if not self.is_central:
-            raise ModelRuntimeConfigurationError("中央模型网关未启用")
         normalized = operation.strip().lower()
         field_name = _OPERATION_ROUTE_FIELDS.get(normalized)
         if field_name is None:
@@ -78,7 +80,7 @@ class ModelRuntime:
 
 
 def resolve_model_runtime(settings: Any) -> ModelRuntime:
-    """Resolve central-vs-direct once and fail closed on partial central config."""
+    """Resolve the Model Gateway runtime; never fall back to direct providers."""
 
     central_base_url = str(
         getattr(settings, "model_gateway_base_url", "") or ""
@@ -90,84 +92,40 @@ def resolve_model_runtime(settings: Any) -> ModelRuntime:
         raise ModelRuntimeConfigurationError(
             "MODEL_GATEWAY_BASE_URL 和 MODEL_GATEWAY_API_KEY 必须同时配置"
         )
+    if not central_base_url:
+        raise ModelRuntimeConfigurationError(MODEL_GATEWAY_REQUIRED_MESSAGE)
 
     dimensions = _embedding_dimensions(settings)
-    if central_base_url:
-        routes = {
-            field_name: str(getattr(settings, field_name, "") or "").strip()
-            for field_name in set(_OPERATION_ROUTE_FIELDS.values())
-        }
-        missing_routes = sorted(name for name, value in routes.items() if not value)
-        if missing_routes:
-            raise ModelRuntimeConfigurationError(
-                "中央模型网关缺少稳定 route 配置：" + ", ".join(missing_routes)
-            )
-        embedding_space = " ".join(
-            str(
-                getattr(settings, "model_gateway_embedding_space_id", "") or ""
-            ).strip().split()
+    routes = {
+        field_name: str(getattr(settings, field_name, "") or "").strip()
+        for field_name in set(_OPERATION_ROUTE_FIELDS.values())
+    }
+    missing_routes = sorted(name for name, value in routes.items() if not value)
+    if missing_routes:
+        raise ModelRuntimeConfigurationError(
+            "中央模型网关缺少稳定 route 配置：" + ", ".join(missing_routes)
         )
-        embedding = EmbeddingRuntime(
-            enabled=bool(embedding_space),
-            base_url=central_base_url,
-            api_key=central_api_key,
-            model=routes["model_gateway_embedding_model"],
-            dimensions=dimensions,
-            space_id=embedding_space,
-            model_gateway_mode=True,
-        )
-        return ModelRuntime(
-            mode="central",
-            base_url=central_base_url,
-            api_key=central_api_key,
-            routes=MappingProxyType(routes),
-            embedding=embedding,
-        )
-
-    direct_base_url = str(
-        getattr(settings, "embedding_base_url", "") or ""
-    ).strip().rstrip("/")
-    direct_api_key = str(getattr(settings, "embedding_api_key", "") or "").strip()
-    direct_model = str(getattr(settings, "embedding_model", "") or "").strip()
-    direct_enabled = bool(direct_base_url and direct_api_key and direct_model)
-    direct_space = (
-        direct_embedding_space_id(
-            base_url=direct_base_url,
-            model=direct_model,
-            dimensions=dimensions,
-        )
-        if direct_enabled
-        else ""
+    embedding_space = " ".join(
+        str(
+            getattr(settings, "model_gateway_embedding_space_id", "") or ""
+        ).strip().split()
     )
     embedding = EmbeddingRuntime(
-        enabled=direct_enabled,
-        base_url=direct_base_url,
-        api_key=direct_api_key,
-        model=direct_model,
+        enabled=bool(embedding_space),
+        base_url=central_base_url,
+        api_key=central_api_key,
+        model=routes["model_gateway_embedding_model"],
         dimensions=dimensions,
-        space_id=direct_space,
-        model_gateway_mode=False,
+        space_id=embedding_space,
+        model_gateway_mode=True,
     )
     return ModelRuntime(
-        mode="direct",
-        base_url="",
-        api_key="",
-        routes=MappingProxyType({}),
+        mode="central",
+        base_url=central_base_url,
+        api_key=central_api_key,
+        routes=MappingProxyType(routes),
         embedding=embedding,
     )
-
-
-def direct_embedding_space_id(*, base_url: str, model: str, dimensions: int) -> str:
-    identity = "\0".join(
-        (
-            "direct-openai-compatible-v1",
-            base_url.strip().rstrip("/"),
-            model.strip(),
-            str(dimensions),
-        )
-    )
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return f"direct-openai-compatible-v1:{digest}"
 
 
 def _embedding_dimensions(settings: Any) -> int:

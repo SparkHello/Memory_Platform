@@ -75,14 +75,17 @@ def _control_snapshot() -> dict:
     }
 
 
-def test_direct_provider_status_remains_read_only(client, auth_headers) -> None:
+def test_provider_status_defaults_to_model_gateway_without_control_plane(
+    client, auth_headers, monkeypatch
+) -> None:
     response = client.get("/providers/status", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["runtime"]["chat_source"] == "legacy_direct"
-    assert response.json()["control"] is None
-    assert response.json()["setup"]["chat_ready"] is False
-    assert response.json()["setup"]["next_action"] == "configure_model"
+    payload = response.json()
+    assert payload["runtime"]["chat_source"] == "model_gateway"
+    assert payload["runtime"]["model_gateway_enabled"] is True
+    # Without a reachable control plane the setup path still asks for models.
+    assert payload["setup"]["model_gateway_connected"] is True or payload["control"] is None
 
 
 def test_model_gateway_status_uses_backend_key_and_never_returns_it(

@@ -25,11 +25,13 @@ def test_model_gateway_settings_require_base_url_and_key_together() -> None:
         Settings(
             _env_file=None,
             MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+            MODEL_GATEWAY_API_KEY="",
         )
 
     with pytest.raises(ValidationError, match="必须同时配置"):
         Settings(
             _env_file=None,
+            MODEL_GATEWAY_BASE_URL="",
             MODEL_GATEWAY_API_KEY="local-model-key",
         )
 
@@ -258,8 +260,6 @@ def test_runtime_resolver_prefers_complete_central_configuration_without_fallbac
         MODEL_GATEWAY_CHAT_MODEL="custom.chat",
         MODEL_GATEWAY_EMBEDDING_MODEL="custom.embedding",
         MODEL_GATEWAY_EMBEDDING_SPACE_ID="space-v1",
-        EMBEDDING_API_KEY="must-not-be-used",
-        EMBEDDING_MODEL="direct-embedding",
         EMBEDDING_DIMENSIONS=3,
         DATABASE_PATH=str(tmp_path / "memory.db"),
         KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
@@ -291,23 +291,15 @@ def test_runtime_resolver_rejects_partial_central_configuration() -> None:
         resolve_model_runtime(settings)
 
 
-def test_runtime_resolver_uses_direct_only_when_central_is_empty(tmp_path) -> None:
+def test_runtime_resolver_rejects_empty_central_configuration(tmp_path) -> None:
     settings = Settings(
         _env_file=None,
         MODEL_GATEWAY_BASE_URL="",
         MODEL_GATEWAY_API_KEY="",
-        EMBEDDING_BASE_URL="https://embedding.example.invalid/v1",
-        EMBEDDING_API_KEY="direct-secret",
-        EMBEDDING_MODEL="direct-embedding",
         EMBEDDING_DIMENSIONS=3,
         DATABASE_PATH=str(tmp_path / "memory.db"),
         KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
     )
 
-    runtime = resolve_model_runtime(settings)
-
-    assert runtime.mode == "direct"
-    assert runtime.embedding.enabled is True
-    assert runtime.embedding.model_gateway_mode is False
-    assert runtime.embedding.space_id.startswith("direct-openai-compatible-v1:")
-    assert "direct-secret" not in repr(runtime)
+    with pytest.raises(ModelRuntimeConfigurationError, match="仅支持通过 Model Gateway"):
+        resolve_model_runtime(settings)

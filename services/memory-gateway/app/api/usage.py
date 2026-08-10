@@ -1,4 +1,3 @@
-import asyncio
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -7,12 +6,11 @@ import httpx
 
 from app.api.deps import get_user_id, require_api_key
 from app.config import Settings, get_settings
-from app.llm.runtime import resolve_model_runtime
+from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
 from app.usage.attribution import (
     UsageAttributionNotConfigured,
     model_gateway_user_tag,
 )
-from app.usage.store import UsageStore
 
 
 router = APIRouter(
@@ -51,13 +49,10 @@ async def model_usage_summary(
     ] = "30",
 ):
     days = None if range == "all" else int(range)
-    runtime = resolve_model_runtime(settings)
-    if not runtime.is_central:
-        return await asyncio.to_thread(
-            UsageStore(settings.database_path).summary,
-            user_id=user_id,
-            days=days,
-        )
+    try:
+        runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError:
+        return _usage_proxy_error("model_gateway_runtime_unavailable")
     try:
         user_tag = model_gateway_user_tag(
             signing_secret=settings.gateway_signing_secret,

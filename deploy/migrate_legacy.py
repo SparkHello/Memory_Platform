@@ -19,7 +19,6 @@ import tempfile
 
 from app.cli_config import read_env_file, write_env_atomic
 from app.auth.tokens import AuthTokenStore
-from app.model_catalog import validate_catalog_and_routes
 from app.usage.pricing import load_pricing_catalog
 from model_gateway.config_store import load_config, read_secrets, write_config
 
@@ -75,13 +74,15 @@ def main() -> int:
 
     memory_config = MEMORY_DATA / "config"
     memory_config.mkdir(parents=True, mode=0o700, exist_ok=False)
-    for filename in ("project.json", "models.json", "routes.json", "pricing.json"):
-        _copy_file(legacy_memory / filename, memory_config / filename, required=True)
-    validate_catalog_and_routes(
-        catalog_path=memory_config / "models.json",
-        routes_path=memory_config / "routes.json",
-    )
-    load_pricing_catalog(memory_config / "pricing.json")
+    # project.json is required; local models/routes catalogs are legacy backup
+    # only (routing lives in Model Gateway). pricing.json still backs local
+    # usage ledger display for known historical model IDs.
+    _copy_file(legacy_memory / "project.json", memory_config / "project.json", required=True)
+    for filename in ("models.json", "routes.json", "pricing.json"):
+        _copy_file(legacy_memory / filename, memory_config / filename, required=False)
+    pricing_path = memory_config / "pricing.json"
+    if pricing_path.is_file():
+        load_pricing_catalog(pricing_path)
 
     legacy_eval = legacy_memory / "eval"
     if legacy_eval.exists():
@@ -94,6 +95,38 @@ def main() -> int:
             and name not in {"GATEWAY_API_KEY", "MODEL_GATEWAY_API_KEY"}
         ) or name == "MEMORY_CONSOLE_ADMIN_KEY":
             migrated_settings.pop(name, None)
+    # Drop retired direct-provider / local catalog route keys.  *_API_KEY
+    # variants are already removed by the suffix sweep above.
+    for retired in (
+        "PROVIDERS_PATH",
+        "ROUTES_PATH",
+        "MODEL_CATALOG_PATH",
+        "MODEL_ROUTES_PATH",
+        "PRICING_CATALOG_PATH",
+        "UPSTREAM_BASE_URL",
+        "UPSTREAM_MODEL",
+        "LLM_PROVIDER_PRIORITY",
+        "LLM_RATE_LIMIT_COOLDOWN_SECONDS",
+        "LLM_MIMO_BASE_URL",
+        "LLM_MIMO_MODEL",
+        "LLM_KIMI_BASE_URL",
+        "LLM_KIMI_MODEL",
+        "LLM_DEEPSEEK_BASE_URL",
+        "LLM_DEEPSEEK_FLASH_MODEL",
+        "LLM_DEEPSEEK_PRO_MODEL",
+        "EMBEDDING_BASE_URL",
+        "EMBEDDING_MODEL",
+        "KNOWLEDGE_AGENT_PROVIDER_PRIORITY",
+        "KNOWLEDGE_AGENT_BASE_URL",
+        "KNOWLEDGE_AGENT_FLASH_MODEL",
+        "KNOWLEDGE_AGENT_PRO_MODEL",
+        "KNOWLEDGE_AGENT_MIMO_BASE_URL",
+        "KNOWLEDGE_AGENT_MIMO_MODEL",
+        "KNOWLEDGE_AGENT_KIMI_BASE_URL",
+        "KNOWLEDGE_AGENT_KIMI_MODEL",
+        "KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS",
+    ):
+        migrated_settings.pop(retired, None)
     migrated_settings.update(
         {
             "DATABASE_PATH": "/data/memory.db",
@@ -101,9 +134,6 @@ def main() -> int:
             "AUTH_DATABASE_PATH": "/data/auth.db",
             "EVAL_DIR": "/data/eval",
             "UI_DIST_DIR": "/app/ui/dist",
-            "MODEL_CATALOG_PATH": "/data/config/models.json",
-            "MODEL_ROUTES_PATH": "/data/config/routes.json",
-            "PRICING_CATALOG_PATH": "/data/config/pricing.json",
             "MODEL_GATEWAY_BASE_URL": "http://model-gateway:2030/v1",
             "MODEL_GATEWAY_ALLOW_PRIVATE_HTTP": "true",
         }

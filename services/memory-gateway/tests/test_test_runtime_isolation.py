@@ -26,8 +26,11 @@ def test_global_test_runtime_is_sandboxed(tmp_path: Path) -> None:
     assert Path(os.environ["MODEL_GATEWAY_SECRETS_PATH"]).resolve() == (
         tmp_path / "model-secrets" / "secrets.env"
     ).resolve()
+    # Model Gateway backend key is part of the default dual-gateway test sandbox;
+    # every other API key must stay empty so developer secrets cannot leak in.
     assert all(
-        not value
+        (name == "MODEL_GATEWAY_API_KEY" and value == "pytest-central-backend-key")
+        or not value
         for name, value in os.environ.items()
         if name.endswith("_API_KEY")
     )

@@ -160,95 +160,29 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
             "embedding_model": "",
         }
 
-    if model_runtime.is_central:
-        embedding_enabled = model_runtime.embedding.enabled
-        return {
-            "model_runtime": "central",
-            "model_runtime_error": "",
-            "model_gateway_enabled": True,
-            "agent_enabled": settings.knowledge_agent_egress_policy != "none",
-            "agent_egress_policy": settings.knowledge_agent_egress_policy,
-            "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
-            "agent_provider_priority": "G",
-            "agent_configured_providers": ["G"],
-            "agent_rate_limit_cooldown_seconds": 0.0,
-            "llm_provider_priority": "G",
-            "llm_configured_providers": ["G"],
-            "llm_rate_limit_cooldown_seconds": 0.0,
-            "agent_mimo_model": "",
-            "agent_kimi_model": "",
-            "agent_flash_model": model_runtime.route_for("knowledge.fast"),
-            "agent_pro_model": model_runtime.route_for("knowledge.pro"),
-            "sensitive_egress_enabled": settings.allow_sensitive_egress,
-            "embedding_enabled": embedding_enabled,
-            "embedding_model": (
-                model_runtime.embedding.model if embedding_enabled else ""
-            ),
-        }
-
-    provider_priority = list(settings.llm_provider_priority)
-    if provider_priority == ["M"]:
-        provider_priority.append("D")
-    provider_configured = {
-        "M": bool(
-            settings.llm_mimo_base_url
-            and settings.llm_mimo_api_key
-            and settings.llm_mimo_model
-        ),
-        "K": bool(
-            settings.llm_kimi_base_url
-            and settings.llm_kimi_api_key
-            and settings.llm_kimi_model
-        ),
-        "D": bool(
-            settings.llm_deepseek_base_url
-            and settings.llm_deepseek_api_key
-            and settings.llm_deepseek_flash_model
-        ),
-    }
-    configured_providers = [
-        code for code in provider_priority if provider_configured[code]
-    ]
-    llm_provider_configured = {
-        **provider_configured,
-        "D": bool(
-            provider_configured["D"]
-            or (
-                settings.upstream_base_url
-                and settings.upstream_api_key
-                and settings.upstream_model
-            )
-        ),
-    }
-    llm_configured_providers = [
-        code for code in provider_priority if llm_provider_configured[code]
-    ]
     embedding_enabled = model_runtime.embedding.enabled
     return {
-        "model_runtime": "direct",
+        "model_runtime": "central",
         "model_runtime_error": "",
-        "model_gateway_enabled": False,
-        "agent_enabled": bool(
-            configured_providers
-            and settings.knowledge_agent_egress_policy != "none"
-        ),
+        "model_gateway_enabled": True,
+        "agent_enabled": settings.knowledge_agent_egress_policy != "none",
         "agent_egress_policy": settings.knowledge_agent_egress_policy,
         "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
-        "agent_provider_priority": settings.llm_provider_priority,
-        "llm_provider_priority": settings.llm_provider_priority,
-        "agent_configured_providers": configured_providers,
-        "llm_configured_providers": llm_configured_providers,
-        "agent_rate_limit_cooldown_seconds": (
-            settings.llm_rate_limit_cooldown_seconds
-        ),
-        "llm_rate_limit_cooldown_seconds": settings.llm_rate_limit_cooldown_seconds,
-        "agent_mimo_model": settings.llm_mimo_model,
-        "agent_kimi_model": settings.llm_kimi_model,
-        "agent_flash_model": settings.llm_deepseek_flash_model,
-        "agent_pro_model": settings.llm_deepseek_pro_model,
+        "agent_provider_priority": "G",
+        "agent_configured_providers": ["G"],
+        "agent_rate_limit_cooldown_seconds": 0.0,
+        "llm_provider_priority": "G",
+        "llm_configured_providers": ["G"],
+        "llm_rate_limit_cooldown_seconds": 0.0,
+        "agent_mimo_model": "",
+        "agent_kimi_model": "",
+        "agent_flash_model": model_runtime.route_for("knowledge.fast"),
+        "agent_pro_model": model_runtime.route_for("knowledge.pro"),
         "sensitive_egress_enabled": settings.allow_sensitive_egress,
         "embedding_enabled": embedding_enabled,
-        "embedding_model": model_runtime.embedding.model if embedding_enabled else "",
+        "embedding_model": (
+            model_runtime.embedding.model if embedding_enabled else ""
+        ),
     }
 
 

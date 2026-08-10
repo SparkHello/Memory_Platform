@@ -25,15 +25,6 @@ from app.llm.model_gateway import (
     validate_model_gateway_metadata,
 )
 from app.llm.runtime import ModelRuntime
-from app.llm.routing import (
-    GLOBAL_PROVIDER_COOLDOWNS as _GLOBAL_PROVIDER_COOLDOWNS,
-    LLMProvider,
-    LLMProvider as _KnowledgeProvider,
-    ProviderCooldowns as KnowledgeProviderCooldowns,
-    ProviderCoolingDown as KnowledgeProviderCoolingDown,
-    retry_after_seconds as _retry_after_seconds,
-)
-from app.llm.protocol import auto_tool_choice_allowed, thinking_payload
 from app.usage.context import model_usage_scope
 from app.usage.recorder import UsageRecorder
 from app.usage.attribution import model_gateway_usage_headers
@@ -73,14 +64,11 @@ class KnowledgeAgentConfig(BaseModel):
     model.
     """
 
-    fast_providers: list[LLMProvider] = Field(default_factory=list)
-    pro_provider: LLMProvider | None = None
     model_runtime: ModelRuntime | None = Field(
         default=None,
         exclude=True,
         repr=False,
     )
-    rate_limit_cooldown_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
     egress_policy: KnowledgeAgentEgressPolicy = "none"
     allow_sensitive_egress: bool = False
     timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
@@ -90,15 +78,15 @@ class KnowledgeAgentConfig(BaseModel):
 
     @property
     def flash_model(self) -> str:
-        if self.model_runtime is not None and self.model_runtime.is_central:
-            return self.model_runtime.route_for("knowledge.fast")
-        return self.fast_providers[0].model if self.fast_providers else ""
+        if self.model_runtime is None:
+            return ""
+        return self.model_runtime.route_for("knowledge.fast")
 
     @property
     def pro_model(self) -> str:
-        if self.model_runtime is not None and self.model_runtime.is_central:
-            return self.model_runtime.route_for("knowledge.pro")
-        return self.pro_provider.model if self.pro_provider else ""
+        if self.model_runtime is None:
+            return ""
+        return self.model_runtime.route_for("knowledge.pro")
 
 
 class KnowledgeAgentToolStep(BaseModel):
@@ -161,13 +149,11 @@ class OpenAICompatibleKnowledgeAgentClient:
         config: KnowledgeAgentConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
-        cooldowns: KnowledgeProviderCooldowns | None = None,
         wall_clock: Any = time.time,
         usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.config = config
         self.transport = transport
-        self.cooldowns = cooldowns or _GLOBAL_PROVIDER_COOLDOWNS
         self._wall_clock = wall_clock
         self.usage_recorder = usage_recorder
         self._central_affinity: dict[str, str] = {}
@@ -182,40 +168,17 @@ class OpenAICompatibleKnowledgeAgentClient:
         affinity_scope: str = "",
     ) -> dict[str, Any]:
         runtime = self.config.model_runtime
-        if runtime is not None and runtime.is_central:
-            return await self._create_model_gateway_completion(
-                model=model,
-                messages=messages,
-                tools=tools,
-                timeout_seconds=timeout_seconds,
-                affinity_scope=affinity_scope,
+        if runtime is None or not runtime.is_central:
+            raise RuntimeError(
+                "Knowledge agent requires Model Gateway; direct providers are removed"
             )
-        if self.config.fast_providers and model == self.config.flash_model:
-            return await self._create_flash_completion(
-                messages=messages,
-                tools=tools,
-                timeout_seconds=timeout_seconds,
-            )
-
-        provider = self.config.pro_provider
-        if provider is None or not provider.configured:
-            raise RuntimeError("no configured knowledge.pro provider is available")
-        remaining = self.cooldowns.remaining(provider)
-        if remaining > 0:
-            raise KnowledgeProviderCoolingDown(
-                f"DeepSeek provider is cooling down for {remaining:.1f} seconds"
-            )
-        try:
-            return await self._post(
-                provider=provider,
-                messages=messages,
-                tools=tools,
-                timeout_seconds=timeout_seconds,
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
-                self._defer_after_429(provider, exc.response)
-            raise
+        return await self._create_model_gateway_completion(
+            model=model,
+            messages=messages,
+            tools=tools,
+            timeout_seconds=timeout_seconds,
+            affinity_scope=affinity_scope,
+        )
 
     async def _create_model_gateway_completion(
         self,
@@ -263,7 +226,15 @@ class OpenAICompatibleKnowledgeAgentClient:
                     ),
                 },
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                # A rejected call (e.g. 409 affinity unavailable) means the
+                # gateway no longer honors the cached deployment pin.  Drop it
+                # so the next call re-resolves affinity instead of pinning a
+                # dead deployment; the failed call itself is never retried.
+                self._central_affinity.pop(scope, None)
+                raise
 
         metadata = parse_model_gateway_metadata(response.headers)
         validate_model_gateway_metadata(
@@ -278,114 +249,8 @@ class OpenAICompatibleKnowledgeAgentClient:
         data.setdefault("model", metadata.upstream_model)
         return data
 
-    async def _create_flash_completion(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        timeout_seconds: float,
-    ) -> dict[str, Any]:
-        providers = [
-            provider for provider in self.config.fast_providers if provider.configured
-        ]
-        if not providers:
-            raise RuntimeError("no configured knowledge-agent provider is available")
 
-        eligible = [
-            provider for provider in providers if self.cooldowns.remaining(provider) <= 0
-        ]
-        if not eligible:
-            raise KnowledgeProviderCoolingDown(
-                "all configured knowledge-agent providers are cooling down"
-            )
 
-        last_rate_limit: httpx.HTTPStatusError | None = None
-        for provider in eligible:
-            try:
-                return await self._post(
-                    provider=provider,
-                    messages=messages,
-                    tools=tools,
-                    timeout_seconds=timeout_seconds,
-                )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 429:
-                    raise
-                last_rate_limit = exc
-                self._defer_after_429(provider, exc.response)
-
-        if last_rate_limit is not None:
-            raise last_rate_limit
-        raise KnowledgeProviderCoolingDown(
-            "all configured knowledge-agent providers are cooling down"
-        )
-
-    async def _post(
-        self,
-        *,
-        provider: _KnowledgeProvider,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        timeout_seconds: float,
-    ) -> dict[str, Any]:
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {provider.api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        payload = {
-            "model": provider.model,
-            "messages": messages,
-            "tools": tools,
-            "temperature": 1 if provider.quirks.forces_temperature_one else 0,
-            "max_tokens": 1024,
-            "stream": False,
-        }
-        payload.update(thinking_payload(provider.quirks, thinking="enabled"))
-        if auto_tool_choice_allowed(provider.quirks):
-            payload["tool_choice"] = "auto"
-        timeout = min(timeout_seconds, self.config.timeout_seconds)
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            transport=self.transport,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError("knowledge agent response must be a JSON object")
-        data.setdefault("model", provider.model)
-        if self.usage_recorder is not None:
-            await anyio.to_thread.run_sync(
-                partial(
-                    self.usage_recorder.record_response,
-                    payload=data,
-                    model=provider.model,
-                    kind="chat",
-                    provider_code=provider.code,
-                    base_url=provider.base_url,
-                )
-            )
-        return data
-
-    def _defer_after_429(
-        self,
-        provider: _KnowledgeProvider,
-        response: httpx.Response,
-    ) -> None:
-        retry_after = _retry_after_seconds(
-            response.headers.get("Retry-After", ""),
-            wall_time=self._wall_clock(),
-        )
-        seconds = max(self.config.rate_limit_cooldown_seconds, retry_after)
-        self.cooldowns.defer(provider, seconds)
-        logger.warning(
-            "知识代理触发 429，临时后移 provider=%s cooldown_seconds=%.1f",
-            provider.code,
-            seconds,
-        )
 
 
 def _model_gateway_knowledge_payload(
@@ -1366,14 +1231,10 @@ async def _await_with_timeout(value: Any, timeout: float) -> Any:
 
 
 def _configured_provider_codes(config: KnowledgeAgentConfig) -> list[str]:
-    """Ordered ids of the fast-route providers that actually have a key."""
+    """Central gateway is the only supported knowledge agent backend."""
     if config.model_runtime is not None and config.model_runtime.is_central:
         return ["G"]
-    return [
-        provider.code
-        for provider in config.fast_providers
-        if provider.configured
-    ]
+    return []
 
 
 def _response_model(response: Mapping[str, Any], *, fallback: str) -> str:
@@ -1394,8 +1255,6 @@ def _response_message_text(response: Mapping[str, Any], field: str) -> str:
 def _agent_failure_reason(exc: Exception) -> str:
     if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
         return "agent_timeout"
-    if isinstance(exc, KnowledgeProviderCoolingDown):
-        return "agent_rate_limited"
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         if status_code == 429:

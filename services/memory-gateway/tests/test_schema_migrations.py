@@ -15,7 +15,7 @@ import sqlite3
 
 import pytest
 
-import app.memory.store as memory_store_module
+import app.memory.store.migrations as memory_store_module
 from app.knowledge.store import KnowledgeStore
 from app.memory.store import MemoryStore
 from app.schema_migrations import enable_wal_with_retry

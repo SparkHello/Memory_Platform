@@ -298,9 +298,7 @@ def test_init_is_offline_and_only_one_shot_service_sees_all_private_volumes():
     initializer_source = (ROOT / "deploy" / "init_stack.py").read_text()
     assert '"MODEL_GATEWAY_BASE_URL": "http://model-gateway:2030/v1"' in initializer_source
     assert '"MODEL_GATEWAY_ALLOW_PRIVATE_HTTP": "true"' in initializer_source
-    assert '"MODEL_CATALOG_PATH": "/data/config/models.json"' in initializer_source
-    assert '"MODEL_ROUTES_PATH": "/data/config/routes.json"' in initializer_source
-    assert '"PRICING_CATALOG_PATH": "/data/config/pricing.json"' in initializer_source
+    # Direct-provider catalog paths are no longer seeded by the installer.
 
 
 def test_release_compose_and_dockerfile_never_use_main_latest_or_mutable_bases():

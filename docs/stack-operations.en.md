@@ -264,13 +264,11 @@ scripts/memgw stack restore /safe/path/memory-stack.zip --yes --start
 
 Keep the old directories as read-only rollback sources at first. Never let the old and new stacks bind the same ports or write the same database. After verifying the new stack, Web Console, memory count, and knowledge documents, decide whether to archive the old directories.
 
-## Direct-provider compatibility mode
+## Model Gateway is the only model path
 
-If you are not running a separate Model Gateway yet, Memory Gateway still supports the older `UPSTREAM_*`, `LLM_*`, `memgw model`, `memgw route`, and `memgw pricing` paths.
+The direct-provider compatibility mode has been removed: the `UPSTREAM_*` / `LLM_*` settings and the `memgw model`, `memgw route`, and `memgw pricing` subcommands no longer work. These commands only print migration guidance and exit with code 2.
 
-New deployments should use Model Gateway. When `MODEL_GATEWAY_BASE_URL` and `MODEL_GATEWAY_API_KEY` are configured as a pair, chat, background memory tasks, the knowledge agent, and embeddings call stable routes only. They do not silently fall back to old `.env` provider keys when central routing fails.
-
-See [Memory Gateway configuration](../services/memory-gateway/README.md#配置项) for the complete compatibility settings.
+`MODEL_GATEWAY_BASE_URL` and `MODEL_GATEWAY_API_KEY` are required and must be configured as a pair: chat, background memory tasks, the knowledge agent, and embeddings call the stable routes of Model Gateway only. To migrate from direct-provider, see [Migrate to Model Gateway](migrate-to-model-gateway.md); the full settings table is in [Memory Gateway configuration](../services/memory-gateway/README.md#配置项).
 
 ## Developer entry point
 

@@ -125,13 +125,6 @@ def main() -> int:
         "AUTH_DATABASE_PATH": "/data/auth.db",
         "EVAL_DIR": "/data/eval",
         "UI_DIST_DIR": "/app/ui/dist",
-        # ``memgw stack install`` runs in this one-shot container with its
-        # Memory volume mounted at /memory-data, so the generated overlay
-        # paths otherwise retain that initializer-only prefix.  Long-lived
-        # Memory Gateway mounts the same volume at /data.
-        "MODEL_CATALOG_PATH": "/data/config/models.json",
-        "MODEL_ROUTES_PATH": "/data/config/routes.json",
-        "PRICING_CATALOG_PATH": "/data/config/pricing.json",
     }
     for name, value in runtime_settings.items():
         update_env_value(paths.settings_env, name, value)

@@ -12,11 +12,8 @@ from typing import Literal, Self
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, ValidationError, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from app.llm.routing import normalize_provider_priority
-
 
 _PRIVATE_MODEL_GATEWAY_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
@@ -27,7 +24,6 @@ _PRIVATE_MODEL_GATEWAY_NETWORKS = (
 _SETTINGS_FILE_MAX_BYTES = 1024 * 1024
 _SETTINGS_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
-
 def _is_safe_private_model_gateway_host(hostname: str) -> bool:
     if hostname == "model-gateway":
         return True
@@ -36,7 +32,6 @@ def _is_safe_private_model_gateway_host(hostname: str) -> bool:
     except ValueError:
         return False
     return any(address in network for network in _PRIVATE_MODEL_GATEWAY_NETWORKS)
-
 
 def describe_settings_error(exc: Exception) -> str:
     """Render a Settings validation error without embedding submitted values."""
@@ -47,7 +42,6 @@ def describe_settings_error(exc: Exception) -> str:
             parts.append(f"{location}: {error.get('msg', '配置无效')}")
         return "；".join(parts) or "配置无效"
     return str(exc)
-
 
 class Settings(BaseSettings):
     gateway_api_key: str = Field(
@@ -149,12 +143,6 @@ class Settings(BaseSettings):
         le=20000,
         validation_alias="CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS",
     )
-    upstream_base_url: str = Field(
-        default="https://open.bigmodel.cn/api/paas/v4",
-        validation_alias="UPSTREAM_BASE_URL",
-    )
-    upstream_api_key: str = Field(default="", validation_alias="UPSTREAM_API_KEY")
-    upstream_model: str = Field(default="glm-5.1", validation_alias="UPSTREAM_MODEL")
     model_gateway_base_url: str = Field(
         default="",
         validation_alias="MODEL_GATEWAY_BASE_URL",
@@ -203,15 +191,6 @@ class Settings(BaseSettings):
         default="",
         validation_alias="MODEL_GATEWAY_EMBEDDING_SPACE_ID",
     )
-    embedding_base_url: str = Field(
-        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        validation_alias="EMBEDDING_BASE_URL",
-    )
-    embedding_api_key: str = Field(default="", validation_alias="EMBEDDING_API_KEY")
-    embedding_model: str = Field(
-        default="qwen3.7-text-embedding",
-        validation_alias="EMBEDDING_MODEL",
-    )
     embedding_dimensions: int = Field(default=1024, validation_alias="EMBEDDING_DIMENSIONS")
     database_path: str = Field(default="data/memory.db", validation_alias="DATABASE_PATH")
     auth_database_path: str = Field(
@@ -258,113 +237,6 @@ class Settings(BaseSettings):
         le=1.0,
         validation_alias="KNOWLEDGE_HYBRID_VECTOR_WEIGHT",
     )
-    llm_deepseek_base_url: str = Field(
-        default="https://api.deepseek.com",
-        validation_alias=AliasChoices(
-            "LLM_DEEPSEEK_BASE_URL",
-            "KNOWLEDGE_AGENT_BASE_URL",
-        ),
-    )
-    llm_deepseek_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "LLM_DEEPSEEK_API_KEY",
-            "KNOWLEDGE_AGENT_API_KEY",
-        ),
-    )
-    llm_deepseek_flash_model: str = Field(
-        default="deepseek-v4-flash",
-        validation_alias=AliasChoices(
-            "LLM_DEEPSEEK_FLASH_MODEL",
-            "KNOWLEDGE_AGENT_FLASH_MODEL",
-        ),
-    )
-    llm_deepseek_pro_model: str = Field(
-        default="deepseek-v4-pro",
-        validation_alias=AliasChoices(
-            "LLM_DEEPSEEK_PRO_MODEL",
-            "KNOWLEDGE_AGENT_PRO_MODEL",
-        ),
-    )
-    llm_provider_priority: str = Field(
-        default="D",
-        validation_alias=AliasChoices(
-            "LLM_PROVIDER_PRIORITY",
-            "KNOWLEDGE_AGENT_PROVIDER_PRIORITY",
-        ),
-    )
-    model_catalog_path: str = Field(
-        default="",
-        validation_alias="MODEL_CATALOG_PATH",
-    )
-    model_routes_path: str = Field(
-        default="",
-        validation_alias="MODEL_ROUTES_PATH",
-    )
-    # New two-level provider configuration; consumers are still being migrated.
-    providers_path: str = Field(
-        default="",
-        validation_alias="PROVIDERS_PATH",
-    )
-    routes_path: str = Field(
-        default="",
-        validation_alias="ROUTES_PATH",
-    )
-    pricing_catalog_path: str = Field(
-        default="",
-        validation_alias="PRICING_CATALOG_PATH",
-    )
-    llm_mimo_base_url: str = Field(
-        default="https://api.xiaomimimo.com/v1",
-        validation_alias=AliasChoices(
-            "LLM_MIMO_BASE_URL",
-            "KNOWLEDGE_AGENT_MIMO_BASE_URL",
-        ),
-    )
-    llm_mimo_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "LLM_MIMO_API_KEY",
-            "KNOWLEDGE_AGENT_MIMO_API_KEY",
-        ),
-    )
-    llm_mimo_model: str = Field(
-        default="mimo-v2.5-pro-ultraspeed",
-        validation_alias=AliasChoices(
-            "LLM_MIMO_MODEL",
-            "KNOWLEDGE_AGENT_MIMO_MODEL",
-        ),
-    )
-    llm_kimi_base_url: str = Field(
-        default="https://api.moonshot.cn/v1",
-        validation_alias=AliasChoices(
-            "LLM_KIMI_BASE_URL",
-            "KNOWLEDGE_AGENT_KIMI_BASE_URL",
-        ),
-    )
-    llm_kimi_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "LLM_KIMI_API_KEY",
-            "KNOWLEDGE_AGENT_KIMI_API_KEY",
-        ),
-    )
-    llm_kimi_model: str = Field(
-        default="kimi-k2.7-code",
-        validation_alias=AliasChoices(
-            "LLM_KIMI_MODEL",
-            "KNOWLEDGE_AGENT_KIMI_MODEL",
-        ),
-    )
-    llm_rate_limit_cooldown_seconds: float = Field(
-        default=300.0,
-        ge=1.0,
-        le=3600.0,
-        validation_alias=AliasChoices(
-            "LLM_RATE_LIMIT_COOLDOWN_SECONDS",
-            "KNOWLEDGE_AGENT_RATE_LIMIT_COOLDOWN_SECONDS",
-        ),
-    )
     knowledge_agent_egress_policy: Literal["none", "normal", "all"] = Field(
         default="none",
         validation_alias="KNOWLEDGE_AGENT_EGRESS_POLICY",
@@ -385,51 +257,6 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="ALLOW_SENSITIVE_EGRESS",
     )
-
-    @field_validator("llm_provider_priority")
-    @classmethod
-    def _validate_llm_provider_priority(cls, value: str) -> str:
-        return normalize_provider_priority(value)
-
-    @field_validator(
-        "upstream_base_url",
-        "embedding_base_url",
-        "llm_deepseek_base_url",
-        "llm_mimo_base_url",
-        "llm_kimi_base_url",
-    )
-    @classmethod
-    def _validate_legacy_direct_base_url(cls, value: str) -> str:
-        if value != value.strip():
-            raise ValueError("direct provider Base URL 不能包含外围空白")
-        normalized = value.rstrip("/")
-        parsed = urlsplit(normalized)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or any(character.isspace() or ord(character) < 32 for character in normalized)
-        ):
-            raise ValueError("direct provider Base URL 不是安全的服务 URL")
-        try:
-            parsed.port
-        except ValueError as exc:
-            raise ValueError("direct provider Base URL 不是安全的服务 URL") from exc
-        if parsed.scheme == "http":
-            hostname = str(parsed.hostname).lower()
-            loopback = hostname == "localhost"
-            if not loopback:
-                try:
-                    loopback = ipaddress.ip_address(hostname).is_loopback
-                except ValueError:
-                    loopback = False
-            if not loopback:
-                raise ValueError("direct provider 的非回环服务必须使用 HTTPS")
-        return normalized
 
     @field_validator("model_gateway_base_url")
     @classmethod
@@ -637,14 +464,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-
 @lru_cache
 def get_settings() -> Settings:
     settings_path = os.getenv("MEMGW_SETTINGS_PATH", "").strip()
     if not settings_path:
         return Settings()
     return Settings.model_validate(_private_settings_values(Path(settings_path)))
-
 
 def _private_settings_values(path: Path) -> dict[str, str]:
     """Read a private settings file without exporting its secrets.
@@ -697,7 +522,6 @@ def _private_settings_values(path: Path) -> dict[str, str]:
         if _SETTINGS_NAME_RE.fullmatch(name) and not _is_secret_setting_name(name):
             values[name] = value
     return values
-
 
 def _is_secret_setting_name(name: str) -> bool:
     return name.upper().endswith(

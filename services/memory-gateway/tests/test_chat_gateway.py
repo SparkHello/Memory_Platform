@@ -117,7 +117,6 @@ def test_v1_gateway_uses_central_runtime_without_rewriting_extensions(
         MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
         MODEL_GATEWAY_API_KEY="central-backend-key",
         MODEL_GATEWAY_CHAT_MODEL="memory.chat.central",
-        UPSTREAM_API_KEY="direct-key-must-not-be-used",
     )
     gateway = OpenAIChatGatewayClient(
         settings,

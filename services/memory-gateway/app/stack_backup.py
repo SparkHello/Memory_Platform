@@ -23,8 +23,6 @@ from app.cli_config import (
     read_env_file,
     write_env_atomic,
 )
-from app.model_catalog import validate_catalog_and_routes
-from app.usage.pricing import load_pricing_catalog
 
 
 STACK_BACKUP_VERSION = 2
@@ -541,13 +539,8 @@ def _validate_restore_payloads(
     settings_payload = extracted.get("memory/settings.json")
     if settings_payload is not None:
         _json_object(settings_payload.read_bytes(), "memory/settings.json")
-    catalog = extracted.get("memory/models.json")
-    routes = extracted.get("memory/routes.json")
-    if catalog is not None and routes is not None:
-        validate_catalog_and_routes(catalog_path=catalog, routes_path=routes)
-    pricing = extracted.get("memory/pricing.json")
-    if pricing is not None:
-        load_pricing_catalog(pricing)
+    # Legacy memory-side model/pricing catalog files may still appear in older
+    # backups. They are no longer runtime truth; only require valid JSON if present.
     model_gateway_config = extracted.get("model-gateway/config.json")
     if model_gateway_config is not None:
         _validate_model_gateway_config(model_gateway_config)

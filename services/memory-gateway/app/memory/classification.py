@@ -3,7 +3,6 @@ import re
 from pydantic import BaseModel, Field
 
 from app.memory.models import CandidateMemory
-from app.memory.store import normalize_classification_names
 
 
 SPACE_WORK = "工作与项目"
@@ -72,6 +71,41 @@ def classify_memory(
         space_names=space_names,
         reason="llm_labels_with_rule_fallback" if candidate.topics or candidate.entities else "rule_fallback",
     )
+
+
+def normalize_classification_name(value: str, *, field_name: str) -> str:
+    normalized = " ".join(str(value).strip().split())
+    if not normalized:
+        raise ValueError(f"{field_name} 不能为空")
+    if len(normalized) > 40:
+        raise ValueError(f"{field_name} 不能超过 40 个字符")
+    return normalized
+
+
+def normalize_classification_names(
+    values: list[str],
+    *,
+    max_items: int,
+    field_name: str,
+) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        raw = " ".join(str(value).strip().split())
+        if not raw:
+            continue
+        if len(raw) > 40:
+            raise ValueError(f"{field_name} 单项不能超过 40 个字符")
+        key = raw.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(raw)
+    if len(normalized) > max_items:
+        raise ValueError(f"{field_name} 最多 {max_items} 个")
+    return normalized
 
 
 def normalize_classification_values(

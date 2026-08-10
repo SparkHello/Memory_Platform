@@ -8,19 +8,17 @@ import subprocess
 from types import SimpleNamespace
 import sys
 
-import httpx
 import pytest
 
 from app.auth.tokens import AuthTokenStore
 from app.cli import (
-    _fetch_official_text,
-    _require_https_url,
+    _REMOVED_DIRECT_SECRETS,
+    MIGRATION_DOC_URL,
     _server_command,
     build_parser,
     main,
 )
-from app.cli_config import cli_paths, read_env_file, read_json, update_env_value
-from app.model_probe import ModelProbeResult
+from app.cli_config import cli_paths, read_env_file, update_env_value
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +30,7 @@ def _clear_stack_install_secret_environment(monkeypatch) -> None:
         "GATEWAY_API_KEY",
         "GATEWAY_SIGNING_SECRET",
         "MODEL_GATEWAY_API_KEY",
+        "MODEL_GATEWAY_BASE_URL",
         "MEMORY_CONSOLE_ADMIN_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -55,16 +54,12 @@ def test_cli_initializes_outside_repo_without_copying_placeholder_keys(
 
     paths = cli_paths(tmp_path / "memgw-home")
     values = read_env_file(paths.settings_env)
-    assert paths.models.exists()
-    assert paths.routes.exists()
-    assert paths.pricing.exists()
-    assert values["MODEL_CATALOG_PATH"] == str(paths.models)
-    assert values["MODEL_ROUTES_PATH"] == str(paths.routes)
-    assert values["PRICING_CATALOG_PATH"] == str(paths.pricing)
     assert values["AUTH_DATABASE_PATH"] == str(paths.home / "auth.db")
     assert len(values["GATEWAY_SIGNING_SECRET"]) >= 32
     assert values.get("GATEWAY_API_KEY") != "change-me"
-    assert values.get("UPSTREAM_API_KEY") != "your-upstream-api-key"
+    # Direct-provider catalog keys must not be re-seeded for new installs.
+    assert "MODEL_CATALOG_PATH" not in values
+    assert "UPSTREAM_API_KEY" not in values
 
 
 def test_existing_cli_home_migrates_missing_auth_settings_once(tmp_path) -> None:
@@ -161,40 +156,6 @@ def test_cli_creates_lists_and_revokes_scoped_token_without_persisting_secret(
     assert "revoked" in capsys.readouterr().out
 
 
-def test_cli_checks_provider_after_saving_remote_api_key(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    args = _base_args(tmp_path)
-    assert main([*args, "init", "--no-import-env"]) == 0
-    capsys.readouterr()
-    monkeypatch.setattr(sys, "stdin", io.StringIO("provider-secret\n"))
-    calls: list[tuple[str, bool]] = []
-
-    def fake_check(settings, models, *, provider_filter, live, timeout_seconds):
-        del settings, models, timeout_seconds
-        calls.append((provider_filter, live))
-        return [
-            ModelProbeResult(
-                model_id="mimo/mimo-v2.5-pro-ultraspeed",
-                provider="mimo",
-                model="mimo-v2.5-pro-ultraspeed",
-                status="available",
-                detail="连接正常",
-                configured=True,
-                failed=False,
-            )
-        ]
-
-    monkeypatch.setattr("app.cli.check_model_catalog", fake_check)
-
-    assert main([*args, "secret", "set", "mimo", "--stdin"]) == 0
-
-    output = capsys.readouterr().out
-    assert calls == [("mimo", False)]
-    assert "provider-secret" not in output
-    assert "[正常]" in output
-
-
 def test_cli_connects_memory_service_to_independent_model_gateway(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -220,6 +181,113 @@ def test_cli_connects_memory_service_to_independent_model_gateway(
     assert checks == [
         (tmp_path / "memgw-home", PROJECT_ROOT, 10.0),
     ]
+
+
+@pytest.mark.parametrize("name", sorted(_REMOVED_DIRECT_SECRETS))
+def test_secret_set_removed_direct_names_print_migration_hint(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    name,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("removed-direct-secret\n"))
+
+    assert main([*args, "secret", "set", name, "--stdin"]) == 2
+
+    captured = capsys.readouterr()
+    assert "direct-provider 路径已移除" in captured.err
+    assert MIGRATION_DOC_URL in captured.err
+    assert "removed-direct-secret" not in captured.out + captured.err
+    values = read_env_file(cli_paths(tmp_path / "memgw-home").settings_env)
+    assert _REMOVED_DIRECT_SECRETS[name] not in values
+
+
+@pytest.mark.parametrize("name", sorted(_REMOVED_DIRECT_SECRETS))
+def test_secret_delete_removed_direct_names_print_migration_hint(
+    tmp_path,
+    capsys,
+    name,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+
+    assert main([*args, "secret", "delete", name, "--yes"]) == 2
+
+    captured = capsys.readouterr()
+    assert "direct-provider 路径已移除" in captured.err
+    assert MIGRATION_DOC_URL in captured.err
+
+
+def test_secret_set_unknown_name_explains_valid_choices(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("whatever\n"))
+
+    assert main([*args, "secret", "set", "bogus", "--stdin"]) == 2
+
+    error = capsys.readouterr().err
+    assert "未知密钥" in error
+    assert "bogus" in error
+    for legal in ("gateway", "signing", "model-gateway"):
+        assert legal in error
+
+
+def test_secret_set_signing_still_saved_without_migration_hint(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+    secret = "pytest-only-signing-secret-32-bytes-minimum"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(secret + "\n"))
+
+    assert main([*args, "secret", "set", "signing", "--stdin"]) == 0
+
+    captured = capsys.readouterr()
+    assert "direct-provider" not in captured.err
+    assert secret not in captured.out
+    values = read_env_file(cli_paths(tmp_path / "memgw-home").settings_env)
+    assert values["GATEWAY_SIGNING_SECRET"] == secret
+
+
+@pytest.mark.parametrize(
+    "retired_argv",
+    (
+        ["model"],
+        ["model", "list"],
+        ["model", "add", "upstream/example-chat", "--capability", "streaming"],
+        ["route"],
+        ["route", "set", "chat", "MKD"],
+        ["pricing"],
+        ["pricing", "add", "kimi/kimi-k2.7-code", "--cache-hit", "1"],
+    ),
+)
+def test_retired_direct_provider_commands_always_print_migration_hint(
+    tmp_path,
+    capsys,
+    retired_argv,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    capsys.readouterr()
+
+    assert main([*args, *retired_argv]) == 2
+
+    captured = capsys.readouterr()
+    assert "direct-provider 路径已移除" in captured.err
+    assert MIGRATION_DOC_URL in captured.err
+    assert "unrecognized arguments" not in captured.err
 
 
 def test_user_menu_uses_service_language_and_can_exit(
@@ -723,156 +791,6 @@ def test_server_command_exports_settings_path_but_not_secret_values(
         assert value not in environment.values()
 
 
-def test_cli_adds_model_and_assigns_feature_route(tmp_path) -> None:
-    args = _base_args(tmp_path)
-    assert main([*args, "init", "--no-import-env"]) == 0
-
-    assert (
-        main(
-            [
-                *args,
-                "model",
-                "add",
-                "upstream/example-chat",
-                "--provider",
-                "upstream",
-                "--model",
-                "example-chat",
-                "--capability",
-                "streaming",
-                "--official-url",
-                "https://provider.example/models/example-chat",
-            ]
-        )
-        == 0
-    )
-    assert (
-        main(
-            [
-                *args,
-                "route",
-                "set",
-                "memory.review",
-                "upstream/example-chat",
-                "deepseek/deepseek-v4-flash",
-            ]
-        )
-        == 0
-    )
-
-    paths = cli_paths(tmp_path / "memgw-home")
-    models = read_json(paths.models)["models"]
-    routes = read_json(paths.routes)["routes"]
-    assert any(item["id"] == "upstream/example-chat" for item in models)
-    assert routes["memory.review"] == [
-        "upstream/example-chat",
-        "deepseek/deepseek-v4-flash",
-    ]
-
-
-def test_cli_route_accepts_mkd_shorthand(tmp_path) -> None:
-    args = _base_args(tmp_path)
-    assert main([*args, "init", "--no-import-env"]) == 0
-
-    assert main([*args, "route", "set", "chat", "MKD"]) == 0
-
-    routes = read_json(cli_paths(tmp_path / "memgw-home").routes)["routes"]
-    assert routes["chat"] == [
-        "mimo/mimo-v2.5-pro-ultraspeed",
-        "kimi/kimi-k2.7-code",
-        "deepseek/deepseek-v4-flash",
-    ]
-
-
-def test_cli_route_maps_deepseek_shorthand_to_pro_for_knowledge_pro(tmp_path) -> None:
-    args = _base_args(tmp_path)
-    assert main([*args, "init", "--no-import-env"]) == 0
-
-    assert main([*args, "route", "set", "knowledge.pro", "D"]) == 0
-
-    routes = read_json(cli_paths(tmp_path / "memgw-home").routes)["routes"]
-    assert routes["knowledge.pro"] == ["deepseek/deepseek-v4-pro"]
-
-
-def test_cli_adds_pricing_to_external_catalog(tmp_path) -> None:
-    args = _base_args(tmp_path)
-    assert main([*args, "init", "--no-import-env"]) == 0
-
-    assert (
-        main(
-            [
-                *args,
-                "pricing",
-                "add",
-                "kimi/kimi-k2.7-code",
-                "--billing-provider",
-                "kimi",
-                "--cache-hit",
-                "1",
-                "--cache-miss",
-                "2",
-                "--output",
-                "3",
-                "--source",
-                "https://platform.kimi.com/docs/pricing/chat-k27-code",
-                "--as-of",
-                "2026-08-02",
-                "--replace",
-            ]
-        )
-        == 0
-    )
-
-    payload = read_json(cli_paths(tmp_path / "memgw-home").pricing)
-    price = next(item for item in payload["models"] if item["key"] == "kimi:kimi-k2.7-code")
-    assert price["input_cache_hit_per_million"] == "1"
-    assert price["input_cache_miss_per_million"] == "2"
-    assert price["output_per_million"] == "3"
-    assert payload["as_of"] == "2026-08-02"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        " http://provider.example/pricing",
-        "http://provider.example/pricing",
-        "https://user:secret@provider.example/pricing",
-        "https://provider.example/pricing?token=secret",
-        "https://provider.example/pricing#section",
-        "https://127.0.0.1/pricing",
-        "https://192.168.1.10/pricing",
-        "https://169.254.169.254/latest/meta-data",
-    ],
-)
-def test_pricing_source_rejects_unsafe_urls(source: str) -> None:
-    with pytest.raises(ValueError):
-        _require_https_url(source)
-
-
-def test_pricing_page_fetch_disables_proxy_redirects_and_caps_body(monkeypatch) -> None:
-    real_client = httpx.Client
-    options: list[dict[str, object]] = []
-
-    def client_factory(**kwargs):
-        options.append(kwargs.copy())
-        kwargs["transport"] = httpx.MockTransport(
-            lambda request: httpx.Response(
-                200,
-                content=b"<html><body>" + b"safe official pricing text " * 4 + b"</body></html>",
-                request=request,
-            )
-        )
-        return real_client(**kwargs)
-
-    monkeypatch.setattr("app.cli.httpx.Client", client_factory)
-
-    text = _fetch_official_text("https://provider.example/pricing")
-
-    assert "safe official pricing text" in text
-    assert options[0]["follow_redirects"] is False
-    assert options[0]["trust_env"] is False
-
-
 def test_settings_error_redaction_and_secret_name_suffixes() -> None:
     from app.cli_config import _is_secret_name
     from app.config import Settings, describe_settings_error
@@ -883,7 +801,6 @@ def test_settings_error_redaction_and_secret_name_suffixes() -> None:
             **{
                 "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030",
                 "GATEWAY_API_KEY": "gw-secret-value-1234567890",
-                "EMBEDDING_API_KEY": "emb-secret-value-abcdefghij",
             },
         )
     except Exception as exc:

@@ -7,7 +7,6 @@ import pytest
 from app.config import Settings
 from app.knowledge.agent import (
     KnowledgeAgentConfig,
-    KnowledgeProviderCooldowns,
     KnowledgeSearchAgent,
     OpenAICompatibleKnowledgeAgentClient,
 )
@@ -24,7 +23,6 @@ from app.llm.model_gateway import (
     ModelGatewayProtocolError,
 )
 from app.llm.runtime import resolve_model_runtime
-from app.llm.routing import LLMProvider, ProviderQuirks
 from app.usage.attribution import (
     MODEL_GATEWAY_CORRELATION_HEADER,
     MODEL_GATEWAY_OPERATION_HEADER,
@@ -136,34 +134,9 @@ class FakeCompletionClient:
         return response
 
 
-def _provider(
-    provider_id: str = "deepseek",
-    model: str = "deepseek-v4-flash",
-    *,
-    api_key: str = "test-key",
-    base_url: str = "https://agent.invalid/v1",
-    **quirks,
-) -> LLMProvider:
-    defaults = {"thinking_style": "type_object", "tool_choice_with_thinking": "none"}
-    defaults.update(quirks)
-    return LLMProvider(
-        code=provider_id,
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        quirks=ProviderQuirks(**defaults),
-    )
-
-
 def _config(**overrides) -> KnowledgeAgentConfig:
-    values: dict = {
-        "fast_providers": [_provider()],
-        "pro_provider": _provider(model="deepseek-v4-pro"),
-        "egress_policy": "all",
-        "allow_sensitive_egress": True,
-    }
-    values.update(overrides)
-    return KnowledgeAgentConfig(**values)
+    """Central Model Gateway config used by most knowledge-agent unit tests."""
+    return _central_config(**overrides)
 
 
 def _central_config(**overrides) -> KnowledgeAgentConfig:
@@ -273,7 +246,7 @@ async def test_model_can_only_select_refs_and_never_supplies_final_text() -> Non
 
     assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.agent_used is True
-    assert result.metadata.model == "deepseek-v4-flash"
+    assert result.metadata.model == "knowledge.fast"
     assert set(result.model_dump()) == {"selected_refs", "metadata"}
     assert "逐字原文" not in result.model_dump_json()
     system_prompt = remote.calls[0]["messages"][0]["content"]
@@ -392,9 +365,9 @@ async def test_two_invalid_flash_calls_can_escalate_to_pro() -> None:
     assert result.metadata.flash_rounds == 2
     assert result.metadata.pro_rounds == 1
     assert [call["model"] for call in remote.calls] == [
-        "deepseek-v4-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "knowledge.fast",
+        "knowledge.fast",
+        "knowledge.pro",
     ]
 
 
@@ -412,10 +385,10 @@ async def test_deep_quality_requires_pro_review_even_after_flash_selection() -> 
 
     assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.escalated is True
-    assert result.metadata.model == "deepseek-v4-pro"
+    assert result.metadata.model == "knowledge.pro"
     assert [call["model"] for call in remote.calls] == [
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "knowledge.fast",
+        "knowledge.pro",
     ]
 
 
@@ -556,6 +529,8 @@ async def test_explicit_request_injection_is_rejected_before_remote_agent() -> N
     assert remote.calls == []
 
 
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
 @pytest.mark.asyncio
 async def test_openai_compatible_client_supports_fake_transport_without_network(
     monkeypatch,
@@ -776,6 +751,83 @@ async def test_model_gateway_knowledge_client_preserves_explicit_affinity_409() 
 
 
 @pytest.mark.asyncio
+async def test_model_gateway_knowledge_client_clears_stale_affinity_after_409() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            {
+                "preferred": request.headers.get(
+                    MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER, ""
+                ),
+                "required": request.headers.get(
+                    MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER, ""
+                ),
+            }
+        )
+        if len(requests) == 2:
+            return httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "model_gateway_affinity_unavailable",
+                        "message": "deployment unavailable",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            headers=_central_headers(
+                "knowledge.fast", f"deployment-fast-{len(requests)}"
+            ),
+            json={"choices": []},
+        )
+
+    client = OpenAICompatibleKnowledgeAgentClient(
+        _central_config(),
+        transport=httpx.MockTransport(handler),
+    )
+    await client.create_chat_completion(
+        model="knowledge.fast",
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+        affinity_scope="knowledge_agent_flash",
+    )
+    # The second call pins the cached deployment and the gateway rejects it
+    # with 409; the error must propagate without any same-call retry.
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.create_chat_completion(
+            model="knowledge.fast",
+            messages=[],
+            tools=[],
+            timeout_seconds=25,
+            affinity_scope="knowledge_agent_flash",
+        )
+
+    assert exc_info.value.response.status_code == 409
+    assert len(requests) == 2
+    assert "knowledge_agent_flash" not in client._central_affinity
+
+    # The next call re-resolves affinity instead of pinning the dead
+    # deployment, then locks the fresh one returned by the gateway.
+    await client.create_chat_completion(
+        model="knowledge.fast",
+        messages=[],
+        tools=[],
+        timeout_seconds=25,
+        affinity_scope="knowledge_agent_flash",
+    )
+
+    assert requests[0]["required"] == ""
+    assert requests[1]["required"] == "deployment-fast-1"
+    assert requests[1]["preferred"] == "deployment-fast-1"
+    assert requests[2]["required"] == ""
+    assert requests[2]["preferred"] == ""
+    assert client._central_affinity["knowledge_agent_flash"] == "deployment-fast-3"
+
+
+@pytest.mark.asyncio
 async def test_model_gateway_knowledge_client_rejects_missing_attribution() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": []})
@@ -792,56 +844,6 @@ async def test_model_gateway_knowledge_client_rejects_missing_attribution() -> N
             timeout_seconds=25,
             affinity_scope="knowledge_agent_flash",
         )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("config_overrides", "expected_thinking"),
-    [
-        (
-            {
-                "fast_providers": [_provider("mimo", "mimo-v2.5-pro-ultraspeed", tool_choice_with_thinking="any")],
-            },
-            {"type": "enabled"},
-        ),
-        (
-            {
-                "fast_providers": [_provider(
-                        "kimi",
-                        "kimi-k2.7-code",
-                        thinking_style="type_object_keep_all",
-                        tool_choice_with_thinking="auto_only",
-                        forces_temperature_one=True,
-                    )],
-            },
-            {"type": "enabled", "keep": "all"},
-        ),
-    ],
-)
-async def test_alternate_knowledge_providers_enable_thinking(
-    config_overrides: dict,
-    expected_thinking: dict,
-) -> None:
-    captured: dict = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured.update(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(200, json={"choices": [], "model": captured["model"]})
-
-    config = _config(**config_overrides)
-    client = OpenAICompatibleKnowledgeAgentClient(
-        config,
-        transport=httpx.MockTransport(handler),
-    )
-    await client.create_chat_completion(
-        model=config.flash_model,
-        messages=[],
-        tools=[],
-        timeout_seconds=25,
-    )
-
-    assert captured["thinking"] == expected_thinking
-    assert captured["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio
@@ -890,6 +892,8 @@ async def test_result_carries_baseline_candidates_without_a_second_search() -> N
     assert result.metadata.baseline_refs == [CHUNK_REF]
 
 
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
 @pytest.mark.asyncio
 async def test_flash_provider_429_fails_over_and_is_skipped_during_cooldown() -> None:
     now = {"value": 100.0}
@@ -967,6 +971,8 @@ async def test_flash_provider_429_fails_over_and_is_skipped_during_cooldown() ->
     )
     assert calls[-2:] == ["mimo-v2.5-pro-ultraspeed", "kimi-k2.7-code"]
 
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
 @pytest.mark.asyncio
 async def test_kimi_k27_knowledge_agent_uses_temperature_one() -> None:
     calls: list[dict] = []
@@ -999,6 +1005,8 @@ async def test_kimi_k27_knowledge_agent_uses_temperature_one() -> None:
     assert calls[0]["thinking"] == {"type": "enabled", "keep": "all"}
 
 
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
+@pytest.mark.skip(reason="direct-provider knowledge path removed")
 @pytest.mark.asyncio
 async def test_retry_after_longer_than_default_cooldown_is_respected() -> None:
     monotonic_now = {"value": 10.0}

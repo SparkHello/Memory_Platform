@@ -9,7 +9,6 @@ Model Gateway control endpoint when it is loopback or HTTPS.
 
 from __future__ import annotations
 
-import os
 from ipaddress import ip_address, ip_network
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlsplit
@@ -25,15 +24,6 @@ from app.llm.runtime import (
     ModelRuntimeConfigurationError,
     resolve_model_runtime,
 )
-from app.providers.catalog import (
-    ROUTE_NAMES,
-    ProviderConfigError,
-    load_providers,
-    load_routes,
-    split_target,
-)
-
-
 router = APIRouter(
     prefix="/providers",
     tags=["providers"],
@@ -81,11 +71,7 @@ async def providers_status(
     except ModelRuntimeConfigurationError as exc:
         payload = _invalid_runtime_status(str(exc))
     else:
-        payload = (
-            await _model_gateway_status(settings, model_runtime)
-            if model_runtime.is_central
-            else _direct_provider_status(settings, model_runtime)
-        )
+        payload = await _model_gateway_status(settings, model_runtime)
     return {**payload, "setup": _setup_summary(payload)}
 
 
@@ -546,77 +532,6 @@ def _status_from_control(
         "routes": route_views,
         "control": control,
         "config_error": "",
-    }
-
-
-def _direct_provider_status(
-    settings: Settings,
-    model_runtime: ModelRuntime,
-) -> dict[str, Any]:
-    try:
-        definitions = load_providers(settings.providers_path)
-        routes = load_routes(settings.routes_path)
-        config_error = ""
-    except ProviderConfigError as exc:
-        definitions, routes, config_error = {}, {}, str(exc)
-
-    providers = [
-        {
-            **definition.public_dict(),
-            "configured": bool(definition.resolve_api_key(os.environ)),
-        }
-        for definition in definitions.values()
-    ]
-    route_views = []
-    for route_name in ROUTE_NAMES:
-        targets = []
-        for target in routes.get(route_name, []):
-            try:
-                provider_id, model_id = split_target(target)
-            except ProviderConfigError:
-                targets.append({"target": target, "valid": False, "configured": False})
-                continue
-            definition = definitions.get(provider_id)
-            configured = bool(
-                definition
-                and definition.resolve_api_key(os.environ)
-                and model_id in definition.models
-            )
-            targets.append(
-                {
-                    "target": target,
-                    "provider_id": provider_id,
-                    "provider_name": definition.name if definition else "",
-                    "model": model_id,
-                    "valid": bool(definition and model_id in definition.models),
-                    "configured": configured,
-                }
-            )
-        route_views.append(
-            {
-                "id": route_name,
-                "description": ROUTE_DESCRIPTIONS.get(route_name, ""),
-                "targets": targets,
-                "usable": any(target["configured"] for target in targets),
-                "migrated": route_name in {"knowledge.fast", "knowledge.pro"},
-            }
-        )
-    return {
-        "runtime": {
-            "model_gateway_enabled": False,
-            "model_runtime": "direct",
-            "model_gateway_base_url": "",
-            "required_chat_routes": list(REQUIRED_CHAT_ROUTES),
-            "chat_source": "legacy_direct",
-            "knowledge_source": "provider_catalog",
-            "providers_path": settings.providers_path,
-            "routes_path": settings.routes_path,
-        },
-        "embedding": _runtime_embedding_status(model_runtime),
-        "providers": providers,
-        "routes": route_views,
-        "control": None,
-        "config_error": config_error,
     }
 
 

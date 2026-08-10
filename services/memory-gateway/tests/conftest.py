@@ -1,4 +1,4 @@
-﻿from collections.abc import Iterator
+from collections.abc import Iterator
 import atexit
 import json
 import os
@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+from types import SimpleNamespace
+from typing import Any
 
 
 _RUNTIME_ENVIRONMENT_EXACT = {
@@ -107,8 +109,6 @@ os.environ.update(
         "EVAL_DIR": str(_SESSION_RUNTIME_ROOT / "eval"),
         "GATEWAY_API_KEY": "",
         "MODEL_GATEWAY_API_KEY": "",
-        "UPSTREAM_API_KEY": "",
-        "EMBEDDING_API_KEY": "",
         "MODEL_GATEWAY_BASE_URL": "",
         "KNOWLEDGE_AGENT_EGRESS_POLICY": "none",
         "ALLOW_SENSITIVE_EGRESS": "false",
@@ -145,7 +145,6 @@ Settings.model_config = {**Settings.model_config, "env_file": None}
 from app.api import deps
 from app.api.chat_gateway import clear_chat_gateway_state
 from app.knowledge.store import KnowledgeStore
-from app.llm.routing import LLMProvider
 from app.main import create_app
 from app.memory.search import NullEmbeddingClient
 from app.memory.store import MemoryStore
@@ -197,21 +196,19 @@ def isolate_test_runtime(tmp_path) -> Iterator[None]:
         "KNOWLEDGE_DATABASE_PATH": str(tmp_path / "runtime-knowledge.db"),
         "USAGE_DATABASE_PATH": str(tmp_path / "runtime-usage.db"),
         "EVAL_DIR": str(tmp_path / "eval"),
-        "MODEL_CATALOG_PATH": "",
-        "MODEL_ROUTES_PATH": "",
-        "PROVIDERS_PATH": "",
-        "ROUTES_PATH": "",
-        "PRICING_CATALOG_PATH": "",
         "ALLOW_SENSITIVE_EGRESS": "false",
         "KNOWLEDGE_AGENT_EGRESS_POLICY": "none",
         "GATEWAY_SIGNING_SECRET": "pytest-only-signing-secret-32-bytes-minimum",
         "GATEWAY_LEGACY_API_KEY_ENABLED": "true",
-        "MODEL_GATEWAY_BASE_URL": "",
+        # Memory Gateway only supports Model Gateway. Tests that need the
+        # unconfigured state must explicitly clear both fields.
+        "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030/v1",
+        "MODEL_GATEWAY_API_KEY": "pytest-central-backend-key",
+        "MODEL_GATEWAY_EMBEDDING_SPACE_ID": "",
     }
     for name in (
         "GATEWAY_API_KEY",
         "UPSTREAM_API_KEY",
-        "MODEL_GATEWAY_API_KEY",
         "EMBEDDING_API_KEY",
         "LLM_DEEPSEEK_API_KEY",
         "LLM_MIMO_API_KEY",
@@ -452,7 +449,7 @@ class FakeLLMClient:
 
 
 class FakeGatewayStream:
-    def __init__(self, chunks: list[bytes], *, provider: LLMProvider) -> None:
+    def __init__(self, chunks: list[bytes], *, provider: Any) -> None:
         self.chunks = chunks
         self.headers = {"content-type": "text/event-stream"}
         self.closed = False
@@ -501,7 +498,7 @@ class FakeChatGatewayClient:
         ]
         self.last_stream: FakeGatewayStream | None = None
         self.error: GatewayUpstreamHTTPError | None = None
-        self.provider = LLMProvider(
+        self.provider = SimpleNamespace(
             code="D",
             base_url="https://upstream.invalid/v1",
             api_key="test",
@@ -595,19 +592,15 @@ def client(
         knowledge_store.database_path,
     )
     monkeypatch.setenv("KNOWLEDGE_AGENT_API_KEY", "")
-    monkeypatch.setenv("LLM_PROVIDER_PRIORITY", "D")
     monkeypatch.setenv("KNOWLEDGE_AGENT_MIMO_API_KEY", "")
     monkeypatch.setenv("KNOWLEDGE_AGENT_KIMI_API_KEY", "")
-    monkeypatch.setenv("LLM_DEEPSEEK_API_KEY", "")
-    monkeypatch.setenv("LLM_MIMO_API_KEY", "")
-    monkeypatch.setenv("LLM_KIMI_API_KEY", "")
     monkeypatch.setenv("KNOWLEDGE_AGENT_EGRESS_POLICY", "none")
     # Egress-blocking assertions must not depend on the developer's local .env.
     monkeypatch.setenv("ALLOW_SENSITIVE_EGRESS", "false")
     monkeypatch.setenv("EVAL_DIR", str(Path(memory_store.database_path).with_name("eval")))
-    monkeypatch.setenv("UPSTREAM_API_KEY", "")
-    monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")
-    monkeypatch.setenv("EMBEDDING_API_KEY", "")
+    monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "http://127.0.0.1:2030/v1")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "pytest-central-backend-key")
+    monkeypatch.setenv("MODEL_GATEWAY_EMBEDDING_SPACE_ID", "")
     monkeypatch.setenv("TIME_RIPPLE_DELTA", "0.0")
     monkeypatch.setenv("TIME_RIPPLE_WINDOW_HOURS", "48")
     monkeypatch.setenv("CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES", "65536")

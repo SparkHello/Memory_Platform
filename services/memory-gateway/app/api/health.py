@@ -80,12 +80,11 @@ async def _readiness_result(settings: Settings) -> tuple[int, dict[str, Any]]:
     disk_code = await asyncio.to_thread(disk_readiness_code, settings)
     if disk_code:
         return _not_ready(disk_code)
-    if runtime.is_central:
-        if not settings.gateway_signing_secret:
-            return _not_ready("model_gateway_usage_attribution_unavailable")
-        model_code = await _central_model_readiness_code(settings, runtime)
-        if model_code:
-            return _not_ready(model_code)
+    if not settings.gateway_signing_secret:
+        return _not_ready("model_gateway_usage_attribution_unavailable")
+    model_code = await _central_model_readiness_code(settings, runtime)
+    if model_code:
+        return _not_ready(model_code)
     return 200, {
         "status": "ready",
         "model_runtime": runtime.mode,
@@ -122,9 +121,6 @@ def _readyz_cache_fingerprint(settings: Settings) -> str:
         settings.model_gateway_embedding_model,
         settings.model_gateway_embedding_space_id,
         str(settings.embedding_dimensions),
-        settings.embedding_base_url,
-        settings.embedding_api_key,
-        settings.embedding_model,
         str(settings.request_timeout_seconds),
         str(settings.disk_soft_reserve_bytes),
         str(settings.disk_hard_reserve_bytes),

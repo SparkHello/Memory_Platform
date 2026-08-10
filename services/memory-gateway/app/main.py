@@ -21,10 +21,13 @@ from app.cli_config import cli_paths
 from app.config import get_settings
 from app.disk_capacity import DiskCapacityMiddleware
 from app.knowledge.store import KnowledgeStore
+from app.llm.runtime import (
+    MODEL_GATEWAY_REQUIRED_MESSAGE,
+    ModelRuntimeConfigurationError,
+)
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
-from app.model_catalog import validate_catalog_and_routes
 from app.request_limits import (
     RequestTargetLimitMiddleware,
     RouteAwareRequestBodyLimitMiddleware,
@@ -32,7 +35,6 @@ from app.request_limits import (
 )
 from app.security_headers import SecurityHeadersMiddleware
 from app.stack_backup import assert_no_interrupted_stack_restore
-from app.usage.pricing import configure_pricing_catalog
 from app.usage.store import UsageStore
 
 
@@ -101,11 +103,8 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         settings = get_settings()
         assert_no_interrupted_stack_restore(cli_paths().home)
-        validate_catalog_and_routes(
-            catalog_path=settings.model_catalog_path,
-            routes_path=settings.model_routes_path,
-        )
-        configure_pricing_catalog(settings.pricing_catalog_path)
+        # Model routing lives in Model Gateway. Local catalog/pricing files are
+        # legacy artifacts retained only for stack backup restore validation.
         _validate_database_paths(
             settings.database_path,
             settings.knowledge_database_path,
@@ -144,6 +143,24 @@ def create_app() -> FastAPI:
     app.add_middleware(DiskCapacityMiddleware)
     # Security headers remain the outermost response wrapper, including 507s.
     app.add_middleware(SecurityHeadersMiddleware)
+
+    @app.exception_handler(ModelRuntimeConfigurationError)
+    async def model_runtime_configuration_error_handler(request, exc):
+        # Runtime deps (chat gateway client, embedding, knowledge agent) fail
+        # closed before central credentials exist; surface the migration hint
+        # as a stable 503 envelope instead of a bare 500 traceback. /readyz
+        # catches this error itself and keeps its own not_ready contract.
+        del request, exc
+        return UTF8JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "model_runtime_configuration_error",
+                    "message": MODEL_GATEWAY_REQUIRED_MESSAGE,
+                }
+            },
+        )
+
     app.include_router(health_router)
     app.include_router(chat_gateway_router)
     app.include_router(auth_tokens_router)

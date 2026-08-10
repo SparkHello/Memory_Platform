@@ -8,8 +8,6 @@ import sqlite3
 import pytest
 
 from app.cli_config import read_env_file, write_env_atomic
-from app.model_catalog import BUILTIN_CATALOG_PATH, BUILTIN_ROUTES_PATH
-from app.usage.pricing import BUILTIN_PRICING_PATH
 from model_gateway.config_store import load_config, write_config, write_secrets
 from model_gateway.models import GatewayConfig
 
@@ -45,7 +43,6 @@ def _legacy_fixture(root: Path) -> None:
             "GATEWAY_API_KEY": "legacy-gateway-test-value",
             "MODEL_GATEWAY_API_KEY": "legacy-backend-test-value",
             "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030/v1",
-            "LLM_DEEPSEEK_API_KEY": "legacy-direct-provider-test-value",
             "MEMORY_CONSOLE_ADMIN_KEY": "legacy-admin-env-residue",
         },
     )
@@ -53,9 +50,6 @@ def _legacy_fixture(root: Path) -> None:
         '{"version":1,"project_root":"/app/services/memory-gateway","port":2026}\n',
         encoding="utf-8",
     )
-    shutil.copyfile(BUILTIN_CATALOG_PATH, memory / "models.json")
-    shutil.copyfile(BUILTIN_ROUTES_PATH, memory / "routes.json")
-    shutil.copyfile(BUILTIN_PRICING_PATH, memory / "pricing.json")
     (memory / "eval").mkdir()
     (memory / "eval" / "canary.txt").write_text("synthetic", encoding="utf-8")
 

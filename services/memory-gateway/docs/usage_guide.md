@@ -50,21 +50,21 @@ CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS=8
 CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS=6000
 CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS=4000
 
-# 【推荐】上游聊天模型，用于 /v1 对话代理、记忆提取、核心记忆整理、AI 体检。
-# 不配则 /v1 对话和记忆自动提取不可用，但手动保存、检索、管理功能仍可用。
-# DeepSeek、MiMo、Kimi 和支持 thinking 的智谱 GLM 会自动开启思考。
-UPSTREAM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-UPSTREAM_API_KEY=your-upstream-api-key
-UPSTREAM_MODEL=glm-5.1
+# 【必填】中央 Model Gateway。/v1 对话代理、记忆提取、核心记忆整理、AI 体检、
+# 知识代理与 embedding 都只调用它的稳定 route；两项必须成对配置。
+# 未配置时 /readyz 返回 model_runtime_configuration_error，依赖模型的功能不可用，
+# 但手动保存、检索、管理功能仍可用。渠道、模型与价格在 Model Gateway 侧管理。
+MODEL_GATEWAY_BASE_URL=http://127.0.0.1:2030/v1
+MODEL_GATEWAY_API_KEY=your-local-model-gateway-client-key
 
 # 【安全边界】是否允许把本地判定为 private/sensitive 的文本发给远程模型。
 # 默认 false，只有确认 provider 获准处理敏感数据时才改 true。
 ALLOW_SENSITIVE_EGRESS=false
 
-# 【可选】embedding 服务。EMBEDDING_API_KEY 留空 = 使用关键词检索，不调用 embedding。
-EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_API_KEY=
-EMBEDDING_MODEL=text-embedding-v4
+# 【可选】向量检索。在 Model Gateway 配好 memory.embedding route 后，填写它声明的
+# 精确空间 ID 与维度；留空或与空间/维度 Header、实际向量长度不匹配时安全回退关键词/FTS。
+MODEL_GATEWAY_EMBEDDING_MODEL=memory.embedding
+MODEL_GATEWAY_EMBEDDING_SPACE_ID=
 EMBEDDING_DIMENSIONS=1024
 
 # 【一般保持默认】
@@ -165,11 +165,11 @@ PDF 必须自带可提取文本层，扫描件需先 OCR。导入时可填写标
 “确认按所选级别导入”后才会写入，同时保存这次确认记录。
 「知识检索调试」页可按这些字段限定范围，并显示 FTS/embedding 混合召回信号。
 
-「用量与费用」页会从本版本启用后的新调用开始，统计 `/v1` 聊天、记忆后台任务、
-知识代理和 embedding 的实际用量。`LLM_PROVIDER_PRIORITY` 发生故障切换时按最终成功的
-provider/model 归账；Token 只认上游 `usage`，金额使用事件发生时的官方公开 API 原价快照。
-缺少 usage 或缺少明确公开单价的调用会标为“缺少 usage”或“待定价”，不会反向猜测历史账单，
-也不会把未知价格显示成免费。计量事件只保存元数据，不保存提示词或回复正文。
+「用量与费用」页改为展示 Model Gateway 的用量汇总：`/v1` 聊天、记忆后台任务、
+知识代理和 embedding 按实际渠道、provider/model、Token 和价格归账，以
+`modelgw usage summary` 为权威，并按当前用户的归因标签隔离。本版本起 Memory
+不再本地记录计量事件；旧版本保存的本地历史事件仍留在本地数据库中，不反向估算，
+也不保存提示词或回复正文。
 
 ### 3.5 接入支持远程 Streamable HTTP 的 MCP 客户端
 
@@ -299,12 +299,12 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1   # 卸�
 ## 5. 常见问题
 
 - **接口返回 500 / 401**：检查 `.env` 是否配置了 `GATEWAY_API_KEY`，以及请求头 `Authorization: Bearer ...` 是否一致。
-- **记忆没有被自动提取**：确认 `UPSTREAM_API_KEY` / `UPSTREAM_MODEL` 配置正确，并到“决策日志”查看 `model_reason_code`；空候选会显示临时事项、假设、非用户陈述、敏感授权不足、无长期价值或未分类等受控原因码，自由文本理由仍保持脱敏。敏感文本在 `ALLOW_SENSITIVE_EGRESS=false` 时不会发给远程提取，属预期行为。
-- **搜索只有关键词效果**：`EMBEDDING_API_KEY` 为空时记忆与知识库都会自动回退关键词检索，属预期行为；知识状态接口会显示 embedding 是否启用。
+- **记忆没有被自动提取**：确认 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY` 成对配置且 `memory.extract` route 可用（可用 `memgw doctor` 检查），并到“决策日志”查看 `model_reason_code`；空候选会显示临时事项、假设、非用户陈述、敏感授权不足、无长期价值或未分类等受控原因码，自由文本理由仍保持脱敏。敏感文本在 `ALLOW_SENSITIVE_EGRESS=false` 时不会发给远程提取，属预期行为。
+- **搜索只有关键词效果**：`MODEL_GATEWAY_EMBEDDING_SPACE_ID` 未配置，或与 Model Gateway 返回的空间/维度 Header、实际向量长度不匹配时，记忆与知识库都会安全回退关键词/FTS 检索，属预期行为；知识状态接口会显示 embedding 是否启用。
 - **扫描 PDF 无法导入**：当前只读取 PDF 自带文本层，请先用 OCR 工具生成可搜索 PDF。
 - **AI 客户端连不上 `/mcp`**：确认服务用 `--host 0.0.0.0` 启动、端口 2026 未被防火墙拦截，且客户端带了 Bearer token。
 - **FLIT 连不上或不流式**：Base URL 应以 `/v1` 结尾，API 路径使用 `/chat/completions`，Responses API 必须关闭；API Key 填本地 `GATEWAY_API_KEY`，助手模型的“流式输出”保持开启。
 - **FLIT 看不到工具、推理或原图能力**：编辑 `memory-auto`，把输入模态设为“文本 + 图片”、输出模态设为“文本”，并开启“工具 + 推理”；这些能力不会由标准模型列表自动识别。
-- **FLIT 能聊天但没有语义记忆**：确认 `X-Memory-Mode` 不是 `off`，并配置 `EMBEDDING_API_KEY`；未配置时仍会使用关键词召回，自动保存也仍可工作。
+- **FLIT 能聊天但没有语义记忆**：确认 `X-Memory-Mode` 不是 `off`，并在 Model Gateway 配好 `memory.embedding` route 后填写 `MODEL_GATEWAY_EMBEDDING_SPACE_ID`；未配置时仍会使用关键词召回，自动保存也仍可工作。
 - **“用量与费用”金额少于 provider 账单**：页面只累加同时具有上游 `usage` 和明确官方单价的调用，并且不含历史调用、套餐、赠金、折扣或账户优惠。先查看“计费完整度”和最近调用中的“缺少 usage / 待定价”状态。
 - **`data/memory.db` 是真实数据**：不要手工编辑或删除；测试和脚本用的是临时库，不会污染它。

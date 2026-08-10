@@ -155,37 +155,30 @@ Recommended system-prompt policy:
 
 ## Knowledge Agent Egress
 
-Knowledge retrieval always runs the local FTS index and, when `EMBEDDING_API_KEY`
-is configured, a local chunk-vector channel before weighted RRF fusion. An embedding
-provider failure falls back to FTS. Document tags and scalar metadata can restrict the
-authorized local scope before either channel runs. When all providers selected by
-`LLM_PROVIDER_PRIORITY` lack an API key, or
-`KNOWLEDGE_AGENT_EGRESS_POLICY=none`, no query or excerpt is sent to a remote model.
-`normal` permits only normal documents; `all` may also
-permit private/sensitive excerpts, but sensitive egress additionally requires the existing
-`ALLOW_SENSITIVE_EGRESS=true` gate. The agent can only search local candidates and select
-version-bound references; response text is always read from local SQLite.
+Knowledge retrieval always runs the local FTS index and, when
+`MODEL_GATEWAY_EMBEDDING_SPACE_ID` is configured, a local chunk-vector channel before
+weighted RRF fusion. Vectors come from the central Model Gateway `memory.embedding`
+route; the configured space and `EMBEDDING_DIMENSIONS` are validated against the
+response space/dimension headers and the actual vector length, and any blank, missing,
+or mismatched configuration safely falls back to local FTS rather than mixing vector
+spaces. Document tags and scalar metadata can restrict the authorized local scope
+before either channel runs. When `KNOWLEDGE_AGENT_EGRESS_POLICY=none`, no query or
+excerpt is sent to a remote model. `normal` permits only normal documents; `all` may
+also permit private/sensitive excerpts, but sensitive egress additionally requires the
+existing `ALLOW_SENSITIVE_EGRESS=true` gate. The agent can only search local candidates
+and select version-bound references; response text is always read from local SQLite.
 
-`LLM_PROVIDER_PRIORITY` uses `M`, `K`, and `D` for MiMo, Kimi, and DeepSeek, and
-is shared by memory extraction, core consolidation, review AI edits, and the fast
-knowledge-agent phase. A 429 response immediately fails over to the next configured provider and
-puts the limited provider in a process-local cooldown (default 300 seconds, or a longer
-server `Retry-After`). The cooldown is never written to `.env` and disappears on process
-restart. While a provider is cooling down it is skipped entirely, rather than retried at
-the end of the same priority list. A priority of `M` implicitly adds configured DeepSeek
-as an emergency fallback when MiMo is missing, cooling down, or returns 429. DeepSeek
-keeps the direct V4 API IDs `deepseek-v4-flash` and
-`deepseek-v4-pro`. The Web Console shows whether the agent is enabled without exposing
-any API key. The former `KNOWLEDGE_AGENT_*` provider variables remain accepted as
-configuration aliases, but new deployments should use the shared `LLM_*` names.
-
-Remote MiMo, Kimi, and DeepSeek knowledge-agent calls explicitly enable thinking.
-Tool-call turns preserve and replay `reasoning_content`; Kimi K2.7 uses preserved
-thinking and provider-required `temperature=1`. MiMo UltraSpeed review revisions use
-a forced function call instead of JSON mode so the high-speed model can return validated
-structured arguments. Memory LLM calls fail over on provider-level model, authentication,
-balance, timeout, network, and 5xx failures, while content/policy errors remain terminal.
-DeepSeek thinking requests omit the incompatible `tool_choice` field.
+All remote model calls — memory extraction, core consolidation, review AI edits, and
+the `knowledge.fast` / `knowledge.pro` agent phases — go through the stable routes of
+the central Model Gateway (`MODEL_GATEWAY_BASE_URL` + `MODEL_GATEWAY_API_KEY`,
+configured as a pair). Provider order, failover, and cooldowns are route configuration
+on the Model Gateway side; the old direct-provider `LLM_*` priority settings and the
+`KNOWLEDGE_AGENT_*` aliases have been removed (see `docs/migrate-to-model-gateway.md`
+at the repository root). Multi-turn agent calls still preserve and replay
+`reasoning_content` between tool-call turns, and each phase pins its first actual
+deployment; thinking/tool compatibility is enforced by Model Gateway deployment
+profiles before paid requests. The Web Console shows whether the agent is enabled
+without exposing any API key.
 
 The MCP upload tools accept UTF-8 text/Markdown parts. Binary PDF, DOCX, and EPUB files
 must be imported through the Web Console or `POST /knowledge/import`; they are parsed

@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.api import deps
 from app.api import health as health_api
 from app.api.knowledge import _knowledge_runtime_status
 from app.auth.tokens import AuthTokenStore
 from app.config import Settings, get_settings
+from app.llm.runtime import MODEL_GATEWAY_REQUIRED_MESSAGE
 
 
 def _central_settings(memory_store, knowledge_store) -> Settings:
@@ -285,6 +287,39 @@ def test_partial_central_runtime_is_not_ready_and_never_reports_direct(
     assert "必须同时配置" in knowledge["model_runtime_error"]
 
 
+def test_chat_completions_returns_503_envelope_without_central_runtime(
+    client,
+    auth_headers,
+    memory_store,
+    knowledge_store,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_base_url = ""
+    settings.model_gateway_api_key = ""
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    # The real chat gateway dependency must run so its fail-closed constructor
+    # raises inside the request stack instead of reaching the fake client.
+    client.app.dependency_overrides.pop(deps.get_chat_gateway_client, None)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "你好"}],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "model_runtime_configuration_error",
+            "message": MODEL_GATEWAY_REQUIRED_MESSAGE,
+        }
+    }
+    assert "Traceback" not in response.text
+
+
 def test_central_knowledge_status_uses_resolved_routes_and_embedding(
     memory_store,
     knowledge_store,
@@ -308,11 +343,17 @@ def _clear_readyz_cache() -> Iterator[None]:
     health_api._readyz_cache.clear()
 
 
-def _direct_settings(memory_store, knowledge_store) -> Settings:
-    settings = _central_settings(memory_store, knowledge_store)
-    settings.model_gateway_base_url = ""
-    settings.model_gateway_api_key = ""
-    return settings
+def _ready_central_settings(memory_store, knowledge_store) -> Settings:
+    return _central_settings(memory_store, knowledge_store)
+
+
+def _install_ready_model_gateway(monkeypatch, settings: Settings) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(200, json=_control_payload(settings))
+
+    _install_model_transport(monkeypatch, handler)
 
 
 def _count_database_checks(monkeypatch) -> list[int]:
@@ -333,8 +374,9 @@ def test_readyz_caches_ready_result_within_ttl(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    settings = _direct_settings(memory_store, knowledge_store)
+    settings = _ready_central_settings(memory_store, knowledge_store)
     client.app.dependency_overrides[get_settings] = lambda: settings
+    _install_ready_model_gateway(monkeypatch, settings)
     calls = _count_database_checks(monkeypatch)
 
     first = client.get("/readyz")
@@ -344,8 +386,8 @@ def test_readyz_caches_ready_result_within_ttl(
     assert second.status_code == 200
     assert second.json() == first.json() == {
         "status": "ready",
-        "model_runtime": "direct",
-        "embedding_enabled": False,
+        "model_runtime": "central",
+        "embedding_enabled": True,
     }
     assert calls[0] == 1
 
@@ -356,7 +398,7 @@ def test_readyz_caches_not_ready_result_within_ttl(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    settings = _direct_settings(memory_store, knowledge_store)
+    settings = _ready_central_settings(memory_store, knowledge_store)
     settings.gateway_api_key = ""
     settings.gateway_legacy_api_key_enabled = False
     client.app.dependency_overrides[get_settings] = lambda: settings
@@ -380,8 +422,9 @@ def test_readyz_recomputes_after_cache_expiry(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    settings = _direct_settings(memory_store, knowledge_store)
+    settings = _ready_central_settings(memory_store, knowledge_store)
     client.app.dependency_overrides[get_settings] = lambda: settings
+    _install_ready_model_gateway(monkeypatch, settings)
     calls = _count_database_checks(monkeypatch)
     now = [1000.0]
     monkeypatch.setattr(
@@ -403,9 +446,17 @@ def test_readyz_cache_is_scoped_to_settings_fingerprint(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    settings_a = _direct_settings(memory_store, knowledge_store)
-    settings_b = _direct_settings(memory_store, knowledge_store)
+    settings_a = _ready_central_settings(memory_store, knowledge_store)
+    settings_b = _ready_central_settings(memory_store, knowledge_store)
     settings_b.embedding_dimensions = 512
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        current = client.app.dependency_overrides[get_settings]()
+        return httpx.Response(200, json=_control_payload(current))
+
+    _install_model_transport(monkeypatch, handler)
     calls = _count_database_checks(monkeypatch)
 
     client.app.dependency_overrides[get_settings] = lambda: settings_a
@@ -424,15 +475,23 @@ def test_readyz_cache_evicts_oldest_beyond_capacity(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    base = _direct_settings(memory_store, knowledge_store)
+    base = _ready_central_settings(memory_store, knowledge_store)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        current = client.app.dependency_overrides[get_settings]()
+        return httpx.Response(200, json=_control_payload(current))
+
+    _install_model_transport(monkeypatch, handler)
     calls = _count_database_checks(monkeypatch)
 
     client.app.dependency_overrides[get_settings] = lambda: base
     assert client.get("/readyz").status_code == 200
     for extra in range(health_api._READYZ_CACHE_MAX_ENTRIES):
-        settings = _direct_settings(memory_store, knowledge_store)
+        settings = _ready_central_settings(memory_store, knowledge_store)
         settings.embedding_dimensions = 64 + extra
-        client.app.dependency_overrides[get_settings] = lambda: settings
+        client.app.dependency_overrides[get_settings] = lambda s=settings: s
         assert client.get("/readyz").status_code == 200
     assert calls[0] == health_api._READYZ_CACHE_MAX_ENTRIES + 1
 
@@ -446,7 +505,8 @@ async def test_readyz_concurrent_requests_share_single_computation(
     knowledge_store,
     monkeypatch,
 ) -> None:
-    settings = _direct_settings(memory_store, knowledge_store)
+    settings = _ready_central_settings(memory_store, knowledge_store)
+    _install_ready_model_gateway(monkeypatch, settings)
     calls = [0]
     started = threading.Event()
     release = threading.Event()

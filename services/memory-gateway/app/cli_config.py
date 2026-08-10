@@ -13,13 +13,6 @@ from typing import Any, Mapping
 
 from dotenv import dotenv_values
 
-from app.model_catalog import (
-    BUILTIN_CATALOG_PATH,
-    BUILTIN_ROUTES_PATH,
-    validate_catalog_and_routes,
-)
-from app.usage.pricing import BUILTIN_PRICING_PATH, load_pricing_catalog
-
 
 _PLACEHOLDERS = {
     "change-me",
@@ -29,6 +22,34 @@ _PLACEHOLDERS = {
 }
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# Direct-provider / local catalog env names retired after Model Gateway convergence.
+_RETIRED_DIRECT_ENV_PREFIXES = (
+    "UPSTREAM_",
+    "LLM_MIMO_",
+    "LLM_KIMI_",
+    "LLM_DEEPSEEK_",
+    "KNOWLEDGE_AGENT_MIMO_",
+    "KNOWLEDGE_AGENT_KIMI_",
+    "MODEL_CATALOG_",
+    "MODEL_ROUTES_",
+    "PRICING_CATALOG_",
+)
+_RETIRED_DIRECT_ENV_NAMES = frozenset(
+    {
+        "PROVIDERS_PATH",
+        "ROUTES_PATH",
+        "EMBEDDING_BASE_URL",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_MODEL",
+        "LLM_PROVIDER_PRIORITY",
+        "KNOWLEDGE_AGENT_PROVIDER_PRIORITY",
+        "KNOWLEDGE_AGENT_BASE_URL",
+        "KNOWLEDGE_AGENT_API_KEY",
+        "KNOWLEDGE_AGENT_FLASH_MODEL",
+        "KNOWLEDGE_AGENT_PRO_MODEL",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CliPaths:
@@ -36,6 +57,7 @@ class CliPaths:
     credentials: Path
     project_file: Path
     settings_env: Path
+    # Legacy catalog paths kept for stack backup/restore of old installs only.
     models: Path
     routes: Path
     pricing: Path
@@ -108,17 +130,9 @@ def initialize_cli(
         {"version": 1, "project_root": str(project_root.resolve()), "port": 2026},
         backup=False,
     )
+    # Local model/routes/pricing catalogs are no longer seeded. Routing lives
+    # in Model Gateway; leftover files from old installs remain for backup only.
     created: list[str] = []
-    for source, target in (
-        (BUILTIN_CATALOG_PATH, paths.models),
-        (BUILTIN_ROUTES_PATH, paths.routes),
-        (BUILTIN_PRICING_PATH, paths.pricing),
-    ):
-        if target.exists():
-            continue
-        shutil.copyfile(source, target)
-        os.chmod(target, 0o600)
-        created.append(target.name)
 
     values = read_env_file(paths.settings_env)
     imported: list[str] = []
@@ -126,35 +140,27 @@ def initialize_cli(
         for name, value in read_env_file(project_root / ".env").items():
             if name in values or not value or _is_placeholder(value):
                 continue
+            if _is_retired_direct_env(name):
+                continue
             values[name] = value
             imported.append(name)
-    values.update(
-        {
-            "MODEL_CATALOG_PATH": str(paths.models),
-            "MODEL_ROUTES_PATH": str(paths.routes),
-            "PRICING_CATALOG_PATH": str(paths.pricing),
-        }
-    )
+    for name in list(values):
+        if _is_retired_direct_env(name):
+            values.pop(name, None)
     _migrate_security_settings(paths, values)
     write_env_atomic(paths.settings_env, values)
-    validate_catalog_and_routes(catalog_path=paths.models, routes_path=paths.routes)
-    load_pricing_catalog(paths.pricing)
     return {"created": created, "imported": sorted(imported)}
 
 
 def ensure_initialized(paths: CliPaths, project_root: Path) -> None:
-    if all(
-        path.exists()
-        for path in (
-            paths.project_file,
-            paths.settings_env,
-            paths.models,
-            paths.routes,
-            paths.pricing,
-        )
-    ):
+    if paths.project_file.exists() and paths.settings_env.exists():
         values = read_env_file(paths.settings_env)
-        if _migrate_security_settings(paths, values):
+        changed = _migrate_security_settings(paths, values)
+        for name in list(values):
+            if _is_retired_direct_env(name):
+                values.pop(name, None)
+                changed = True
+        if changed:
             write_env_atomic(paths.settings_env, values)
         return
     initialize_cli(paths=paths, project_root=project_root)
@@ -177,23 +183,33 @@ def _migrate_security_settings(
     return changed
 
 
+def _is_retired_direct_env(name: str) -> bool:
+    upper = name.upper()
+    if upper in _RETIRED_DIRECT_ENV_NAMES:
+        return True
+    return any(upper.startswith(prefix) for prefix in _RETIRED_DIRECT_ENV_PREFIXES)
+
+
 def effective_environment(paths: CliPaths, project_root: Path) -> dict[str, str]:
     merged = dict(os.environ)
     project_values = {
         name: value
         for name, value in read_env_file(project_root / ".env").items()
         if not (_is_secret_name(name) and _is_placeholder(value))
+        and not _is_retired_direct_env(name)
     }
     merged.update(project_values)
-    merged.update(read_env_file(paths.settings_env))
-    merged.update(
-        {
-            "MODEL_CATALOG_PATH": str(paths.models),
-            "MODEL_ROUTES_PATH": str(paths.routes),
-            "PRICING_CATALOG_PATH": str(paths.pricing),
-            "PYTHONUNBUFFERED": "1",
-        }
-    )
+    settings_values = {
+        name: value
+        for name, value in read_env_file(paths.settings_env).items()
+        if not _is_retired_direct_env(name)
+    }
+    merged.update(settings_values)
+    merged["PYTHONUNBUFFERED"] = "1"
+    # Drop any retired keys that still linger in the process environment.
+    for name in list(merged):
+        if _is_retired_direct_env(name):
+            merged.pop(name, None)
     return merged
 
 
@@ -343,7 +359,9 @@ def _is_placeholder(value: str) -> bool:
 
 def _is_secret_name(name: str) -> bool:
     upper = name.upper()
-    return upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_CREDENTIALS"))
+    return upper.endswith(
+        ("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_CREDENTIALS")
+    )
 
 
 def _chmod_private_directory(path: Path) -> None:

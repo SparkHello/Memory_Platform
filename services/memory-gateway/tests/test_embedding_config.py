@@ -15,34 +15,13 @@ from app.usage.attribution import (
 from app.usage.context import model_usage_scope
 
 
-def test_embedding_client_uses_embedding_config_only(monkeypatch) -> None:
-    monkeypatch.setenv("UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-    monkeypatch.setenv("UPSTREAM_API_KEY", "zhipu-key")
-    monkeypatch.setenv("UPSTREAM_MODEL", "glm-5.1")
-    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    monkeypatch.setenv("EMBEDDING_API_KEY", "dashscope-key")
-    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-v4")
-    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "1024")
+def test_embedding_client_requires_model_gateway(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "")
     get_settings.cache_clear()
 
-    client = get_embedding_client(get_settings())
-
-    assert isinstance(client, OpenAICompatibleEmbeddingClient)
-    assert client.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert client.api_key == "dashscope-key"
-    assert client.model == "text-embedding-v4"
-    assert client.dimensions == 1024
-    assert client.api_key != "zhipu-key"
-
-
-def test_embedding_client_falls_back_without_embedding_api_key(monkeypatch) -> None:
-    monkeypatch.setenv("UPSTREAM_API_KEY", "zhipu-key")
-    monkeypatch.setenv("EMBEDDING_API_KEY", "")
-    get_settings.cache_clear()
-
-    client = get_embedding_client(get_settings())
-
-    assert isinstance(client, NullEmbeddingClient)
+    with pytest.raises(Exception, match="Model Gateway"):
+        get_embedding_client(get_settings())
 
 
 def test_embedding_client_uses_central_runtime_and_never_direct_fallback(tmp_path) -> None:
@@ -50,8 +29,6 @@ def test_embedding_client_uses_central_runtime_and_never_direct_fallback(tmp_pat
         "MODEL_GATEWAY_BASE_URL": "http://127.0.0.1:2030/v1",
         "MODEL_GATEWAY_API_KEY": "central-key",
         "MODEL_GATEWAY_EMBEDDING_MODEL": "memory.embedding.custom",
-        "EMBEDDING_API_KEY": "direct-key-must-not-be-used",
-        "EMBEDDING_MODEL": "direct-model",
         "EMBEDDING_DIMENSIONS": 3,
         "DATABASE_PATH": str(tmp_path / "memory.db"),
         "KNOWLEDGE_DATABASE_PATH": str(tmp_path / "knowledge.db"),
@@ -90,86 +67,17 @@ def test_knowledge_agent_uses_same_central_runtime_and_ignores_direct_routes(
         MODEL_GATEWAY_API_KEY="central-key",
         MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL="knowledge.fast.custom",
         MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL="knowledge.pro.custom",
-        LLM_DEEPSEEK_API_KEY="direct-key-must-not-be-used",
         DATABASE_PATH=str(tmp_path / "memory.db"),
         KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
     )
 
     agent = get_knowledge_search_agent(object(), settings)
 
-    assert agent.config.fast_providers == []
-    assert agent.config.pro_provider is None
     assert agent.config.model_runtime is not None
     assert agent.config.model_runtime.is_central is True
     assert agent.config.flash_model == "knowledge.fast.custom"
     assert agent.config.pro_model == "knowledge.pro.custom"
     assert "central-key" not in repr(agent.config)
-
-
-def test_direct_embedding_uses_stable_local_space_without_key_material(tmp_path) -> None:
-    common = {
-        "MODEL_GATEWAY_BASE_URL": "",
-        "MODEL_GATEWAY_API_KEY": "",
-        "EMBEDDING_BASE_URL": "https://embedding.example.invalid/v1/",
-        "EMBEDDING_MODEL": "embedding-v1",
-        "EMBEDDING_DIMENSIONS": 768,
-        "DATABASE_PATH": str(tmp_path / "memory.db"),
-    }
-    original = get_embedding_client(
-        Settings(_env_file=None, EMBEDDING_API_KEY="first-key", **common)
-    )
-    rotated_key = get_embedding_client(
-        Settings(_env_file=None, EMBEDDING_API_KEY="second-key", **common)
-    )
-    changed_model = get_embedding_client(
-        Settings(
-            _env_file=None,
-            EMBEDDING_API_KEY="first-key",
-            **{**common, "EMBEDDING_MODEL": "embedding-v2"},
-        )
-    )
-    changed_dimensions = get_embedding_client(
-        Settings(
-            _env_file=None,
-            EMBEDDING_API_KEY="first-key",
-            **{**common, "EMBEDDING_DIMENSIONS": 1024},
-        )
-    )
-
-    assert isinstance(original, OpenAICompatibleEmbeddingClient)
-    assert isinstance(rotated_key, OpenAICompatibleEmbeddingClient)
-    assert original.expected_space_id == ""
-    assert original.embedding_space_id.startswith(
-        "direct-openai-compatible-v1:"
-    )
-    assert original.embedding_space_id == rotated_key.embedding_space_id
-    assert original.embedding_space_id != changed_model.embedding_space_id
-    assert original.embedding_space_id != changed_dimensions.embedding_space_id
-    assert "first-key" not in original.embedding_space_id
-
-
-@pytest.mark.parametrize(
-    "unsafe_url",
-    [
-        "http://provider.example/v1",
-        "https://user:secret@provider.example/v1",
-        "https://provider.example/v1?token=secret",
-        "https://provider.example/v1#fragment",
-        "https://provider.example:99999/v1",
-        "https://provider.example/v1\n",
-    ],
-)
-def test_legacy_direct_provider_urls_reject_plaintext_or_embedded_credentials(
-    unsafe_url: str,
-) -> None:
-    with pytest.raises(ValueError):
-        Settings(_env_file=None, EMBEDDING_BASE_URL=unsafe_url)
-
-
-def test_legacy_direct_provider_allows_loopback_http_only() -> None:
-    settings = Settings(_env_file=None, EMBEDDING_BASE_URL="http://127.0.0.1:11434/v1/")
-
-    assert settings.embedding_base_url == "http://127.0.0.1:11434/v1"
 
 
 @pytest.mark.asyncio

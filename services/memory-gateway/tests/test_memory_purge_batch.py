@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from app.memory import store as store_module
 from app.memory.store import MemoryStore
+from app.memory.store import lifecycle_purge as store_module
 
 
 def _preview(client, auth_headers, memory_ids, *, headers=None):

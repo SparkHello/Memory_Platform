@@ -3,13 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 
 BUILTIN_PRICING_PATH = Path(__file__).parents[1] / "catalog" / "pricing.json"
-_configured_pricing_path = ""
 
 
 class PricingCatalogError(ValueError):
@@ -131,9 +129,7 @@ def load_pricing_catalog(
     path: str | Path | None = None,
 ) -> tuple[tuple[ModelPrice, ...], dict[str, str]]:
     builtins, builtin_meta = _parse_catalog(_load_json(BUILTIN_PRICING_PATH))
-    selected = str(
-        path or _configured_pricing_path or os.getenv("PRICING_CATALOG_PATH", "")
-    ).strip()
+    selected = str(path or "").strip()
     if not selected:
         return tuple(builtins.values()), builtin_meta
     overlay_path = Path(selected).expanduser()
@@ -156,14 +152,6 @@ def pricing_catalog() -> dict[str, object]:
         "models": [price.public_dict() for price in prices],
         "note": metadata["note"],
     }
-
-
-def configure_pricing_catalog(path: str = "") -> None:
-    global _configured_pricing_path
-    selected = path.strip()
-    if selected:
-        load_pricing_catalog(selected)
-    _configured_pricing_path = selected
 
 
 def _parse_catalog(

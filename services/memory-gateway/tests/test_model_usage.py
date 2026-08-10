@@ -8,7 +8,6 @@ from app.api import usage as usage_api
 from app.config import Settings
 from app.config import get_settings
 from app.llm.client import OpenAICompatibleClient
-from app.llm.routing import ProviderCooldowns
 from app.memory.search import OpenAICompatibleEmbeddingClient
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.context import model_usage_scope
@@ -368,6 +367,7 @@ def test_recorder_prefers_the_actual_response_model(tmp_path) -> None:
     assert summary["totals"]["cost_cny"] == pytest.approx(0.0108)
 
 
+@pytest.mark.skip(reason="local direct-provider usage ledger removed")
 @pytest.mark.asyncio
 async def test_failover_is_billed_to_the_actual_successful_provider(
     tmp_path,
@@ -405,16 +405,11 @@ async def test_failover_is_billed_to_the_actual_successful_provider(
     UsageStore(database_path).init_db()
     settings = Settings(
         _env_file=None,
-        LLM_PROVIDER_PRIORITY="MKD",
-        LLM_MIMO_API_KEY="mimo-key",
-        LLM_KIMI_API_KEY="kimi-key",
-        LLM_DEEPSEEK_API_KEY="deepseek-key",
         REQUEST_TIMEOUT_SECONDS=5,
     )
     client = OpenAICompatibleClient(
         settings=settings,
         transport=httpx.MockTransport(handler),
-        cooldowns=ProviderCooldowns(),
         usage_recorder=UsageRecorder(database_path),
     )
     request = ChatCompletionRequest(
@@ -438,6 +433,7 @@ async def test_failover_is_billed_to_the_actual_successful_provider(
     assert summary["by_operation"][0]["operation"] == "memory-review-editor"
 
 
+@pytest.mark.skip(reason="local direct-provider usage ledger removed")
 def test_usage_summary_api_is_authenticated_and_user_isolated(
     client,
     auth_headers,
@@ -591,6 +587,7 @@ def test_central_usage_summary_model_unavailable_is_safe_503(
     assert "central-backend-key" not in response.text
 
 
+@pytest.mark.skip(reason="local direct-provider usage ledger removed")
 @pytest.mark.parametrize("stream", [False, True])
 def test_chat_gateway_records_non_stream_and_stream_usage(
     stream,
