@@ -13,7 +13,11 @@ _SECURITY_HEADERS = (
         b"default-src 'self'; object-src 'none'; base-uri 'none'; "
         b"frame-ancestors 'none'; form-action 'self'; script-src 'self'; "
         b"style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-        b"font-src 'self' data:; connect-src 'self' http: https: ws: wss:",
+        # The Console only talks to its same-origin Memory API.  Provider and
+        # Model control calls are server-side, so permitting arbitrary HTTP(S)
+        # here would turn any future XSS into an easy scoped-token exfiltration
+        # channel.
+        b"font-src 'self' data:; connect-src 'self'",
     ),
 )
 

@@ -23,6 +23,8 @@ def test_ui_entrypoints_redirect_or_fall_back_to_index(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "UI_DIST_DIR", ui_dist)
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setenv("KNOWLEDGE_DATABASE_PATH", str(tmp_path / "knowledge.db"))
+    monkeypatch.setenv("EVAL_DIR", str(tmp_path / "eval"))
     monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
     get_settings.cache_clear()
 
@@ -40,6 +42,12 @@ def test_ui_entrypoints_redirect_or_fall_back_to_index(tmp_path, monkeypatch):
             assert response.headers["x-frame-options"] == "DENY"
             assert response.headers["referrer-policy"] == "no-referrer"
             assert "frame-ancestors 'none'" in response.headers[
+                "content-security-policy"
+            ]
+            assert "connect-src 'self'" in response.headers[
+                "content-security-policy"
+            ]
+            assert "connect-src 'self' http:" not in response.headers[
                 "content-security-policy"
             ]
 

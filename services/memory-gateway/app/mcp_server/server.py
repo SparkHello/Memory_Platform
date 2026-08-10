@@ -15,6 +15,7 @@ from app.api.deps import (
     get_llm_client,
     get_memory_store,
 )
+from app.auth.signing import require_signing_secret
 from app.config import get_settings
 from app.knowledge.agent import KnowledgeSearchAgent
 from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
@@ -41,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 # MCP 工具的 recent context summary 单条长度上限（工具契约，不随配置变化）。
 MAX_RECENT_CONTEXT_SUMMARY_CHARS = 12000
+MAX_PUBLIC_QUERY_CHARS = 4096
+MAX_PUBLIC_MEMORY_CHARS = 65_536
+MAX_PUBLIC_NOTE_CHARS = 20_000
+MAX_PUBLIC_ID_CHARS = 200
 
 SERVER_INSTRUCTIONS = """这是用户的长期记忆与独立长文本知识服务。
 
@@ -461,6 +466,11 @@ async def list_knowledge_documents(
     只有用户本轮明确要求查看相关敏感资料时才设置 include_sensitive=true。
     知识文档不会进入长期记忆检索、自动上下文或衰减机制。
     """
+    if len(query or "") > MAX_PUBLIC_QUERY_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("query must not exceed 4096 characters"),
+            operation="list_knowledge_documents",
+        )
     if status not in {"active", "deleted", "all"}:
         return _knowledge_error(
             KnowledgeValidationError("status must be active, deleted, or all"),
@@ -506,6 +516,16 @@ async def search_knowledge(
     if not request_text:
         return _knowledge_error(
             KnowledgeValidationError("request must not be blank"),
+            operation="search_knowledge",
+        )
+    if len(request_text) > MAX_PUBLIC_QUERY_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("request must not exceed 4096 characters"),
+            operation="search_knowledge",
+        )
+    if any(len(reference) > MAX_PUBLIC_ID_CHARS for reference in document_refs or []):
+        return _knowledge_error(
+            KnowledgeValidationError("document references must not exceed 200 characters"),
             operation="search_knowledge",
         )
     if quality not in {"fast", "balanced", "deep"}:
@@ -616,6 +636,16 @@ async def read_knowledge(
     chunk 引用用于精读一个搜索命中；version 引用按连续原文分页。若 complete=false，
     使用原样返回的 next_cursor 继续读取，不能跳页或声称已经读完整个文件。
     """
+    if not reference or len(reference) > MAX_PUBLIC_ID_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("reference must contain 1 to 200 characters"),
+            operation="read_knowledge",
+        )
+    if len(cursor or "") > 4000:
+        return _knowledge_error(
+            KnowledgeValidationError("cursor must not exceed 4000 characters"),
+            operation="read_knowledge",
+        )
     try:
         store, _ = _knowledge_services()
         settings = get_settings()
@@ -627,7 +657,7 @@ async def read_knowledge(
                 cursor=cursor,
                 max_chars=max(1, min(max_chars, 20000)),
                 include_sensitive=include_sensitive,
-                signing_key=settings.gateway_api_key,
+                signing_key=require_signing_secret(settings),
             )
         )
         result = _knowledge_model_dump(payload) if not isinstance(payload, dict) else payload
@@ -650,6 +680,11 @@ async def begin_knowledge_upload(
     content_type 仅支持 text/plain 或 text/markdown。replace_document_ref 为空时创建
     新文档；传入现有 document 引用时创建不可变新版本，并在提交时检查并发修改。
     """
+    if len(replace_document_ref or "") > MAX_PUBLIC_ID_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("replace_document_ref must not exceed 200 characters"),
+            operation="begin_knowledge_upload",
+        )
     if content_type not in {"text/plain", "text/markdown"}:
         return _knowledge_error(
             KnowledgeValidationError("content_type must be text/plain or text/markdown"),
@@ -684,6 +719,11 @@ async def begin_knowledge_upload(
 
 async def append_knowledge_upload(upload_id: str, sequence: int, text: str) -> str:
     """按 sequence 幂等追加一个上传片段；单片最多 20,000 字符。"""
+    if not upload_id or len(upload_id) > MAX_PUBLIC_ID_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("upload_id must contain 1 to 200 characters"),
+            operation="append_knowledge_upload",
+        )
     if len(text) > 20000:
         return _knowledge_error(
             KnowledgeValidationError("MCP upload part must not exceed 20000 characters"),
@@ -716,6 +756,11 @@ async def commit_knowledge_upload(
     expected_sha256: str = "",
 ) -> str:
     """校验连续片段和可选 SHA-256，保存版本并同步构建本地索引。"""
+    if not upload_id or len(upload_id) > MAX_PUBLIC_ID_CHARS:
+        return _knowledge_error(
+            KnowledgeValidationError("upload_id must contain 1 to 200 characters"),
+            operation="commit_knowledge_upload",
+        )
     try:
         store, _ = _knowledge_services()
         result = await anyio.to_thread.run_sync(
@@ -764,6 +809,18 @@ async def manage_knowledge_document(
     soft_delete 必须把完整 document_ref 同时放入 confirm_document_ref。永久清理仅能在
     Web/REST 管理界面执行，不能通过 MCP 调用。
     """
+    if any(
+        len(value or "") > MAX_PUBLIC_ID_CHARS
+        for value in (
+            document_ref,
+            version_ref,
+            confirm_document_ref,
+        )
+    ):
+        return _knowledge_error(
+            KnowledgeValidationError("knowledge references must not exceed 200 characters"),
+            operation="manage_knowledge_document",
+        )
     allowed = {
         "update_metadata",
         "soft_delete",
@@ -894,6 +951,8 @@ async def search_memory(query: str, limit: int = 8, include_sensitive: bool = Fa
     被返回的记忆会自动增加底层 usage_count 并刷新 last_used_at；对外请解释为
     activation_count（活跃度），不是精确搜索次数。Time Ripple 是默认关闭的实验能力。
     """
+    if not query.strip() or len(query) > MAX_PUBLIC_QUERY_CHARS:
+        return _dump({"error": "query must contain 1 to 4096 characters"})
     store, embedding_client = _services()
     service = _search_service(store, embedding_client)
     hits = await service.search_hits(
@@ -949,6 +1008,10 @@ async def submit_memory_text(text: str, conversation_id: str = "") -> str:
     不需要追踪时可省略或传空字符串。
     返回 JSON：{"created": 0, "updated": 0, "ignored": 1, "items": [...]}。
     """
+    if not text.strip() or len(text) > MAX_PUBLIC_MEMORY_CHARS:
+        return _dump({"error": "text must contain 1 to 65536 characters"})
+    if len(conversation_id or "") > MAX_PUBLIC_ID_CHARS:
+        return _dump({"error": "conversation_id must not exceed 200 characters"})
     settings = get_settings()
     store = get_memory_store(settings)
     embedding_client = get_embedding_client(settings)
@@ -974,6 +1037,8 @@ async def get_recent_context_summary(conversation_id: str = "") -> str:
     用于用户问「最近我们在聊什么」或需要恢复最近上下文时。摘要是短期上下文，
     不属于长期记忆，也不会进入核心记忆。
     """
+    if len(conversation_id or "") > MAX_PUBLIC_ID_CHARS:
+        return _dump({"found": False, "error": "conversation_id exceeds 200 characters"})
     store, _ = _services()
     summary = await anyio.to_thread.run_sync(
         partial(
@@ -990,6 +1055,8 @@ async def get_recent_context_summary(conversation_id: str = "") -> str:
 async def update_recent_context_summary(conversation_id: str = "", summary: str = "") -> str:
     """Submit or replace a short-term recent conversation summary."""
     summary_text = (summary or "").strip()
+    if len(conversation_id or "") > MAX_PUBLIC_ID_CHARS:
+        return _dump({"updated": False, "error": "conversation_id exceeds 200 characters"})
     if not summary_text:
         return _dump({"updated": False, "error": "summary is required"})
     if len(summary_text) > MAX_RECENT_CONTEXT_SUMMARY_CHARS:
@@ -1047,6 +1114,13 @@ async def digest_memories(
     reflective and emotional outputs, mark source memories digested, and resolve
     selected memories.
     """
+    if len(reflection or "") > MAX_PUBLIC_MEMORY_CHARS or len(feel or "") > MAX_PUBLIC_MEMORY_CHARS:
+        return _dump({"error": "reflection and feel must not exceed 65536 characters"})
+    if len(source_ids or []) > 1000 or len(resolved_ids or []) > 1000 or any(
+        len(memory_id) > MAX_PUBLIC_ID_CHARS
+        for memory_id in [*(source_ids or []), *(resolved_ids or [])]
+    ):
+        return _dump({"error": "memory id list exceeds count or 200-character ID limit"})
     settings = get_settings()
     store, _ = _services()
     user_id = current_user_id.get()

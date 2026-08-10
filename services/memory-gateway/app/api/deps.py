@@ -1,10 +1,9 @@
-import hashlib
-import hmac
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, HTTPException, Request, status
 
+from app.auth.signing import SigningSecretNotConfigured, require_signing_secret
+from app.auth.tokens import AuthPrincipal, AuthTokenStore
 from app.config import Settings, get_settings
 from app.knowledge.agent import (
     KnowledgeAgentConfig,
@@ -16,6 +15,10 @@ from app.knowledge.retrieval import (
 )
 from app.knowledge.store import KnowledgeStore
 from app.llm.client import OpenAICompatibleClient
+from app.llm.runtime import (
+    direct_embedding_space_id as build_direct_embedding_space_id,
+    resolve_model_runtime,
+)
 from app.providers.catalog import providers_for_route
 from app.memory.search import (
     EmbeddingClient,
@@ -27,9 +30,6 @@ from app.memory.store import MemoryStore
 from app.openai_compat.gateway_client import OpenAIChatGatewayClient
 from app.usage.recorder import UsageRecorder
 
-security = HTTPBearer(auto_error=False)
-
-
 def direct_embedding_space_id(settings: Settings) -> str:
     """Return a stable local identity for a direct-provider vector space.
 
@@ -40,38 +40,25 @@ def direct_embedding_space_id(settings: Settings) -> str:
     vector space.
     """
 
-    identity = "\0".join(
-        (
-            "direct-openai-compatible-v1",
-            settings.embedding_base_url.strip().rstrip("/"),
-            settings.embedding_model.strip(),
-            str(settings.embedding_dimensions),
-        )
+    return build_direct_embedding_space_id(
+        base_url=settings.embedding_base_url,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
     )
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return f"direct-openai-compatible-v1:{digest}"
 
 
 def embedding_runtime_enabled(settings: Settings) -> bool:
     """Whether the active runtime has a trustworthy embedding space."""
 
-    return bool(
-        settings.embedding_api_key.strip() and settings.embedding_model.strip()
-    )
+    return resolve_model_runtime(settings).embedding.enabled
 
 
 def require_api_key(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
-    settings: Annotated[Settings, Depends(get_settings)],
+    request: Request,
 ) -> None:
-    if not settings.gateway_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="GATEWAY_API_KEY 未配置",
-        )
-    if credentials is None or not hmac.compare_digest(
-        credentials.credentials, settings.gateway_api_key
-    ):
+    """Defense in depth: protected routers require an early-auth principal."""
+
+    if not isinstance(getattr(request.state, "auth_principal", None), AuthPrincipal):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization Bearer token 无效",
@@ -80,24 +67,35 @@ def require_api_key(
 
 
 def get_user_id(
-    settings: Annotated[Settings, Depends(get_settings)],
-    x_user_id: Annotated[str | None, Header()] = None,
+    request: Request,
 ) -> str:
-    """Resolve the namespace bound to the authenticated gateway credential.
+    return get_auth_principal(request).user_id
 
-    The legacy shared-key header behaviour is available only through an
-    explicit migration switch.
-    """
-    bound_user_id = settings.gateway_user_id.strip() or "default"
-    requested_user_id = (x_user_id or "").strip()
-    if not requested_user_id or requested_user_id == bound_user_id:
-        return bound_user_id
-    if settings.gateway_allow_user_id_header:
-        return requested_user_id
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="X-User-Id 与当前凭证绑定的用户不匹配",
-    )
+
+def get_auth_principal(request: Request) -> AuthPrincipal:
+    principal = getattr(request.state, "auth_principal", None)
+    if not isinstance(principal, AuthPrincipal):
+        raise HTTPException(status_code=401, detail="请求缺少已认证身份")
+    return principal
+
+
+def get_auth_token_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AuthTokenStore:
+    # Schema initialization/migration runs once in the application lifespan.
+    return AuthTokenStore(settings.auth_database_path)
+
+
+def get_signing_secret(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str:
+    try:
+        return require_signing_secret(settings)
+    except SigningSecretNotConfigured as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 def get_memory_store(settings: Annotated[Settings, Depends(get_settings)]) -> MemoryStore:
@@ -118,21 +116,31 @@ def get_knowledge_store(
 def get_embedding_client(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> EmbeddingClient:
-    if settings.embedding_api_key and settings.embedding_model:
+    runtime = resolve_model_runtime(settings)
+    embedding = runtime.embedding
+    if embedding.enabled:
         client = OpenAICompatibleEmbeddingClient(
-            base_url=settings.embedding_base_url,
-            api_key=settings.embedding_api_key,
-            model=settings.embedding_model,
-            dimensions=settings.embedding_dimensions,
+            base_url=embedding.base_url,
+            api_key=embedding.api_key,
+            model=embedding.model,
+            dimensions=embedding.dimensions,
+            expected_space_id=(embedding.space_id if embedding.model_gateway_mode else ""),
+            model_gateway_mode=embedding.model_gateway_mode,
             timeout_seconds=settings.request_timeout_seconds,
             allow_sensitive_egress=settings.allow_sensitive_egress,
-            usage_recorder=UsageRecorder(settings.database_path),
+            usage_recorder=(
+                None
+                if embedding.model_gateway_mode
+                else UsageRecorder(settings.database_path)
+            ),
+            usage_hmac_secret=settings.gateway_signing_secret,
         )
         # Direct providers normally cannot attest an immutable space in their
         # response headers.  Keep response validation independent while still
         # tagging every newly generated vector with a deterministic local
         # space.  Existing rows remain NULL/unknown until explicitly re-embedded.
-        client.embedding_space_id = direct_embedding_space_id(settings)
+        if not embedding.model_gateway_mode:
+            client.embedding_space_id = embedding.space_id
         return client
     return NullEmbeddingClient()
 
@@ -168,20 +176,33 @@ def get_knowledge_search_agent(
     ],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> KnowledgeSearchAgent:
-    fast_providers = providers_for_route(settings, "knowledge.fast")
-    pro_providers = providers_for_route(settings, "knowledge.pro")
+    runtime = resolve_model_runtime(settings)
+    fast_providers = (
+        []
+        if runtime.is_central
+        else providers_for_route(settings, "knowledge.fast")
+    )
+    pro_providers = (
+        []
+        if runtime.is_central
+        else providers_for_route(settings, "knowledge.pro")
+    )
     config = KnowledgeAgentConfig(
         fast_providers=fast_providers,
         pro_provider=pro_providers[0] if pro_providers else None,
+        model_runtime=runtime if runtime.is_central else None,
         rate_limit_cooldown_seconds=settings.llm_rate_limit_cooldown_seconds,
         egress_policy=settings.knowledge_agent_egress_policy,
         allow_sensitive_egress=settings.allow_sensitive_egress,
         timeout_seconds=settings.knowledge_agent_timeout_seconds,
+        usage_hmac_secret=settings.gateway_signing_secret,
     )
     return KnowledgeSearchAgent(
         store=retrieval,
         config=config,
-        usage_recorder=UsageRecorder(settings.database_path),
+        usage_recorder=(
+            None if runtime.is_central else UsageRecorder(settings.database_path)
+        ),
     )
 
 
@@ -201,9 +222,12 @@ def get_memory_search_service(
 def get_llm_client(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> OpenAICompatibleClient:
+    runtime = resolve_model_runtime(settings)
     return OpenAICompatibleClient(
         settings=settings,
-        usage_recorder=UsageRecorder(settings.database_path),
+        usage_recorder=(
+            None if runtime.is_central else UsageRecorder(settings.database_path)
+        ),
     )
 
 
@@ -215,5 +239,9 @@ def get_chat_gateway_client(
 
 def get_usage_recorder(
     settings: Annotated[Settings, Depends(get_settings)],
-) -> UsageRecorder:
-    return UsageRecorder(settings.database_path)
+) -> UsageRecorder | None:
+    return (
+        None
+        if resolve_model_runtime(settings).is_central
+        else UsageRecorder(settings.database_path)
+    )

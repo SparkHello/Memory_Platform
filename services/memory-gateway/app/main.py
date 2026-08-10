@@ -8,20 +8,30 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Scope
 
+from app.api.auth_tokens import router as auth_tokens_router
 from app.api.chat_gateway import router as chat_gateway_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memories import router as memories_router
 from app.api.providers import router as providers_router
 from app.api.usage import router as usage_router
+from app.auth.middleware import EarlyAuthMiddleware
+from app.auth.tokens import AuthTokenStore
+from app.cli_config import cli_paths
 from app.config import get_settings
+from app.disk_capacity import DiskCapacityMiddleware
 from app.knowledge.store import KnowledgeStore
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
 from app.memory.store import MemoryStore
 from app.model_catalog import validate_catalog_and_routes
-from app.request_limits import ChatRequestBodyLimitMiddleware
+from app.request_limits import (
+    RequestTargetLimitMiddleware,
+    RouteAwareRequestBodyLimitMiddleware,
+    initialize_request_spool_directories,
+)
 from app.security_headers import SecurityHeadersMiddleware
+from app.stack_backup import assert_no_interrupted_stack_restore
 from app.usage.pricing import configure_pricing_catalog
 from app.usage.store import UsageStore
 
@@ -90,12 +100,19 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         settings = get_settings()
+        assert_no_interrupted_stack_restore(cli_paths().home)
         validate_catalog_and_routes(
             catalog_path=settings.model_catalog_path,
             routes_path=settings.model_routes_path,
         )
         configure_pricing_catalog(settings.pricing_catalog_path)
-        _validate_database_paths(settings.database_path, settings.knowledge_database_path)
+        _validate_database_paths(
+            settings.database_path,
+            settings.knowledge_database_path,
+            settings.auth_database_path,
+        )
+        initialize_request_spool_directories(settings)
+        AuthTokenStore(settings.auth_database_path).init_db()
         MemoryStore(settings.database_path).init_db()
         UsageStore(settings.database_path).init_db()
         app.state.knowledge_init_error = ""
@@ -113,17 +130,23 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="memory-gateway",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
     )
-    app.add_middleware(
-        ChatRequestBodyLimitMiddleware,
-        max_body_bytes=get_settings().chat_gateway_max_request_body_bytes,
-    )
+    app.add_middleware(RouteAwareRequestBodyLimitMiddleware)
+    app.add_middleware(RequestTargetLimitMiddleware)
+    # Starlette executes the most recently added middleware first. Auth is
+    # therefore outside body buffering, but inside the response hardening layer.
+    app.add_middleware(EarlyAuthMiddleware)
+    # Storage exhaustion from body spooling, auth bookkeeping and endpoint
+    # transactions shares one safe 507 contract.
+    app.add_middleware(DiskCapacityMiddleware)
+    # Security headers remain the outermost response wrapper, including 507s.
     app.add_middleware(SecurityHeadersMiddleware)
     app.include_router(health_router)
     app.include_router(chat_gateway_router)
+    app.include_router(auth_tokens_router)
     app.include_router(memories_router)
     app.include_router(knowledge_router)
     app.include_router(providers_router)
@@ -155,15 +178,27 @@ def create_app() -> FastAPI:
     return app
 
 
-def _validate_database_paths(memory_path: str, knowledge_path: str) -> None:
-    """Knowledge and memory are deliberately separate failure/security domains."""
-    memory = Path(memory_path).expanduser().resolve()
-    knowledge = Path(knowledge_path).expanduser().resolve()
-    same_file = memory == knowledge
-    if not same_file and memory.exists() and knowledge.exists():
-        same_file = memory.samefile(knowledge)
-    if same_file:
-        raise RuntimeError("KNOWLEDGE_DATABASE_PATH 不能与 DATABASE_PATH 指向同一个文件")
+def _validate_database_paths(
+    memory_path: str,
+    knowledge_path: str,
+    auth_path: str | None = None,
+) -> None:
+    """Memory, knowledge and auth remain separate failure/security domains."""
+
+    paths = {
+        "DATABASE_PATH": Path(memory_path).expanduser().resolve(),
+        "KNOWLEDGE_DATABASE_PATH": Path(knowledge_path).expanduser().resolve(),
+    }
+    if auth_path is not None:
+        paths["AUTH_DATABASE_PATH"] = Path(auth_path).expanduser().resolve()
+    items = list(paths.items())
+    for index, (left_name, left) in enumerate(items):
+        for right_name, right in items[index + 1 :]:
+            same_file = left == right
+            if not same_file and left.exists() and right.exists():
+                same_file = left.samefile(right)
+            if same_file:
+                raise RuntimeError(f"{right_name} 不能与 {left_name} 指向同一个文件")
 
 
 app = create_app()

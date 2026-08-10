@@ -5,7 +5,9 @@ import asyncio
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 import getpass
+import hmac
 from html.parser import HTMLParser
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,8 @@ import re
 import secrets
 import shutil
 import signal
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +27,7 @@ import webbrowser
 
 import httpx
 
+from app.auth.tokens import AUTH_ROLES, AuthTokenStore
 from app.cli_config import (
     CliPaths,
     cli_paths,
@@ -53,6 +58,7 @@ from app.openai_compat.schemas import ChatCompletionRequest
 from app.stack_backup import (
     create_stack_backup,
     default_model_gateway_home,
+    recover_interrupted_stack_restore,
     restore_stack_backup,
 )
 from app.usage.pricing import (
@@ -63,9 +69,10 @@ from app.usage.pricing import (
 )
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 _SECRET_ALIASES = {
     "gateway": "GATEWAY_API_KEY",
+    "signing": "GATEWAY_SIGNING_SECRET",
     "model-gateway": "MODEL_GATEWAY_API_KEY",
     "mimo": "LLM_MIMO_API_KEY",
     "kimi": "LLM_KIMI_API_KEY",
@@ -171,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_stack_commands(subparsers)
     _add_config_commands(subparsers)
     _add_secret_commands(subparsers)
+    _add_token_commands(subparsers)
     _add_model_commands(subparsers)
     _add_route_commands(subparsers)
     _add_pricing_commands(subparsers)
@@ -178,7 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="监听地址；默认仅本机。局域网使用需显式传 --host 0.0.0.0",
+    )
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--reload", action="store_true")
 
@@ -197,6 +209,16 @@ def _add_stack_commands(subparsers: Any) -> None:
         help="Model Gateway 源码或发行包路径；默认发现相邻项目或已安装命令",
     )
     install.add_argument("--model-gateway-home", default="")
+    install.add_argument(
+        "--credential-dir",
+        default="",
+        help="首次 Console/admin 凭据的私有文件目录；默认用户配置目录/credentials",
+    )
+    install.add_argument(
+        "--defer-credential-delivery",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     install.add_argument(
         "--keep-backend-key",
         action="store_true",
@@ -243,6 +265,14 @@ def _add_stack_commands(subparsers: Any) -> None:
     restore.add_argument("--yes", action="store_true", help="确认停止服务并替换当前数据")
     restore.set_defaults(handler=_cmd_stack_restore)
 
+    recover_restore = commands.add_parser(
+        "recover-restore",
+        help="离线回滚被断电或强制终止打断的整栈恢复",
+    )
+    recover_restore.add_argument("--model-gateway-home", default="")
+    recover_restore.add_argument("--yes", action="store_true")
+    recover_restore.set_defaults(handler=_cmd_stack_recover_restore)
+
 
 def _add_config_commands(subparsers: Any) -> None:
     parser = subparsers.add_parser("config", help="管理普通运行配置")
@@ -276,6 +306,24 @@ def _add_secret_commands(subparsers: Any) -> None:
     delete_parser.add_argument("name", choices=sorted(_SECRET_ALIASES))
     delete_parser.add_argument("--yes", action="store_true")
     delete_parser.set_defaults(handler=_cmd_secret_delete)
+
+
+def _add_token_commands(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "token",
+        help="管理按设备和用途隔离的访问 token",
+    )
+    commands = parser.add_subparsers(dest="token_command", required=True)
+    create = commands.add_parser("create", help="创建并仅显示一次新 token")
+    create.add_argument("--name", required=True, help="设备或客户端名称")
+    create.add_argument("--user", default="default", help="绑定的用户命名空间")
+    create.add_argument("--role", required=True, choices=AUTH_ROLES)
+    create.set_defaults(handler=_cmd_token_create)
+    list_parser = commands.add_parser("list", help="列出 token 元数据，不显示密钥")
+    list_parser.set_defaults(handler=_cmd_token_list)
+    revoke = commands.add_parser("revoke", help="按 token id 立即撤销")
+    revoke.add_argument("token_id")
+    revoke.set_defaults(handler=_cmd_token_revoke)
 
 
 def _add_model_commands(subparsers: Any) -> None:
@@ -373,14 +421,17 @@ def _cmd_init(args: Any, paths: CliPaths, project_root: Path) -> int:
         print("已创建：" + ", ".join(result["created"]))
     if result["imported"]:
         print(f"已从项目 .env 导入 {len(result['imported'])} 项非占位配置。")
-    print("项目中的 .env 未被修改。接下来可运行 `memgw secret set gateway`。")
+    print("项目中的 .env 未被修改。接下来可运行 `memgw stack install`。")
     return 0
 
 
 # 自定义密钥的强度下限。这两枚密钥背后是全部记忆和供应商额度，一旦把服务绑到
 # 0.0.0.0 就直接暴露在网络上，所以用户自己指定的值也要过一道最低门槛。
 MIN_CUSTOM_KEY_LENGTH = 16
-CUSTOM_KEY_VARIABLES = ("GATEWAY_API_KEY", "MEMORY_CONSOLE_ADMIN_KEY")
+CUSTOM_KEY_VARIABLES = (
+    "GATEWAY_API_KEY",
+    "GATEWAY_SIGNING_SECRET",
+)
 
 
 def _describe_weak_key(name: str, value: str) -> str:
@@ -408,11 +459,234 @@ def _check_custom_keys(environment: dict[str, str]) -> int:
     return 0
 
 
+def _stack_credential_directory(args: Any, paths: CliPaths) -> Path:
+    configured = str(getattr(args, "credential_dir", "") or "").strip()
+    project_config = read_json(paths.project_file)
+    remembered = str(project_config.get("credential_dir") or "").strip()
+    selected_value = configured or remembered
+    selected = (
+        Path(selected_value).expanduser() if selected_value else paths.credentials
+    )
+    if not selected.is_absolute():
+        selected = Path.cwd() / selected
+    selected = selected.absolute()
+    try:
+        metadata = selected.lstat()
+    except FileNotFoundError:
+        selected.mkdir(parents=True, mode=0o700)
+        metadata = selected.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("credential-dir 必须是非符号链接的私有目录")
+    if os.name == "posix" and hasattr(os, "geteuid"):
+        if metadata.st_uid != os.geteuid():
+            raise ValueError("credential-dir 必须由当前用户持有")
+    try:
+        os.chmod(selected, 0o700)
+    except OSError as exc:
+        raise ValueError("无法把 credential-dir 权限设为 0700") from exc
+    if configured and remembered != str(selected):
+        project_config["credential_dir"] = str(selected)
+        write_json_atomic(paths.project_file, project_config)
+    return selected
+
+
+def _read_private_credential(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"首次凭据文件缺失：{path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"首次凭据必须是普通文件且不能是符号链接：{path}")
+    if metadata.st_size <= 0 or metadata.st_size > 16 * 1024:
+        raise ValueError(f"首次凭据文件大小无效：{path}")
+    if os.name == "posix" and hasattr(os, "geteuid"):
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(f"首次凭据文件必须由当前用户持有：{path}")
+    try:
+        os.chmod(path, 0o600)
+        value = path.read_text(encoding="ascii").rstrip("\r\n")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"首次凭据文件无法安全读取：{path}") from exc
+    if not value or any(character in value for character in "\r\n\x00"):
+        raise ValueError(f"首次凭据文件内容无效：{path}")
+    return value
+
+
+def _deliver_private_credential(path: Path, value: str) -> None:
+    if (
+        not value
+        or len(value) > 16 * 1024
+        or not value.isascii()
+        or any(character in value for character in "\r\n\x00")
+    ):
+        raise ValueError("拒绝写入格式无效的首次凭据")
+    if path.exists() or path.is_symlink():
+        current = _read_private_credential(path)
+        if not hmac.compare_digest(current.encode("ascii"), value.encode("ascii")):
+            raise ValueError(f"首次凭据文件已存在且内容不同，拒绝覆盖：{path}")
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        current = _read_private_credential(path)
+        if not hmac.compare_digest(current.encode("ascii"), value.encode("ascii")):
+            raise ValueError(
+                f"首次凭据文件在写入期间被占用且内容不同，拒绝覆盖：{path}"
+            ) from None
+        return
+    created = True
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as handle:
+            descriptor = -1
+            handle.write(value)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o600)
+        created = False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created:
+            path.unlink(missing_ok=True)
+
+
+def _validate_first_console_credential(
+    store: AuthTokenStore,
+    credential_path: Path,
+    active_records: list[Any],
+) -> bool:
+    managed = [record for record in active_records if record.name == "first-console"]
+    if not managed:
+        return False
+    if len(managed) != 1:
+        raise ValueError("first-console 凭据状态不唯一，拒绝继续安装")
+    token = _read_private_credential(credential_path)
+    authenticated = store.authenticate(token)
+    if (
+        authenticated is None
+        or authenticated.token_id != managed[0].token_id
+        or authenticated.user_id != "default"
+        or authenticated.role != "console"
+    ):
+        raise ValueError("gateway.key 与 auth.db 中的 first-console 不匹配")
+    return True
+
+
+def _provision_stack_console_credential(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    credential_path: Path,
+    persisted_settings: dict[str, str],
+) -> tuple[Path | None, bool]:
+    """Provision only genuinely fresh installs; preserve explicit legacy migrations."""
+
+    legacy_value = persisted_settings.get("GATEWAY_API_KEY", "").strip()
+    legacy_flag = persisted_settings.get("GATEWAY_LEGACY_API_KEY_ENABLED", "").strip().lower()
+    legacy_explicitly_disabled = legacy_flag in {"0", "false", "no", "off"}
+    if legacy_value and not is_placeholder_value(legacy_value) and not legacy_explicitly_disabled:
+        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "true")
+        return None, False
+
+    store = _cli_auth_store(paths, project_root)
+    active = [record for record in store.list_tokens() if record.revoked_at is None]
+    if _validate_first_console_credential(store, credential_path, active):
+        update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
+        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
+        return credential_path, False
+
+    if active:
+        # An operator already manages scoped credentials explicitly. Never mint
+        # an extra console credential behind their back.
+        update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
+        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
+        return None, False
+
+    created = store.create_token(
+        name="first-console",
+        user_id="default",
+        role="console",
+    )
+    try:
+        _deliver_private_credential(credential_path, created.token)
+    except Exception:
+        store.revoke_token(created.record.token_id)
+        raise
+    update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
+    update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
+    return credential_path, True
+
+
 def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
+    forbidden_environment_secrets = [
+        name
+        for name in (
+            "GATEWAY_API_KEY",
+            "GATEWAY_SIGNING_SECRET",
+            "MODEL_GATEWAY_API_KEY",
+            "MEMORY_CONSOLE_ADMIN_KEY",
+        )
+        if os.environ.get(name, "").strip()
+    ]
+    if forbidden_environment_secrets:
+        print(
+            "拒绝从进程环境读取首次访问凭据："
+            + ", ".join(forbidden_environment_secrets),
+            file=sys.stderr,
+        )
+        print(
+            "请移除这些环境变量；fresh install 会把随机凭据仅写入 0600 文件。",
+            file=sys.stderr,
+        )
+        return 2
     ensure_initialized(paths, project_root)
-    custom_key_problem = _check_custom_keys(effective_environment(paths, project_root))
+    environment = effective_environment(paths, project_root)
+    custom_key_problem = _check_custom_keys(environment)
     if custom_key_problem:
         return custom_key_problem
+    persisted_settings = read_env_file(paths.settings_env)
+    defer_credentials = bool(getattr(args, "defer_credential_delivery", False))
+    credential_directory = (
+        None if defer_credentials else _stack_credential_directory(args, paths)
+    )
+    gateway_credential_path = (
+        credential_directory / "gateway.key" if credential_directory else None
+    )
+    admin_credential_path = (
+        credential_directory / "admin.key" if credential_directory else None
+    )
+    persisted_legacy = persisted_settings.get("GATEWAY_API_KEY", "").strip()
+    legacy_flag = persisted_settings.get(
+        "GATEWAY_LEGACY_API_KEY_ENABLED", ""
+    ).strip().lower()
+    legacy_migration = bool(
+        persisted_legacy
+        and not is_placeholder_value(persisted_legacy)
+        and legacy_flag not in {"0", "false", "no", "off"}
+    )
+    active_access_tokens = False
+    if not defer_credentials and not legacy_migration:
+        access_store = _cli_auth_store(paths, project_root)
+        active_records = [
+            record for record in access_store.list_tokens() if record.revoked_at is None
+        ]
+        active_access_tokens = bool(active_records)
+        if gateway_credential_path is not None and _validate_first_console_credential(
+            access_store,
+            gateway_credential_path,
+            active_records,
+        ):
+            if admin_credential_path is None or not admin_credential_path.exists():
+                raise ValueError("安全 scoped 安装缺少 admin.key；拒绝修改现有接线")
+            _read_private_credential(admin_credential_path)
+    fresh_access_install = (
+        not defer_credentials and not legacy_migration and not active_access_tokens
+    )
     modelgw = _ensure_model_gateway_runtime(args, project_root)
     model_home = _stack_model_gateway_home(args)
     if _run_modelgw(modelgw, model_home, ["init"]):
@@ -430,33 +704,56 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
         if isinstance(backend, dict)
         else set()
     )
+    required_backend_routes = list(
+        dict.fromkeys(
+            environment.get(name, default).strip() or default
+            for name, default in (
+                ("MODEL_GATEWAY_CHAT_MODEL", "memory.chat"),
+                ("MODEL_GATEWAY_MEMORY_EXTRACT_MODEL", "memory.extract"),
+                ("MODEL_GATEWAY_MEMORY_COMPACT_MODEL", "memory.compact"),
+                ("MODEL_GATEWAY_MEMORY_CORE_MODEL", "memory.core"),
+                ("MODEL_GATEWAY_MEMORY_REVIEW_MODEL", "memory.review"),
+                ("MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL", "knowledge.fast"),
+                ("MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL", "knowledge.pro"),
+                ("MODEL_GATEWAY_EMBEDDING_MODEL", "memory.embedding"),
+            )
+        )
+    )
     if (
         not isinstance(backend, dict)
         or backend.get("kind") != "backend"
         or not backend.get("enabled", True)
-        or not {"memory.*", "knowledge.*"}.issubset(backend_routes)
+        or backend_routes != set(required_backend_routes)
+        or backend.get("allow_direct_deployments", False)
     ):
+        client_arguments = [
+            "client",
+            "add",
+            "memory-gateway",
+            "--kind",
+            "backend",
+        ]
+        for route_id in required_backend_routes:
+            client_arguments.extend(["--route", route_id])
+        client_arguments.append("--replace")
         result = _run_modelgw(
             modelgw,
             model_home,
-            [
-                "client",
-                "add",
-                "memory-gateway",
-                "--kind",
-                "backend",
-                "--route",
-                "memory.*",
-                "--route",
-                "knowledge.*",
-                "--replace",
-            ],
+            client_arguments,
         )
         if result:
             return result
 
     admin = client_by_id.get("memory-console-admin")
-    admin_needs_secret = not isinstance(admin, dict) or not admin.get("secret_configured")
+    admin_needs_secret = (
+        not isinstance(admin, dict)
+        or not admin.get("secret_configured")
+        or (
+            fresh_access_install
+            and admin_credential_path is not None
+            and not admin_credential_path.exists()
+        )
+    )
     if (
         not isinstance(admin, dict)
         or admin.get("kind") != "admin"
@@ -494,17 +791,22 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     if result:
         return result
 
-    # 同步生成 Web 配置管理密钥（admin key），与 GATEWAY_API_KEY 一样只打印一次，
-    # 让首次安装后可以直接在 Web Console 完成渠道与路由配置，无需再跑 CLI。
+    # Model 管理密钥与 Memory 的 scoped Console token 独立生成。明文仅交付到
+    # 用户指定的 0600 文件；命令输出、项目目录和服务进程环境都不得包含它。
     admin_key = ""
-    admin_key_supplied = False
     if admin_needs_secret:
-        supplied_admin = environment.get("MEMORY_CONSOLE_ADMIN_KEY", "").strip()
-        if supplied_admin and not is_placeholder_value(supplied_admin):
-            admin_key = supplied_admin
-            admin_key_supplied = True
-        else:
-            admin_key = secrets.token_urlsafe(48)
+        admin_key = secrets.token_urlsafe(48)
+        if admin_credential_path is not None and (
+            admin_credential_path.exists() or admin_credential_path.is_symlink()
+        ):
+            existing_admin = _read_private_credential(admin_credential_path)
+            if not hmac.compare_digest(
+                existing_admin.encode("ascii"),
+                admin_key.encode("ascii"),
+            ):
+                raise ValueError(
+                    "admin.key 已存在且无法与待配置密钥匹配，拒绝轮换或覆盖"
+                )
         result = _run_modelgw(
             modelgw,
             model_home,
@@ -514,6 +816,8 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
         )
         if result:
             return result
+        if admin_credential_path is not None:
+            _deliver_private_credential(admin_credential_path, admin_key)
 
     config = _read_model_gateway_config(model_home)
     server = config.get("server") if isinstance(config.get("server"), dict) else {}
@@ -528,19 +832,27 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
             embedding_space,
         )
 
-    # Auto-generate the client-facing gateway key when absent or still a
-    # placeholder, mirroring how the backend key is minted above. This removes
-    # the mandatory manual `secret set gateway` step from first-run setup.
-    persisted_gateway_key = read_env_file(paths.settings_env).get("GATEWAY_API_KEY", "").strip()
-    gateway_key = environment.get("GATEWAY_API_KEY", "").strip()
-    gateway_key_generated = False
-    if not gateway_key or is_placeholder_value(gateway_key):
-        gateway_key = secrets.token_urlsafe(32)
-        gateway_key_generated = True
-    # 自带的密钥同样要落到 settings.env：它可能只存在于本次进程环境里（例如
-    # Docker 首启时传入），不写下来的话服务重启后就没有密钥可用了。
-    update_env_value(paths.settings_env, "GATEWAY_API_KEY", gateway_key)
-    gateway_key_supplied = not gateway_key_generated and gateway_key != persisted_gateway_key
+    console_credential_path: Path | None = None
+    console_credential_generated = False
+    if gateway_credential_path is not None:
+        console_credential_path, console_credential_generated = (
+            _provision_stack_console_credential(
+                paths=paths,
+                project_root=project_root,
+                credential_path=gateway_credential_path,
+                persisted_settings=persisted_settings,
+            )
+        )
+    if (
+        console_credential_path is not None
+        and admin_credential_path is not None
+        and not admin_credential_path.exists()
+    ):
+        raise ValueError(
+            "安全 scoped 安装缺少 admin.key；拒绝报告安装完成"
+        )
+    if admin_credential_path is not None and admin_credential_path.exists():
+        _read_private_credential(admin_credential_path)
 
     memory_port = int(read_json(paths.project_file).get("port") or 2026)
     # 在容器里 uvicorn 固定绑 2026，宿主机映射到哪个端口只有 compose 知道。用户
@@ -561,35 +873,26 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     print(f"MCP                    http://127.0.0.1:{public_port}/mcp")
     print(f"Model Gateway base URL http://127.0.0.1:{port}/v1")
     print("                       ↑ 内部接线地址，不要填进客户端")
-    if gateway_key_generated:
+    if console_credential_path is not None:
         print("")
-        print("已为你自动生成客户端访问密钥（GATEWAY_API_KEY）。")
-        print("请妥善保存，它不会再次显示，也不会写入项目 .env：")
-        print(f"  {gateway_key}")
-        print("如需更换，可运行：memgw secret set gateway")
-    elif gateway_key_supplied:
+        action = "已生成" if console_credential_generated else "已校验"
+        print(f"{action} scoped Console token；明文未显示：")
+        print(f"  {console_credential_path}")
+        print("聊天/MCP 客户端请分别用 `memgw token create --role chat|mcp` 创建。")
+    elif legacy_migration:
         print("")
-        print("客户端访问密钥（GATEWAY_API_KEY）使用了你提供的值，未重新生成。")
-        print("它不会在这里回显；如需更换，可运行：memgw secret set gateway")
-    else:
-        print("客户端访问密钥（GATEWAY_API_KEY）已存在，未改动。")
-    if admin_key and admin_key_supplied:
+        print("检测到旧版 GATEWAY_API_KEY，已保留一个版本的 legacy 兼容；值未显示。")
+        print("建议为设备创建 scoped token 后禁用 legacy 兼容。")
+    elif not defer_credentials:
         print("")
-        print("Web 配置管理密钥（admin key）使用了你提供的值，未重新生成。")
-        print("它权限高于客户端访问密钥，只用于在浏览器里解锁渠道与路由配置，")
-        print("不需要填进任何客户端，也不需要传到手机上。")
-    elif admin_key:
-        print("")
-        print("已为你自动生成 Web 配置管理密钥（Model Gateway admin key）。")
-        print("它只显示这一次，用于在 Web Console 解锁渠道与路由配置；")
-        print("权限高于普通访问密钥，请与 GATEWAY_API_KEY 分开妥善保存。")
-        print("它留在这台电脑上就够了，不需要填进客户端或传到手机：")
-        print(f"  {admin_key}")
-        print("如丢失，可运行：modelgw secret set memory-console-admin 重新设置。")
+        print("已有用户管理的 scoped token，安装未额外生成 Console token。")
+    if admin_credential_path is not None and admin_credential_path.exists():
+        print("Model Gateway admin key 明文未显示：")
+        print(f"  {admin_credential_path}")
     if args.start:
         return _cmd_stack_restart(
             argparse.Namespace(
-                host="0.0.0.0",
+                host="127.0.0.1",
                 port=None,
                 reload=False,
                 model_gateway_home=str(model_home),
@@ -686,6 +989,7 @@ def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
     settings = Settings(_env_file=None, **effective_environment(paths, project_root))
     memory_database = _resolve_runtime_path(project_root, settings.database_path)
     knowledge_database = _resolve_runtime_path(project_root, settings.knowledge_database_path)
+    auth_database = _resolve_runtime_path(project_root, settings.auth_database_path)
     default_name = "memory-stack-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".zip"
     destination = Path(args.output).expanduser() if args.output else Path.cwd() / default_name
     result = create_stack_backup(
@@ -693,6 +997,7 @@ def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
         paths=paths,
         memory_database=memory_database,
         knowledge_database=knowledge_database,
+        auth_database=auth_database,
         model_gateway_home=_stack_model_gateway_home(args),
         force=bool(args.force),
     )
@@ -702,9 +1007,11 @@ def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
     return 0
 
 
-def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
-    if not args.yes:
-        raise ValueError("恢复会替换当前数据库和配置；确认后请加 --yes")
+def _stop_stack_for_offline_restore(
+    args: Any,
+    paths: CliPaths,
+    project_root: Path,
+) -> int:
     ensure_initialized(paths, project_root)
     modelgw = _find_modelgw(project_root)
     memory_stop = _cmd_stop(argparse.Namespace(force=False), paths, project_root)
@@ -726,6 +1033,40 @@ def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
         )
     if _model_gateway_health_ok(_stack_model_gateway_home(args)):
         raise ValueError("Model Gateway 仍在运行；拒绝替换其配置和用量数据库")
+    return 0
+
+
+def _cmd_stack_recover_restore(
+    args: Any,
+    paths: CliPaths,
+    project_root: Path,
+) -> int:
+    if not args.yes:
+        raise ValueError("恢复中断回滚会替换当前文件；确认后请加 --yes")
+    stopped = _stop_stack_for_offline_restore(args, paths, project_root)
+    if stopped:
+        return stopped
+    settings = Settings(_env_file=None, **effective_environment(paths, project_root))
+    result = recover_interrupted_stack_restore(
+        paths=paths,
+        memory_database=_resolve_runtime_path(project_root, settings.database_path),
+        knowledge_database=_resolve_runtime_path(
+            project_root,
+            settings.knowledge_database_path,
+        ),
+        auth_database=_resolve_runtime_path(project_root, settings.auth_database_path),
+        model_gateway_home=_stack_model_gateway_home(args),
+    )
+    print(f"已回滚 {result['recovered_journals']} 个中断的整栈恢复 journal。")
+    return 0
+
+
+def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
+    if not args.yes:
+        raise ValueError("恢复会替换当前数据库和配置；确认后请加 --yes")
+    stopped = _stop_stack_for_offline_restore(args, paths, project_root)
+    if stopped:
+        return stopped
 
     settings = Settings(_env_file=None, **effective_environment(paths, project_root))
     result = restore_stack_backup(
@@ -733,6 +1074,7 @@ def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
         paths=paths,
         memory_database=_resolve_runtime_path(project_root, settings.database_path),
         knowledge_database=_resolve_runtime_path(project_root, settings.knowledge_database_path),
+        auth_database=_resolve_runtime_path(project_root, settings.auth_database_path),
         model_gateway_home=_stack_model_gateway_home(args),
     )
     print(f"已恢复 {len(result['restored'])} 个组件。")
@@ -750,11 +1092,11 @@ def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
     )
     if install_result:
         return install_result
-    print("供应商 API Key 和本机 GATEWAY_API_KEY 不在备份中；缺失时请重新输入。")
+    print("供应商 API Key 和首次凭据文件不在备份中；缺失时请重新配置。")
     if args.start:
         return _cmd_stack_start(
             argparse.Namespace(
-                host="0.0.0.0",
+                host="127.0.0.1",
                 port=None,
                 reload=False,
                 model_gateway_home=args.model_gateway_home,
@@ -920,7 +1262,7 @@ def _cmd_config_set(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
     name = args.name.strip().upper()
     if is_secret_name(name):
-        raise ValueError("API Key 请使用 `memgw secret set`，避免出现在终端历史中")
+        raise ValueError("密钥请使用 `memgw secret set`，避免出现在终端历史中")
     update_env_value(paths.settings_env, name, args.value)
     print(f"已设置 {name}。重启服务后生效。")
     return 0
@@ -930,7 +1272,7 @@ def _cmd_config_unset(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
     name = args.name.strip().upper()
     if is_secret_name(name):
-        raise ValueError("API Key 请使用 `memgw secret delete`")
+        raise ValueError("密钥请使用 `memgw secret delete`")
     update_env_value(paths.settings_env, name, None)
     print(f"已移除 {name}。")
     return 0
@@ -948,13 +1290,26 @@ def _cmd_secret_list(args: Any, paths: CliPaths, project_root: Path) -> int:
 def _cmd_secret_set(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
     variable = _SECRET_ALIASES[args.name]
-    value = sys.stdin.read().strip() if args.stdin else getpass.getpass(f"{args.name} API Key：")
+    value = sys.stdin.read().strip() if args.stdin else getpass.getpass(f"{args.name} 密钥：")
     if not value:
-        raise ValueError("API Key 不能为空")
+        raise ValueError("密钥不能为空")
+    if args.name in {"gateway", "signing"}:
+        candidate = effective_environment(paths, project_root)
+        candidate[variable] = value
+        Settings(_env_file=None, **candidate)
     update_env_value(paths.settings_env, variable, value)
-    print(f"已安全保存 {args.name} API Key；不会写入项目 .env。")
+    print(f"已安全保存 {args.name} 密钥；不会写入项目 .env。")
     if args.name == "gateway":
-        print("gateway 是本地访问密钥；重启服务后由客户端请求验证。")
+        update_env_value(
+            paths.settings_env,
+            "GATEWAY_LEGACY_API_KEY_ENABLED",
+            "true",
+        )
+        print("已显式启用一个版本的 legacy all-scope gateway key 兼容。")
+        print("新设备优先使用 `memgw token create` 创建 scoped token。")
+        return 0
+    if args.name == "signing":
+        print("signing 仅用于内部游标与预览签名，不能作为客户端访问 token。")
         return 0
     if args.name == "model-gateway":
         environment = effective_environment(paths, project_root)
@@ -983,18 +1338,76 @@ def _cmd_secret_set(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 def _cmd_secret_delete(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
-    if not args.yes and not _confirm(f"确定移除 {args.name} API Key？"):
+    if not args.yes and not _confirm(f"确定移除 {args.name} 密钥？"):
         print("已取消。")
         return 0
     # Keep an explicit empty override so deleting a migrated secret cannot
     # silently reveal the older value still present in the untouched project
     # .env beneath this user-owned configuration layer.
     update_env_value(paths.settings_env, _SECRET_ALIASES[args.name], "")
+    if args.name == "gateway":
+        update_env_value(
+            paths.settings_env,
+            "GATEWAY_LEGACY_API_KEY_ENABLED",
+            "false",
+        )
     if args.name == "model-gateway":
         # The Settings contract requires the local URL and client key as a
         # pair. Removing both keeps direct-provider compatibility usable.
         update_env_value(paths.settings_env, "MODEL_GATEWAY_BASE_URL", "")
-    print(f"已移除 {args.name} API Key。")
+    print(f"已移除 {args.name} 密钥。")
+    return 0
+
+
+def _cli_auth_store(paths: CliPaths, project_root: Path) -> AuthTokenStore:
+    ensure_initialized(paths, project_root)
+    settings = Settings(
+        _env_file=None,
+        **effective_environment(paths, project_root),
+    )
+    database_path = _resolve_runtime_path(project_root, settings.auth_database_path)
+    store = AuthTokenStore(database_path)
+    store.init_db()
+    return store
+
+
+def _cmd_token_create(args: Any, paths: CliPaths, project_root: Path) -> int:
+    created = _cli_auth_store(paths, project_root).create_token(
+        name=args.name,
+        user_id=args.user,
+        role=args.role,
+    )
+    print("访问 token（仅显示这一次，请立即保存到对应设备）：")
+    print(created.token)
+    print(
+        f"id={created.record.token_id} role={created.record.role} "
+        f"user={created.record.user_id} name={created.record.name}"
+    )
+    return 0
+
+
+def _cmd_token_list(args: Any, paths: CliPaths, project_root: Path) -> int:
+    del args
+    records = _cli_auth_store(paths, project_root).list_tokens()
+    if not records:
+        print("尚无 scoped token。")
+        return 0
+    print("ID               ROLE     USER             STATUS    NAME")
+    for record in records:
+        status_label = "revoked" if record.revoked_at else "active"
+        print(
+            f"{record.token_id} {record.role:8} {record.user_id[:16]:16} "
+            f"{status_label:9} {record.name}"
+        )
+    return 0
+
+
+def _cmd_token_revoke(args: Any, paths: CliPaths, project_root: Path) -> int:
+    token_id = args.token_id.strip().lower()
+    if not _cli_auth_store(paths, project_root).revoke_token(token_id):
+        print(f"未找到 active token：{token_id}", file=sys.stderr)
+        return 1
+    print(f"已撤销 token：{token_id}")
     return 0
 
 
@@ -1013,6 +1426,7 @@ def _run_model_gateway_check(
         with httpx.Client(
             timeout=timeout_seconds,
             follow_redirects=False,
+            trust_env=False,
         ) as client:
             response = client.get(
                 url,
@@ -1416,10 +1830,12 @@ def _cmd_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
     if settings is not None:
         memory_path = _resolve_runtime_path(project_root, settings.database_path)
         knowledge_path = _resolve_runtime_path(project_root, settings.knowledge_database_path)
+        auth_path = _resolve_runtime_path(project_root, settings.auth_database_path)
         print(f"记忆库：{memory_path}（{'存在' if memory_path.exists() else '尚未创建'}）")
         print(f"知识库：{knowledge_path}（{'存在' if knowledge_path.exists() else '尚未创建'}）")
-        if memory_path == knowledge_path:
-            problems.append("DATABASE_PATH 与 KNOWLEDGE_DATABASE_PATH 不能相同")
+        print(f"凭证库：{auth_path}（{'存在' if auth_path.exists() else '尚未创建'}）")
+        if len({memory_path, knowledge_path, auth_path}) != 3:
+            problems.append("DATABASE_PATH、KNOWLEDGE_DATABASE_PATH 与 AUTH_DATABASE_PATH 必须互不相同")
         if settings.model_gateway_enabled:
             print(f"模型模式：独立 Model Gateway（{settings.model_gateway_base_url}）")
             for route_name, alias in (
@@ -1449,11 +1865,28 @@ def _cmd_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
         and not is_placeholder_value(environment.get(variable, ""))
         for variable in _SECRET_ALIASES.values()
     )
-    print(f"API Key：已配置 {configured_secrets}/{len(_SECRET_ALIASES)} 项（值已隐藏）")
-    if not environment.get("GATEWAY_API_KEY") or is_placeholder_value(
-        environment.get("GATEWAY_API_KEY", "")
+    print(f"密钥：已配置 {configured_secrets}/{len(_SECRET_ALIASES)} 项（值已隐藏）")
+    if not environment.get("GATEWAY_SIGNING_SECRET") or is_placeholder_value(
+        environment.get("GATEWAY_SIGNING_SECRET", "")
     ):
-        problems.append("GATEWAY_API_KEY 尚未通过 `memgw secret set gateway` 配置")
+        problems.append("GATEWAY_SIGNING_SECRET 尚未配置")
+    if settings is not None:
+        active_scoped_token = False
+        auth_path = _resolve_runtime_path(project_root, settings.auth_database_path)
+        if auth_path.exists():
+            try:
+                active_scoped_token = AuthTokenStore(auth_path).has_active_tokens()
+            except (OSError, sqlite3.Error, ValueError):
+                problems.append("AUTH_DATABASE_PATH 无法读取或 schema 不兼容")
+        legacy_key_available = bool(environment.get("GATEWAY_API_KEY")) and not (
+            is_placeholder_value(environment.get("GATEWAY_API_KEY", ""))
+        )
+        if not active_scoped_token and not (
+            settings.gateway_legacy_api_key_enabled and legacy_key_available
+        ):
+            problems.append(
+                "没有可用访问凭证；请运行 `memgw token create`，或启用并配置 legacy gateway key"
+            )
     if (
         settings is not None
         and not settings.model_gateway_enabled
@@ -1519,7 +1952,7 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
         print("1. 启动或停止记忆服务")
         print("2. 设置模型渠道、模型和用途")
         print("3. 检查整个系统是否可用")
-        print("4. 设置本机访问密钥")
+        print("4. 为设备创建最小权限 token")
         print("5. 查看最近日志")
         print("6. 打开记忆管理页面")
         print("7. 重启记忆服务")
@@ -1537,7 +1970,7 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
                     _cmd_stop(argparse.Namespace(force=False), paths, project_root)
             else:
                 _cmd_start(
-                    argparse.Namespace(host="0.0.0.0", port=None, reload=False),
+                    argparse.Namespace(host="127.0.0.1", port=None, reload=False),
                     paths,
                     project_root,
                 )
@@ -1555,11 +1988,17 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
                 print("[注意] 没有找到独立模型服务。")
             _cmd_doctor(None, paths, project_root)
         elif choice == "4":
-            _cmd_secret_set(
-                argparse.Namespace(name="gateway", stdin=False, no_check=True),
-                paths,
-                project_root,
-            )
+            name = input("设备或客户端名称：").strip()
+            role = input("用途（chat/mcp/console，默认 chat）：").strip() or "chat"
+            user = input("用户命名空间（默认 default）：").strip() or "default"
+            if not name or role not in AUTH_ROLES:
+                print("名称不能为空，用途必须是 chat、mcp 或 console。")
+            else:
+                _cmd_token_create(
+                    argparse.Namespace(name=name, role=role, user=user),
+                    paths,
+                    project_root,
+                )
         elif choice == "5":
             _cmd_logs(argparse.Namespace(lines=40, follow=False), paths, project_root)
         elif choice == "6":
@@ -1567,7 +2006,7 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
         elif choice == "7":
             _cmd_restart(
                 argparse.Namespace(
-                    host="0.0.0.0",
+                    host="127.0.0.1",
                     port=None,
                     reload=False,
                     force=False,
@@ -1785,7 +2224,17 @@ def _server_command(args: Any, paths: CliPaths, project_root: Path) -> tuple[lis
     ]
     if args.reload:
         command.append("--reload")
-    return command, effective_environment(paths, project_root), port
+    # The service reads its private 0600 file itself. Passing only the path
+    # prevents gateway/backend/provider/signing material from lingering in
+    # uvicorn and worker process environments (and therefore /proc or process
+    # inspection output). Non-secret operational overrides remain available.
+    environment = {
+        name: value
+        for name, value in effective_environment(paths, project_root).items()
+        if not is_secret_name(name)
+    }
+    environment["MEMGW_SETTINGS_PATH"] = str(paths.settings_env)
+    return command, environment, port
 
 
 def _project_python(project_root: Path) -> Path:
@@ -1858,11 +2307,30 @@ def _confirm(prompt: str) -> bool:
 
 
 def _require_https_url(value: str) -> None:
+    if value != value.strip() or re.search(r"[\x00-\x20\x7f]", value):
+        raise ValueError("官方来源不能包含外围空白或控制字符")
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("官方来源必须是完整的 HTTPS URL")
-    if parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("官方来源不能包含账号或密钥")
+    if parsed.query or parsed.fragment:
+        raise ValueError("官方来源不能包含 query 或 fragment")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("官方来源端口格式无效") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("官方来源端口超出范围")
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost":
         raise ValueError("官方来源不能指向本机地址")
+    try:
+        literal = ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise ValueError("官方来源不能指向本机或私有地址")
 
 
 def _validate_date(value: str) -> None:
@@ -1958,17 +2426,34 @@ def _billing_provider(spec: Any, paths: CliPaths, project_root: Path) -> str:
 
 
 def _fetch_official_text(url: str) -> str:
-    response = httpx.get(
-        url,
-        follow_redirects=True,
-        timeout=20,
-        headers={"User-Agent": "memory-gateway-pricing-research/1.0"},
-    )
-    response.raise_for_status()
-    if urlparse(str(response.url)).scheme != "https":
-        raise ValueError("官方价格页重定向到了非 HTTPS 地址")
+    _require_https_url(url)
+    chunks: list[bytes] = []
+    total = 0
+    with httpx.Client(
+        follow_redirects=False,
+        trust_env=False,
+        timeout=httpx.Timeout(connect=10, read=20, write=10, pool=10),
+        headers={
+            "Accept": "text/html, text/plain;q=0.9",
+            "Accept-Encoding": "identity",
+            "User-Agent": "memory-gateway-pricing-research/0.2",
+        },
+    ) as client:
+        with client.stream("GET", url) as response:
+            if response.is_redirect:
+                raise ValueError("官方价格页返回重定向；请显式提供最终 HTTPS URL")
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > 1_500_000:
+                    raise ValueError("官方价格页超过 1.5 MB 安全上限")
+                chunks.append(chunk)
+    try:
+        page = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("官方价格页必须是 UTF-8 文本") from exc
     parser = _VisibleTextParser()
-    parser.feed(response.text[:1_500_000])
+    parser.feed(page)
     text = re.sub(r"\s+", " ", parser.text).strip()
     if len(text) < 40:
         raise ValueError("官方页面没有可供分析的文本；可能需要 JavaScript 或登录")

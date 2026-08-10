@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -32,6 +33,7 @@ _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 @dataclass(frozen=True, slots=True)
 class CliPaths:
     home: Path
+    credentials: Path
     project_file: Path
     settings_env: Path
     models: Path
@@ -43,10 +45,16 @@ class CliPaths:
 
 def cli_paths(home: str | Path = "") -> CliPaths:
     root = Path(home).expanduser() if str(home).strip() else default_cli_home()
+    settings_override = os.getenv("MEMGW_SETTINGS_PATH", "").strip()
     return CliPaths(
         home=root,
+        credentials=root / "credentials",
         project_file=root / "project.json",
-        settings_env=root / "settings.env",
+        settings_env=(
+            Path(settings_override).expanduser()
+            if settings_override
+            else root / "settings.env"
+        ),
         models=root / "models.json",
         routes=root / "routes.json",
         pricing=root / "pricing.json",
@@ -127,6 +135,7 @@ def initialize_cli(
             "PRICING_CATALOG_PATH": str(paths.pricing),
         }
     )
+    _migrate_security_settings(paths, values)
     write_env_atomic(paths.settings_env, values)
     validate_catalog_and_routes(catalog_path=paths.models, routes_path=paths.routes)
     load_pricing_catalog(paths.pricing)
@@ -144,8 +153,28 @@ def ensure_initialized(paths: CliPaths, project_root: Path) -> None:
             paths.pricing,
         )
     ):
+        values = read_env_file(paths.settings_env)
+        if _migrate_security_settings(paths, values):
+            write_env_atomic(paths.settings_env, values)
         return
     initialize_cli(paths=paths, project_root=project_root)
+
+
+def _migrate_security_settings(
+    paths: CliPaths,
+    values: dict[str, str],
+) -> bool:
+    changed = False
+    if not values.get("AUTH_DATABASE_PATH", "").strip():
+        values["AUTH_DATABASE_PATH"] = str(paths.home / "auth.db")
+        changed = True
+    if "GATEWAY_SIGNING_SECRET" not in values:
+        # Stable across restarts, never printed, and independent of every
+        # client-facing access token. An explicit blank is preserved so an
+        # operator can deliberately disable signed features.
+        values["GATEWAY_SIGNING_SECRET"] = secrets.token_urlsafe(48)
+        changed = True
+    return changed
 
 
 def effective_environment(paths: CliPaths, project_root: Path) -> dict[str, str]:
@@ -262,6 +291,8 @@ def _write_text_atomic(path: Path, text: str, *, backup: bool) -> None:
         backup_path = path.with_suffix(path.suffix + ".bak")
         shutil.copyfile(path, backup_path)
         os.chmod(backup_path, 0o600)
+        _fsync_file(backup_path)
+        _fsync_directory(path.parent)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         dir=path.parent,
@@ -275,6 +306,7 @@ def _write_text_atomic(path: Path, text: str, *, backup: bool) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -283,6 +315,25 @@ def _write_text_atomic(path: Path, text: str, *, backup: bool) -> None:
 def _quote_env_value(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _is_placeholder(value: str) -> bool:

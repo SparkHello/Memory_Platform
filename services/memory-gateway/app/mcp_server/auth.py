@@ -1,19 +1,13 @@
-import hmac
 import json
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.config import get_settings
+from app.auth.tokens import AuthPrincipal
 from app.mcp_server.context import current_user_id
 
 
 class MCPAuthMiddleware:
-    """MCP 子应用以 ASGI 方式挂载，不经过 FastAPI 依赖注入，鉴权在这一层完成。
-
-    校验规则与 REST 层 require_api_key 保持一致：
-    未配置 GATEWAY_API_KEY 返回 500，Bearer token 不匹配返回 401。
-    通过后使用凭证绑定用户；仅显式开启兼容模式时允许 X-User-Id 覆写。
-    """
+    """Bridge the early-auth principal into MCP's request context."""
 
     def __init__(self, app: ASGIApp):
         self.app = app
@@ -23,17 +17,8 @@ class MCPAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {
-            key.decode("latin-1").lower(): value.decode("latin-1")
-            for key, value in scope.get("headers", [])
-        }
-        settings = get_settings()
-        if not settings.gateway_api_key:
-            await _send_json(send, 500, {"detail": "GATEWAY_API_KEY 未配置"})
-            return
-        if not hmac.compare_digest(
-            headers.get("authorization") or "", f"Bearer {settings.gateway_api_key}"
-        ):
+        principal = scope.get("state", {}).get("auth_principal")
+        if not isinstance(principal, AuthPrincipal):
             await _send_json(
                 send,
                 401,
@@ -41,26 +26,7 @@ class MCPAuthMiddleware:
                 extra_headers=[(b"www-authenticate", b"Bearer")],
             )
             return
-
-        bound_user_id = settings.gateway_user_id.strip() or "default"
-        requested_user_id = (headers.get("x-user-id") or "").strip()
-        if (
-            requested_user_id
-            and requested_user_id != bound_user_id
-            and not settings.gateway_allow_user_id_header
-        ):
-            await _send_json(
-                send,
-                403,
-                {"detail": "X-User-Id 与当前凭证绑定的用户不匹配"},
-            )
-            return
-        user_id = (
-            requested_user_id
-            if settings.gateway_allow_user_id_header and requested_user_id
-            else bound_user_id
-        )
-        token = current_user_id.set(user_id)
+        token = current_user_id.set(principal.user_id)
         try:
             await self.app(scope, receive, send)
         finally:
