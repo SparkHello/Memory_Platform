@@ -34,7 +34,16 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
   await page.getByPlaceholder("sk-...").fill(candidateKey);
   await page.getByRole("button", { name: "只读发现模型" }).click();
   await expect(page.getByText(/候选渠道和密钥尚未保存/)).toBeVisible();
+  // 已填写供应商 API Key 时关闭必须先确认，误触不会直接丢弃草稿。
   await page.getByRole("button", { name: "关闭新建渠道" }).click();
+  const discardDialog = page
+    .getByRole("dialog")
+    .filter({ hasText: "丢弃未保存的渠道配置" });
+  await expect(discardDialog).toBeVisible();
+  await discardDialog.getByRole("button", { name: "继续编辑" }).click();
+  await expect(page.getByRole("heading", { name: "新建渠道" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭新建渠道" }).click();
+  await discardDialog.getByRole("button", { name: "丢弃并关闭" }).click();
   await expect(page.getByRole("heading", { name: "新建渠道" })).toHaveCount(0);
 
   expect(

@@ -26,8 +26,9 @@ test("mobile routes and repeated current destination reset real page scrolling",
 
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(300);
-  await mobileNav.getByRole("button", { name: "模型", exact: true }).click();
-  await expect(page).toHaveURL(/#\/providers$/);
+  // 移动底栏主导航现在是 工作台/记忆库/知识库/接入信息；「模型」在「更多」抽屉里。
+  await mobileNav.getByRole("button", { name: "接入", exact: true }).click();
+  await expect(page).toHaveURL(/#\/integration$/);
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
   expect(
     await page.evaluate(() => document.querySelector<HTMLElement>(".content-area")?.scrollTop || 0)
