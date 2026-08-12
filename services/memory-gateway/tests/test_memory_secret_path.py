@@ -96,6 +96,10 @@ def test_private_settings_secret_never_appears_in_process_environment(
         name: value
         for name, value in os.environ.items()
         if not name.endswith(("_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD"))
+        # 沙箱 fixture 注入的中央网关配置必须成对剥离：只按后缀剥掉
+        # MODEL_GATEWAY_API_KEY 会留下孤立的 BASE_URL，触发"必须同时
+        # 配置"校验，子进程在真正的断言前就崩溃。
+        and not name.startswith("MODEL_GATEWAY_")
     }
     environment["MEMGW_SETTINGS_PATH"] = str(settings_path)
     process = subprocess.Popen(
