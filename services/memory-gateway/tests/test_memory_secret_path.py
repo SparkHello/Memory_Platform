@@ -106,19 +106,30 @@ def test_private_settings_secret_never_appears_in_process_environment(
                 "from pathlib import Path; import time; "
                 "from app.config import get_settings; "
                 "assert get_settings().gateway_api_key; "
-                f"Path({str(ready_path)!r}).write_text('ready'); time.sleep(5)"
+                f"Path({str(ready_path)!r}).write_text('ready'); time.sleep(30)"
             ),
         ],
         cwd=Path(__file__).resolve().parents[1],
         env=environment,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     try:
-        deadline = time.monotonic() + 3
+        # 冷缓存的 CI runner 上，子进程 import pydantic/设置栈可能就要数秒；
+        # 等待循环在 ready 出现时立即返回，放宽上限不会拖慢正常用例。
+        deadline = time.monotonic() + 30
         while not ready_path.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
             time.sleep(0.02)
-        assert ready_path.exists()
+        if not ready_path.exists():
+            stderr_output = b""
+            if process.poll() is not None and process.stderr is not None:
+                stderr_output = process.stderr.read()
+            raise AssertionError(
+                "子进程未在期限内完成配置加载；"
+                f"exit={process.poll()!r} stderr={stderr_output.decode(errors='replace')!r}"
+            )
         assert secret.encode() not in Path(f"/proc/{process.pid}/environ").read_bytes()
     finally:
         process.terminate()
