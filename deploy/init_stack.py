@@ -279,16 +279,25 @@ def _secure_credentials() -> None:
         try:
             descriptor = _open_regular_no_follow(path, os.O_RDONLY)
         except FileNotFoundError as exc:
-            raise RuntimeError("published credential is missing") from exc
+            raise RuntimeError(_missing_credential_message(path)) from exc
         try:
             metadata = os.fstat(descriptor)
             if metadata.st_size <= 0:
-                raise RuntimeError("published credential is missing")
+                raise RuntimeError(_missing_credential_message(path))
             os.fchmod(descriptor, 0o600)
             if uid is not None and gid is not None:
                 os.fchown(descriptor, uid, gid)
         finally:
             os.close(descriptor)
+
+
+def _missing_credential_message(path: Path) -> str:
+    return (
+        f"数据卷已初始化，但宿主 credentials/{path.name} 缺失。"
+        "数据没有丢：把原安装目录中的 credentials/gateway.key 和 "
+        "credentials/admin.key 放回安装目录的 credentials/ 后重跑同一条安装命令即可。"
+        "两枚密钥都遗失时参见 docs/stack-operations.md 的密钥重设章节。"
+    )
 
 
 def _validate_published_credentials() -> None:
@@ -305,7 +314,7 @@ def _validate_published_credentials() -> None:
         try:
             descriptor = _open_regular_no_follow(path, os.O_RDONLY)
         except FileNotFoundError as exc:
-            raise RuntimeError("published credential is missing") from exc
+            raise RuntimeError(_missing_credential_message(path)) from exc
         try:
             metadata = os.fstat(descriptor)
             if metadata.st_size <= 0 or stat.S_IMODE(metadata.st_mode) != 0o600:

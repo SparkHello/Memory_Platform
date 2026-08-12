@@ -79,7 +79,7 @@ curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSIO
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-Windows PowerShell uses the matching release installer:
+Windows PowerShell uses the matching release installer (currently **experimental**: it passed PowerShell syntax regression and containerized fault-injection tests, but has not yet completed a disaster-recovery drill on a real NTFS + Docker Desktop machine — keep an extra manual backup of important data):
 
 ```powershell
 $Version = "v0.2.0"
@@ -88,9 +88,22 @@ irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deplo
 & .\install-memory-platform.ps1
 ```
 
-The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. First start takes 1–2 minutes. “Base service ready” does not mean chat is ready yet; choose a model provider in the browser before connecting a client.
+After installation, remember two credential files and three steps:
 
-Initial credentials are written directly to `credentials/gateway.key` and `credentials/admin.key` with owner-only permissions; their values are never printed to Docker logs or passed through Compose environment variables. Re-running the same release installer finds the existing installation, creates and verifies a pre-upgrade backup before downloading replacement Compose content, then rolls back automatically if the new stack regresses. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows.
+1. Sign in to the Web Console at `http://127.0.0.1:2026/ui/` with the token in `credentials/gateway.key`;
+2. Open Models & Routes and enter the admin key from `credentials/admin.key` to configure a model channel;
+3. Create a chat token in the Web Console and paste it into your chat client.
+
+First start takes 1–2 minutes; chat works once a model channel is configured. Credential values are never printed to Docker logs or passed through Compose environment variables — they live only in owner-only files under `credentials/`.
+
+<details>
+<summary>Installer implementation details (digest pinning, backup and upgrade strategy)</summary>
+
+The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. Re-running the same release installer finds the existing installation; on upgrade it stops the old stack, creates and verifies a single consistent backup, then rolls back automatically if the new stack regresses. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows. Sigstore signature verification is skipped by default (images are already digest-pinned); set `MEMORY_VERIFY_SIGNATURES=1` to enable it.
+
+If GHCR or GitHub is unreachable from your network, set an HTTPS proxy before re-running the script, or set `MEMORY_IMAGE_REGISTRY=<ghcr-mirror-host>` to pull the images through a GHCR mirror (only the registry host changes; repository paths and digest pinning stay identical).
+
+</details>
 
 ### Manual path (to review each step)
 

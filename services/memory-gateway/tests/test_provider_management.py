@@ -159,7 +159,56 @@ def test_setup_is_ready_only_when_every_chat_route_is_usable(
         "usable_chat_routes": list(providers_api.REQUIRED_CHAT_ROUTES),
         "missing_chat_routes": [],
         "next_action": "connect_client",
+        # 常规 status 不做上游实测，live 字段保持 None（由 /providers/live-probe 填充）。
+        "live_probe": None,
+        "upstream_ready": None,
     }
+
+
+def test_live_probe_respects_cache_and_explicit_force(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    providers_api._LIVE_PROBE_CACHE.clear()
+    providers_api._LIVE_PROBE_INFLIGHT.clear()
+    upstream_calls = {"count": 0}
+
+    class _FakeAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> bool:
+            return False
+
+        async def post(self, url, **kwargs):
+            del kwargs
+            upstream_calls["count"] += 1
+            return httpx.Response(
+                200,
+                json={"id": "probe"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(providers_api.httpx, "AsyncClient", _FakeAsyncClient)
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    try:
+        first = client.post("/providers/live-probe", headers=auth_headers).json()
+        second = client.post("/providers/live-probe", headers=auth_headers).json()
+        forced = client.post(
+            "/providers/live-probe?force=true", headers=auth_headers
+        ).json()
+    finally:
+        providers_api._LIVE_PROBE_CACHE.clear()
+
+    assert first["ok"] is True and first["cached"] is False
+    assert second["ok"] is True and second["cached"] is True
+    assert forced["cached"] is False
+    # 两次真实上游调用：首次 + 显式 force；缓存命中不再花 token。
+    assert upstream_calls["count"] == 2
 
 
 def test_setup_uses_resolved_custom_route_ids(

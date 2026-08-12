@@ -351,7 +351,7 @@ export function KnowledgeSearchPage({
                             <small>{headingText(hit)}{lineText(hit) ? ` · ${lineText(hit)}` : ""}</small>
                           </div>
                         </div>
-                        <button className="secondary-button compact" type="button" onClick={() => void copyText(hit.chunk_ref).then(() => notify("片段引用已复制", "success"))}><Clipboard size={13} />复制引用</button>
+                        <button className="secondary-button compact" type="button" onClick={() => void copyText(hit.chunk_ref).then(() => notify("片段引用已复制", "success")).catch((cause) => notify(`复制失败：${errorMessage(cause)}`, "error"))}><Clipboard size={13} />复制引用</button>
                       </header>
                       <pre>{hit.excerpt}</pre>
                       <footer>
@@ -369,7 +369,7 @@ export function KnowledgeSearchPage({
           <section className="panel knowledge-json-panel">
             <div className="panel-header">
               <div><h2>MCP 响应预览</h2><p className="muted">REST 调试结果与 MCP 搜索响应使用同一语义字段。</p></div>
-              <button className="secondary-button" type="button" onClick={() => void copyText(JSON.stringify(result, null, 2)).then(() => notify("JSON 已复制", "success"))}><Clipboard size={15} />复制 JSON</button>
+              <button className="secondary-button" type="button" onClick={() => void copyText(JSON.stringify(result, null, 2)).then(() => notify("JSON 已复制", "success")).catch((cause) => notify(`复制失败：${errorMessage(cause)}`, "error"))}><Clipboard size={15} />复制 JSON</button>
             </div>
             <pre className="json-block">{JSON.stringify(result, null, 2)}</pre>
           </section>

@@ -40,6 +40,7 @@ import {
 } from "../utils/constants";
 import { clampNumber, dateText, displayText, errorMessage, percent, reviewActionText, shortId } from "../utils/format";
 import {
+  contentDivergesFromSource,
   editDraftToPayload,
   editDraftToSpacesPayload,
   memoryToEditDraft,
@@ -489,6 +490,13 @@ export function MemoryDetailDrawer({
             {(memory.source_message || why) && (
               <section className="subpanel profile-source">
                 <h3>来源</h3>
+                {memory.source_message &&
+                  contentDivergesFromSource(memory.content, memory.source_message) && (
+                    <div className="notice warning">
+                      <ShieldAlert size={16} />
+                      正文与原始来源已明显不同（可能经过编辑），以下原文仅供追溯。
+                    </div>
+                  )}
                 {memory.source_message && <blockquote>{memory.source_message}</blockquote>}
                 {why && (
                   <FieldList

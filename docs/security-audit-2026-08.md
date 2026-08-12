@@ -269,6 +269,7 @@ DeepSeek 目标固定为官方当前稳定快照 `deepseek-v4-flash-0731`，不�
 - Core 模型仍会漏掉约 2/6 合成分区，但所有失败为空结果，未发生错主体/错证据保存；功能仅人工触发且 UI 要求复核。继续提高召回属于模型/prompt 质量迭代，不应以降低证据门控换取。
 - Memory 不持久挂载 Model secret，但渠道管理请求中的 admin/provider key 会短暂经过 Memory 进程内存。要消除此瞬时暴露必须让浏览器直连 2030 或增加另一控制面，会扩大 LAN 暴露与复杂度；当前以 HTTPS 上游、无日志/持久化、低频配置接受。
 - Docker Desktop 无法同时让 Memory 只连接 `internal` 网络并直接发布宿主端口。为保持两容器边界，宿主 2026 由 Model 容器内一个固定目标、纯字节转发的最小 relay 接收，再转给 internal Memory；它不解析 HTTP、不记录正文或 Header，并受 128 连接、64 KiB 缓冲和超时限制，2030 仍不发布。这样 Memory 确实没有 provider egress，但入口 relay 与 provider secret 处于同一容器；相较增加第三个无 secret sidecar，这是当前两容器约束下接受的 P2 权衡。可信 LAN 中 128 个长期空闲 TCP 连接仍可在 30 分钟 idle timeout 内暂时占满入口，后续可增加握手截止时间或按源速率门禁。
+  - **2026-08 复审更新**：综合评审（JJC-20260812-003）判定该 relay 收益近零（Memory 本就必须能调用 Model Gateway，被攻破后仍可经其外传数据）且引入静默限流故障，已删除。现由 memory-gateway 挂非 internal `ingress` 网络直接发布宿主 2026，接受 Memory 具备出站 egress 的微小残余风险；model-gateway 仍不发布任何宿主端口。本节其余描述保留为审计时点记录。
 - 无修复版本的基础 OS HIGH/CRITICAL 扫描项不会被悄悄忽略：流水线完整报告，有修复版本的 HIGH/CRITICAL 一律阻断；但未修复项的人工 VEX 审批目前仍是流程要求而非 CI 强制 gate。最终镜像报告必须披露实际数量，不能写成“零漏洞”。
 - Model pricing 快照没有覆盖本次 Qwen cached-input tier 时，账本明确标记 incomplete/unknown，不把部分估价当完整账单；本报告按普通输入价保守计费。正式更新官方价格快照后可消除该提示。
 - 原生 Windows 的源码 CLI 仍依赖 Python `chmod`，不具备 PowerShell Docker installer 的显式 DACL；当前目标部署为 macOS/Linux Docker。若未来支持原生 Windows 服务，应补 ACL 后再宣称同等 secret 权限。

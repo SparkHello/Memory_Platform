@@ -12,10 +12,16 @@ import sqlite3
 from typing import Literal
 import unicodedata
 
+from app.schema_versions import AUTH_SCHEMA_VERSION
+
 
 AuthRole = Literal["chat", "mcp", "console"]
 AUTH_ROLES: tuple[AuthRole, ...] = ("chat", "mcp", "console")
-_SCHEMA_VERSION = 1
+# chat tokens may cap automatic memory writes; mcp/console keep "read-write"
+# for schema uniformity but ignore the field on non-chat routes.
+MemoryAccess = Literal["read", "read-write"]
+MEMORY_ACCESS_VALUES: tuple[MemoryAccess, ...] = ("read", "read-write")
+_SCHEMA_VERSION = AUTH_SCHEMA_VERSION
 _TOKEN_RE = re.compile(r"^mgw_([a-f0-9]{16})_([A-Za-z0-9_-]{32,128})$")
 _TOKEN_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 
@@ -29,6 +35,7 @@ class AuthTokenRecord:
     created_at: str
     last_used_at: str | None
     revoked_at: str | None
+    memory_access: MemoryAccess = "read-write"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +52,7 @@ class AuthPrincipal:
     user_id: str
     role: AuthRole | Literal["legacy"]
     legacy: bool = False
+    memory_access: MemoryAccess = "read-write"
 
 
 class AuthStoreError(ValueError):
@@ -90,6 +98,8 @@ class AuthTokenStore:
                         user_id TEXT NOT NULL,
                         role TEXT NOT NULL
                             CHECK(role IN ('chat', 'mcp', 'console')),
+                        memory_access TEXT NOT NULL DEFAULT 'read-write'
+                            CHECK(memory_access IN ('read', 'read-write')),
                         created_at TEXT NOT NULL,
                         last_used_at TEXT,
                         revoked_at TEXT
@@ -100,6 +110,13 @@ class AuthTokenStore:
                     "CREATE INDEX IF NOT EXISTS idx_auth_tokens_role_active "
                     "ON auth_tokens(role, revoked_at)"
                 )
+                # A pre-versioned database may already have the table without
+                # the v2 column; CREATE TABLE IF NOT EXISTS skips it silently.
+                self._ensure_memory_access_column(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                connection.commit()
+            elif version == 1:
+                self._ensure_memory_access_column(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
             self._validate_schema(connection)
@@ -114,6 +131,7 @@ class AuthTokenStore:
         name: str,
         user_id: str,
         role: AuthRole,
+        memory_access: MemoryAccess = "read-write",
     ) -> CreatedAuthToken:
         normalized_name = _validate_label(name, field="name", max_length=100)
         normalized_user_id = _validate_label(
@@ -123,6 +141,14 @@ class AuthTokenStore:
         )
         if role not in AUTH_ROLES:
             raise AuthStoreError("role 必须是 chat、mcp 或 console")
+        if memory_access not in MEMORY_ACCESS_VALUES:
+            raise AuthStoreError("memory_access 必须是 read 或 read-write")
+        # Only chat tokens constrain automatic memory write. Reject an
+        # explicit "read" on other roles instead of silently widening it.
+        if role != "chat" and memory_access != "read-write":
+            raise AuthStoreError(
+                "memory_access=read 仅支持 chat token；mcp/console token 不接受该参数"
+            )
 
         created_at = _utc_now()
         for _ in range(5):
@@ -135,15 +161,16 @@ class AuthTokenStore:
                     connection.execute(
                         """
                         INSERT INTO auth_tokens(
-                            token_hash, name, user_id, role, created_at,
-                            last_used_at, revoked_at
-                        ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
+                            token_hash, name, user_id, role, memory_access,
+                            created_at, last_used_at, revoked_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
                         """,
                         (
                             token_hash,
                             normalized_name,
                             normalized_user_id,
                             role,
+                            memory_access,
                             created_at,
                         ),
                     )
@@ -158,6 +185,7 @@ class AuthTokenStore:
                         created_at=created_at,
                         last_used_at=None,
                         revoked_at=None,
+                        memory_access=memory_access,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -180,8 +208,8 @@ class AuthTokenStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT token_hash, name, user_id, role, created_at,
-                       last_used_at, revoked_at
+                SELECT token_hash, name, user_id, role, memory_access,
+                       created_at, last_used_at, revoked_at
                 FROM auth_tokens
                 WHERE token_hash = ?
                 """,
@@ -213,8 +241,8 @@ class AuthTokenStore:
             else None
         )
         query = """
-            SELECT token_hash, name, user_id, role, created_at,
-                   last_used_at, revoked_at
+            SELECT token_hash, name, user_id, role, memory_access,
+                   created_at, last_used_at, revoked_at
             FROM auth_tokens
         """
         params: tuple[str, ...] = ()
@@ -302,6 +330,18 @@ class AuthTokenStore:
         return connection
 
     @staticmethod
+    def _ensure_memory_access_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(auth_tokens)").fetchall()
+        }
+        if columns and "memory_access" not in columns:
+            connection.execute(
+                "ALTER TABLE auth_tokens ADD COLUMN memory_access "
+                "TEXT NOT NULL DEFAULT 'read-write'"
+            )
+
+    @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         columns = {
             str(row["name"])
@@ -312,18 +352,26 @@ class AuthTokenStore:
             "name",
             "user_id",
             "role",
+            "memory_access",
             "created_at",
             "last_used_at",
             "revoked_at",
         }
         if columns != expected:
             raise AuthStoreError("AUTH_DATABASE_PATH 的 auth_tokens schema 不兼容")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != _SCHEMA_VERSION:
+            raise AuthStoreError("AUTH_DATABASE_PATH 的 schema 版本与程序不一致")
 
 
 def _record_from_row(row: sqlite3.Row | dict[str, object]) -> AuthTokenRecord:
     role = str(row["role"])
     if role not in AUTH_ROLES:
         raise AuthStoreError("auth token role 无效")
+    raw_access = row["memory_access"] if "memory_access" in row.keys() else "read-write"
+    memory_access = str(raw_access or "read-write")
+    if memory_access not in MEMORY_ACCESS_VALUES:
+        memory_access = "read-write"
     return AuthTokenRecord(
         token_id=str(row["token_hash"])[:16],
         name=str(row["name"]),
@@ -334,6 +382,7 @@ def _record_from_row(row: sqlite3.Row | dict[str, object]) -> AuthTokenRecord:
             str(row["last_used_at"]) if row["last_used_at"] is not None else None
         ),
         revoked_at=(str(row["revoked_at"]) if row["revoked_at"] is not None else None),
+        memory_access=memory_access,  # type: ignore[arg-type]
     )
 
 

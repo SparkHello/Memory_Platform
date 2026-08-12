@@ -68,7 +68,6 @@ FROM runtime-common AS model-runtime
 ENV MODEL_GATEWAY_HOME=/data \
     MODEL_GATEWAY_SECRETS_PATH=/secrets/secrets.env
 COPY deploy/model-entrypoint.sh /usr/local/bin/model-gateway-entrypoint
-COPY deploy/ingress_relay.py /usr/local/libexec/memory-platform/ingress_relay.py
 RUN groupadd --gid 10002 model-gateway \
  && useradd --uid 10002 --gid 10002 --no-create-home \
       --home-dir /nonexistent --shell /usr/sbin/nologin model-gateway \
@@ -77,7 +76,7 @@ RUN groupadd --gid 10002 model-gateway \
  && chown 10002:10002 /data /secrets
 USER 10002:10002
 VOLUME ["/data", "/secrets"]
-EXPOSE 2026 2030
+EXPOSE 2030
 ENTRYPOINT ["model-gateway-entrypoint"]
 
 # One-shot root image.  It is run with networking disabled, initializes or

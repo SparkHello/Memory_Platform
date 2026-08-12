@@ -31,6 +31,7 @@ from app.schema_migrations import (
     enable_wal_with_retry,
     validated_schema_version,
 )
+from app.schema_versions import KNOWLEDGE_SCHEMA_VERSION
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -3461,3 +3462,8 @@ _KNOWLEDGE_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], Non
     (1, _knowledge_migration_v1),
     (2, _knowledge_migration_v2),
 ]
+
+if _KNOWLEDGE_SCHEMA_MIGRATIONS[-1][0] != KNOWLEDGE_SCHEMA_VERSION:
+    raise RuntimeError(
+        "app.schema_versions.KNOWLEDGE_SCHEMA_VERSION 与 knowledge 迁移列表不一致"
+    )

@@ -283,7 +283,7 @@ X-Model-Gateway-Reasoning-Origin-Deployment: chat-primary
 - 上游重定向不会携带凭据跟随；
 - `usage.db` 用 `usage_events` 记录逻辑请求、用 `attempt_events` 记录每次真实上游发送的有限元数据与逐渠道费用；受信 backend 可附加 correlation/operation/opaque user tag 并查询中央事实，不保存正文或上游错误原文；
 - 401/402/429 按 connection 熔断，结构化模型不存在和连续 5xx 按 deployment 熔断，并在每个 attempt 前复查；
-- 上游 URL、敏感转发 Header、环境代理、discovery 数量和响应字节都有统一安全边界；私有或 RFC 2544 映射地址必须显式声明最小允许 CIDR，默认拒绝；
+- 上游 URL、敏感转发 Header、环境代理、discovery 数量和响应字节都有统一安全边界；私有或 RFC 2544（Clash/Surge fake-ip 的 `198.18.0.0/15`）地址必须显式声明允许 CIDR，默认拒绝；
 - 缺 usage、官方价格或某类单价时，费用保持不完整；embedding 只要求输入 Token 与输入单价。
 - 原始 usage 保留 90 天后滚入日汇总，日汇总保留 365 天；`modelgw usage prune --vacuum` 可在低峰期回收空间。
 - 付费上游发送前会为逐 attempt ledger 保留磁盘空间；低于硬保留量时返回 `507 model_gateway_insufficient_storage`、`attempts=0`，不会先调用 provider。上游已调用后才发生的罕见写盘竞态优先返回原上游结果，将 ledger Header 标为 `incomplete`，并令服务至少一次 not-ready。

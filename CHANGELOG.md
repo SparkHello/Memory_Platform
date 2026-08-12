@@ -4,6 +4,49 @@
 
 ## Unreleased
 
+### Fixed
+
+- 渠道向导「复制客户端配置」不再误用 Console token：apply 成功后自动创建 chat token，仅复制该设备密钥。
+- Model Gateway 上游地址校验失败时返回可读中文原因（含 fake-ip / 198.18 提示），而不再只显示裸 `ConnectError` 类型名。
+- 显式 `allowed_private_networks` 现可写入整个 RFC 2544 段 `198.18.0.0/15`（Clash/Surge TUN fake-ip），不再强制只能 `/32`。
+- 多意图消息（「新事实 + 提问」混在一条）现按句多路召回取并集，不再因整句语义稀释而漏召相关记忆。
+- 检索与聊天注入的记忆激活加上上限（每次最多 5 条头部命中），「被检索曝光就自增激活度」的正反馈回路被消除；聊天召回本身不再计入使用。
+- mcp/console token 请求 `memory_access="read"` 不再被静默改写为 read-write，而是返回 422。
+- 偏好软路径只在 `source_quote` 内匹配偏好标记，英文标记要求词边界；无关候选不再被误降门槛。
+- 提取候选的实体列表清洗复合名称碎片（如「Dark Mode」不再拆出「Dark」），提示词同步约束实体完整性与中性配置偏好的 semantic 归类。
+- 整栈备份的 schema 版本常量收敛为单一事实源（`app/schema_versions.py`），恢复时校验支持区间并拒绝未知版本；错误路径不再留下半写文件。
+- 聊天 finalize outbox 补齐状态机：`done` 为终态不可回退、stale claim 清理、周期 drainer 兜底重试、完成后清除 payload。
+- `POST /providers/live-probe` 尊重 60s 缓存并支持显式 `force`，并发探测去重；该端点不再被误分类为不可逆操作而占用破坏性操作限流预算。
+
+### Added
+
+- Console「报告与备份」支持下载**整栈便携备份**（`POST /memories/stack-backup`）；Docker 拆分部署可附带 `X-Model-Gateway-Admin-Key` 拉取 Model 脱敏配置。
+- Model Gateway `GET /admin/portable-config`：admin 导出完整配置 JSON（仍不含 secrets.env）。
+- 工作室展示「最近未写入记忆」及原因（来自决策日志 ignore）。
+- 第一人称偏好句（如「我喜欢…」）对 semantic 等类型启用略低的 importance 门槛（soft path），假设/敏感门控不变。
+- `GET /providers/status?live_probe=true` 与 `POST /providers/live-probe`：探测 memory.chat 上游连通性（约 60s 缓存）；Console「模型与路由」可一键探测。
+- chat token 支持 `memory_access=read|read-write`：只读 token 可召回但禁止自动提取写入；接入页可选择。
+- 聊天 finalize **outbox**（`chat_finalize_jobs`）：提取意图先落库，进程重启后可恢复未完成的记忆写入。
+- 大库（≥2000 条）纯关键词检索改用 SQLite FTS5 索引生成候选再精排，打分与解释字段不变；小库、embedding 查询与单字/类别查询自动回退全表扫描。
+- 记忆详情在正文明显偏离原始来源时显示「可能经过编辑，原文仅供追溯」提示。
+- 工作台在「模型已就绪但还没有 chat token」时显示接入引导卡片：一键生成 token 并复制三行客户端配置。
+- 安装器支持 `MEMORY_IMAGE_REGISTRY` 指定 GHCR 镜像加速站，GitHub 直连失败时给出代理/镜像指引；回滚校验对任意 registry 的 digest 固定引用一视同仁。
+- usage 事件保留策略：Memory / Model Gateway 每日删除超过 365 天的用量明细（汇总不受影响）。
+
+### Changed
+
+- Memory / Model Gateway 默认关闭 `/docs`、`/redoc`、`/openapi.json`；开发可用 `MEMGW_ENABLE_OPENAPI=1` 或 `MODEL_GATEWAY_ENABLE_OPENAPI=1` 打开。
+- 渠道向导增加「TUN fake-ip 代理」勾选；知识库空态说明导入文档不会自动进入普通聊天；移动底栏主导航改为含「接入信息」。
+- 工作室与导航在 legacy 共享密钥仍启用时显示醒目迁移提示。
+- Docker 拓扑简化：`memory-gateway` 直接发布宿主端口，Model Gateway 保持私网不发布端口。
+- 安装器减负：Sigstore/Cosign 验证改为 `MEMORY_VERIFY_SIGNATURES=1` 显式开启（digest 固定不变）；Compose 拓扑校验移入 CI；升级备份收敛为停旧栈后的单次静默备份并做真实复验（ZIP CRC + SQLite quick_check）；`MEMORY_HOST` 允许任意本机 IPv4；端口被占自动顺延时显式提醒替换文档中的端口。
+- README 快速开始改写为三步凭据导览；Windows PowerShell 安装器标注为实验性；文档补充安装目录丢失后的重挂载恢复步骤。
+- Console token 展示统一默认掩码、显式「显示 token」切换；开发者页新增关闭 legacy key 的分步指引。
+
+### Removed
+
+- 删除 Model Gateway 前的 ingress TCP relay（`deploy/ingress_relay.py`）及其入口脚本接线；连接路径少一跳，安全边界由网络隔离与鉴权承担（见 `docs/security-audit-2026-08.md` 附录）。
+
 ## 0.3.0 - 2026-08-10
 
 ### Changed

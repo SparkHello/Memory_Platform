@@ -123,8 +123,8 @@ const STATUS_MESSAGES: Record<number, string> = {
   504: "上游服务响应超时，请稍后重试"
 };
 
-// 4xx 校验类错误保留服务端细节，帮助定位具体字段
-const DETAIL_STATUSES = new Set([400, 409, 422]);
+// 4xx 校验/权限类错误保留服务端细节，帮助定位具体字段或缺失的权限
+const DETAIL_STATUSES = new Set([400, 403, 409, 422]);
 
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) {

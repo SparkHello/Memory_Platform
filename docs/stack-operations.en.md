@@ -86,6 +86,8 @@ irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deplo
 & .\install-memory-platform.ps1
 ```
 
+> The Windows installer is currently **experimental**: it passed PowerShell syntax regression and containerized fault-injection tests, but has not yet completed a disaster-recovery drill on a real NTFS + Docker Desktop machine. Keep an extra manual backup of important data.
+
 Source installs listen on loopback by default. Pass `--host 0.0.0.0` explicitly only when LAN access is required.
 
 Do this only on trusted home networks or Tailscale. Every entry point still requires a scoped or migration-time credential, but never expose the service to the public internet.
@@ -209,6 +211,8 @@ scripts/memgw stack backup --output memory-stack.zip
 
 Backup v2 requires the memory database, knowledge database, Auth token hash database, redacted Model configuration, and a manifest that explicitly marks usage present or absent. It excludes provider, admin, backend, legacy Gateway, and device-token plaintext secrets.
 
+The stack backup (including the Console "Reports & backup" download button and `POST /memories/stack-backup`) is a **whole-instance** export: it contains the complete data of every user on the deployment, not only the requesting identity.
+
 Even without keys, the archive contains complete private memory and knowledge content. Treat it as a sensitive file.
 
 Restore to a new machine after installing dependencies:
@@ -248,6 +252,15 @@ docker compose -f docker-compose.user.yml up -d
 ```
 
 The portable archive never brings in or overwrites a target's secret volumes. Auth DB contains only token hashes, so known device token plaintext can migrate; the plaintext still exists only at the device. Stop both long-lived services before restore. The one-shot maintenance process validates disk space, hashes, SQLite integrity, schema, and `secrets_included=false`, then journals atomic replacement and retains a rollback copy.
+
+### Lost install directory while the data volumes survive
+
+Deleting the install directory (default `~/memory-platform`) does not lose data: the four Docker volumes live independently of it. To recover:
+
+1. Recreate the install directory and put `credentials/gateway.key` and `credentials/admin.key` back into its `credentials/` folder (if you kept copies elsewhere).
+2. Re-run the same one-line install command. The installer detects the four project volumes and reattaches to the old data.
+
+If both credential files are truly lost, the volumes are still intact but the credentials must be reset: create a new Console token with the maintenance container (`--profile maintenance run --rm stack-maintenance token create --role console ...`) and reset the admin key with `modelgw secret set memory-console-admin --stdin`. When the installer sees "four volumes present but credentials missing", it refuses to continue as a fresh install to avoid accidental re-initialization.
 
 ### Migrating from the former two-directory layout
 

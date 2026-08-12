@@ -22,6 +22,10 @@ _NANOS_PER_UNIT = Decimal("1000000000")
 _TOKENS_PER_MILLION = Decimal("1000000")
 _USAGE_DB_INIT_LOCK = threading.Lock()
 
+# Raw usage events power the Console cost views (30/90 day windows). One year
+# keeps every view working while bounding growth for always-on deployments.
+EVENT_RETENTION_DAYS = 365
+
 
 class _ClosingSQLiteConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
@@ -169,6 +173,23 @@ class UsageStore:
                 ),
             )
         return event_id
+
+    def prune(
+        self,
+        *,
+        retention_days: int = EVENT_RETENTION_DAYS,
+        now: datetime | None = None,
+    ) -> int:
+        """Delete usage events older than the retention window; returns count."""
+        cutoff = (
+            (now or datetime.now(UTC)) - timedelta(days=max(1, int(retention_days)))
+        ).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM model_usage_events WHERE created_at < ?",
+                (cutoff,),
+            )
+            return int(cursor.rowcount or 0)
 
     def summary(self, *, user_id: str, days: int | None = 30) -> dict[str, Any]:
         end = datetime.now(UTC)

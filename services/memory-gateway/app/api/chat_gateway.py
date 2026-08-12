@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
 from app.api.deps import (
+    get_auth_principal,
     get_chat_gateway_client,
     get_embedding_client,
     get_llm_client,
@@ -27,6 +28,7 @@ from app.api.deps import (
     get_user_id,
     require_api_key,
 )
+from app.auth.tokens import AuthPrincipal, MemoryAccess
 from app.config import Settings, get_settings
 from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import (
@@ -43,7 +45,12 @@ from app.memory.conversation_context import (
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import MemoryRecord, RecentContextSummary
 from app.memory.redaction import detect_text_sensitivity
-from app.memory.search import EmbeddingClient, MemorySearchService, NullEmbeddingClient
+from app.memory.search import (
+    ACTIVATION_LIMIT,
+    EmbeddingClient,
+    MemorySearchService,
+    NullEmbeddingClient,
+)
 from app.memory.store import MemoryStore
 from app.openai_compat.gateway_client import (
     GatewayUpstreamHTTPError,
@@ -270,6 +277,7 @@ async def chat_completions(
     body: Annotated[dict[str, Any], Body()],
     settings: Annotated[Settings, Depends(get_settings)],
     user_id: Annotated[str, Depends(get_user_id)],
+    principal: Annotated[AuthPrincipal, Depends(get_auth_principal)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     search_service: Annotated[
         MemorySearchService, Depends(get_memory_search_service)
@@ -286,6 +294,10 @@ async def chat_completions(
         memory_mode = _memory_mode(
             request.headers.get("X-Memory-Mode"),
             default=settings.chat_gateway_default_memory_mode,
+        )
+        memory_mode = _clamp_memory_mode_to_token(
+            memory_mode,
+            token_access=principal.memory_access,
         )
         conversation_id = _conversation_id(
             request.headers.get("X-Conversation-Id")
@@ -582,6 +594,17 @@ def _memory_mode(value: str | None, *, default: MemoryMode) -> MemoryMode:
             detail="X-Memory-Mode 只支持 off、read 或 read-write",
         )
     return normalized  # type: ignore[return-value]
+
+
+def _clamp_memory_mode_to_token(
+    mode: MemoryMode,
+    *,
+    token_access: MemoryAccess,
+) -> MemoryMode:
+    """read-only chat tokens may never trigger automatic extract/write."""
+    if token_access == "read" and mode == "read-write":
+        return "read"
+    return mode
 
 
 def _conversation_id(value: Any) -> str | None:
@@ -1394,7 +1417,9 @@ async def _finalize_turn(
             await anyio.to_thread.run_sync(
                 partial(
                     store.mark_memories_used,
-                    memory_ids=memory_ids,
+                    # 只强化真正注入并完成回答的头部记忆，与检索侧激活上限
+                    # 一致，避免"被检索曝光"就自增的正反馈。
+                    memory_ids=memory_ids[:ACTIVATION_LIMIT],
                     user_id=user_id,
                     time_ripple_delta=settings.time_ripple_delta,
                     time_ripple_window_hours=settings.time_ripple_window_hours,
@@ -1512,6 +1537,71 @@ async def _finalize_turn(
     ):
         return
     ingest_key = f"{key}\0{assistant_digest}"
+    job_id = hashlib.sha256(
+        f"ingest\0{user_id}\0{ingest_key}".encode("utf-8")
+    ).hexdigest()
+    # Durable intent before claim/process so crash recovery can finish extract.
+    try:
+        store.enqueue_chat_finalize_job(
+            job_id=job_id,
+            user_id=user_id,
+            kind="ingest",
+            claim_key=ingest_key,
+            payload={
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+                "conversation_id": source_conversation_id,
+                "extraction_context": extraction_context,
+                "context_quote_source": context_quote_source,
+            },
+        )
+    except Exception:
+        logger.exception("聊天网关无法写入 finalize outbox；继续尝试本轮提取。")
+    await _run_ingest_finalize_job(
+        store=store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+        settings=settings,
+        job_id=job_id,
+        user_id=user_id,
+        ingest_key=ingest_key,
+        user_text=user_text,
+        assistant_text=assistant_text,
+        conversation_id=source_conversation_id,
+        extraction_context=extraction_context,
+        context_quote_source=context_quote_source,
+    )
+
+
+async def _run_ingest_finalize_job(
+    *,
+    store: MemoryStore,
+    embedding_client: EmbeddingClient,
+    llm_client: OpenAICompatibleClient,
+    settings: Settings,
+    job_id: str,
+    user_id: str,
+    ingest_key: str,
+    user_text: str,
+    assistant_text: str,
+    conversation_id: str | None,
+    extraction_context: str | None,
+    context_quote_source: str | None,
+    force_reclaim: bool = False,
+) -> bool:
+    """Run one durable ingest job. Returns True when the job actually ran."""
+    if force_reclaim:
+        # Crash recovery: the previous worker died between claim and
+        # completion, leaving a persistent claim that would otherwise block
+        # this replay until its TTL expires.
+        _release_turn_side_effect(
+            cache=_INGESTED_TURNS,
+            store=store,
+            kind="ingest",
+            key=ingest_key,
+            user_id=user_id,
+        )
+
     if not _claim_turn_side_effect(
         cache=_INGESTED_TURNS,
         store=store,
@@ -1520,7 +1610,24 @@ async def _finalize_turn(
         user_id=user_id,
         ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
     ):
-        return
+        # Another worker is handling the same turn; leave job for recovery only
+        # if still pending after claim TTL.
+        return False
+    try:
+        # Mark running only after winning the claim so a losing duplicate
+        # delivery never overwrites the winner's state, and never after the
+        # winner already marked the job done (guarded in the store).
+        marked = store.mark_chat_finalize_job(
+            job_id=job_id,
+            status="running",
+            bump_attempts=True,
+        )
+        if not marked:
+            # Job already completed elsewhere; keep the claim so the turn is
+            # not re-ingested.
+            return False
+    except Exception:
+        logger.exception("聊天网关无法标记 finalize job 为 running")
     try:
         result = await MemoryIngestService(
             store=store,
@@ -1530,7 +1637,7 @@ async def _finalize_turn(
         ).ingest(
             user_id=user_id,
             text=user_text,
-            conversation_id=source_conversation_id,
+            conversation_id=conversation_id,
             assistant_message=assistant_text,
             conversation_context=extraction_context,
             context_quote_source=context_quote_source,
@@ -1544,7 +1651,15 @@ async def _finalize_turn(
                 key=ingest_key,
                 user_id=user_id,
             )
-    except Exception:
+            store.mark_chat_finalize_job(
+                job_id=job_id,
+                status="pending",
+                last_error=result.reason or "retryable_upstream",
+            )
+            return True
+        store.mark_chat_finalize_job(job_id=job_id, status="done")
+        return True
+    except Exception as exc:
         _release_turn_side_effect(
             cache=_INGESTED_TURNS,
             store=store,
@@ -1552,4 +1667,113 @@ async def _finalize_turn(
             key=ingest_key,
             user_id=user_id,
         )
+        try:
+            store.mark_chat_finalize_job(
+                job_id=job_id,
+                status="pending",
+                last_error=f"{type(exc).__name__}",
+            )
+        except Exception:
+            logger.exception("聊天网关无法回写 finalize job 状态")
         logger.exception("聊天网关后台提取长期记忆失败；不影响聊天响应。")
+        return True
+
+
+async def recover_pending_chat_finalize_jobs(
+    *,
+    store: MemoryStore,
+    embedding_client: EmbeddingClient,
+    llm_client: OpenAICompatibleClient,
+    settings: Settings,
+    limit: int = 10,
+) -> int:
+    """Replay durable ingest jobs left pending after a crash or restart."""
+    try:
+        jobs = await anyio.to_thread.run_sync(
+            partial(
+                store.list_recoverable_chat_finalize_jobs,
+                limit=limit,
+                stale_running_seconds=120.0,
+            )
+        )
+    except Exception:
+        logger.exception("聊天网关读取 finalize outbox 失败")
+        return 0
+    recovered = 0
+    for job in jobs:
+        if str(job.get("kind") or "") != "ingest":
+            continue
+        if int(job.get("attempts") or 0) >= 8:
+            try:
+                store.mark_chat_finalize_job(
+                    job_id=str(job["id"]),
+                    status="failed",
+                    last_error="max_attempts_exceeded",
+                )
+            except Exception:
+                logger.exception("无法将超次 finalize job 标记为 failed")
+            continue
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        executed = await _run_ingest_finalize_job(
+            store=store,
+            embedding_client=embedding_client,
+            llm_client=llm_client,
+            settings=settings,
+            job_id=str(job["id"]),
+            user_id=str(job.get("user_id") or "default"),
+            ingest_key=str(job.get("claim_key") or ""),
+            user_text=str(payload.get("user_text") or ""),
+            assistant_text=str(payload.get("assistant_text") or ""),
+            conversation_id=(
+                str(payload["conversation_id"])
+                if payload.get("conversation_id") is not None
+                else None
+            ),
+            extraction_context=(
+                str(payload["extraction_context"])
+                if payload.get("extraction_context") is not None
+                else None
+            ),
+            context_quote_source=(
+                str(payload["context_quote_source"])
+                if payload.get("context_quote_source") is not None
+                else None
+            ),
+            # A stale-running job means the previous worker crashed after
+            # claiming; its persistent claim must not block the replay.
+            force_reclaim=str(job.get("status") or "") == "running",
+        )
+        if executed:
+            recovered += 1
+    return recovered
+
+
+async def chat_finalize_outbox_drainer(
+    *,
+    store: MemoryStore,
+    embedding_client: EmbeddingClient,
+    llm_client: OpenAICompatibleClient,
+    settings: Settings,
+    interval_seconds: float = 300.0,
+    batch_limit: int = 10,
+) -> None:
+    """Background loop: replay leftover finalize jobs and cap terminal rows.
+
+    Runs once immediately at startup (crash recovery) and then periodically so
+    pending/retryable jobs drain without waiting for the next chat request.
+    """
+    while True:
+        try:
+            recovered = await recover_pending_chat_finalize_jobs(
+                store=store,
+                embedding_client=embedding_client,
+                llm_client=llm_client,
+                settings=settings,
+                limit=batch_limit,
+            )
+            if recovered:
+                logger.info("已恢复 %s 个聊天 finalize outbox 任务", recovered)
+            await anyio.to_thread.run_sync(store.prune_chat_finalize_jobs)
+        except Exception:
+            logger.exception("聊天 finalize outbox drainer 执行失败；将按周期重试。")
+        await asyncio.sleep(max(30.0, interval_seconds))

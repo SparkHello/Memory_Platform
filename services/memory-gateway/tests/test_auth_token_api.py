@@ -26,6 +26,7 @@ def test_console_rest_creates_only_device_tokens_and_never_repeats_secret(
     assert raw_token.startswith(f'mgw_{payload["record"]["token_id"]}_')
     assert payload["record"]["name"] == "Living room Chatbox"
     assert payload["record"]["role"] == "chat"
+    assert payload["record"]["memory_access"] == "read-write"
     assert payload["record"]["user_id"] == "default"
     assert "token" not in payload["record"]
     assert "token_hash" not in payload["record"]
@@ -57,6 +58,40 @@ def test_console_rest_creates_only_device_tokens_and_never_repeats_secret(
     assert injected_user.status_code == 422
     assert len(_store().list_tokens(user_id="default")) == 1
     assert _store().list_tokens(user_id="other") == []
+
+
+def test_console_can_create_read_only_chat_token(client, auth_headers) -> None:
+    created = client.post(
+        "/auth/tokens",
+        headers=auth_headers,
+        json={
+            "name": "Demo kiosk",
+            "role": "chat",
+            "memory_access": "read",
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["record"]["memory_access"] == "read"
+    record = _store().list_tokens(user_id="default")[-1]
+    assert record.memory_access == "read"
+
+
+def test_read_only_memory_access_is_rejected_for_non_chat_roles(
+    client, auth_headers
+) -> None:
+    before = len(_store().list_tokens(user_id="default"))
+    created = client.post(
+        "/auth/tokens",
+        headers=auth_headers,
+        json={
+            "name": "MCP read-only",
+            "role": "mcp",
+            "memory_access": "read",
+        },
+    )
+    assert created.status_code == 422
+    assert "chat token" in created.json()["detail"]
+    assert len(_store().list_tokens(user_id="default")) == before
 
 
 def test_token_management_requires_console_scope_and_is_user_isolated(client) -> None:

@@ -47,6 +47,28 @@ _TYPE_THRESHOLDS: dict[str, tuple[int, float]] = {
     "reflective": (5, 0.80),
 }
 
+# First-person preference statements (e.g. "我喜欢黑咖啡") are high-value for
+# personal assistants but models often score them around importance 5. Soften
+# only this narrow semantic path; sensitive / assumption gates still apply.
+_PREFERENCE_SOFT_IMPORTANCE = 5
+_PREFERENCE_SOFT_CONFIDENCE = 0.80
+_PREFERENCE_MARKERS = (
+    "我喜欢",
+    "我爱",
+    "我偏好",
+    "我习惯",
+    "我更喜欢",
+    "我不喜欢",
+    "我讨厌",
+    "我受不了",
+    "i like",
+    "i love",
+    "i prefer",
+    "i hate",
+    "i don't like",
+    "i do not like",
+)
+
 SENSITIVE_MIN_IMPORTANCE = 8
 SENSITIVE_MIN_CONFIDENCE = 0.9
 
@@ -815,6 +837,9 @@ def _validate_candidate_for_save(
     min_imp, min_conf = _TYPE_THRESHOLDS.get(
         candidate.type, (MIN_IMPORTANCE, MIN_CONFIDENCE)
     )
+    if _eligible_for_preference_soft_path(candidate, user_message=user_message):
+        min_imp = min(min_imp, _PREFERENCE_SOFT_IMPORTANCE)
+        min_conf = min(min_conf, _PREFERENCE_SOFT_CONFIDENCE)
     if candidate.importance < min_imp:
         return f"importance {candidate.importance} 低于保存阈值 {min_imp}（类型: {candidate.type}）"
     if candidate.confidence < min_conf:
@@ -838,6 +863,31 @@ def _validate_candidate_for_save(
     if marker:
         return f"假设场景（命中「{marker}」），不保存"
     return None
+
+
+def _eligible_for_preference_soft_path(
+    candidate: CandidateMemory,
+    *,
+    user_message: str | None,
+) -> bool:
+    """Allow slightly lower importance for clear first-person preferences."""
+    if candidate.type not in {"semantic", "procedural", "emotional"}:
+        return False
+    if str(getattr(candidate, "sensitivity", "normal") or "normal") != "normal":
+        # Sensitive content keeps the strict floors.
+        return False
+    # Only the verbatim evidence counts: a marker elsewhere in a long user
+    # message (or in model-written memory text) must not soften the floor for
+    # an unrelated candidate. English markers additionally require word
+    # boundaries so "i liked the alike design" does not match "i like".
+    haystack = (candidate.source_quote or "").lower()
+    for marker in _PREFERENCE_MARKERS:
+        if marker.isascii():
+            if re.search(rf"\b{re.escape(marker)}\b", haystack):
+                return True
+        elif marker in haystack:
+            return True
+    return False
 
 
 def _gate_reason(

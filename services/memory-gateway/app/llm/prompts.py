@@ -137,7 +137,7 @@ valid_until 只在用户明确给出截止日期、阶段或明显短期事实�
 valid_from 只在用户明确给出开始时间、任职/居住/使用状态开始生效时间，或当前事实必须带时间锚点时填写；无法确定时用 null。
 temporal_subject/temporal_predicate 只用于白名单 profile 槽位；不要发明其他谓词。白名单：current_employer（当前雇主/任职公司）、current_city（当前居住城市）、primary_ai_client（主要 AI 客户端）、primary_device（主力设备）、preferred_name（用户希望被称呼的名字）。
 只有用户明确表达“现在/目前/主要/默认/从某时开始”的当前状态，或“叫我/称呼我/我的名字是”这类称呼事实时，才填写 temporal_subject="用户" 和白名单 temporal_predicate；拿不准、只是普通补充、偏好、经历回顾或一次性事件时都填 null，避免误触发自动失效。
-topics/entities 必须是短数组：topics 用宽泛短标签，entities 只放用户原话中明确出现的实体名。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
+topics/entities 必须是短数组：topics 用宽泛短标签，entities 只放用户原话中明确出现的实体名。entities 必须是完整名称，不要从复合名称里拆出形容词或修饰词碎片（例如「Dark Mode」不要拆成「Dark」）；单独的颜色词、形容词不是实体。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
 temporal key 正例：用户说“我从 2026 年开始在 Acme 工作”，当前雇主可用 temporal_subject="用户"、temporal_predicate="current_employer"，并在日期明确时填写 valid_from；用户说“我现在主要用 Kelivo 当 AI 客户端”，当前主要 AI 客户端可用 temporal_subject="用户"、temporal_predicate="primary_ai_client"；用户说“以后叫我阿澈”，称呼可用 temporal_predicate="preferred_name"。
 temporal key 反例：用户喜欢黑咖啡、去年去过京都、总结出长文档先做提纲、一次性安排、含糊推断出的事实，都不要填写 temporal_subject/temporal_predicate。
 review_after 用于“可能会过期但不能确定”的记忆，例如最近在准备旅行、阶段性尝试某个习惯；没有明确复核价值时用 null，不要猜日期。
@@ -150,6 +150,7 @@ sensitivity 选择参考：普通偏好和事实用 normal；家庭、财务、�
 - emotional：用户表达的偏好、雷点、情绪、强烈态度或价值取向，例如“用户讨厌冗长解释”“用户喜欢简洁代码”。
 - reflective：用户对过去经验的总结、复盘或高层推论，例如“用户发现先收口 P0 再扩展更适合该项目”。
 当内容同时是“事实 + 偏好/雷点”时优先 emotional；当内容是“事实 + 流程步骤”时优先 procedural；当内容是“事实 + 复盘结论”时优先 reflective。
+注意：界面配色、主题、字号、默认设置这类中性的配置选择属于稳定事实，用 semantic 且 valence=0.5；只有用户明显带情绪或强烈态度（喜欢/讨厌/受不了）时才用 emotional 并调整 valence。
 用户明确说「记住」「别忘了」「以后记得」时，如果内容符合长期有用且非假设，应优先保存。
 
 以下内容一律输出 action 为 "ignore"：
@@ -233,12 +234,12 @@ MEMORY_BATCH_EXTRACTION_SYSTEM_PROMPT = """你是 memory-gateway 的记忆提取
 - 一条候选只表达一个长期事实、偏好、关系、人物、目标、项目或沟通风格。
 - 如果同一段话包含多个独立长期信息，拆成多条 memories。
 - 不要把多个无关事实塞进同一条 memory。
-- type 扇区选择必须尽量分散，不要把明显非事实类内容都塞进 semantic：事件经历用 episodic；稳定事实/人物/关系/背景用 semantic；流程步骤和操作方法用 procedural；情绪、偏好、雷点和强烈态度用 emotional；经验总结、复盘和高层推论用 reflective。事实+偏好优先 emotional，事实+流程优先 procedural，事实+复盘结论优先 reflective。
+- type 扇区选择必须尽量分散，不要把明显非事实类内容都塞进 semantic：事件经历用 episodic；稳定事实/人物/关系/背景用 semantic；流程步骤和操作方法用 procedural；情绪、偏好、雷点和强烈态度用 emotional；经验总结、复盘和高层推论用 reflective。事实+偏好优先 emotional，事实+流程优先 procedural，事实+复盘结论优先 reflective。界面配色、主题、字号、默认设置这类中性的配置选择用 semantic 且 valence=0.5，只有明显带情绪时才用 emotional。
 - 不要保存临时状态、玩笑、一次性安排、假设场景、模型推测或助手自己说的话。
 - 对敏感信息保持保守：健康、医疗、财务、证件、账号、精确住址等只有在用户明确说「记住」时才可输出保存候选，并标为 private 或 sensitive。
 - valid_from 只在用户明确给出开始时间、任职/居住/使用状态开始生效时间，或当前事实必须带时间锚点时填写；无法确定时用 null。
 - temporal_subject/temporal_predicate 只用于白名单 profile 槽位，不要发明其他谓词。白名单：current_employer、current_city、primary_ai_client、primary_device、preferred_name。只有用户明确表达当前状态，或“叫我/称呼我/我的名字是”这类称呼事实时才填写；拿不准、只是普通补充、偏好、经历回顾或一次性事件时都填 null。
-- topics/entities 必须是短数组：topics 用宽泛短标签，entities 只放用户原文中明确出现的实体名。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
+- topics/entities 必须是短数组：topics 用宽泛短标签，entities 只放用户原文中明确出现的实体名。entities 必须是完整名称，不要从复合名称里拆出形容词或修饰词碎片（例如「Dark Mode」不要拆成「Dark」）；单独的颜色词、形容词不是实体。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
 - temporal key 正例：用户说“我从 2026 年开始在 Acme 工作”，当前雇主可用 temporal_subject="用户"、temporal_predicate="current_employer"，并在日期明确时填写 valid_from；用户说“我现在主要用 Kelivo 当 AI 客户端”，当前主要 AI 客户端可用 temporal_subject="用户"、temporal_predicate="primary_ai_client"；用户说“以后叫我阿澈”，称呼可用 temporal_predicate="preferred_name"。
 - temporal key 反例：用户喜欢黑咖啡、去年去过京都、总结出长文档先做提纲、一次性安排、含糊推断出的事实，都不要填写 temporal_subject/temporal_predicate。
 - source_quote 必须是本轮用户原文里的逐字片段，禁止改写或编造；每条候选都要有自己的 source_quote。

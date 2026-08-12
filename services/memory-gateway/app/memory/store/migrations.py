@@ -8,6 +8,7 @@ from app.memory.store import conversation
 from app.memory.store import core_memory
 from app.memory.store import decision_logs
 from app.memory.store import schema_ensure
+from app.schema_versions import MEMORY_SCHEMA_VERSION
 
 # ---------------------------------------------------------------------------
 # Schema migrations (PRAGMA user_version)
@@ -67,10 +68,45 @@ def _memory_migration_v4(connection: sqlite3.Connection) -> None:
     )
 
 
+def _memory_migration_v5(connection: sqlite3.Connection) -> None:
+    # Durable finalize outbox: survives process crash between "answer complete"
+    # and long-term ingest. Payload is capped by chat gateway limits; no secrets.
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_finalize_jobs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            claim_key TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK(status IN ('pending', 'running', 'done', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(kind, claim_key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_finalize_jobs_status
+        ON chat_finalize_jobs(status, updated_at)
+        """
+    )
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
     (2, _memory_migration_v2),
     (3, _memory_migration_v3),
     (4, _memory_migration_v4),
+    (5, _memory_migration_v5),
 ]
+
+if _MEMORY_SCHEMA_MIGRATIONS[-1][0] != MEMORY_SCHEMA_VERSION:
+    raise RuntimeError(
+        "app.schema_versions.MEMORY_SCHEMA_VERSION 与 memory 迁移列表不一致"
+    )
 

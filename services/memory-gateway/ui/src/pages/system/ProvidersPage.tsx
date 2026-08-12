@@ -17,7 +17,7 @@ import {
   XCircle
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { isAbortError, type MemoryApi } from "../../api";
+import { ApiError, isAbortError, type MemoryApi } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
@@ -122,7 +122,21 @@ export function ProvidersPage({
       setError(null);
       try {
         const next = await api.providersStatus(signal);
-        setStatus(next);
+        setStatus((current) => {
+          // 常规 status 响应的 live_probe 为 null；不要让刷新覆盖掉
+          // 用户刚手动实测得到的探测结果。
+          if (current?.setup?.live_probe && next.setup && next.setup.live_probe == null) {
+            return {
+              ...next,
+              setup: {
+                ...next.setup,
+                live_probe: current.setup.live_probe,
+                upstream_ready: current.setup.upstream_ready
+              }
+            };
+          }
+          return next;
+        });
         if (!preserveDrafts) {
           setDrafts(routeDrafts(next.control));
           setValidatedSignature("");
@@ -282,6 +296,37 @@ export function ProvidersPage({
     }
   };
 
+  const runLiveProbe = async () => {
+    if (busyAction) return;
+    setBusyAction("live-probe");
+    setFeedback(null);
+    try {
+      const probe = await api.liveUpstreamProbe();
+      setStatus((current) =>
+        current
+          ? {
+              ...current,
+              setup: {
+                ...current.setup,
+                live_probe: probe,
+                upstream_ready: probe.ok
+              }
+            }
+          : current
+      );
+      setFeedback({
+        tone: probe.ok ? "success" : "error",
+        message: probe.ok
+          ? `上游可达（${probe.latency_ms ?? "?"} ms · ${probe.route || "chat"}）`
+          : `上游探测失败：${probe.message || probe.code}`
+      });
+    } catch (cause) {
+      setFeedback({ tone: "error", message: errorMessage(cause) });
+    } finally {
+      setBusyAction("");
+    }
+  };
+
   const checkAdminKey = async () => {
     if (!adminKey.trim() || adminCheck === "checking") return;
     setAdminCheck("checking");
@@ -296,7 +341,11 @@ export function ProvidersPage({
       }
     } catch (cause) {
       setAdminCheck("invalid");
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      const message =
+        cause instanceof ApiError && cause.status === 401
+          ? "验证失败：这不是 Model Gateway 的 admin 密钥。注意 admin 密钥（admin.key）与登录网页用的 Console token（gateway.key）是两把不同的钥匙。"
+          : errorMessage(cause);
+      setFeedback({ tone: "error", message });
     }
   };
 
@@ -441,7 +490,15 @@ export function ProvidersPage({
         <>
           {setupMode && <FirstRunProgress status={status} adminCheck={adminCheck} />}
           {status.config_error && <ErrorBlock message={`配置不可用：${status.config_error}`} />}
-          {!setupMode && <RuntimeBanner status={status} dirty={dirty} validated={validated} />}
+          {!setupMode && (
+            <RuntimeBanner
+              status={status}
+              dirty={dirty}
+              validated={validated}
+              onLiveProbe={() => void runLiveProbe()}
+              liveProbeBusy={busyAction === "live-probe"}
+            />
+          )}
 
           {feedback && (
             <div className={`provider-feedback is-${feedback.tone}`} role={feedback.tone === "error" ? "alert" : "status"}>
@@ -490,6 +547,7 @@ export function ProvidersPage({
                   api={api}
                   adminKey={adminKey}
                   control={status.control}
+                  confirm={confirm}
                   onClose={() => setWizardOpen(false)}
                 onCompleted={() => refreshAll(false)}
               />
@@ -1125,13 +1183,18 @@ function EditableRoute({
 function RuntimeBanner({
   status,
   dirty,
-  validated
+  validated,
+  onLiveProbe,
+  liveProbeBusy
 }: {
   status: ProvidersStatus;
   dirty: boolean;
   validated: boolean;
+  onLiveProbe?: () => void;
+  liveProbeBusy?: boolean;
 }) {
-  const { runtime, embedding } = status;
+  const { runtime, embedding, setup } = status;
+  const probe = setup.live_probe;
   return (
     <div className="runtime-banner">
       <div>
@@ -1159,6 +1222,29 @@ function RuntimeBanner({
       <div>
         <strong>页面状态</strong>
         <span>{validated ? "草稿已校验" : dirty ? "有未应用草稿" : "与运行配置一致"}</span>
+      </div>
+      <div>
+        <strong>上游探测</strong>
+        <span>
+          {probe
+            ? probe.ok
+              ? `可达 · ${probe.latency_ms ?? "?"} ms${probe.cached ? "（缓存）" : ""}`
+              : `失败 · ${probe.message || probe.code}`
+            : setup.chat_ready
+              ? "尚未探测"
+              : "配置未就绪"}
+        </span>
+        {onLiveProbe && setup.chat_ready && (
+          <button
+            type="button"
+            className="ghost-button compact"
+            onClick={onLiveProbe}
+            disabled={liveProbeBusy}
+            style={{ marginTop: 6 }}
+          >
+            {liveProbeBusy ? "探测中…" : "立即探测上游"}
+          </button>
+        )}
       </div>
     </div>
   );

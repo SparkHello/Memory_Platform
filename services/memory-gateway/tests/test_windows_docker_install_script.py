@@ -53,17 +53,21 @@ def test_windows_installer_never_accepts_or_recovers_secret_values_from_logs() -
 def test_windows_upgrade_backs_up_before_candidate_replacement_and_cleans_temp() -> None:
     text = _installer()
 
-    backup = text.index('Write-Step "准备升级前备份"')
+    snapshot = text.index('Write-Step "保存旧 Compose 快照"')
     download = text.index('Write-Step "下载 $release Compose 并校验"')
+    quiesced = text.index('Write-Step "旧服务已停写，创建并复验最终一致性备份"')
     replace = text.index(
         "Replace-ComposeAtomically $script:CandidateCompose $script:ComposePath",
         download,
     )
-    assert backup < download < replace
-    assert "stack backup --model-gateway-home /model-data" in text
+    assert snapshot < download < quiesced < replace
+    assert '"stack", "backup", "--model-gateway-home", "/model-data"' in text
     assert "docker cp" in text
-    assert "Remove-VolumeBackup" in text
-    assert "unlink(missing_ok=True)" in text
+    # 每次升级恰好一份停写一致性备份，并做真实复验（ZIP CRC + SQLite quick_check）。
+    assert "Test-BackupArchive" in text
+    assert "archive.testzip()" in text
+    assert "PRAGMA quick_check" in text
+    assert "import os,sys; os.unlink(sys.argv[1])" in text
     assert "pre-upgrade-$stamp.compose.yml" in text
     assert "MEMORY_BACKUP_RETENTION" in text
     assert "Remove-StaleHostBackups" in text
@@ -99,8 +103,9 @@ def test_windows_legacy_migration_is_offline_and_fail_closed_with_rollback() -> 
 def test_windows_acceptance_keeps_model_private_and_checks_health_regression() -> None:
     text = _installer()
 
-    assert 'Get-JsonPropertyValue $privateService "ports"' in text
-    assert '$ingressPorts = @(Get-JsonPropertyValue $modelService "ports")' in text
+    # 意外发布宿主端口的检查改为查 Docker 端口映射，而非宿主 curl。
+    assert "docker port $candidateId" in text
+    assert "意外发布宿主端口" in text
     assert "Model Gateway 2030 仅位于 Docker 内部网络" in text
     assert 'Wait-HttpEndpoint "http://127.0.0.1:$port/health" 180' in text
     assert 'Wait-HttpEndpoint "http://127.0.0.1:$port/readyz" 90' in text
@@ -109,9 +114,9 @@ def test_windows_acceptance_keeps_model_private_and_checks_health_regression() -
     assert "readiness 退化" in text
     assert "2030 仅位于 Docker 内部网络" in text
     assert "ports: !reset []" in text
-    assert "Test-SignedInternalComposeRuntime" in text
+    assert "Test-InternalOverrideCompose" in text
     assert "Wait-CandidateContainerHttp" in text
-    assert '"model-gateway"; Url = "http://127.0.0.1:2026/health"' in text
+    assert '"model-gateway"; Url = "http://127.0.0.1:2030/health"' in text
     assert "Test-CandidateCredential" in text
     internal_start = text.index('Write-Step "在无宿主发布端口的隔离模式启动候选服务"')
     commit = text.index("Mark-CutoverCommitted", internal_start)
@@ -142,8 +147,13 @@ def test_windows_release_authentication_covers_compose_and_all_images() -> None:
     assert "docker.yml@refs/tags/$Release" in text
     assert "https://token.actions.githubusercontent.com" in text
     assert text.count("Test-ReleaseSignature") >= 4
-    assert "Test-SignedComposeRuntime" in text
-    assert "/usr/local/libexec/memory-platform/validate_compose.py" in text
+    assert "Test-ReleaseComposeSignature" in text
+    # 验签默认跳过（镜像仍按不可变 digest 固定），MEMORY_VERIFY_SIGNATURES=1 显式开启。
+    assert "MEMORY_VERIFY_SIGNATURES" in text
+    assert "if ($verifySignatures)" in text
+    assert "已按默认跳过 Sigstore 签名验证" in text
+    # 完整拓扑隔离契约由仓库 CI 的 validate_compose.py 门禁强制。
+    assert "validate_compose.py" in text
 
 
 def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> None:
@@ -162,7 +172,8 @@ def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> N
     assert "publish_host" in text
     assert "publish_port" in text
     assert "Test-ImmutableOldImageReference" in text
-    assert "ghcr.io/sparkhello/memory-platform-init" in text
+    # 允许 MEMORY_IMAGE_REGISTRY 覆盖 registry 主机，仓库路径保持固定。
+    assert "sparkhello/memory-platform-init" in text
     assert "legacy_targets_absent" in text
     assert "Test-LegacyTargetVolumeExists" in text
     assert "Remove-LegacyTransactionVolumes" in text

@@ -44,7 +44,8 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   developer: Wrench
 };
 
-const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "providers"];
+// 接入信息放在主导航：首通后复制 chat token 是最高频步骤之一。
+const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "developer"];
 
 export type NavBadge = {
   text: string;

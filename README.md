@@ -79,9 +79,24 @@ curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSIO
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-脚本会：先用旧版本创建并验证备份 → 下载固定 release → 把三枚镜像解析为不可变 digest → 离线初始化或迁移 → 启动独立的 Memory/Model 容器。访问密钥不会进入环境变量、命令参数或 Docker 日志，只写入安装目录下的 `credentials/gateway.key` 与 `credentials/admin.key`（权限 `0600`）；终端只报告文件路径。首次启动需要 1–2 分钟，此时还要在网页中配置模型渠道后才能聊天。
+安装完成后记住两枚密钥文件、三步用法：
 
-重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。安装器会先备份，再升级，`/readyz` 退化时自动恢复旧 Compose 和数据。默认目录是 `~/memory-platform`。
+1. 用 `credentials/gateway.key` 里的 token 登录网页控制台 `http://127.0.0.1:2026/ui/`；
+2. 在「模型与路由」输入 `credentials/admin.key` 里的 admin key，配置模型渠道；
+3. 在网页里生成聊天 key（chat token），填进你的聊天客户端。
+
+首次启动需要 1–2 分钟；配置完模型渠道后即可聊天。密钥值不会进入环境变量、命令参数或 Docker 日志，只写入安装目录 `credentials/` 下的 `0600` 文件；终端只报告文件路径。
+
+<details>
+<summary>安装器实现细节（digest 固定、备份与升级策略、离线迁移）</summary>
+
+脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或迁移 → 启动独立的 Memory/Model 容器。
+
+重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。`/readyz` 退化时自动恢复旧 Compose 和数据。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。
+
+</details>
+
+国内网络直连 GHCR 或 GitHub 受阻时：脚本下载失败可先设代理（`HTTPS_PROXY=http://127.0.0.1:7890`）重跑；镜像拉取失败可设 `MEMORY_IMAGE_REGISTRY=<GHCR 镜像站域名>` 覆盖镜像源（只替换 registry 主机，仓库路径与 digest 固定不变）。
 
 ### 手工方式（想自己控制每一步）
 

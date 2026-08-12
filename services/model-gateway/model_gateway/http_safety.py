@@ -20,10 +20,10 @@ _ALLOWED_PRIVATE_SUPERNETS = tuple(
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
-        # RFC 2544 benchmarking space is non-global and is used by some
-        # sandboxed/transparent network environments as an explicit egress
-        # mapping.  It remains denied by default and may only be enabled with
-        # a caller-supplied CIDR (normally an exact /32).
+        # RFC 2544 benchmarking space is non-global and is used by Clash/Surge
+        # style TUN fake-ip mappings.  It remains denied by default and may
+        # only be enabled with an explicit caller-supplied CIDR inside the
+        # supernet (anything from the full /15 down to a single /32).
         str(_RFC2544_BENCHMARK_SUPERNET),
         "fc00::/7",
         "fe80::/10",
@@ -41,12 +41,9 @@ def normalize_private_networks(values: Iterable[str]) -> list[str]:
             network = ip_network(raw, strict=True)
         except ValueError as exc:
             raise ValueError("allowed_private_networks 必须是规范 CIDR") from exc
-        if (
-            network.version == 4
-            and network.subnet_of(_RFC2544_BENCHMARK_SUPERNET)
-            and network.prefixlen != 32
-        ):
-            raise ValueError("RFC 2544 映射只能显式允许单个 /32 地址")
+        # RFC 2544 (198.18.0.0/15) is non-global and used by Clash/Surge TUN
+        # fake-ip. Any CIDR inside that supernet may be listed explicitly
+        # (including /15 or /32). Unlisted addresses remain denied by default.
         if not any(
             network.version == parent.version and network.subnet_of(parent)
             for parent in _ALLOWED_PRIVATE_SUPERNETS
@@ -261,6 +258,7 @@ def _validate_resolved_addresses(
     resolved = {ip_address(value.split("%", 1)[0]) for value in values}
     if not resolved:
         raise ValueError("base_url hostname 没有可用地址")
+    blocked: list[str] = []
     for address in resolved:
         if hostname == "localhost":
             if address.is_loopback:
@@ -273,7 +271,22 @@ def _validate_resolved_addresses(
             for network in networks
         ):
             continue
-        raise ValueError("base_url hostname 解析到未显式允许的本地或私有地址")
+        blocked.append(str(address))
+    if blocked:
+        shown = ", ".join(sorted(blocked)[:8])
+        fake_ip_hint = ""
+        if any(
+            address.version == 4 and address in _RFC2544_BENCHMARK_SUPERNET
+            for address in (ip_address(item) for item in blocked)
+        ):
+            fake_ip_hint = (
+                " 若使用 Clash/Surge 等 TUN fake-ip，请在渠道 "
+                "allowed_private_networks 中显式加入 198.18.0.0/15，或关闭 fake-ip。"
+            )
+        raise ValueError(
+            f"base_url hostname 解析到未显式允许的本地或私有地址"
+            f"（{hostname} → {shown}）。{fake_ip_hint}".rstrip()
+        )
 
 
 def _has_control(value: str) -> bool:

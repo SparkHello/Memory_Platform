@@ -97,11 +97,14 @@ export interface ConnectionSettings {
 
 export type AuthTokenRole = "chat" | "mcp" | "console";
 
+export type AuthTokenMemoryAccess = "read" | "read-write";
+
 export interface AuthTokenRecord {
   token_id: string;
   name: string;
   user_id: string;
   role: AuthTokenRole;
+  memory_access?: AuthTokenMemoryAccess;
   created_at: string;
   last_used_at?: string | null;
   revoked_at?: string | null;
@@ -1448,5 +1451,14 @@ export interface ProvidersStatus {
     usable_chat_routes: string[];
     missing_chat_routes: string[];
     next_action: "configure_model" | "repair_model_gateway" | "connect_client";
+    live_probe?: {
+      ok: boolean;
+      code: string;
+      message: string;
+      latency_ms?: number;
+      cached?: boolean;
+      route?: string;
+    } | null;
+    upstream_ready?: boolean | null;
   };
 }

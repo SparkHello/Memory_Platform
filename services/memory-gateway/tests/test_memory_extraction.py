@@ -775,6 +775,107 @@ def test_type_specific_threshold_reflective_lower():
     assert rejection is None
 
 
+def test_preference_soft_path_accepts_semantic_importance_five():
+    """第一人称偏好句：semantic importance=5 可通过 soft path。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户喜欢黑咖啡。",
+        type="semantic",
+        importance=5,
+        confidence=0.85,
+        reason="",
+        source_quote="我喜欢黑咖啡",
+        sensitivity="normal",
+    )
+    rejection = validate_candidate_for_save(
+        c,
+        user_message="我喜欢黑咖啡。",
+        require_quote_in_user_message=True,
+    )
+    assert rejection is None
+
+
+def test_preference_soft_path_does_not_lower_generic_semantic():
+    """无偏好标记的 semantic 仍要求 importance≥6。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户在上海工作。",
+        type="semantic",
+        importance=5,
+        confidence=0.9,
+        reason="",
+        source_quote="我在上海工作",
+        sensitivity="normal",
+    )
+    rejection = validate_candidate_for_save(
+        c,
+        user_message="我在上海工作。",
+        require_quote_in_user_message=True,
+    )
+    assert rejection is not None
+    assert "importance" in rejection
+
+
+def test_preference_soft_path_requires_marker_in_source_quote():
+    """user_message 里其他句子的偏好标记不能软化无关候选。"""
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    c = CandidateMemory(
+        action="create",
+        memory="用户在上海工作。",
+        type="semantic",
+        importance=5,
+        confidence=0.9,
+        reason="",
+        source_quote="我在上海工作",
+        sensitivity="normal",
+    )
+    rejection = validate_candidate_for_save(
+        c,
+        user_message="我喜欢黑咖啡。我在上海工作。",
+        require_quote_in_user_message=True,
+    )
+    assert rejection is not None
+    assert "importance" in rejection
+
+
+def test_preference_soft_path_english_marker_needs_word_boundary():
+    """英文标记要求词边界：'alike' 不应命中 'i like'。"""
+    from app.memory.extractor import _eligible_for_preference_soft_path
+    from app.memory.models import CandidateMemory
+
+    boundary_miss = CandidateMemory(
+        action="create",
+        memory="User thinks the twins look alike.",
+        type="semantic",
+        importance=5,
+        confidence=0.9,
+        reason="",
+        source_quote="i think the twins look ai like designs do",
+        sensitivity="normal",
+    )
+    assert not _eligible_for_preference_soft_path(boundary_miss, user_message=None)
+
+    boundary_hit = CandidateMemory(
+        action="create",
+        memory="User likes black coffee.",
+        type="semantic",
+        importance=5,
+        confidence=0.9,
+        reason="",
+        source_quote="i like black coffee",
+        sensitivity="normal",
+    )
+    assert _eligible_for_preference_soft_path(boundary_hit, user_message=None)
+
+
 def test_type_specific_threshold_reflective_rejects_below_min():
     """reflective 类型: importance=4 (<5) 应被拒绝。"""
     from app.memory.extractor import validate_candidate_for_save
@@ -2143,3 +2244,19 @@ async def test_all_upstream_5xx_extraction_failures_are_retryable(
     assert result.status == "retryable_error"
     assert result.retryable is True
     assert result.ignored == 0
+
+
+def test_candidate_entities_drop_compound_fragments_and_duplicates() -> None:
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory="用户在界面上使用 Dark Mode。",
+        type="semantic",
+        importance=6,
+        confidence=0.9,
+        source_quote="我一直用 Dark Mode",
+        entities=["Dark Mode", "Dark", " dark mode ", "", "Kelivo"],
+    )
+
+    assert candidate.entities == ["Dark Mode", "Kelivo"]

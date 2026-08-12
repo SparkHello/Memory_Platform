@@ -196,6 +196,7 @@ def _authenticate(token: str, settings: Settings) -> AuthPrincipal | None:
             user_id=bound_user_id,
             role="legacy",
             legacy=True,
+            memory_access="read-write",
         )
     if not token.startswith("mgw_"):
         return None
@@ -214,6 +215,7 @@ def _authenticate(token: str, settings: Settings) -> AuthPrincipal | None:
         user_id=record.user_id,
         role=record.role,
         legacy=False,
+        memory_access=record.memory_access,
     )
 
 
@@ -233,6 +235,7 @@ def _bind_user(
         user_id=requested_user_id,
         role=principal.role,
         legacy=True,
+        memory_access=principal.memory_access,
     )
 
 
@@ -270,6 +273,8 @@ def _is_irreversible(scope: Scope) -> bool:
                 "/providers/routes/validate",
                 "/providers/channels/discover",
                 "/providers/channel-bundles/validate",
+                # 只读连通性探测：不修改任何配置，不应占用不可逆操作预算。
+                "/providers/live-probe",
             }
         )
     return path in {

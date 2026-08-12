@@ -1,7 +1,22 @@
 """/memories routes: export."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from functools import partial
+import os
+from pathlib import Path
+import tempfile
+
+import anyio.to_thread
+import httpx
+from fastapi import Header
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+
 from app.api.memories.common import *  # noqa: F403
+from app.cli_config import cli_paths
+from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
+from app.stack_backup import create_stack_backup, default_model_gateway_home
 
 @router.get("/report", response_model=None)
 def get_memory_report(
@@ -79,3 +94,202 @@ def restore_memories_from_export(
         include_deleted=body.include_deleted,
         dry_run=body.dry_run,
     )
+
+
+@router.post("/stack-backup", response_model=None)
+async def download_stack_backup(
+    settings: Annotated[Settings, Depends(get_settings)],
+    model_gateway_admin_key: Annotated[
+        str | None,
+        Header(
+            alias="X-Model-Gateway-Admin-Key",
+            description="当本机读不到 Model Gateway 数据目录时，用 admin 密钥拉取脱敏配置",
+        ),
+    ] = None,
+) -> Response:
+    """Download a portable stack zip (secrets excluded).
+
+    The archive contains the complete databases of **every user** on this
+    deployment, not only the requesting identity: stack backup is a whole
+    instance migration tool, not a per-user export.
+
+    Source installs usually have ``MODEL_GATEWAY_HOME`` on disk. Split Docker
+    Memory containers do not mount Model volumes; pass the Model admin key so
+    the gateway can fetch ``/admin/portable-config`` over the private network.
+    """
+    paths = cli_paths(os.environ.get("MEMGW_HOME", "").strip())
+    memory_db = Path(settings.database_path).expanduser()
+    knowledge_db = Path(settings.knowledge_database_path).expanduser()
+    auth_db = Path(settings.auth_database_path).expanduser()
+
+    model_home = Path(
+        os.environ.get("MODEL_GATEWAY_HOME", "").strip() or default_model_gateway_home()
+    ).expanduser()
+    local_config = model_home / "config.json"
+    model_config_override: Path | None = None
+    override_cleanup: Path | None = None
+    try:
+        if local_config.is_file():
+            model_gateway_home = model_home
+        else:
+            model_gateway_home = None
+            admin_key = (model_gateway_admin_key or "").strip()
+            if not admin_key:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "model_gateway_home_unavailable",
+                        "message": (
+                            "本进程读不到 Model Gateway 数据目录。"
+                            "请在请求头提供 X-Model-Gateway-Admin-Key，"
+                            "或在源码/同机部署中设置 MODEL_GATEWAY_HOME；"
+                            "Docker 也可用 maintenance 配置文件执行 memgw stack backup。"
+                        ),
+                    },
+                )
+            model_config_override = await _fetch_model_portable_config(
+                settings=settings,
+                admin_key=admin_key,
+            )
+            override_cleanup = model_config_override
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        destination = (
+            Path(tempfile.gettempdir())
+            / f"memory-stack-backup-{stamp}-{os.getpid()}.zip"
+        )
+        try:
+            # Snapshotting and zipping the databases is blocking, potentially
+            # multi-second work; keep the event loop free for other requests.
+            await anyio.to_thread.run_sync(
+                partial(
+                    create_stack_backup,
+                    destination=destination,
+                    paths=paths,
+                    memory_database=memory_db,
+                    knowledge_database=knowledge_db,
+                    auth_database=auth_db,
+                    model_gateway_home=model_gateway_home,
+                    model_config_override=model_config_override,
+                    force=True,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "stack_backup_failed", "message": str(exc)},
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                detail={
+                    "code": "stack_backup_storage",
+                    "message": f"无法写入备份：{type(exc).__name__}",
+                },
+            ) from exc
+
+        filename = f"memory-stack-backup-{stamp}.zip"
+        # Stream from disk instead of buffering the whole archive in memory;
+        # delete the temporary file only after the response has been sent.
+        return FileResponse(
+            destination,
+            media_type="application/zip",
+            filename=filename,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Backup-Scope": "all-users",
+            },
+            background=BackgroundTask(destination.unlink, missing_ok=True),
+        )
+    finally:
+        if override_cleanup is not None:
+            override_cleanup.unlink(missing_ok=True)
+
+
+async def _fetch_model_portable_config(
+    *,
+    settings: Settings,
+    admin_key: str,
+) -> Path:
+    try:
+        runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "model_runtime_unavailable", "message": str(exc)},
+        ) from exc
+    if not runtime.is_central:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "model_runtime_unavailable",
+                "message": "当前未启用中央 Model Gateway，无法远程拉取配置",
+            },
+        )
+    base = runtime.base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(
+                f"{base}/admin/portable-config",
+                headers={
+                    "Authorization": f"Bearer {admin_key}",
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "model_gateway_unreachable",
+                "message": f"无法连接 Model Gateway：{type(exc).__name__}",
+            },
+        ) from exc
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "model_admin_unauthorized",
+                "message": "Model Gateway admin 密钥无效",
+            },
+        )
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "model_admin_forbidden",
+                "message": "该密钥不是 Model Gateway admin 客户端",
+            },
+        )
+    if not response.is_success:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "model_portable_config_failed",
+                "message": f"拉取 Model 配置失败（HTTP {response.status_code}）",
+            },
+        )
+    try:
+        # Validate schema before packaging.
+        from model_gateway.models import GatewayConfig
+
+        GatewayConfig.model_validate_json(response.content)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "model_portable_config_invalid",
+                "message": "Model 返回的配置无法通过 schema 校验",
+            },
+        ) from exc
+    handle, name = tempfile.mkstemp(prefix="memgw-model-config-", suffix=".json")
+    os.close(handle)
+    path = Path(name)
+    path.write_bytes(response.content)
+    os.chmod(path, 0o600)
+    return path

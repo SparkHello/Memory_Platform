@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { MemoryApi } from "../../api";
+import type { ConfirmFn } from "../../hooks/useConfirm";
 import { loadSettings } from "../../storage";
 import type {
   ModelGatewayAdapter,
@@ -131,6 +132,9 @@ const CAPABILITY_OPTIONS: Array<{
   { key: "json_schema", label: "JSON Schema json_schema" }
 ];
 
+/** Clash/Surge TUN fake-ip range; only applied when the user opts in. */
+const FAKE_IP_CIDR = "198.18.0.0/15";
+
 function suggestEmbeddingSpace(operator: string, model: string, dimensions: string): string {
   const slug = model
     .trim()
@@ -141,6 +145,21 @@ function suggestEmbeddingSpace(operator: string, model: string, dimensions: stri
   const owner = operator.trim().toLowerCase() || "channel";
   const dims = dimensions.trim();
   return `${owner}.${slug}${dims ? `:${dims}` : ""}`;
+}
+
+function parseCidrList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function joinCidrList(items: string[]): string {
+  return Array.from(new Set(items)).join(", ");
+}
+
+function cidrListIncludesFakeIp(items: string[]): boolean {
+  return items.some((item) => item === FAKE_IP_CIDR || item.startsWith("198.18."));
 }
 
 function routePolicy(
@@ -161,12 +180,14 @@ export function NewChannelWizard({
   api,
   adminKey,
   control,
+  confirm,
   onClose,
   onCompleted
 }: {
   api: MemoryApi;
   adminKey: string;
   control: ModelGatewayControlSnapshot;
+  confirm: ConfirmFn;
   onClose: () => void;
   onCompleted: () => Promise<void> | void;
 }) {
@@ -199,6 +220,11 @@ export function NewChannelWizard({
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [done, setDone] = useState(false);
   const [appliedSummary, setAppliedSummary] = useState({ deployments: 0, routes: 0 });
+  /** One-time chat token minted after successful apply; never Console key. */
+  const [clientChatToken, setClientChatToken] = useState<string | null>(null);
+  const [clientTokenError, setClientTokenError] = useState<string | null>(null);
+  const [showClientToken, setShowClientToken] = useState(false);
+  const [clientTokenCopied, setClientTokenCopied] = useState(false);
 
   const hasAdminKey = Boolean(adminKey.trim());
   const models = discovery?.models || [];
@@ -208,6 +234,12 @@ export function NewChannelWizard({
   const currentEmbedding = embeddingRoute?.targets[0]
     ? control.deployments.find((deployment) => deployment.id === embeddingRoute.targets[0])
     : undefined;
+  const privateNetworkList = useMemo(
+    () => parseCidrList(allowedPrivateNetworks),
+    [allowedPrivateNetworks]
+  );
+  const fakeIpEnabled = cidrListIncludesFakeIp(privateNetworkList);
+  const clientBaseUrl = `${loadSettings().apiBaseUrl.replace(/\/+$/, "")}/v1`;
 
   const missingChatRoutes = useMemo(
     () => CHAT_ROUTE_IDS.filter((id) => !control.routes.some((route) => route.id === id)),
@@ -264,6 +296,18 @@ export function NewChannelWizard({
     invalidateBundle();
   };
 
+  const setFakeIpEnabled = (enabled: boolean) => {
+    const current = parseCidrList(allowedPrivateNetworks).filter(
+      (item) => item !== FAKE_IP_CIDR
+    );
+    if (enabled) {
+      setAllowedPrivateNetworks(joinCidrList([...current, FAKE_IP_CIDR]));
+    } else {
+      setAllowedPrivateNetworks(joinCidrList(current));
+    }
+    invalidateDiscovery();
+  };
+
   const discover = async () => {
     if (!hasAdminKey || busy || !operator.trim() || !baseUrl.trim() || !apiKey.trim()) return;
     setBusy("discover");
@@ -278,10 +322,7 @@ export function NewChannelWizard({
           base_url: baseUrl.trim(),
           adapter,
           auth_type: authType,
-          allowed_private_networks: allowedPrivateNetworks
-            .split(",")
-            .map((item) => item.trim())
-            .filter(Boolean),
+          allowed_private_networks: parseCidrList(allowedPrivateNetworks),
           models_endpoint: "/models"
         },
         adminKey.trim()
@@ -299,9 +340,15 @@ export function NewChannelWizard({
       });
     } catch (cause) {
       setDiscovery(null);
+      const detail = errorMessage(cause);
+      // 只有明确命中 fake-ip 网段特征时才引导用户勾选 TUN 选项；
+      // 泛化的"私网/安全校验"字样也会出现在与代理无关的错误里。
+      const looksLikeFakeIp = /198\.18|fake-ip/i.test(detail) && !fakeIpEnabled;
       setFeedback({
         tone: "error",
-        message: `${errorMessage(cause)}；候选渠道、密钥和 deployment 均未保存。`
+        message: looksLikeFakeIp
+          ? `${detail}；候选渠道、密钥和 deployment 均未保存。若本机使用 Clash/Surge TUN fake-ip，请勾选下方「使用 TUN fake-ip 代理」后重试发现。`
+          : `${detail}；候选渠道、密钥和 deployment 均未保存。`
       });
     } finally {
       setBusy("");
@@ -365,10 +412,7 @@ export function NewChannelWizard({
         auth_type: authType,
         plan,
         usage_scope: usageScope,
-        allowed_private_networks: allowedPrivateNetworks
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean)
+        allowed_private_networks: parseCidrList(allowedPrivateNetworks)
       },
       deployments: [
         {
@@ -437,6 +481,10 @@ export function NewChannelWizard({
     }
     setBusy("apply");
     setFeedback(null);
+    setClientChatToken(null);
+    setClientTokenError(null);
+    setShowClientToken(false);
+    setClientTokenCopied(false);
     try {
       const result = await api.applyProviderChannelBundle(bundle, adminKey.trim());
       setApiKey("");
@@ -450,13 +498,40 @@ export function NewChannelWizard({
       } catch {
         refreshFailed = true;
       }
+
+      // Mint a device chat token so "copy client config" never uses Console key.
+      let tokenOk = false;
+      try {
+        const dateTag = new Date().toISOString().slice(0, 10);
+        const tokenName = `${operator.trim() || "渠道"}-客户端-${dateTag}`.slice(0, 100);
+        const created = await api.createAuthToken(tokenName, "chat");
+        setClientChatToken(created.token);
+        tokenOk = true;
+      } catch (tokenCause) {
+        setClientTokenError(errorMessage(tokenCause));
+      }
+
       setDone(true);
-      setFeedback({
-        tone: refreshFailed ? "warning" : "success",
-        message: refreshFailed
-          ? "原子提交已经成功，但页面刷新失败；请手动刷新确认最新 revision，不要重复提交。"
-          : "渠道、密钥、deployment 和路由已在一次 CAS 提交中生效，无需重启。"
-      });
+      if (refreshFailed) {
+        setFeedback({
+          tone: "warning",
+          message:
+            "原子提交已经成功，但页面刷新失败；请手动刷新确认最新 revision，不要重复提交。"
+        });
+      } else if (!tokenOk) {
+        setFeedback({
+          tone: "warning",
+          message:
+            "渠道配置已生效，但自动创建 chat token 失败。请打开「接入信息」手动创建设备 token，切勿把 Console 密钥填进聊天客户端。"
+        });
+      } else {
+        setFeedback({
+          tone: "success",
+          message:
+            "渠道已生效，并已创建仅用于聊天的 chat token（明文只显示一次）。请复制下方客户端配置，不要使用 Console 或 admin 密钥。" +
+            "若之前为该渠道创建过 token，可在「接入信息」页撤销不再使用的旧 token。"
+        });
+      }
     } catch (cause) {
       setValidated(false);
       setFeedback({
@@ -469,18 +544,66 @@ export function NewChannelWizard({
   };
 
   const copyClientSettings = async () => {
-    const settings = loadSettings();
-    const clientBaseUrl = `${settings.apiBaseUrl.replace(/\/+$/, "")}/v1`;
-    await copyText(`Base URL: ${clientBaseUrl}\nAPI Key: ${settings.apiKey}\n模型名: memory-auto`);
-    setFeedback({ tone: "success", message: "客户端配置已复制；内容包含访问密钥，请妥善保管。" });
+    if (!clientChatToken) {
+      setFeedback({
+        tone: "error",
+        message:
+          "还没有 chat token 可复制。请到「接入信息」为该设备创建 chat token；不会用 Console 密钥冒充客户端密钥。"
+      });
+      return;
+    }
+    try {
+      await copyText(
+        `Base URL: ${clientBaseUrl}\nAPI Key: ${clientChatToken}\n模型名: memory-auto`
+      );
+      setClientTokenCopied(true);
+      setFeedback({
+        tone: "success",
+        message: "客户端配置已复制（含 chat token）；请勿分享给他人或填入管理端。"
+      });
+    } catch (cause) {
+      setFeedback({
+        tone: "error",
+        message:
+          `复制失败：${errorMessage(cause)}。局域网 HTTP 页面浏览器可能禁止自动复制；` +
+          "请点击「显示 token」后手动选中并复制。"
+      });
+    }
+  };
+
+  const requestClose = async () => {
+    // 原子提交进行中禁止关闭：结果未知时关闭会让用户既拿不到 token 也不知道是否已生效。
+    if (busy === "apply") return;
+    if (done) {
+      if (clientChatToken && !clientTokenCopied) {
+        const confirmed = await confirm({
+          title: "chat token 只显示这一次",
+          message:
+            "关闭后将无法再查看这个 chat token 明文，只能撤销后重新创建。确认已把客户端配置保存到安全的地方了吗？",
+          confirmLabel: "已保存，关闭",
+          cancelLabel: "返回复制",
+          tone: "warning"
+        });
+        if (!confirmed) return;
+      }
+      onClose();
+      return;
+    }
+    if (apiKey.trim()) {
+      const confirmed = await confirm({
+        title: "丢弃未保存的渠道配置？",
+        message: "已填写的供应商 API Key 与表单内容不会保存，关闭后需要重新输入。",
+        confirmLabel: "丢弃并关闭",
+        cancelLabel: "继续编辑",
+        tone: "warning"
+      });
+      if (!confirmed) return;
+    }
+    onClose();
   };
 
   const embeddingReplacement =
     embeddingEnabled && embeddingRoute && embeddingRouteOperation === "replace";
-  const privateNetworkList = allowedPrivateNetworks
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
 
   return (
     <section className="panel provider-editor-section provider-wizard" aria-labelledby="new-channel-title">
@@ -489,7 +612,14 @@ export function NewChannelWizard({
           <h2 id="new-channel-title">新建渠道</h2>
           <p>先只读发现模型，再校验整套 bundle；只有最后确认时才原子保存。</p>
         </div>
-        <button type="button" className="icon-button" onClick={onClose} aria-label="关闭新建渠道" title="关闭">
+        <button
+          type="button"
+          className="icon-button"
+          onClick={() => void requestClose()}
+          disabled={busy === "apply"}
+          aria-label="关闭新建渠道"
+          title={busy === "apply" ? "正在原子应用，暂不能关闭" : "关闭"}
+        >
           <X size={16} aria-hidden />
         </button>
       </div>
@@ -506,18 +636,52 @@ export function NewChannelWizard({
           <div className="provider-wizard-step">
             <h3><CheckCircle2 size={18} aria-hidden /> 模型配置完成</h3>
             <p className="provider-wizard-hint">
-              已保存 {appliedSummary.deployments} 个 deployment，变更 {appliedSummary.routes} 条路由。现在可连接 OpenAI 兼容客户端。
+              已保存 {appliedSummary.deployments} 个 deployment，变更 {appliedSummary.routes} 条路由。
+              请用下方 <strong>chat token</strong> 连接 OpenAI 兼容客户端；Console / admin 密钥不能填进 Chatbox 等聊天应用。
             </p>
             <div className="client-config-summary">
               <span><small>类型</small><strong>OpenAI 兼容 · Chat Completions</strong></span>
-              <span><small>Base URL</small><code>{loadSettings().apiBaseUrl.replace(/\/+$/, "")}/v1</code></span>
+              <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
               <span><small>模型名</small><code>memory-auto</code></span>
+              <span>
+                <small>API Key（chat token）</small>
+                {clientChatToken ? (
+                  <code className="client-token-value">
+                    {showClientToken
+                      ? clientChatToken
+                      : `${clientChatToken.slice(0, 12)}…${clientChatToken.slice(-4)}`}
+                  </code>
+                ) : (
+                  <strong className="text-warning">未创建 — 请到「接入信息」手动创建</strong>
+                )}
+              </span>
             </div>
+            {clientTokenError && (
+              <div className="provider-feedback is-warning" role="status">
+                <TriangleAlert size={18} aria-hidden />
+                <span>自动创建 chat token 失败：{clientTokenError}</span>
+              </div>
+            )}
             <div className="provider-wizard-actions">
-              <button type="button" className="secondary-button" onClick={() => void copyClientSettings()}>
+              {clientChatToken && (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setShowClientToken((value) => !value)}
+                >
+                  {showClientToken ? <EyeOff size={16} aria-hidden /> : <Eye size={16} aria-hidden />}
+                  {showClientToken ? "隐藏 token" : "显示 token"}
+                </button>
+              )}
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void copyClientSettings()}
+                disabled={!clientChatToken}
+              >
                 <ClipboardCopy size={16} aria-hidden />复制客户端配置
               </button>
-              <button type="button" className="primary-button" onClick={onClose}>完成</button>
+              <button type="button" className="primary-button" onClick={() => void requestClose()}>完成</button>
             </div>
           </div>
         ) : (
@@ -629,12 +793,29 @@ export function NewChannelWizard({
                       value={allowedPrivateNetworks}
                       onChange={(event) => { setAllowedPrivateNetworks(event.target.value); invalidateDiscovery(); }}
                       spellCheck={false}
-                      placeholder="例如 192.168.50.0/24"
+                      placeholder="例如 192.168.50.0/24 或 198.18.0.0/15"
                       disabled={Boolean(busy)}
                     />
                   </label>
+                  <label className="field-block provider-checkbox-field">
+                    <span>TUN fake-ip 代理</span>
+                    <label className="inline-check">
+                      <input
+                        type="checkbox"
+                        checked={fakeIpEnabled}
+                        onChange={(event) => setFakeIpEnabled(event.target.checked)}
+                        disabled={Boolean(busy)}
+                      />
+                      使用 Clash/Surge 等 TUN fake-ip（写入 198.18.0.0/15）
+                    </label>
+                  </label>
                 </div>
-                {privateNetworkList.length > 0 && <p className="provider-wizard-hint">只会允许显式列出的私网段，不会放开任意内网访问。</p>}
+                <p className="provider-wizard-hint">
+                  只会允许显式列出的私网段，不会放开任意内网访问。
+                  {fakeIpEnabled
+                    ? " 已允许 RFC 2544 fake-ip 段；仅在你确实使用此类代理时勾选。"
+                    : " 若发现模型时报「解析到未允许的私网/198.18」，再勾选 fake-ip。"}
+                </p>
               </details>
 
               {usageScope !== "backend_allowed" && (

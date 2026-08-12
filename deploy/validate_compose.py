@@ -65,7 +65,8 @@ def validate_compose(
             "tmpfs",
             "user",
             "volumes",
-        },
+        }
+        | ({"ports"} if publish_ingress else set()),
         "model-gateway": {
             "cap_drop",
             "command",
@@ -84,8 +85,7 @@ def validate_compose(
             "tmpfs",
             "user",
             "volumes",
-        }
-        | ({"ports"} if publish_ingress else set()),
+        },
         "stack-init": {
             "cap_add",
             "cap_drop",
@@ -273,7 +273,7 @@ def validate_compose(
                 "CMD",
                 "python",
                 "-c",
-                "import socket,sys,urllib.request; s=socket.create_connection(('127.0.0.1',2026),timeout=3); s.close(); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2030/health',timeout=3).status==200 else 1)",
+                "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2030/health',timeout=3).status==200 else 1)",
             ],
             "timeout": "5s",
             "interval": "10s",
@@ -290,7 +290,7 @@ def validate_compose(
         "model_healthcheck",
     )
     _require(
-        set((memory.get("networks") or {}).keys()) == {"backend"},
+        set((memory.get("networks") or {}).keys()) == {"backend", "ingress"},
         "memory_networks",
     )
     _require(
@@ -317,12 +317,12 @@ def validate_compose(
         "maintenance_network",
     )
     _require(
-        not memory.get("ports")
+        not model.get("ports")
         and not initializer.get("ports")
         and not maintenance.get("ports"),
         "private_ports",
     )
-    ports = model.get("ports") or []
+    ports = memory.get("ports") or []
     if publish_ingress:
         _require(len(ports) == 1, "ingress_port_count")
         published = ports[0]
@@ -424,13 +424,17 @@ def validate_compose(
     _require(bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project)), "project_name")
     networks = configuration.get("networks") or {}
     _require(
-        set(networks) == {"backend", "provider-egress"},
+        set(networks) == {"backend", "ingress", "provider-egress"},
         "network_set",
     )
     _require(
         networks["backend"]
         == {"name": f"{project}_backend", "ipam": {}, "internal": True},
         "backend_network",
+    )
+    _require(
+        networks["ingress"] == {"name": f"{project}_ingress", "ipam": {}},
+        "ingress_network",
     )
     _require(
         networks["provider-egress"]

@@ -4,9 +4,13 @@ import {
   Brain,
   CheckCircle2,
   ChevronDown,
+  ClipboardCopy,
   Download,
+  Eye,
+  EyeOff,
   GitBranch,
   Layers3,
+  PlugZap,
   RefreshCcw,
   ShieldAlert,
   SlidersHorizontal,
@@ -67,6 +71,10 @@ type DashboardData = {
   spaces: MemorySpace[];
   evalProgress: EvalProgress | null;
   setup: ProvidersStatus["setup"] | null;
+  legacyKeyEnabled: boolean;
+  authenticatedWithLegacyKey: boolean;
+  // token 列表拉取失败时为 null，避免误判"没有 chat token"而弹首登卡。
+  hasChatToken: boolean | null;
 };
 
 type NetworkFilters = {
@@ -182,30 +190,32 @@ export function DashboardPage({
       const density =
         NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) ||
         NETWORK_DENSITY_OPTIONS[0];
-      const [health, report, review, logs, surfaced, network, spaces, workbench, providers] = await Promise.all([
-        api.health(signal),
-        api.memoryReport(signal),
-        api.reviewMemories(signal),
-        api.decisionLogs(10, {}, signal),
-        api.surfaceMemories(6, nextSurfaceMode, { redactSensitive: true }, signal),
-        api.memoryNetwork({
-          limit: density.limit,
-          similarityThreshold: 0.42,
-          maxSimilarityEdges: density.maxSimilarityEdges,
-          spaceId: nextFilters.spaceId === "all" ? undefined : nextFilters.spaceId,
-          type: nextFilters.type === "all" ? undefined : nextFilters.type,
-          sensitivity:
-            nextFilters.sensitivity === "all" ? undefined : nextFilters.sensitivity,
-          valenceMin: nextFilters.valenceMin,
-          valenceMax: nextFilters.valenceMax,
-          arousalMin: nextFilters.arousalMin,
-          arousalMax: nextFilters.arousalMax,
-          redactSensitive: true
-        }, signal),
-        api.listMemorySpaces(signal),
-        api.recallEvaluationWorkbench({}, signal).catch(() => null),
-        api.providersStatus(signal).catch(() => null)
-      ]);
+      const [health, report, review, logs, surfaced, network, spaces, workbench, providers, tokens] =
+        await Promise.all([
+          api.health(signal),
+          api.memoryReport(signal),
+          api.reviewMemories(signal),
+          api.decisionLogs(10, {}, signal),
+          api.surfaceMemories(6, nextSurfaceMode, { redactSensitive: true }, signal),
+          api.memoryNetwork({
+            limit: density.limit,
+            similarityThreshold: 0.42,
+            maxSimilarityEdges: density.maxSimilarityEdges,
+            spaceId: nextFilters.spaceId === "all" ? undefined : nextFilters.spaceId,
+            type: nextFilters.type === "all" ? undefined : nextFilters.type,
+            sensitivity:
+              nextFilters.sensitivity === "all" ? undefined : nextFilters.sensitivity,
+            valenceMin: nextFilters.valenceMin,
+            valenceMax: nextFilters.valenceMax,
+            arousalMin: nextFilters.arousalMin,
+            arousalMax: nextFilters.arousalMax,
+            redactSensitive: true
+          }, signal),
+          api.listMemorySpaces(signal),
+          api.recallEvaluationWorkbench({}, signal).catch(() => null),
+          api.providersStatus(signal).catch(() => null),
+          api.authTokens(signal).catch(() => null)
+        ]);
       setState({
         loading: false,
         error: null,
@@ -218,7 +228,14 @@ export function DashboardPage({
           network,
           spaces,
           evalProgress: summarizeEvalProgress(workbench),
-          setup: providers?.setup || null
+          setup: providers?.setup || null,
+          legacyKeyEnabled: Boolean(tokens?.legacy_key_enabled),
+          authenticatedWithLegacyKey: Boolean(tokens?.authenticated_with_legacy_key),
+          hasChatToken: tokens
+            ? tokens.data.some(
+                (record) => record.role === "chat" && !record.revoked_at
+              )
+            : null
         }
       });
     } catch (error) {
@@ -357,6 +374,12 @@ export function DashboardPage({
     : [];
 
   const actions = data ? buildStudioActions(data) : [];
+  const recentIgnores = useMemo(() => {
+    if (!data) return [];
+    return data.logs
+      .filter((log) => log.decision === "ignore")
+      .slice(0, 5);
+  }, [data]);
   const todayText = useMemo(
     () => new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" }),
     []
@@ -450,7 +473,38 @@ export function DashboardPage({
             )}
           </section>
 
+          {data.setup?.chat_ready &&
+            data.setup.next_action === "connect_client" &&
+            data.hasChatToken === false && (
+              <ConnectClientCard api={api} settings={settings} notify={notify} />
+            )}
+
           <MetricStrip metrics={metrics} />
+
+          {recentIgnores.length > 0 && (
+            <section className="panel panel--quiet ingest-skip-panel" aria-label="最近未写入记忆">
+              <div className="panel-header">
+                <h2>
+                  <ShieldAlert size={18} />
+                  最近未写入记忆
+                </h2>
+                <button className="ghost-button compact" type="button" onClick={() => setPage("logs")}>
+                  打开决策日志
+                </button>
+              </div>
+              <p className="muted ingest-skip-hint">
+                系统保守保存：不是所有对话都会落库。下面是最近几条被跳过的原因，便于确认「没记住」是设计而非故障。
+              </p>
+              <ul className="ingest-skip-list">
+                {recentIgnores.map((log) => (
+                  <li key={log.id}>
+                    <time dateTime={log.created_at}>{dateText(log.created_at)}</time>
+                    <span>{log.reason || "未记录原因"}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           <div className="studio-grid">
             <div className="studio-main">
@@ -1033,6 +1087,111 @@ function EmotionQuadrant({ valence, arousal }: { valence: number; arousal: numbe
   );
 }
 
+function ConnectClientCard({
+  api,
+  settings,
+  notify
+}: {
+  api: MemoryApi;
+  settings: ConnectionSettings;
+  notify: Notify;
+}) {
+  const [token, setToken] = useState<string | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const clientBaseUrl = `${settings.apiBaseUrl.replace(/\/+$/, "")}/v1`;
+
+  const createToken = async () => {
+    setCreating(true);
+    try {
+      const dateTag = new Date().toISOString().slice(0, 10);
+      const result = await api.createAuthToken(`我的第一台设备 · ${dateTag}`, "chat");
+      setToken(result.token);
+      notify("chat token 已创建；明文只显示这一次，请立即保存到客户端。", "success");
+    } catch (error) {
+      notify(`创建 chat token 失败：${errorMessage(error)}`, "error");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const copyConfig = async () => {
+    if (!token) return;
+    try {
+      await navigator.clipboard.writeText(
+        `Base URL: ${clientBaseUrl}\nAPI Key: ${token}\n模型名: memory-auto`
+      );
+      notify("客户端配置已复制（含 chat token）；请勿分享给他人。", "success");
+    } catch (error) {
+      notify(
+        `复制失败：${errorMessage(error)}。局域网 HTTP 页面浏览器可能禁止自动复制；请点击「显示 token」后手动选中复制。`,
+        "error"
+      );
+    }
+  };
+
+  return (
+    <section className="panel connect-client-panel" aria-labelledby="connect-client-title">
+      <div className="panel-header">
+        <h2 id="connect-client-title">
+          <PlugZap size={18} />
+          连接你的第一个聊天客户端
+        </h2>
+      </div>
+      <p className="muted">
+        模型已就绪，但还没有任何设备接入。生成一枚 chat token，把下面三行填进
+        OpenAI 兼容客户端（如 Chatbox、Lobe Chat）即可开始积累记忆。
+      </p>
+      <div className="client-config-summary">
+        <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
+        <span><small>模型名</small><code>memory-auto</code></span>
+        <span>
+          <small>API Key（chat token）</small>
+          {token ? (
+            <code className="client-token-value">
+              {showToken ? token : `${token.slice(0, 12)}…${token.slice(-4)}`}
+            </code>
+          ) : (
+            <strong className="text-warning">未创建 — 点击下方按钮生成</strong>
+          )}
+        </span>
+      </div>
+      <div className="provider-wizard-actions">
+        {token ? (
+          <>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setShowToken((value) => !value)}
+            >
+              {showToken ? <EyeOff size={16} aria-hidden /> : <Eye size={16} aria-hidden />}
+              {showToken ? "隐藏 token" : "显示 token"}
+            </button>
+            <button type="button" className="primary-button" onClick={() => void copyConfig()}>
+              <ClipboardCopy size={16} aria-hidden />
+              复制客户端配置
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void createToken()}
+            disabled={creating}
+          >
+            {creating ? "正在创建…" : "生成 chat token"}
+          </button>
+        )}
+      </div>
+      {token && (
+        <p className="muted">
+          token 明文只显示这一次；丢失后到「接入信息」撤销并重新创建即可。
+        </p>
+      )}
+    </section>
+  );
+}
+
 function buildStudioActions(data: DashboardData): StudioAction[] {
   const list: StudioAction[] = [];
   if (data.setup && !data.setup.chat_ready) {
@@ -1043,6 +1202,18 @@ function buildStudioActions(data: DashboardData): StudioAction[] {
       value: "还差一步",
       hint: "选择模型渠道并验证后，客户端才能正常聊天",
       page: "providers"
+    });
+  }
+  if (data.legacyKeyEnabled) {
+    list.push({
+      key: "legacy-key",
+      tone: "warning",
+      title: data.authenticatedWithLegacyKey
+        ? "仍在使用旧共享密钥"
+        : "旧共享密钥仍启用",
+      value: "需迁移",
+      hint: "旧 key 同时拥有聊天、MCP 与 Console 权限；请到接入信息改用 scoped token 后关闭 legacy",
+      page: "developer"
     });
   }
   const reviewCount = data.review.recommendations.length;

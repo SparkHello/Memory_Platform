@@ -15,6 +15,7 @@ from app.auth.tokens import (
     AuthTokenRecord,
     AuthTokenStore,
     LastActiveConsoleTokenError,
+    MemoryAccess,
 )
 from app.config import Settings, get_settings
 
@@ -31,6 +32,7 @@ class AuthTokenView(BaseModel):
     name: str
     user_id: str
     role: AuthRole
+    memory_access: MemoryAccess = "read-write"
     created_at: str
     last_used_at: str | None
     revoked_at: str | None
@@ -54,6 +56,8 @@ class AuthTokenCreateRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=100)
     role: Literal["chat", "mcp"]
+    # Only meaningful for chat tokens: read = proxy + recall, no auto extract.
+    memory_access: MemoryAccess = "read-write"
 
 
 class AuthTokenCreateResponse(BaseModel):
@@ -115,6 +119,7 @@ def create_auth_token(
             name=body.name,
             user_id=principal.user_id,
             role=body.role,
+            memory_access=body.memory_access,
         )
     except AuthStoreError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -199,6 +204,7 @@ def _token_view(
         name=record.name,
         user_id=record.user_id,
         role=record.role,
+        memory_access=record.memory_access,
         created_at=record.created_at,
         last_used_at=record.last_used_at,
         revoked_at=record.revoked_at,

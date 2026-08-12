@@ -11,11 +11,17 @@ import zipfile
 import pytest
 
 import app.stack_backup as stack_backup_module
+from app.auth.tokens import AuthTokenStore
 from app.cli_config import (
     cli_paths,
     initialize_cli,
     read_env_file,
     update_env_value,
+)
+from app.schema_versions import (
+    AUTH_SCHEMA_VERSION,
+    KNOWLEDGE_SCHEMA_VERSION,
+    MEMORY_SCHEMA_VERSION,
 )
 from app.stack_backup import (
     create_stack_backup as _create_stack_backup,
@@ -44,12 +50,22 @@ def restore_stack_backup(**kwargs):
 
 def _database(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.name == "auth.db":
+        # Real store schema (current version), not a handwritten replica: the
+        # backup validator must accept exactly what production writes.
+        store = AuthTokenStore(path)
+        store.init_db()
+        store.create_token(name="fixture", user_id="default", role="console")
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE sample (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO sample(value) VALUES (?)", (value,))
+        return
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE sample (value TEXT NOT NULL)")
         connection.execute("INSERT INTO sample(value) VALUES (?)", (value,))
         if path.name == "memory.db":
             connection.executescript(
-                """
+                f"""
                 CREATE TABLE memories (
                     id TEXT, user_id TEXT, content TEXT, type TEXT, archived INTEGER
                 );
@@ -57,12 +73,12 @@ def _database(path: Path, value: str) -> None:
                 CREATE TABLE core_memory_sections (
                     id TEXT, user_id TEXT, section TEXT, content TEXT
                 );
-                PRAGMA user_version = 4;
+                PRAGMA user_version = {MEMORY_SCHEMA_VERSION};
                 """
             )
         elif path.name == "knowledge.db":
             connection.executescript(
-                """
+                f"""
                 CREATE TABLE knowledge_documents (
                     id TEXT, user_id TEXT, title TEXT, status TEXT
                 );
@@ -72,17 +88,7 @@ def _database(path: Path, value: str) -> None:
                 CREATE TABLE knowledge_chunks (
                     id TEXT, version_id TEXT, ordinal INTEGER, content TEXT
                 );
-                PRAGMA user_version = 2;
-                """
-            )
-        elif path.name == "auth.db":
-            connection.executescript(
-                """
-                CREATE TABLE auth_tokens (
-                    token_hash TEXT, name TEXT, user_id TEXT, role TEXT,
-                    created_at TEXT, revoked_at TEXT
-                );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = {KNOWLEDGE_SCHEMA_VERSION};
                 """
             )
         elif path.name == "usage.db":
@@ -155,6 +161,31 @@ def _fixture(tmp_path: Path):
     return paths, memory_database, knowledge_database, model_home
 
 
+def test_stack_backup_endpoint_streams_zip_and_declares_scope(
+    client, auth_headers, monkeypatch, tmp_path: Path
+) -> None:
+    model_home = tmp_path / "endpoint-modelgw-home"
+    model_home.mkdir()
+    (model_home / "config.json").write_text(
+        json.dumps({"schema_version": 1, "server": {"port": 2030}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODEL_GATEWAY_HOME", str(model_home))
+
+    response = client.post("/memories/stack-backup", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["x-backup-scope"] == "all-users"
+    assert response.headers["cache-control"] == "no-store"
+    import io
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["version"] == 2
+        assert manifest["components"]["auth_database"]["status"] == "present"
+
+
 def test_stack_backup_is_portable_and_excludes_all_secrets(tmp_path: Path) -> None:
     paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
     archive_path = tmp_path / "portable.zip"
@@ -187,6 +218,34 @@ def test_stack_backup_is_portable_and_excludes_all_secrets(tmp_path: Path) -> No
             assert b"never-export-this" not in payload
             assert b"never-export-backend" not in payload
             assert b"never-export-provider" not in payload
+
+
+def test_stack_backup_accepts_model_config_override_without_model_home(
+    tmp_path: Path,
+) -> None:
+    """Split Docker: Memory may only have a temp portable config, not Model volumes."""
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    override = tmp_path / "fetched-config.json"
+    override.write_bytes((model_home / "config.json").read_bytes())
+    archive_path = tmp_path / "portable-override.zip"
+
+    result = create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=None,
+        model_config_override=override,
+    )
+
+    assert result["secrets_included"] is False
+    with zipfile.ZipFile(archive_path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["components"]["model_gateway_config"]["status"] == "present"
+        # usage.db is optional when Model home is not mounted
+        assert manifest["components"]["model_gateway_usage"]["status"] == "absent"
+        assert "model-gateway/config.json" in archive.namelist()
+        assert "model-gateway/usage.db" not in archive.namelist()
 
 
 def test_sqlite_staging_recovers_readonly_wal_copy_without_touching_source(
@@ -771,6 +830,88 @@ def test_stack_restore_rejects_future_memory_schema_before_writing(
         )
 
     assert _database_value(memory_database) == "memory-before"
+
+
+def _rewrite_auth_payload_version(
+    tmp_path: Path, archive_path: Path, target_path: Path, version: int
+) -> None:
+    patched_database = tmp_path / f"auth-v{version}.db"
+    with zipfile.ZipFile(archive_path) as archive:
+        patched_database.write_bytes(archive.read("memory/auth.db"))
+    with sqlite3.connect(patched_database) as connection:
+        connection.execute(f"PRAGMA user_version = {version}")
+    with sqlite3.connect(patched_database) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    _replace_archive_payload(
+        archive_path,
+        target_path,
+        "memory/auth.db",
+        patched_database.read_bytes(),
+    )
+
+
+def test_stack_restore_accepts_older_supported_auth_schema(tmp_path: Path) -> None:
+    """v1 auth backups from older releases stay restorable; startup migrates them."""
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "portable.zip"
+    old_path = tmp_path / "old-auth.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+    _rewrite_auth_payload_version(tmp_path, archive_path, old_path, 1)
+
+    result = restore_stack_backup(
+        archive_path=old_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+
+    assert "memory/auth.db" in result["restored"]
+    auth_database = memory_database.with_name("auth.db")
+    with sqlite3.connect(auth_database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    # The regular startup path upgrades the restored older database in place.
+    AuthTokenStore(auth_database).init_db()
+    with sqlite3.connect(auth_database) as connection:
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == AUTH_SCHEMA_VERSION
+        )
+
+
+def test_stack_restore_rejects_future_auth_schema_before_writing(
+    tmp_path: Path,
+) -> None:
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "portable.zip"
+    future_path = tmp_path / "future-auth.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+    _rewrite_auth_payload_version(
+        tmp_path, archive_path, future_path, AUTH_SCHEMA_VERSION + 1
+    )
+
+    with pytest.raises(ValueError, match="更高版本"):
+        restore_stack_backup(
+            archive_path=future_path,
+            paths=paths,
+            memory_database=memory_database,
+            knowledge_database=knowledge_database,
+            model_gateway_home=model_home,
+        )
+
+    assert _database_value(memory_database.with_name("auth.db")) == "auth-before"
 
 
 @pytest.mark.parametrize(

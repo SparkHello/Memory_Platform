@@ -369,7 +369,7 @@ def test_https_hostname_cannot_resolve_to_implicit_private_address(
     )
 
 
-def test_rfc2544_mapping_requires_an_explicit_narrow_cidr(
+def test_rfc2544_mapping_requires_explicit_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def benchmark_dns(host: str, port: int, **kwargs):
@@ -379,20 +379,36 @@ def test_rfc2544_mapping_requires_an_explicit_narrow_cidr(
     with pytest.raises(ValueError, match="未显式允许"):
         require_safe_destination_sync("https://provider.example/v1/models")
 
+    # Exact /32 still works for fixed sandbox mappings.
     require_safe_destination_sync(
         "https://provider.example/v1/models",
         allowed_private_networks=("198.18.0.77/32",),
     )
 
-    with pytest.raises(ValidationError, match="RFC 2544"):
-        ConnectionConfig.model_validate(
-            {
-                "channel_operator": "sandbox-provider",
-                "base_url": "https://provider.example/v1",
-                "allowed_private_networks": ["198.18.0.0/24"],
-                "auth": {"secret_ref": "UPSTREAM_SANDBOX"},
-            }
-        )
+    # Clash/Surge TUN fake-ip ranges may change; users may opt into the whole
+    # RFC 2544 supernet or a broader subnet explicitly.
+    require_safe_destination_sync(
+        "https://provider.example/v1/models",
+        allowed_private_networks=("198.18.0.0/15",),
+    )
+    require_safe_destination_sync(
+        "https://provider.example/v1/models",
+        allowed_private_networks=("198.18.0.0/24",),
+    )
+
+    connection = ConnectionConfig.model_validate(
+        {
+            "channel_operator": "sandbox-provider",
+            "base_url": "https://provider.example/v1",
+            "allowed_private_networks": ["198.18.0.0/15"],
+            "auth": {"secret_ref": "UPSTREAM_SANDBOX"},
+        }
+    )
+    assert list(connection.allowed_private_networks) == ["198.18.0.0/15"]
+
+    # Rejection message should include resolved address and fake-ip guidance.
+    with pytest.raises(ValueError, match="198\\.18\\.0\\.77"):
+        require_safe_destination_sync("https://provider.example/v1/models")
 
 
 def test_client_and_connection_secret_refs_are_disjoint() -> None:

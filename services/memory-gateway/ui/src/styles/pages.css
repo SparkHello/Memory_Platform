@@ -1288,41 +1288,7 @@
     grid-template-columns: 1fr;
   }
 
-  .sidebar {
-    position: static;
-    width: auto;
-    flex-direction: row;
-    flex-wrap: wrap;
-    justify-content: center;
-    max-height: none;
-    margin: 12px;
-    padding: 10px 14px;
-    border-radius: 24px;
-  }
-
-  .brand {
-    width: auto;
-    margin-bottom: 0;
-    padding-bottom: 0;
-    border-bottom: 0;
-  }
-
-  .nav-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    justify-content: center;
-    width: auto;
-  }
-
-  .nav-group {
-    display: contents;
-  }
-
-  .nav-group + .nav-group {
-    padding-top: 0;
-    border-top: 0;
-  }
+  /* 侧栏在此断点由 morning-crystal.css 隐藏并换用底部导航，不在这里覆盖样式 */
 
   .topbar {
     padding-left: 10px;
@@ -1571,4 +1537,62 @@
 
 .traverse-meta {
   margin-top: 8px;
+}
+
+.ingest-skip-panel {
+  margin-bottom: 16px;
+}
+
+/* 首登引导卡：模型就绪但还没有任何 chat token 时的一次性引导。 */
+.connect-client-panel {
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+}
+
+.connect-client-panel .client-config-summary {
+  margin: 12px 0;
+}
+
+.connect-client-panel .provider-wizard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ingest-skip-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ingest-skip-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.ingest-skip-list li {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2, rgba(255, 255, 255, 0.04)) 100%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border, rgba(255, 255, 255, 0.08)) 100%, transparent);
+}
+
+.ingest-skip-list time {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ingest-skip-list span {
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.stack-backup-panel .field-block {
+  margin: 12px 0 16px;
+  max-width: 28rem;
 }

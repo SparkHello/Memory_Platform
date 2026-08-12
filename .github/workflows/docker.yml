@@ -23,6 +23,23 @@ jobs:
           echo "HOST_UID=$(id -u)" >> "$GITHUB_ENV"
           echo "HOST_GID=$(id -g)" >> "$GITHUB_ENV"
 
+      # Installers no longer validate the Compose topology contract on every
+      # install; the release compose is gated here instead.
+      - name: Validate release Compose isolation contract
+        run: |
+          export MEMORY_PLATFORM_INIT_IMAGE="ghcr.io/sparkhello/memory-platform-init@sha256:$(printf 'a%.0s' $(seq 64))"
+          export MEMORY_PLATFORM_MODEL_IMAGE="ghcr.io/sparkhello/memory-platform-model@sha256:$(printf 'b%.0s' $(seq 64))"
+          export MEMORY_PLATFORM_MEMORY_IMAGE="ghcr.io/sparkhello/memory-platform-memory@sha256:$(printf 'c%.0s' $(seq 64))"
+          export MEMORY_HOST=127.0.0.1 MEMORY_PORT=2026
+          export MEMORY_CREDENTIAL_DIR=./credentials HOST_UID=1000 HOST_GID=1000
+          cd deploy
+          docker compose -f docker-compose.user.yml --profile maintenance \
+            config --format json \
+            | python3 validate_compose.py \
+              "$MEMORY_PLATFORM_INIT_IMAGE" "$MEMORY_PLATFORM_MODEL_IMAGE" \
+              "$MEMORY_PLATFORM_MEMORY_IMAGE" 127.0.0.1 2026 \
+              "$PWD/credentials"
+
       - name: Build and start split stack
         run: >-
           docker compose -p memory-platform-ci
@@ -51,21 +68,19 @@ jobs:
           test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/gateway.key")" = 600
           test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/admin.key")" = 600
 
-      - name: Verify provider egress is Model-only
+      - name: Verify split network topology
         run: |
           docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
             exec -T model-gateway python -c \
             'import socket; connection=socket.create_connection(("example.com",443),5); connection.close()'
-          if docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
-            exec -T memory-gateway python -c \
-            'import socket; connection=socket.create_connection(("example.com",443),5); connection.close()'
-          then
-            echo "Memory Gateway unexpectedly has public provider egress" >&2
-            exit 1
-          fi
           docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
             exec -T memory-gateway python -c \
             'import urllib.request; response=urllib.request.urlopen("http://model-gateway:2030/health",timeout=5); assert response.status == 200'
+          # memory-gateway sits on the non-internal ingress network solely to
+          # publish the host port; it must never join provider-egress.
+          docker inspect memory-platform-ci-memory-gateway-1 \
+            --format '{{json .NetworkSettings.Networks}}' | python3 -c \
+            'import json,sys; names=set(json.load(sys.stdin)); assert "memory-platform-ci_provider-egress" not in names, names; assert names == {"memory-platform-ci_backend", "memory-platform-ci_ingress"}, names'
 
       - name: Verify generated credentials never entered daemon logs
         run: |

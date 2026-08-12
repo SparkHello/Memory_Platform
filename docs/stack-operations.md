@@ -86,6 +86,8 @@ irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deplo
 & .\install-memory-platform.ps1
 ```
 
+> Windows 安装器目前为**实验性**：已通过 PowerShell 语法回归和容器内故障注入测试，但尚未在真实 NTFS + Docker Desktop 环境完成灾难恢复实机演练。重要数据请额外保留手动备份。
+
 源码命令默认只监听回环；确需局域网监听时显式传入 `--host 0.0.0.0`，并确认宿主防火墙和路由器没有公网端口映射。
 
 只在可信家庭网络或 Tailscale 内这样用；所有入口仍要求对应 scope 的设备 token（或迁移期 legacy key），但不要把服务暴露到公网。
@@ -209,6 +211,8 @@ scripts/memgw stack backup --output memory-stack.zip
 
 备份 v2 必含记忆库、知识库、Auth token 哈希库和 Model Gateway 脱敏配置；usage 明确标记 present/absent。它不包含 provider key、admin key、backend key、legacy gateway key 或任何 token 明文。
 
+整栈备份（含 Console「报告与备份」页的下载按钮和 `POST /memories/stack-backup`）是**整实例**导出：会包含本部署所有用户的完整数据，不按发起请求的身份过滤。
+
 备份虽然不含密钥，仍包含完整私人记忆和知识正文，必须按敏感文件保管。
 
 恢复到已安装依赖的新设备：
@@ -248,6 +252,15 @@ docker compose -f docker-compose.user.yml up -d
 ```
 
 便携备份不会带入或覆盖目标机已有的 secret volume；恢复后继续使用目标机的 provider/admin/backend 密钥。Auth DB 只含不可逆 token 哈希，因此已有设备 token 可随备份迁移；token 明文本身仍只存在设备端。恢复必须在两个长期服务停止时执行。
+
+### 安装目录丢失但数据卷仍在
+
+误删安装目录（默认 `~/memory-platform`）不会丢数据：四个 Docker 数据卷独立于安装目录存在。恢复步骤：
+
+1. 重建安装目录，并把原目录中的 `credentials/gateway.key` 与 `credentials/admin.key` 放回新目录的 `credentials/` 下（若曾把这两个文件备份到别处）。
+2. 重跑同一条一键安装命令。安装器检测到同名 project 的四个数据卷后会直接接回旧数据。
+
+若两枚密钥文件确实遗失：数据卷本身仍完整，但需要重设凭据——Console token 用维护容器在 Auth 库中新建（`--profile maintenance run --rm stack-maintenance token create --role console ...`），admin key 用 `modelgw secret set memory-console-admin --stdin` 重设。安装器在检测到"四卷存在但 credentials 缺失"时会拒绝按全新安装继续，避免误初始化。
 
 ### 从旧版双目录迁移
 

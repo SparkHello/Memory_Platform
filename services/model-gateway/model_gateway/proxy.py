@@ -159,9 +159,9 @@ class RawOpenAIProxy:
                             target.connection.allowed_private_networks
                         ),
                     )
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     last_network_error = httpx.ConnectError(
-                        "upstream destination validation failed"
+                        _destination_validation_message(exc)
                     )
                     continue
             attempts += 1
@@ -268,10 +268,9 @@ class RawOpenAIProxy:
                 route.targets[0] if route.targets else None,
                 attempt_traces=tuple(attempt_traces),
             )
-        detail = (
-            f"上游网络连接失败：{type(last_network_error).__name__}"
-            if last_network_error is not None
-            else "route 没有配置可用的上游密钥"
+        detail = _network_failure_detail(
+            last_network_error,
+            phase_label="上游网络连接失败",
         )
         return ProxyHTTPResult(
             content=json.dumps(
@@ -315,9 +314,9 @@ class RawOpenAIProxy:
                             target.connection.allowed_private_networks
                         ),
                     )
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     last_network_error = httpx.ConnectError(
-                        "upstream destination validation failed"
+                        _destination_validation_message(exc)
                     )
                     continue
             attempts += 1
@@ -512,10 +511,9 @@ class RawOpenAIProxy:
                 route.targets[0] if route.targets else None,
                 attempt_traces=tuple(attempt_traces),
             )
-        detail = (
-            f"上游流连接失败：{type(last_network_error).__name__}"
-            if last_network_error is not None
-            else "route 没有配置可用的上游密钥"
+        detail = _network_failure_detail(
+            last_network_error,
+            phase_label="上游流连接失败",
         )
         return ProxyHTTPResult(
             content=json.dumps(
@@ -622,6 +620,27 @@ class RawOpenAIProxy:
                 wall_time=self._wall_clock(),
             ),
         )
+
+
+def _destination_validation_message(exc: BaseException) -> str:
+    detail = str(exc).strip() or type(exc).__name__
+    return f"上游地址安全校验失败：{detail}"
+
+
+def _network_failure_detail(
+    exc: httpx.HTTPError | None,
+    *,
+    phase_label: str,
+) -> str:
+    if exc is None:
+        return "route 没有配置可用的上游密钥"
+    message = str(exc).strip()
+    if message and message != type(exc).__name__:
+        # Prefer the concrete ConnectError message (e.g. destination validation).
+        if "上游地址安全校验失败" in message:
+            return message
+        return f"{phase_label}：{message}"
+    return f"{phase_label}：{type(exc).__name__}"
 
 
 def _network_error_can_fail_over(exc: httpx.HTTPError) -> bool:

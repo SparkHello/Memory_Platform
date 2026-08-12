@@ -9,11 +9,14 @@ Model Gateway control endpoint when it is loopback or HTTPS.
 
 from __future__ import annotations
 
+import asyncio
 from ipaddress import ip_address, ip_network
+import threading
+import time
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlsplit
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
 import httpx
 
@@ -29,6 +32,13 @@ router = APIRouter(
     tags=["providers"],
     dependencies=[Depends(require_api_key)],
 )
+
+# Process-local live probe cache: avoids burning tokens on every status poll.
+_LIVE_PROBE_LOCK = threading.Lock()
+_LIVE_PROBE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_LIVE_PROBE_INFLIGHT: dict[str, "asyncio.Task[dict[str, Any]]"] = {}
+_LIVE_PROBE_TTL_SECONDS = 60.0
+_LIVE_PROBE_TIMEOUT_SECONDS = 12.0
 
 
 ROUTE_DESCRIPTIONS: dict[str, str] = {
@@ -65,14 +75,61 @@ _PRIVATE_MODEL_GATEWAY_NETWORKS = (
 @router.get("/status")
 async def providers_status(
     settings: Annotated[Settings, Depends(get_settings)],
+    live_probe: Annotated[
+        bool,
+        Query(
+            description=(
+                "若为 true，在配置已就绪时额外探测 memory.chat 上游连通性"
+                "（结果缓存约 60 秒，可能产生极少量 token 费用）"
+            ),
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     try:
         model_runtime = resolve_model_runtime(settings)
     except ModelRuntimeConfigurationError as exc:
         payload = _invalid_runtime_status(str(exc))
+        model_runtime = None
     else:
         payload = await _model_gateway_status(settings, model_runtime)
-    return {**payload, "setup": _setup_summary(payload)}
+    setup = _setup_summary(payload)
+    if live_probe and model_runtime is not None and setup.get("chat_ready"):
+        setup["live_probe"] = await _live_upstream_probe(
+            settings=settings,
+            model_runtime=model_runtime,
+        )
+        setup["upstream_ready"] = bool(setup["live_probe"].get("ok"))
+    else:
+        setup["live_probe"] = None
+        setup["upstream_ready"] = None
+    return {**payload, "setup": setup}
+
+
+@router.post("/live-probe")
+async def providers_live_probe(
+    settings: Annotated[Settings, Depends(get_settings)],
+    force: Annotated[
+        bool,
+        Query(
+            description="默认复用约 60 秒的缓存结果；仅显式 force=true 时强制重新探测",
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Explicit upstream connectivity check for Console / ops."""
+    try:
+        model_runtime = resolve_model_runtime(settings)
+    except ModelRuntimeConfigurationError as exc:
+        return {
+            "ok": False,
+            "code": "model_runtime_configuration_error",
+            "message": str(exc),
+            "cached": False,
+        }
+    return await _live_upstream_probe(
+        settings=settings,
+        model_runtime=model_runtime,
+        force=force,
+    )
 
 
 @router.post("/admin/check")
@@ -618,7 +675,147 @@ def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "usable_chat_routes": usable,
         "missing_chat_routes": missing,
         "next_action": next_action,
+        "live_probe": None,
+        "upstream_ready": None,
     }
+
+
+async def _live_upstream_probe(
+    *,
+    settings: Settings,
+    model_runtime: ModelRuntime,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Cheap end-to-end check that provider egress and SSRF allowlists work."""
+    try:
+        chat_route = model_runtime.route_for("chat")
+    except ModelRuntimeConfigurationError as exc:
+        return {
+            "ok": False,
+            "code": "chat_route_missing",
+            "message": str(exc),
+            "latency_ms": 0,
+            "cached": False,
+            "route": "",
+        }
+    cache_key = (
+        f"{model_runtime.base_url}|{chat_route}|"
+        f"{bool(settings.model_gateway_api_key)}"
+    )
+    now = time.monotonic()
+    if not force:
+        with _LIVE_PROBE_LOCK:
+            cached = _LIVE_PROBE_CACHE.get(cache_key)
+            if cached is not None and cached[0] > now:
+                result = dict(cached[1])
+                result["cached"] = True
+                return result
+        # In-flight dedup: concurrent non-forced probes join the same upstream
+        # request instead of each spending tokens. Handlers share one loop, so
+        # a plain dict is race-free here.
+        existing = _LIVE_PROBE_INFLIGHT.get(cache_key)
+        if existing is not None:
+            return dict(await asyncio.shield(existing))
+
+    probe = asyncio.ensure_future(
+        _execute_live_probe(
+            settings=settings,
+            chat_route=chat_route,
+            cache_key=cache_key,
+            base_url=model_runtime.base_url,
+        )
+    )
+    _LIVE_PROBE_INFLIGHT[cache_key] = probe
+    try:
+        return dict(await probe)
+    finally:
+        if _LIVE_PROBE_INFLIGHT.get(cache_key) is probe:
+            _LIVE_PROBE_INFLIGHT.pop(cache_key, None)
+
+
+async def _execute_live_probe(
+    *,
+    settings: Settings,
+    chat_route: str,
+    cache_key: str,
+    base_url: str,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = f"{base}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.model_gateway_api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    # Prefer the stable chat route name so Model Gateway selects the configured
+    # production target rather than a free-form model id.
+    payload = {
+        "model": chat_route,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_LIVE_PROBE_TIMEOUT_SECONDS, connect=5.0),
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        body_preview = ""
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                error = body.get("error")
+                if isinstance(error, dict):
+                    body_preview = str(error.get("message") or error.get("type") or "")[
+                        :300
+                    ]
+                elif response.is_success:
+                    body_preview = "ok"
+        except ValueError:
+            body_preview = (response.text or "")[:200]
+        ok = response.is_success
+        code = "ok" if ok else f"http_{response.status_code}"
+        if not ok and (
+            "安全校验" in body_preview
+            or "198.18" in body_preview
+            or "私网" in body_preview
+            or "destination" in body_preview.lower()
+        ):
+            code = "upstream_destination_blocked"
+        result = {
+            "ok": ok,
+            "code": code,
+            "message": body_preview
+            or (f"上游返回 HTTP {response.status_code}" if not ok else "上游可达"),
+            "latency_ms": elapsed_ms,
+            "cached": False,
+            "route": chat_route,
+        }
+    except httpx.HTTPError as exc:
+        result = {
+            "ok": False,
+            "code": "connect_error",
+            "message": f"无法连接 Model Gateway：{type(exc).__name__}",
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "cached": False,
+            "route": chat_route,
+        }
+
+    with _LIVE_PROBE_LOCK:
+        _LIVE_PROBE_CACHE[cache_key] = (
+            time.monotonic() + _LIVE_PROBE_TTL_SECONDS,
+            {k: v for k, v in result.items() if k != "cached"},
+        )
+        # Bound cache size for long-lived processes.
+        while len(_LIVE_PROBE_CACHE) > 16:
+            _LIVE_PROBE_CACHE.pop(next(iter(_LIVE_PROBE_CACHE)))
+    return result
 
 
 def _required_model_routes(model_runtime: ModelRuntime) -> list[str]:

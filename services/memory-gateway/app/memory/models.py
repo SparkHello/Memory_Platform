@@ -387,6 +387,28 @@ class CandidateMemory(BaseModel):
     def _normalize_type(cls, value: object) -> object:
         return normalize_memory_type(value)
 
+    @field_validator("entities")
+    @classmethod
+    def _drop_entity_fragments(cls, value: list[str]) -> list[str]:
+        """去掉空白/重复实体，以及从复合名称拆出的碎片（如 Dark Mode → Dark）。"""
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for entity in value:
+            normalized = entity.strip()
+            if not normalized or normalized.casefold() in seen:
+                continue
+            seen.add(normalized.casefold())
+            cleaned.append(normalized)
+        folded = [entity.casefold() for entity in cleaned]
+        return [
+            entity
+            for index, entity in enumerate(cleaned)
+            if not any(
+                index != other and folded[index] in folded[other]
+                for other in range(len(cleaned))
+            )
+        ]
+
     @field_validator("temporal_subject", "temporal_predicate", mode="before")
     @classmethod
     def _normalize_temporal_key(cls, value: object) -> object:

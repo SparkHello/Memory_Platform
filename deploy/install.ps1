@@ -398,6 +398,19 @@ function Test-PortInUse([int] $Port) {
     return [bool]($listeners | Where-Object { $_.Port -eq $Port } | Select-Object -First 1)
 }
 
+function Test-HostIp([string] $Address) {
+    # 允许操作者绑定任意点分十进制 IPv4（回环、全接口或指定本机地址）。
+    if ([string]::IsNullOrWhiteSpace($Address)) { return $false }
+    $parts = $Address.Split(".")
+    if ($parts.Count -ne 4) { return $false }
+    foreach ($part in $parts) {
+        if ($part -notmatch '^[0-9]{1,3}$') { return $false }
+        if ($part.Length -gt 1 -and $part.StartsWith("0")) { return $false }
+        if ([int] $part -gt 255) { return $false }
+    }
+    return $true
+}
+
 function Test-HttpEndpoint([string] $Url) {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri $Url
@@ -724,15 +737,6 @@ function Test-ExactStringSet([object[]] $Actual, [string[]] $Expected) {
     return [string]::Join("`n", $actualValues) -eq [string]::Join("`n", $expectedValues)
 }
 
-function Get-MountByTarget([object] $Service, [string] $Target) {
-    foreach ($mount in @(Get-JsonPropertyValue $Service "volumes")) {
-        if ([string](Get-JsonPropertyValue $mount "target") -eq $Target) {
-            return $mount
-        }
-    }
-    return $null
-}
-
 function Test-CandidateCompose(
     [string] $ComposeFile,
     [string] $EnvironmentFile,
@@ -769,203 +773,26 @@ function Test-CandidateCompose(
             Stop-Install "候选 Compose 没有使用指定发布镜像。"
         }
     }
-    foreach ($name in $expectedServices) {
-        $service = Get-JsonPropertyValue $services $name
-        if ((Get-JsonPropertyValue $service "read_only") -ne $true -or
-            -not (Test-ExactStringSet `
-                @(Get-JsonPropertyValue $service "cap_drop") @("ALL")) -or
-            @(Get-JsonPropertyValue $service "tmpfs").Count -eq 0 -or
-            @(Get-JsonPropertyValue $service "security_opt") -notcontains
-                "no-new-privileges:true" -or
-            (Get-JsonPropertyValue $service "privileged") -eq $true -or
-            @(Get-JsonPropertyValue $service "devices").Count -gt 0) {
-            Stop-Install "候选 Compose 的只读、capability 或设备隔离无效。"
-        }
-    }
-    $memoryService = Get-JsonPropertyValue $services "memory-gateway"
-    $modelService = Get-JsonPropertyValue $services "model-gateway"
-    $initService = Get-JsonPropertyValue $services "stack-init"
-    $maintenanceService = Get-JsonPropertyValue $services "stack-maintenance"
-    if ([string](Get-JsonPropertyValue $memoryService "user") -ne "10001:10001" -or
-        [string](Get-JsonPropertyValue $modelService "user") -ne "10002:10002") {
-        Stop-Install "候选 Compose 的长期服务 UID 隔离无效。"
-    }
-    if (-not (Test-ExactStringSet `
-            (Get-JsonPropertyNames (Get-JsonPropertyValue $memoryService "networks")) `
-            @("backend")) -or
-        -not (Test-ExactStringSet `
-            (Get-JsonPropertyNames (Get-JsonPropertyValue $modelService "networks")) `
-            @("backend", "provider-egress")) -or
-        [string](Get-JsonPropertyValue $initService "network_mode") -ne "none" -or
-        [string](Get-JsonPropertyValue $maintenanceService "network_mode") -ne "none") {
-        Stop-Install "候选 Compose 的 ingress/backend/provider-egress 隔离无效。"
-    }
-    foreach ($name in @("stack-init", "memory-gateway", "stack-maintenance")) {
-        $privateService = Get-JsonPropertyValue $services $name
-        $privatePorts = Get-JsonPropertyValue $privateService "ports"
-        if ($null -ne $privatePorts -and @($privatePorts).Count -gt 0) {
-            Stop-Install "候选 Compose 为内部服务发布了宿主端口。"
-        }
-    }
-    $ingressPorts = @(Get-JsonPropertyValue $modelService "ports")
-    if ($ingressPorts.Count -ne 1 -or
-        [string](Get-JsonPropertyValue $ingressPorts[0] "target") -ne "2026" -or
-        [string](Get-JsonPropertyValue $ingressPorts[0] "protocol") -ne "tcp") {
-        Stop-Install "候选 Compose 的定向 Memory ingress 发布端口无效。"
-    }
-    $mountContract = @(
-        [pscustomobject]@{ Service = $memoryService; Target = "/data"; Type = "volume"; Source = "memory-data"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $memoryService; Target = "/secrets"; Type = "volume"; Source = "memory-secrets"; ReadOnly = $true },
-        [pscustomobject]@{ Service = $modelService; Target = "/data"; Type = "volume"; Source = "model-data"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $modelService; Target = "/secrets"; Type = "volume"; Source = "model-secrets"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $initService; Target = "/memory-data"; Type = "volume"; Source = "memory-data"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $initService; Target = "/memory-secrets"; Type = "volume"; Source = "memory-secrets"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $initService; Target = "/model-data"; Type = "volume"; Source = "model-data"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $initService; Target = "/model-secrets"; Type = "volume"; Source = "model-secrets"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $initService; Target = "/credentials"; Type = "bind"; Source = ""; ReadOnly = $false },
-        [pscustomobject]@{ Service = $maintenanceService; Target = "/data"; Type = "volume"; Source = "memory-data"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $maintenanceService; Target = "/secrets"; Type = "volume"; Source = "memory-secrets"; ReadOnly = $false },
-        [pscustomobject]@{ Service = $maintenanceService; Target = "/model-data"; Type = "volume"; Source = "model-data"; ReadOnly = $false }
-    )
-    foreach ($contract in $mountContract) {
-        $mount = Get-MountByTarget $contract.Service ([string] $contract.Target)
-        if ($null -eq $mount -or
-            [string](Get-JsonPropertyValue $mount "type") -ne [string] $contract.Type -or
-            (-not [string]::IsNullOrWhiteSpace([string] $contract.Source) -and
-             [string](Get-JsonPropertyValue $mount "source") -ne [string] $contract.Source) -or
-            ([bool](Get-JsonPropertyValue $mount "read_only")) -ne [bool] $contract.ReadOnly) {
-            Stop-Install "候选 Compose 的数据或 secret 卷隔离无效。"
-        }
-    }
-    $expectedMountCounts = @{
-        "memory-gateway" = 2; "model-gateway" = 2
-        "stack-init" = 5; "stack-maintenance" = 3
-    }
-    foreach ($name in $expectedMountCounts.Keys) {
-        if (@(Get-JsonPropertyValue `
-            (Get-JsonPropertyValue $services $name) "volumes").Count -ne
-            [int] $expectedMountCounts[$name]) {
-            Stop-Install "候选 Compose 包含额外卷挂载。"
-        }
-    }
-    $networks = Get-JsonPropertyValue $configuration "networks"
-    $volumes = Get-JsonPropertyValue $configuration "volumes"
-    if (-not (Test-ExactStringSet (Get-JsonPropertyNames $networks) `
-            @("backend", "provider-egress")) -or
-        -not (Test-ExactStringSet (Get-JsonPropertyNames $volumes) `
-            @("memory-data", "memory-secrets", "model-data", "model-secrets")) -or
-        (Get-JsonPropertyValue (Get-JsonPropertyValue $networks "backend") "internal") -ne $true -or
-        (Get-JsonPropertyValue (Get-JsonPropertyValue $networks "provider-egress") "internal") -eq $true) {
-        Stop-Install "候选 Compose 的网络或四卷拓扑无效。"
-    }
+    # The full split-topology isolation contract (ports, networks, UID,
+    # volumes) is enforced against the release Compose by
+    # deploy/validate_compose.py in the repository's CI release gates.
     $rendered = $configuration | ConvertTo-Json -Depth 100 -Compress
     if ($rendered -match '"(?:GATEWAY_API_KEY|MEMORY_CONSOLE_ADMIN_KEY)"\s*:') {
         Stop-Install "候选 Compose 仍试图通过环境变量传递访问密钥。"
     }
 }
 
-function Test-SignedComposeRuntime(
-    [string] $ComposeFile,
-    [string] $EnvironmentFile,
-    [string] $InitImage,
-    [string] $ModelImage,
-    [string] $MemoryImage,
-    [string] $ListenHost,
-    [int] $Port,
-    [string] $CredentialDirectory
-) {
-    $jsonLines = @(& docker compose --env-file $EnvironmentFile `
-        -p $script:ProjectName --profile maintenance `
-        -f $ComposeFile config --format json 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $jsonLines.Count -eq 0) {
-        Stop-Install "候选 Compose 语法无效。"
-    }
-    $renderedPath = New-TemporarySibling $ComposeFile "rendered"
-    try {
-        $utf8NoBom = New-Object Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText(
-            $renderedPath,
-            ([string]::Join("`n", $jsonLines) + "`n"),
-            $utf8NoBom
-        )
-        Protect-PrivatePath $renderedPath
-        # The helper normalizes main/WAL/journal files in a private sibling
-        # stage under the host backup directory; the legacy volume stays
-        # read-only and byte-for-byte untouched.
-        $arguments = @(
-            "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL",
-            "--mount", "type=bind,source=$renderedPath,target=/input/config.json,readonly",
-            "--entrypoint", "python", $InitImage,
-            "/usr/local/libexec/memory-platform/validate_compose.py",
-            $InitImage, $ModelImage, $MemoryImage,
-            $ListenHost, [string] $Port, $CredentialDirectory,
-            "/input/config.json"
-        )
-        & docker @arguments *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Stop-Install "候选 Compose 未通过 split stack 安全拓扑校验。"
-        }
-    } finally {
-        if (Test-Path -LiteralPath $renderedPath) {
-            Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Test-SignedInternalComposeRuntime(
+function Test-InternalOverrideCompose(
     [string] $ComposeFile,
     [string] $OverrideFile,
-    [string] $EnvironmentFile,
-    [string] $InitImage,
-    [string] $ModelImage,
-    [string] $MemoryImage,
-    [string] $ListenHost,
-    [int] $Port,
-    [string] $CredentialDirectory
+    [string] $EnvironmentFile
 ) {
-    $jsonLines = @(& docker compose --env-file $EnvironmentFile `
+    & docker compose --env-file $EnvironmentFile `
         -p $script:ProjectName --profile maintenance `
-        -f $ComposeFile -f $OverrideFile config --format json 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $jsonLines.Count -eq 0) {
+        -f $ComposeFile -f $OverrideFile config *> $null
+    if ($LASTEXITCODE -ne 0) {
         Stop-Install "本地验收 override 无法生成 Compose 配置。"
     }
-    $renderedPath = New-TemporarySibling $ComposeFile "internal-rendered"
-    try {
-        $utf8NoBom = New-Object Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText(
-            $renderedPath,
-            ([string]::Join("`n", $jsonLines) + "`n"),
-            $utf8NoBom
-        )
-        Protect-PrivatePath $renderedPath
-        $arguments = @(
-            "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL",
-            "--mount", "type=bind,source=$renderedPath,target=/input/config.json,readonly",
-            "--entrypoint", "python", $InitImage,
-            "/usr/local/libexec/memory-platform/validate_compose.py",
-            $InitImage, $ModelImage, $MemoryImage,
-            $ListenHost, [string] $Port, $CredentialDirectory,
-            "/input/config.json", "internal"
-        )
-        & docker @arguments *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Stop-Install "本地验收 override 未生成无发布端口的安全拓扑。"
-        }
-    } finally {
-        if (Test-Path -LiteralPath $renderedPath) {
-            Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Remove-VolumeBackup([string] $ComposeFile, [string] $Service, [string] $Archive) {
-    & docker compose -p $script:ProjectName -f $ComposeFile exec -T `
-        --user 10001:10001 $Service python -c `
-        'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)' `
-        "/data/$Archive" *> $null
-    return $LASTEXITCODE -eq 0
 }
 
 function Restore-ImageEnvironment {
@@ -1138,9 +965,11 @@ function Test-ImmutableOldImageReference(
     [string] $Image,
     [string] $Repository
 ) {
+    # $Repository 是不含 registry 主机的仓库路径（如 sparkhello/memory-platform-init）。
+    # 允许任意 registry 主机（GHCR 或镜像加速站）；digest 固定保证不可变性。
     if ($Image -match '^sha256:[0-9a-f]{64}$') { return $true }
     $escapedRepository = [Regex]::Escape($Repository)
-    return $Image -match "^${escapedRepository}@sha256:[0-9a-f]{64}$"
+    return $Image -match "^[A-Za-z0-9._:-]+/${escapedRepository}@sha256:[0-9a-f]{64}$"
 }
 
 function New-CutoverJournal {
@@ -1152,11 +981,11 @@ function New-CutoverJournal {
     try {
         if ($script:Layout -eq "split" -and
             (-not (Test-ImmutableOldImageReference $script:RollbackInitImage `
-                "ghcr.io/sparkhello/memory-platform-init") -or
+                "sparkhello/memory-platform-init") -or
              -not (Test-ImmutableOldImageReference $script:RollbackModelImage `
-                "ghcr.io/sparkhello/memory-platform-model") -or
+                "sparkhello/memory-platform-model") -or
              -not (Test-ImmutableOldImageReference $script:RollbackMemoryImage `
-                "ghcr.io/sparkhello/memory-platform-memory"))) {
+                "sparkhello/memory-platform-memory"))) {
             Stop-Install "无法把旧 split 栈解析为不可变镜像；拒绝开始 cutover。"
         }
         $legacyTargetsAbsent = $false
@@ -1176,11 +1005,16 @@ function New-CutoverJournal {
         [IO.File]::Copy($script:OldComposeBackup, $oldCompose, $false)
         [IO.File]::WriteAllBytes($oldEnvironment, $script:EnvironmentSnapshotBytes)
         $utf8NoBom = New-Object Text.UTF8Encoding($false)
+        # 停写备份在旧栈停止后才创建，journal 建立时先登记为 pending。
+        $backupReference = "pending"
+        if (-not [string]::IsNullOrWhiteSpace($script:BackupPath)) {
+            $backupReference = [IO.Path]::GetFileName($script:BackupPath)
+        }
         $metadata = [ordered]@{
             version = 2
             project = $script:ProjectName
             layout = $script:Layout
-            backup = [IO.Path]::GetFileName($script:BackupPath)
+            backup = $backupReference
             old_init_image = $script:RollbackInitImage
             old_model_image = $script:RollbackModelImage
             old_memory_image = $script:RollbackMemoryImage
@@ -1243,6 +1077,39 @@ function Update-CutoverBackupReference([string] $BackupPath) {
     }
 }
 
+function Test-BackupArchive([string] $BackupPath, [string] $VerifyImage) {
+    # 真实复验：归档内每个成员必须通过 ZIP CRC 校验，且每个 SQLite 库
+    # 必须能重新打开并通过 quick_check=ok。
+    $verifyScript = @'
+import os, shutil, sqlite3, sys, tempfile, zipfile
+archive = zipfile.ZipFile("/backup/verify.zip")
+corrupt = archive.testzip()
+assert corrupt is None, f"CRC mismatch: {corrupt}"
+for member in archive.namelist():
+    if not member.endswith(".db"):
+        continue
+    with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".db", delete=False) as staged:
+        with archive.open(member) as source:
+            shutil.copyfileobj(source, staged)
+        staged_path = staged.name
+    connection = sqlite3.connect(staged_path)
+    try:
+        row = connection.execute("PRAGMA quick_check").fetchone()
+    finally:
+        connection.close()
+        os.unlink(staged_path)
+    assert row and row[0] == "ok", f"quick_check failed: {member}"
+'@
+    $arguments = @(
+        "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--mount", "type=bind,source=$BackupPath,target=/backup/verify.zip,readonly",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=268435456",
+        "--entrypoint", "python", $VerifyImage, "-c", $verifyScript
+    )
+    & docker @arguments *> $null
+    return $LASTEXITCODE -eq 0
+}
+
 function New-QuiescedBackup(
     [string] $OldMemoryContainer,
     [bool] $UpdateJournal = $true
@@ -1285,6 +1152,7 @@ function New-QuiescedBackup(
         )
         $cleanupImage = $script:RollbackInitImage
         $cleanupVolume = $memoryData
+        $verifyImage = $script:RollbackInitImage
     } else {
         $legacyVolume = Get-ContainerVolume $OldMemoryContainer "/data"
         if ([string]::IsNullOrWhiteSpace($legacyVolume) -or
@@ -1305,6 +1173,7 @@ function New-QuiescedBackup(
             $backupName, "10001", "10001"
         )
         $directBackup = $true
+        $verifyImage = $script:InitImage
     }
 
     & docker @arguments *> $null
@@ -1332,6 +1201,10 @@ function New-QuiescedBackup(
     }
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
         (Get-Item -LiteralPath $backupPath).Length -le 0) {
+        return $false
+    }
+    if (-not (Test-BackupArchive $backupPath $verifyImage)) {
+        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
         return $false
     }
     try {
@@ -1412,14 +1285,22 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
     if ($version -notin @(1, 2) -or
         $project -notmatch '^[a-z0-9][a-z0-9_-]*$' -or
         $layout -notin @("split", "legacy") -or
-        $phase -notin @("prepared", "data_may_change", "committed") -or
-        $backupName -notmatch '^pre-upgrade-[A-Za-z0-9_.-]+\.zip$') {
+        $phase -notin @("prepared", "data_may_change", "committed")) {
+        Stop-Install "升级事务 journal 字段无效；拒绝继续。"
+    }
+    if ($backupName -eq "pending") {
+        # `pending` 在停写备份创建前写入，且总在 data_may_change 之前被替换；
+        # 从 prepared 恢复不会回写数据，因此不需要备份档案。
+        if ($phase -ne "prepared") {
+            Stop-Install "升级事务 journal 在数据阶段缺少备份引用。"
+        }
+    } elseif ($backupName -notmatch '^pre-upgrade-[A-Za-z0-9_.-]+\.zip$') {
         Stop-Install "升级事务 journal 字段无效；拒绝继续。"
     }
     $publishPort = 0
     if ($version -eq 2 -and
         ($oldEnvironmentExists -isnot [bool] -or
-         $publishHost -notin @("127.0.0.1", "0.0.0.0") -or
+         -not (Test-HostIp $publishHost) -or
          -not [int]::TryParse($publishPortText, [ref] $publishPort) -or
          $publishPort -lt 1 -or $publishPort -gt 65535)) {
         Stop-Install "升级事务 journal v2 发布或环境字段无效。"
@@ -1429,9 +1310,9 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
     }
     if ($layout -eq "split") {
         $imageReferences = @(
-            @{ Image = $initImage; Repository = "ghcr.io/sparkhello/memory-platform-init" },
-            @{ Image = $modelImage; Repository = "ghcr.io/sparkhello/memory-platform-model" },
-            @{ Image = $memoryImage; Repository = "ghcr.io/sparkhello/memory-platform-memory" }
+            @{ Image = $initImage; Repository = "sparkhello/memory-platform-init" },
+            @{ Image = $modelImage; Repository = "sparkhello/memory-platform-model" },
+            @{ Image = $memoryImage; Repository = "sparkhello/memory-platform-memory" }
         )
         foreach ($entry in $imageReferences) {
             $image = [string] $entry.Image
@@ -1471,10 +1352,13 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
         Write-Host "    已完成中断升级的端口发布；继续校验当前版本。"
         return
     }
-    $backupPath = Join-Path (Join-Path $script:InstallDirectory "backups") $backupName
-    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
-        (Get-Item -LiteralPath $backupPath).Length -le 0) {
-        Stop-Install "升级事务 journal 对应的备份不存在。"
+    $backupPath = ""
+    if ($backupName -ne "pending") {
+        $backupPath = Join-Path (Join-Path $script:InstallDirectory "backups") $backupName
+        if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
+            (Get-Item -LiteralPath $backupPath).Length -le 0) {
+            Stop-Install "升级事务 journal 对应的备份不存在。"
+        }
     }
 
     Write-Step "检测到中断的升级事务，先幂等恢复旧栈"
@@ -1687,6 +1571,24 @@ function Invoke-MemoryPlatformInstall {
         Stop-Install "MEMORY_BACKUP_RETENTION 必须是 1–50 的整数。"
     }
 
+    # Sigstore verification is opt-in: it needs four extra GitHub endpoints
+    # that are unreachable in several target networks, while images are
+    # already pulled by immutable digest.
+    $verifyText = [Environment]::GetEnvironmentVariable("MEMORY_VERIFY_SIGNATURES")
+    if ([string]::IsNullOrWhiteSpace($verifyText)) { $verifyText = "0" }
+    if ($verifyText -notin @("0", "1")) {
+        Stop-Install "MEMORY_VERIFY_SIGNATURES 只允许 0 或 1。"
+    }
+    $verifySignatures = $verifyText -eq "1"
+
+    # GHCR 在部分网络不可达；MEMORY_IMAGE_REGISTRY 只替换 registry 主机，
+    # 仓库路径与 digest 固定不变，隔离契约不受影响。
+    $imageRegistry = [Environment]::GetEnvironmentVariable("MEMORY_IMAGE_REGISTRY")
+    if ([string]::IsNullOrWhiteSpace($imageRegistry)) { $imageRegistry = "ghcr.io" }
+    if ($imageRegistry -notmatch '^[A-Za-z0-9._:-]+$') {
+        Stop-Install "MEMORY_IMAGE_REGISTRY 只能是 registry 主机名（可带端口），如 ghcr.nju.edu.cn。"
+    }
+
     Write-Step "检查运行环境"
     if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
         Stop-Install "未找到 Docker。请先安装并启动 Docker Desktop。"
@@ -1795,12 +1697,31 @@ function Invoke-MemoryPlatformInstall {
         }
     }
     if ($script:Layout -eq "fresh") {
-        foreach ($volumeKey in @(
-            "memory-platform-data", "memory-data", "memory-secrets",
-            "model-data", "model-secrets"
-        )) {
-            if (-not [string]::IsNullOrWhiteSpace((Get-ProjectVolume $volumeKey))) {
-                Stop-Install "发现旧数据卷但没有可验证的旧 Compose；拒绝猜测迁移。请使用固定 release 的 WSL 安装器或手工恢复备份。"
+        if (-not [string]::IsNullOrWhiteSpace((Get-ProjectVolume "memory-platform-data"))) {
+            Stop-Install "发现旧数据卷但没有可验证的旧 Compose；拒绝猜测迁移。请使用固定 release 的 WSL 安装器或手工恢复备份。"
+        }
+        # 安装目录丢失但四个分卷仍在：直接跑新安装会走到凭据验收才失败且
+        # 提示无法行动，这里提前检测并给出接回旧数据的具体做法。
+        $splitVolumesPresent = $true
+        foreach ($volumeKey in @("memory-data", "memory-secrets", "model-data", "model-secrets")) {
+            if ([string]::IsNullOrWhiteSpace((Get-ProjectVolume $volumeKey))) {
+                $splitVolumesPresent = $false
+                break
+            }
+        }
+        if ($splitVolumesPresent) {
+            $gatewayKeyPath = Join-Path $credentialDirectory "gateway.key"
+            $adminKeyPath = Join-Path $credentialDirectory "admin.key"
+            $gatewayKeyMissing = -not (Test-Path -LiteralPath $gatewayKeyPath -PathType Leaf) -or
+                (Get-Item -LiteralPath $gatewayKeyPath).Length -le 0
+            $adminKeyMissing = -not (Test-Path -LiteralPath $adminKeyPath -PathType Leaf) -or
+                (Get-Item -LiteralPath $adminKeyPath).Length -le 0
+            if ($gatewayKeyMissing -or $adminKeyMissing) {
+                Stop-Install ("检测到 project '$($script:ProjectName)' 的四个数据卷仍在，" +
+                    "但 $installDirectory\credentials\ 缺少 gateway.key 或 admin.key。" +
+                    "数据没有丢：把原安装目录里的 credentials\gateway.key 和 credentials\admin.key " +
+                    "放回 $installDirectory\credentials\ 后重跑同一条安装命令即可接回旧数据。" +
+                    "若两枚密钥确实遗失，参见 docs/stack-operations.md 的密钥重置章节。")
             }
         }
     }
@@ -1845,6 +1766,7 @@ function Invoke-MemoryPlatformInstall {
     if (-not [int]::TryParse($portText, [ref] $port) -or $port -lt 1 -or $port -gt 65535) {
         Stop-Install "MEMORY_PORT 必须是 1–65535 的整数。"
     }
+    $requestedPortBeforeSkip = $port
     if ((Test-PortInUse $port) -and -not (Test-ComposeOwnsPort $script:ComposePath $port)) {
         if ($portConfigured) {
             Stop-Install "端口 $port 已被占用；请显式选择另一个端口。"
@@ -1856,6 +1778,10 @@ function Invoke-MemoryPlatformInstall {
         if ($candidatePort -gt 2099) { Stop-Install "2026–2099 端口均被占用。" }
         $port = $candidatePort
     }
+    if ($port -ne $requestedPortBeforeSkip) {
+        Write-Host "提示：端口 $requestedPortBeforeSkip 已被占用，本次改用 ${port}。"
+        Write-Host "      后续文档和示例中的 $requestedPortBeforeSkip 请替换为 ${port}。"
+    }
 
     $explicitHost = $script:RequestedMemoryHost
     $existingHost = Get-ComposeEnvValue $environmentPath "MEMORY_HOST"
@@ -1866,12 +1792,12 @@ function Invoke-MemoryPlatformInstall {
     } else {
         $listenHost = "127.0.0.1"
     }
-    if ($listenHost -notin @("127.0.0.1", "0.0.0.0")) {
-        Stop-Install "MEMORY_HOST 只允许 127.0.0.1 或 0.0.0.0。"
+    if (-not (Test-HostIp $listenHost)) {
+        Stop-Install "MEMORY_HOST 必须是本机可绑定的 IPv4 地址（如 127.0.0.1、0.0.0.0 或局域网 IP）。"
     }
     $script:PublishHost = $listenHost
     $script:PublishPort = $port
-    if ($listenHost -eq "0.0.0.0") {
+    if ($listenHost -ne "127.0.0.1") {
         Write-Host "    已开启可信局域网监听；请确认路由器没有公网端口映射。"
     }
 
@@ -1881,7 +1807,6 @@ function Invoke-MemoryPlatformInstall {
         $containers = @(& docker compose -p $script:ProjectName -f $script:ComposePath `
             ps -q $oldService 2>$null)
         $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
-        $startedOldService = $false
         if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
             $identityVolumeKey = if ($script:Layout -eq "legacy") {
                 "memory-platform-data"
@@ -1891,20 +1816,21 @@ function Invoke-MemoryPlatformInstall {
             if ([string]::IsNullOrWhiteSpace((Get-ProjectVolume $identityVolumeKey))) {
                 Stop-Install "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移。"
             }
-            & docker compose -p $script:ProjectName -f $script:ComposePath `
-                up -d --pull never *> $null
-            if ($LASTEXITCODE -ne 0) {
-                Stop-Install "无法按旧 Compose 启动服务以创建备份；现有数据未修改。"
+            if ($script:Layout -eq "legacy") {
+                & docker compose -p $script:ProjectName -f $script:ComposePath `
+                    up -d --pull never *> $null
+                if ($LASTEXITCODE -ne 0) {
+                    Stop-Install "无法按旧 Compose 启动服务以定位旧数据卷；现有数据未修改。"
+                }
+                $containers = @(& docker compose -p $script:ProjectName -f $script:ComposePath `
+                    ps -q $oldService 2>$null)
+                $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
             }
-            $startedOldService = $true
-            $containers = @(& docker compose -p $script:ProjectName -f $script:ComposePath `
-                ps -q $oldService 2>$null)
-            $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
-        }
-        if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
-            Stop-Install "找不到旧 Memory 容器；拒绝在未备份状态下升级。"
         }
         if ($script:Layout -eq "legacy") {
+            if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
+                Stop-Install "找不到旧 Memory 容器；拒绝在未备份状态下升级。"
+            }
             $legacyImages = @(& docker inspect $oldMemoryContainer `
                 --format '{{.Image}}' 2>$null)
             $script:RollbackMemoryImage = [string](@(
@@ -1914,61 +1840,21 @@ function Invoke-MemoryPlatformInstall {
                 Stop-Install "无法解析旧单卷容器镜像；拒绝开始离线迁移。"
             }
         }
-        $oldPortText = Get-ComposeEnvValue $environmentPath "MEMORY_PORT"
-        $oldPort = 2026
-        if (-not [string]::IsNullOrWhiteSpace($oldPortText) -and
-            (-not [int]::TryParse($oldPortText, [ref] $oldPort) -or
-             $oldPort -lt 1 -or $oldPort -gt 65535)) {
-            Stop-Install "旧 .env 的 MEMORY_PORT 无效；拒绝重启旧栈。"
-        }
-        if ($startedOldService -and
-            -not (Wait-HttpEndpoint "http://127.0.0.1:$oldPort/health" 180)) {
-            Stop-Install "旧服务未能恢复 liveness；拒绝在无法验证旧栈时创建升级备份。"
-        }
-        Write-Step "准备升级前备份"
+        Write-Step "保存旧 Compose 快照"
         $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-$PID"
-        $backupName = "pre-upgrade-$stamp.zip"
-        $script:BackupPath = Join-Path $backupDirectory $backupName
         $script:OldComposeBackup = Join-Path $backupDirectory "pre-upgrade-$stamp.compose.yml"
         [IO.File]::Copy($script:ComposePath, $script:OldComposeBackup, $false)
         Protect-PrivatePath $script:OldComposeBackup
 
+        # Exactly one data backup is created per upgrade.  For split layouts it
+        # is the quiesced snapshot taken right after the old stack stops
+        # writing; for legacy layouts the complete v2 archive is created from
+        # the read-only old volume once the signed init image is available.
+        $script:BackupPath = ""
         if ($script:Layout -eq "legacy") {
-            # The signed candidate code creates a complete v2 archive from a
-            # read-only legacy volume once it is available.  This avoids both
-            # mutating a pre-auth legacy settings file and inventing auth.db in
-            # the old volume.  A second snapshot is taken after stop/fence.
-            $script:BackupPath = ""
             Write-Host "    旧单卷备份将在签名 init 镜像就绪后从只读卷创建。"
         } else {
-            & docker compose -p $script:ProjectName -f $script:ComposePath `
-                --profile maintenance run --rm --no-deps stack-maintenance `
-                --home /data/config --project-root /app/services/memory-gateway `
-                stack backup --model-gateway-home /model-data `
-                --output "/data/$backupName" *> $null
-            $backupCreated = $LASTEXITCODE -eq 0
-            if (-not $backupCreated) {
-                if (-not (Remove-VolumeBackup $script:ComposePath $oldService $backupName)) {
-                    Stop-Install "升级前备份失败，且无法确认数据卷临时副本已清理；旧服务未替换。"
-                }
-                Stop-Install "升级前备份失败；未下载或替换新版本。"
-            }
-            & docker cp "$oldMemoryContainer`:/data/$backupName" $script:BackupPath *> $null
-            $copyExitCode = $LASTEXITCODE
-            $backupCopied = $copyExitCode -eq 0 -and
-                (Test-Path -LiteralPath $script:BackupPath -PathType Leaf) -and
-                (Get-Item -LiteralPath $script:BackupPath).Length -gt 0
-            if (-not (Remove-VolumeBackup $script:ComposePath $oldService $backupName)) {
-                Stop-Install "无法确认数据卷中的临时备份已清理；旧服务未替换。"
-            }
-            if (-not $backupCopied) {
-                if (Test-Path -LiteralPath $script:BackupPath -PathType Leaf) {
-                    Remove-Item -LiteralPath $script:BackupPath -Force
-                }
-                Stop-Install "无法把升级备份完整复制到宿主机；已停止升级。"
-            }
-            Protect-PrivatePath $script:BackupPath
-            Write-Host "    备份已保存：$($script:BackupPath)"
+            Write-Host "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）。"
         }
     }
 
@@ -1980,23 +1866,33 @@ function Invoke-MemoryPlatformInstall {
         Invoke-WebRequest -UseBasicParsing -Uri "$repoRaw/deploy/$($script:ComposeName)" `
             -OutFile $script:CandidateCompose
     } catch {
-        Stop-Install "下载固定发布版 Compose 失败；旧服务未变。"
+        Stop-Install ("下载固定发布版 Compose 失败；旧服务未变。" +
+            "raw.githubusercontent.com 在部分网络不可达：可先为 PowerShell 会话设置代理" +
+            "（`$env:HTTPS_PROXY = 'http://127.0.0.1:7890'）后重跑安装命令。")
     }
-    $script:ComposeBundle = New-TemporarySibling $script:ComposePath "sigstore"
-    try {
-        Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://github.com/SparkHello/Memory_Platform/releases/download/$release/$($script:ComposeName).sigstore.json" `
-            -OutFile $script:ComposeBundle
-    } catch {
-        Stop-Install "下载发布 Compose 的 Sigstore bundle 失败。"
+    if ($verifySignatures) {
+        $script:ComposeBundle = New-TemporarySibling $script:ComposePath "sigstore"
+        try {
+            Invoke-WebRequest -UseBasicParsing `
+                -Uri "https://github.com/SparkHello/Memory_Platform/releases/download/$release/$($script:ComposeName).sigstore.json" `
+                -OutFile $script:ComposeBundle
+        } catch {
+            Stop-Install "下载发布 Compose 的 Sigstore bundle 失败。"
+        }
+        Initialize-CosignVerifier
+        Test-ReleaseComposeSignature `
+            $script:CandidateCompose $script:ComposeBundle $release
+    } else {
+        Write-Host "    已按默认跳过 Sigstore 签名验证；镜像仍按不可变 digest 固定。"
+        Write-Host "    如需启用，设 `$env:MEMORY_VERIFY_SIGNATURES = '1' 后重跑安装命令。"
     }
-    Initialize-CosignVerifier
-    Test-ReleaseComposeSignature `
-        $script:CandidateCompose $script:ComposeBundle $release
 
-    $initTag = "ghcr.io/sparkhello/memory-platform-init:$release"
-    $modelTag = "ghcr.io/sparkhello/memory-platform-model:$release"
-    $memoryTag = "ghcr.io/sparkhello/memory-platform-memory:$release"
+    $initTag = "$imageRegistry/sparkhello/memory-platform-init:$release"
+    $modelTag = "$imageRegistry/sparkhello/memory-platform-model:$release"
+    $memoryTag = "$imageRegistry/sparkhello/memory-platform-memory:$release"
+    if ($imageRegistry -ne "ghcr.io") {
+        Write-Host "    已用 MEMORY_IMAGE_REGISTRY=$imageRegistry 覆盖镜像源；仓库路径与 digest 固定不变。"
+    }
     $script:CandidateEnvironment = New-TemporarySibling $environmentPath "candidate"
     Write-CandidateEnvironment `
         $script:CandidateEnvironment $initTag $modelTag $memoryTag
@@ -2019,15 +1915,19 @@ function Invoke-MemoryPlatformInstall {
     & docker compose --env-file $script:CandidateEnvironment `
         -p $script:ProjectName -f $script:CandidateCompose pull
     if ($LASTEXITCODE -ne 0) {
-        Stop-Install "镜像拉取失败；旧服务未变。"
+        Stop-Install ("镜像拉取失败；旧服务未变。GHCR 在部分网络不可达：" +
+            "可设 `$env:MEMORY_IMAGE_REGISTRY = '<GHCR 镜像站域名>' 重跑安装命令，" +
+            "或在 Docker Desktop → Settings → Resources → Proxies 配置代理。")
     }
     $script:InitImage = Resolve-ImageDigest $initTag
     $modelImage = Resolve-ImageDigest $modelTag
     $memoryImage = Resolve-ImageDigest $memoryTag
-    Write-Step "验证三枚镜像的 Sigstore 发布签名"
-    Test-ReleaseSignature $script:InitImage $release
-    Test-ReleaseSignature $modelImage $release
-    Test-ReleaseSignature $memoryImage $release
+    if ($verifySignatures) {
+        Write-Step "验证三枚镜像的 Sigstore 发布签名"
+        Test-ReleaseSignature $script:InitImage $release
+        Test-ReleaseSignature $modelImage $release
+        Test-ReleaseSignature $memoryImage $release
+    }
     Write-CandidateEnvironment `
         $script:CandidateEnvironment $script:InitImage $modelImage $memoryImage
     Test-CandidateCompose $script:CandidateCompose $script:CandidateEnvironment @{
@@ -2036,24 +1936,18 @@ function Invoke-MemoryPlatformInstall {
         "memory-gateway" = $memoryImage
         "stack-maintenance" = $script:InitImage
     }
-    Write-Step "校验 split stack 的端口、网络、UID 与卷隔离"
-    Test-SignedComposeRuntime `
-        $script:CandidateCompose $script:CandidateEnvironment `
-        $script:InitImage $modelImage $memoryImage `
-        $listenHost $port $credentialDirectory
     $script:CandidateInternalOverride = `
         New-TemporarySibling $script:ComposePath "internal"
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText(
         $script:CandidateInternalOverride,
-        "services:`n  model-gateway:`n    ports: !reset []`n",
+        "services:`n  memory-gateway:`n    ports: !reset []`n",
         $utf8NoBom
     )
     Protect-PrivatePath $script:CandidateInternalOverride
-    Test-SignedInternalComposeRuntime `
+    Test-InternalOverrideCompose `
         $script:CandidateCompose $script:CandidateInternalOverride `
-        $script:CandidateEnvironment $script:InitImage $modelImage $memoryImage `
-        $listenHost $port $credentialDirectory
+        $script:CandidateEnvironment
     if ($script:Layout -eq "legacy") {
         Write-Step "从只读旧单卷创建并复验 v2 升级前备份"
         if (-not (New-QuiescedBackup $oldMemoryContainer $false)) {
@@ -2182,48 +2076,50 @@ function Invoke-MemoryPlatformInstall {
         Stop-Install "新栈启动失败且自动回滚不完整；请保留 backups 与旧卷。"
     }
 
-    $candidateModels = @(& docker compose --env-file $environmentPath `
-        -p $script:ProjectName -f $script:ComposePath `
-        -f $script:CandidateInternalOverride ps -q model-gateway 2>$null)
-    $candidateModel = [string](@(
-        $candidateModels | Where-Object { $_ } | Select-Object -First 1
-    ))
+    # Only Docker's own port mapping tables are consulted: a host HTTP probe
+    # could be answered by an unrelated third-party process on the same port.
     $candidatePublished = @(& docker compose --env-file $environmentPath `
         -p $script:ProjectName -f $script:ComposePath `
-        -f $script:CandidateInternalOverride port model-gateway 2026 2>$null)
+        -f $script:CandidateInternalOverride port memory-gateway 2026 2>$null)
     $runtimePublished = @()
-    if (-not [string]::IsNullOrWhiteSpace($candidateModel)) {
-        $runtimePublished = @(& docker port $candidateModel 2026/tcp 2>$null)
+    foreach ($candidateService in @("memory-gateway", "model-gateway")) {
+        $candidateIds = @(& docker compose --env-file $environmentPath `
+            -p $script:ProjectName -f $script:ComposePath `
+            -f $script:CandidateInternalOverride ps -q $candidateService 2>$null)
+        $candidateId = [string](@(
+            $candidateIds | Where-Object { $_ } | Select-Object -First 1
+        ))
+        if (-not [string]::IsNullOrWhiteSpace($candidateId)) {
+            $runtimePublished += @(& docker port $candidateId 2>$null)
+        }
     }
     if (@($candidatePublished | Where-Object { $_ }).Count -gt 0 -or
-        @($runtimePublished | Where-Object { $_ }).Count -gt 0 -or
-        (Test-HttpEndpoint "http://127.0.0.1:$port/health")) {
+        @($runtimePublished | Where-Object { $_ }).Count -gt 0) {
         if (Invoke-Rollback) {
             Stop-Install "候选验收阶段意外发布宿主端口；旧服务和数据已恢复。"
         }
         Stop-Install "候选验收阶段意外发布宿主端口且自动回滚不完整。"
     }
 
-    Write-Step "通过容器内部链路验收 Memory、Model 与固定 TCP relay"
+    Write-Step "通过容器内部链路验收 Memory 与 Model"
     $candidateChecks = @(
         @{ Service = "memory-gateway"; Url = "http://127.0.0.1:2026/health" },
-        @{ Service = "model-gateway"; Url = "http://127.0.0.1:2030/health" },
-        @{ Service = "model-gateway"; Url = "http://127.0.0.1:2026/health" }
+        @{ Service = "model-gateway"; Url = "http://127.0.0.1:2030/health" }
     )
     foreach ($check in $candidateChecks) {
         if (-not (Wait-CandidateContainerHttp `
             $script:ComposePath $script:CandidateInternalOverride `
             $environmentPath ([string] $check.Service) ([string] $check.Url) 180)) {
             if (Invoke-Rollback) {
-                Stop-Install "候选内部 liveness/relay 验收失败；旧服务和数据已恢复。"
+                Stop-Install "候选内部 liveness 验收失败；旧服务和数据已恢复。"
             }
-            Stop-Install "候选内部 liveness/relay 验收失败且自动回滚不完整。"
+            Stop-Install "候选内部 liveness 验收失败且自动回滚不完整。"
         }
     }
     if ($script:Layout -ne "fresh") {
         foreach ($check in @(
             @{ Service = "memory-gateway"; Url = "http://127.0.0.1:2026/readyz" },
-            @{ Service = "model-gateway"; Url = "http://127.0.0.1:2026/readyz" }
+            @{ Service = "model-gateway"; Url = "http://127.0.0.1:2030/readyz" }
         )) {
             if (-not (Wait-CandidateContainerHttp `
                 $script:ComposePath $script:CandidateInternalOverride `
@@ -2289,7 +2185,7 @@ function Invoke-MemoryPlatformInstall {
     Write-Step "发布已验收的 Memory 入口"
     & docker compose --env-file $environmentPath -p $script:ProjectName `
         -f $script:ComposePath up -d --no-deps --force-recreate `
-        model-gateway *> $null
+        memory-gateway *> $null
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "升级已提交但入口发布失败；不会回滚已接受的新数据，journal 已保留供重试。"
     }
@@ -2300,7 +2196,7 @@ function Invoke-MemoryPlatformInstall {
     }
     $published = @(& docker compose --env-file $environmentPath `
         -p $script:ProjectName -f $script:ComposePath `
-        port model-gateway 2026 2>$null)
+        port memory-gateway 2026 2>$null)
     if (@($published | Where-Object { $_ -and $_.Trim() -match ":$port$" }).Count -eq 0) {
         Stop-Install "升级已提交但宿主端口契约不匹配；journal 已保留供重试。"
     }
@@ -2308,14 +2204,19 @@ function Invoke-MemoryPlatformInstall {
         Write-Host "warning: 新栈已验收并发布，committed journal 将在下次安装时清理。"
     }
 
-    $lanIp = Get-FirstLanIp
     Write-Host ""
     Write-Host "Memory Platform $release 已启动"
     Write-Host "  Web Console:  http://127.0.0.1:$port/ui/"
     Write-Host "  Client URL:   http://127.0.0.1:$port/v1"
     Write-Host "  Model:        memory-auto"
-    if ($listenHost -eq "0.0.0.0" -and -not [string]::IsNullOrWhiteSpace($lanIp)) {
-        Write-Host "  LAN Client:   http://${lanIp}:$port/v1"
+    if ($listenHost -ne "127.0.0.1") {
+        $lanIp = if ($listenHost -eq "0.0.0.0") { Get-FirstLanIp } else { $listenHost }
+        if (-not [string]::IsNullOrWhiteSpace($lanIp)) {
+            Write-Host "  局域网/手机:  http://${lanIp}:$port/v1（Web Console 为 http://${lanIp}:$port/ui/）"
+        } else {
+            Write-Host "  局域网/手机:  http://<本机局域网IP>:$port/v1（PowerShell 用 ipconfig 查询本机 IPv4）"
+        }
+        Write-Host "已监听可信局域网；请确认路由器没有把端口映射到公网。"
     }
     Write-Host "  Console token: $gatewayCredential"
     Write-Host "  Admin key:    $adminCredential"

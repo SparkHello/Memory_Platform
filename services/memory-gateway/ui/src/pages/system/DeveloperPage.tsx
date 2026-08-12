@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import {
   CheckCircle2,
   Clipboard,
+  Eye,
+  EyeOff,
   KeyRound,
   MessageCircle,
   Plug,
@@ -42,9 +44,12 @@ export function DeveloperPage({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [role, setRole] = useState<DeviceRole>("chat");
+  const [memoryAccess, setMemoryAccess] = useState<"read" | "read-write">("read-write");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [created, setCreated] = useState<AuthTokenCreateResult | null>(null);
+  // 一次性 token 统一默认掩码，避免旁观屏幕时明文外泄。
+  const [showCreatedToken, setShowCreatedToken] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
   const chatBaseUrl = joinUrl(settings.apiBaseUrl, "/v1");
@@ -94,8 +99,11 @@ export function DeveloperPage({
     setCreating(true);
     setCreateError(null);
     try {
-      const result = await api.createAuthToken(normalizedName, role);
+      const result = await api.createAuthToken(normalizedName, role, {
+        memoryAccess: role === "chat" ? memoryAccess : undefined
+      });
       setCreated(result);
+      setShowCreatedToken(false);
       setName("");
       setTokens((current) =>
         current
@@ -190,6 +198,16 @@ export function DeveloperPage({
               旧 key 同时拥有聊天、MCP 和 Console 权限。请先为各设备迁移到下方 scoped
               token，再在服务配置中关闭 legacy key。本页只显示迁移状态，绝不会回显旧 key。
             </p>
+            <details className="provider-bootstrap-help">
+              <summary>如何关闭 legacy key？</summary>
+              <p>确认所有设备都已换用下方 scoped token 后：</p>
+              <p>Docker：在安装目录（默认 memory-platform）打开终端后依次运行：</p>
+              <code>docker compose -f docker-compose.user.yml --profile maintenance run --rm stack-maintenance config set GATEWAY_LEGACY_API_KEY_ENABLED false</code>
+              <code>docker compose -f docker-compose.user.yml restart memory-gateway</code>
+              <p>源码安装：在仓库根目录运行后重启服务：</p>
+              <code>scripts/memgw config set GATEWAY_LEGACY_API_KEY_ENABLED false</code>
+              <p>关闭后旧 key 立即失效；如仍有设备在用它，会收到 401，需要改配 scoped token。</p>
+            </details>
           </div>
         </section>
       )}
@@ -246,6 +264,24 @@ export function DeveloperPage({
               disabled={creating || Boolean(created)}
             />
           </label>
+          {role === "chat" && (
+            <label className="field-block">
+              <span>记忆写入权限</span>
+              <select
+                value={memoryAccess}
+                onChange={(event) =>
+                  setMemoryAccess(event.target.value as "read" | "read-write")
+                }
+                disabled={creating || Boolean(created)}
+              >
+                <option value="read-write">读写（默认：自动召回 + 回答后提取）</option>
+                <option value="read">只读（可召回，禁止自动写入记忆）</option>
+              </select>
+              <small className="muted">
+                只读 token 适合演示机或共享设备：仍可聊天并注入已有记忆，但不会因对话新增记忆。
+              </small>
+            </label>
+          )}
           <button
             className="primary-button"
             type="button"
@@ -266,8 +302,20 @@ export function DeveloperPage({
                 <p>服务端只保存哈希。关闭、刷新或离开此页后无法再次查看。</p>
               </div>
             </div>
-            <code className="one-time-token-value">{created.token}</code>
+            <code className="one-time-token-value">
+              {showCreatedToken
+                ? created.token
+                : `${created.token.slice(0, 12)}…${created.token.slice(-4)}`}
+            </code>
             <div className="button-row">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setShowCreatedToken((value) => !value)}
+              >
+                {showCreatedToken ? <EyeOff size={16} /> : <Eye size={16} />}
+                {showCreatedToken ? "隐藏 token" : "显示 token"}
+              </button>
               <button
                 className="primary-button"
                 type="button"
@@ -284,7 +332,10 @@ export function DeveloperPage({
               <button
                 className="secondary-button"
                 type="button"
-                onClick={() => setCreated(null)}
+                onClick={() => {
+                  setCreated(null);
+                  setShowCreatedToken(false);
+                }}
               >
                 <CheckCircle2 size={16} />
                 我已保存
@@ -365,6 +416,11 @@ export function DeveloperPage({
                     <strong>{record.name}</strong>
                     <div className="device-token-tags">
                       <span className={`token-role-pill role-${record.role}`}>{roleLabel(record.role)}</span>
+                      {record.role === "chat" && (
+                        <span className="token-role-pill">
+                          {record.memory_access === "read" ? "记忆只读" : "记忆读写"}
+                        </span>
+                      )}
                       <span className={`token-status-pill ${record.revoked_at ? "revoked" : "active"}`}>
                         {record.revoked_at ? "已撤销" : "可用"}
                       </span>

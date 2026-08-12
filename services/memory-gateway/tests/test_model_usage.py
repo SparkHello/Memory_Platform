@@ -104,6 +104,38 @@ def test_usage_store_preserves_full_user_isolation_key(tmp_path) -> None:
     assert store.summary(user_id=shared_prefix, days=None)["totals"]["calls"] == 0
 
 
+def test_usage_store_prune_deletes_only_expired_events(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    store = UsageStore(str(tmp_path / "usage.db"))
+    store.init_db()
+    for _ in range(2):
+        store.record_response(
+            user_id="alice",
+            operation="chat_completion",
+            provider="deepseek",
+            provider_code="",
+            model="deepseek-chat",
+            kind="chat",
+            payload={"usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+        )
+    future = datetime.now(UTC) + timedelta(days=366)
+    assert store.prune(now=future) == 2
+    assert store.summary(user_id="alice", days=None)["totals"]["calls"] == 0
+
+    store.record_response(
+        user_id="alice",
+        operation="chat_completion",
+        provider="deepseek",
+        provider_code="",
+        model="deepseek-chat",
+        kind="chat",
+        payload={"usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+    )
+    assert store.prune() == 0
+    assert store.summary(user_id="alice", days=None)["totals"]["calls"] == 1
+
+
 def test_usage_recorder_accepts_authoritative_gateway_vendor(tmp_path) -> None:
     database = str(tmp_path / "usage.db")
     store = UsageStore(database)

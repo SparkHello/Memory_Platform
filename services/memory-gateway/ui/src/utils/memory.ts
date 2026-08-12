@@ -97,6 +97,48 @@ export function editDraftToSpacesPayload(draft: MemoryEditDraft): MemorySpacesUp
   };
 }
 
+const WORD_RE = /[a-z0-9][a-z0-9+._#-]*/gi;
+const CJK_RE = /[\u4e00-\u9fff]+/g;
+
+function contentTokens(text: string): string[] {
+  const tokens: string[] = [];
+  for (const match of text.matchAll(WORD_RE)) {
+    const word = match[0].replace(/[+._#-]+$/, "");
+    if (word.length >= 2) tokens.push(word.toLocaleLowerCase());
+  }
+  for (const match of text.matchAll(CJK_RE)) {
+    const run = match[0];
+    if (run.length === 1) {
+      tokens.push(run);
+      continue;
+    }
+    for (let index = 0; index + 1 < run.length; index += 1) {
+      tokens.push(run.slice(index, index + 2));
+    }
+  }
+  return tokens;
+}
+
+/**
+ * 判断记忆正文是否已明显偏离原始来源（如人工编辑后加入了原话没有的事实）。
+ * 纯展示层启发式：正文的内容词若大多数在来源原文里找不到，就提示用户
+ * "来源仅供追溯"。第三人称改写（"我喜欢X"→"用户喜欢X"）不应触发。
+ */
+export function contentDivergesFromSource(
+  content: string,
+  sourceMessage: string | null | undefined
+): boolean {
+  if (!sourceMessage) return false;
+  // "用户"/"User"是改写第三人称时加入的叙述前缀，不算内容词。
+  const tokens = contentTokens(content.replace(/用户/g, "")).filter(
+    (token) => token !== "user"
+  );
+  if (tokens.length < 4) return false;
+  const haystack = sourceMessage.toLocaleLowerCase();
+  const supported = tokens.filter((token) => haystack.includes(token)).length;
+  return supported / tokens.length < 0.5;
+}
+
 export function normalizeTags(values: string[]): string[] {
   const seen = new Set<string>();
   const tags: string[] = [];

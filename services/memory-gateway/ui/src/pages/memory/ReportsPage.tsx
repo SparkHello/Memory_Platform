@@ -36,6 +36,8 @@ export function ReportsPage({
   const [overwrite, setOverwrite] = useState(false);
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [stackAdminKey, setStackAdminKey] = useState("");
+  const [stackBusy, setStackBusy] = useState(false);
   const exportUserId = safeExportUserId(settings.userId || "default");
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -90,6 +92,39 @@ export function ReportsPage({
       notify("已下载 Obsidian Zip", "success");
     } catch (error) {
       notify(errorMessage(error), "error");
+    }
+  };
+
+  const exportStackZip = async () => {
+    const confirmed = await confirm({
+      title: "下载整栈便携备份",
+      message: (
+        <span>
+          将打包记忆库、知识库、访问令牌哈希、脱敏模型配置等。
+          注意这是<strong>整实例</strong>备份：包含本部署<strong>所有用户</strong>的数据，
+          不只是当前登录身份。
+          <strong>不含</strong>供应商 API Key 与 admin 密钥；换机后需重新填写密钥。
+          备份内含明文记忆与知识正文，请当敏感文件保管。
+        </span>
+      ),
+      confirmLabel: "下载备份",
+      tone: "warning"
+    });
+    if (!confirmed) return;
+    setStackBusy(true);
+    try {
+      const blob = await api.exportStackBackup({
+        modelGatewayAdminKey: stackAdminKey.trim() || undefined
+      });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      downloadBlob(`memory-stack-backup-${stamp}.zip`, blob);
+      // 备份完成后立即丢弃 admin 密钥明文，不让它留在表单里。
+      setStackAdminKey("");
+      notify("已下载整栈便携备份（不含密钥）", "success");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    } finally {
+      setStackBusy(false);
     }
   };
 
@@ -200,6 +235,40 @@ export function ReportsPage({
           <button className="secondary-button" type="button" onClick={exportObsidianZip}>
             <Download size={16} />
             下载 Obsidian Zip
+          </button>
+        </div>
+      </section>
+
+      <section className="panel export-panel stack-backup-panel">
+        <div className="panel-header">
+          <h2>整栈便携备份</h2>
+        </div>
+        <p className="muted">
+          适合换机或升级前：记忆 + 知识 + 令牌哈希 + 模型路由配置（不含任何 API Key）。
+          备份覆盖本部署<strong>所有用户</strong>的完整数据，不按当前登录身份过滤。
+          Docker 双容器部署时，Memory 进程通常读不到 Model 数据卷，需要临时填写下方
+          admin 密钥以便通过内网拉取脱敏配置。
+        </p>
+        <label className="field-block">
+          <span>Model Gateway admin 密钥（可选）</span>
+          <input
+            type="password"
+            value={stackAdminKey}
+            onChange={(event) => setStackAdminKey(event.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Docker 拆分部署时填写；同机源码安装通常可留空"
+          />
+        </label>
+        <div className="button-row">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={stackBusy}
+            onClick={() => void exportStackZip()}
+          >
+            <Download size={16} />
+            {stackBusy ? "正在打包…" : "下载整栈备份 Zip"}
           </button>
         </div>
       </section>

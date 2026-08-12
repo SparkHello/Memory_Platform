@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from contextlib import contextmanager
 from hashlib import sha256
@@ -607,6 +608,16 @@ class ConfigManager:
                     self._revision = revision
                     self._last_reload_error = ""
                 return self._config, dict(self._secrets)
+
+    async def snapshot_async(self) -> tuple[GatewayConfig, dict[str, str]]:
+        """Event-loop-safe snapshot.
+
+        ``snapshot()`` takes a cross-process file lock and may re-read config
+        files from disk; both can block for tens of milliseconds under
+        contention, which would stall every in-flight request when called on
+        the event loop. Async handlers must use this wrapper.
+        """
+        return await asyncio.to_thread(self.snapshot)
 
     def force_reload(self) -> tuple[GatewayConfig, dict[str, str]]:
         with self._lock:

@@ -76,12 +76,13 @@ export function App() {
     }
     const next: NavSignals = {};
     try {
-      const [report, review, workbench, knowledge, providers] = await Promise.all([
+      const [report, review, workbench, knowledge, providers, tokens] = await Promise.all([
         api.memoryReport(),
         api.reviewMemories(),
         api.recallEvaluationWorkbench().catch(() => null),
         api.knowledgeStatus().catch(() => null),
-        api.providersStatus().catch(() => null)
+        api.providersStatus().catch(() => null),
+        api.authTokens().catch(() => null)
       ]);
       if (review.recommendations.length > 0) {
         next.review = { text: String(review.recommendations.length), tone: "warning" };
@@ -115,6 +116,12 @@ export function App() {
         setSetupStatus(providers.setup);
       } else if (providers) {
         setSetupStatus(providers.setup);
+      }
+      if (tokens?.legacy_key_enabled) {
+        next.developer = {
+          text: tokens.authenticated_with_legacy_key ? "旧密钥" : "迁移",
+          tone: "warning"
+        };
       }
       setKnowledgeStatus(knowledge);
     } catch {

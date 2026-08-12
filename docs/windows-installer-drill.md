@@ -83,7 +83,7 @@ $LASTEXITCODE   # 记录每次退出码
 - `==> 验证三枚镜像的 Sigstore 发布签名`
 - `==> 校验 split stack 的端口、网络、UID 与卷隔离`
 - `==> 在无宿主发布端口的隔离模式启动候选服务`
-- `==> 通过容器内部链路验收 Memory、Model 与固定 TCP relay`
+- `==> 通过容器内部链路验收 Memory 与 Model`
 - `==> 发布已验收的 Memory 入口`
 - 结尾打印 `Memory Platform v0.2.0 已启动`、Console/Client URL、`Console token: <路径>`、`Admin key: <路径>`（只打印路径，不打印值）、`密钥值没有进入脚本输出、Compose 环境或 Docker 日志。`
 
@@ -99,9 +99,9 @@ curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:2026/health
 # 3. readiness：未配置模型时预期 503（不是 bug，见下）
 curl.exe -s http://127.0.0.1:2026/readyz
 
-# 4. 端口面：2030 不得发布；2026 只绑回环
+# 4. 端口面：model-gateway 不得发布任何端口；memory-gateway 2026 只绑回环
 docker compose -f "$InstallDir\docker-compose.user.yml" port model-gateway 2030   # 预期无输出
-docker compose -f "$InstallDir\docker-compose.user.yml" port model-gateway 2026   # 预期 127.0.0.1:2026
+docker compose -f "$InstallDir\docker-compose.user.yml" port memory-gateway 2026   # 预期 127.0.0.1:2026
 
 # 5. 密钥面：.env 与 Compose 渲染结果中不得出现访问密钥字段
 Select-String -Path "$InstallDir\.env" -Pattern "GATEWAY_API_KEY|MEMORY_CONSOLE_ADMIN_KEY"   # 预期 0 命中

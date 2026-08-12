@@ -52,6 +52,9 @@ _CACHE_METRICS: dict[str, dict[str, int]] = {}
 _CACHE_METRICS_LOCK = threading.Lock()
 _CACHE_METRICS_MAX_USERS = 1024
 _RECALL_LIMIT = 20
+# 单次检索最多激活的记忆条数：只有真正进入回答的头部命中才应获得
+# usage/activation 强化，避免"被检索曝光"就无限自增的正反馈。
+ACTIVATION_LIMIT = 5
 # The evaluation workbench still uses this bounded preview size. Live recall no
 # longer uses it: correctness must not depend on an importance-ordered cutoff.
 RECALL_CANDIDATE_POOL = 10_000
@@ -234,6 +237,32 @@ def _normalize_query(query: str) -> str:
         return normalized
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return f"{normalized[:200]}:{digest}"
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？；\n]+|[!?;]+(?:\s+|$)|\.(?:\s+|$)")
+_MAX_QUERY_SENTENCES = 4
+
+
+def _query_sentences(query: str) -> list[str]:
+    """把"新事实+提问"式多意图消息按中英句读切成独立召回意图。
+
+    单句消息返回空列表（不启用多路召回）；子句数量有上限，防止长消息
+    放大 embedding 调用成本。
+    """
+    text = " ".join(query.split())
+    sentences: list[str] = []
+    for part in _SENTENCE_SPLIT_RE.split(text):
+        cleaned = part.strip(" ，,、·…~—-")
+        if not cleaned:
+            continue
+        compact = re.sub(r"\s+", "", cleaned)
+        # 过短碎片（"好的"、"OK"）没有独立召回价值。
+        if len(compact) < 4:
+            continue
+        sentences.append(cleaned)
+    if len(sentences) < 2:
+        return []
+    return sentences[:_MAX_QUERY_SENTENCES]
 
 
 def _semantic_query_text(query: str) -> str:
@@ -583,6 +612,12 @@ class MemorySearchService:
             user_id=user_id,
             now=now,
         )
+        sentence_queries = _query_sentences(query)
+        sentence_embeddings = (
+            await self._sentence_embeddings(sentence_queries, user_id=user_id, now=now)
+            if sentence_queries
+            else []
+        )
 
         candidate_limit = _RECALL_LIMIT * 2 if self.enable_cache else capped_limit
         hits = await anyio.to_thread.run_sync(
@@ -591,6 +626,8 @@ class MemorySearchService:
                 user_id=user_id,
                 query=query,
                 query_embedding=query_embedding,
+                sentence_queries=sentence_queries,
+                sentence_embeddings=sentence_embeddings,
                 embedding_space_id=embedding_space_id,
                 limit=candidate_limit,
                 include_sensitive=include_sensitive,
@@ -642,12 +679,23 @@ class MemorySearchService:
         embedding_space_id: str,
         limit: int,
         include_sensitive: bool,
+        sentence_queries: list[str] | None = None,
+        sentence_embeddings: list[list[float]] | None = None,
     ) -> list[MemorySearchHit]:
         now = datetime.now(UTC)
         temporal_mode = temporal_query_mode(query, now=now)
         temporal_window = temporal_query_window(query)
-        keyword_query = _keyword_query_text(query)
-        query_terms = _terms(keyword_query)
+        # 多意图消息按句多路召回：整条消息 + 每个子句各自评分，取并集，
+        # 每条记忆保留最高分。channels/score_breakdown 解释字段保持不变。
+        keyword_variants = [query, *(sentence_queries or [])]
+        query_embeddings = [
+            vector
+            for vector in (query_embedding, *(sentence_embeddings or []))
+            if vector
+        ]
+        query_terms: set[str] = set()
+        for variant in keyword_variants:
+            query_terms |= _terms(_keyword_query_text(variant))
         document_frequency = {term: 0 for term in query_terms}
         document_count = 0
 
@@ -666,53 +714,86 @@ class MemorySearchService:
                 and not _query_memory_subject_conflict(query, memory)
             ]
 
-        # A keyword score contains corpus-wide metadata IDF.  The first pass
-        # computes those statistics; the second pass ranks from the exact same
-        # SQLite snapshot and keeps only bounded global channel candidates.
-        with self.store.memory_recall_snapshot(user_id=user_id) as read_pages:
-            for page in read_pages():
-                page = eligible(page)
-                document_count += len(page)
-                for memory in page:
-                    all_terms = (
-                        _terms(memory.content)
-                        | _terms(" ".join(memory.topics))
-                        | _terms(" ".join(memory.entities))
-                    )
-                    for term in query_terms & all_terms:
-                        document_frequency[term] += 1
+        embedding_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
+        keyword_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
+        sequence = 0
 
-            embedding_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
-            keyword_heap: list[tuple[float, int, str, int, MemoryRecord]] = []
-            sequence = 0
-            for page in read_pages():
-                page = eligible(page)
-                if query_embedding:
-                    for score, memory in self._score_by_embedding(
-                        page,
-                        query_embedding,
-                        embedding_space_id=embedding_space_id,
-                    ):
+        # 大库、纯关键词查询时先用 FTS5 索引把候选缩小到"共享至少一个
+        # 查询词"的记忆，再用原有打分精排；embedding 查询、单字/类别
+        # 通道和小库都返回 None，走下面的全表扫描路径。
+        fts_candidates = (
+            self._fts_keyword_candidates(keyword_variants, user_id=user_id)
+            if not query_embeddings
+            else None
+        )
+        if fts_candidates is not None:
+            page = eligible(fts_candidates)
+            page_keyword_best: dict[str, tuple[float, MemoryRecord]] = {}
+            for variant in keyword_variants:
+                for score, memory in self._score_by_keywords(page, variant):
+                    previous = page_keyword_best.get(memory.id)
+                    if previous is None or score > previous[0]:
+                        page_keyword_best[memory.id] = (score, memory)
+            for score, memory in page_keyword_best.values():
+                sequence += 1
+                _push_bounded_scored_memory(
+                    keyword_heap,
+                    score=score,
+                    memory=memory,
+                    sequence=sequence,
+                )
+        else:
+            # A keyword score contains corpus-wide metadata IDF.  The first
+            # pass computes those statistics; the second pass ranks from the
+            # exact same SQLite snapshot and keeps only bounded global channel
+            # candidates.
+            with self.store.memory_recall_snapshot(user_id=user_id) as read_pages:
+                for page in read_pages():
+                    page = eligible(page)
+                    document_count += len(page)
+                    for memory in page:
+                        all_terms = (
+                            _terms(memory.content)
+                            | _terms(" ".join(memory.topics))
+                            | _terms(" ".join(memory.entities))
+                        )
+                        for term in query_terms & all_terms:
+                            document_frequency[term] += 1
+
+                for page in read_pages():
+                    page = eligible(page)
+                    if query_embeddings:
+                        for score, memory in self._score_by_embedding(
+                            page,
+                            query_embeddings,
+                            embedding_space_id=embedding_space_id,
+                        ):
+                            sequence += 1
+                            _push_bounded_scored_memory(
+                                embedding_heap,
+                                score=score,
+                                memory=memory,
+                                sequence=sequence,
+                            )
+                    page_keyword_best = {}
+                    for variant in keyword_variants:
+                        for score, memory in self._score_by_keywords(
+                            page,
+                            variant,
+                            document_frequency=document_frequency,
+                            document_count=document_count,
+                        ):
+                            previous = page_keyword_best.get(memory.id)
+                            if previous is None or score > previous[0]:
+                                page_keyword_best[memory.id] = (score, memory)
+                    for score, memory in page_keyword_best.values():
                         sequence += 1
                         _push_bounded_scored_memory(
-                            embedding_heap,
+                            keyword_heap,
                             score=score,
                             memory=memory,
                             sequence=sequence,
                         )
-                for score, memory in self._score_by_keywords(
-                    page,
-                    query,
-                    document_frequency=document_frequency,
-                    document_count=document_count,
-                ):
-                    sequence += 1
-                    _push_bounded_scored_memory(
-                        keyword_heap,
-                        score=score,
-                        memory=memory,
-                        sequence=sequence,
-                    )
 
         combined: dict[str, MemorySearchHit] = {}
         for score, memory in _scored_memories_descending(embedding_heap):
@@ -725,6 +806,41 @@ class MemorySearchService:
             reverse=True,
         )
         return hits[:limit]
+
+    def _fts_keyword_candidates(
+        self,
+        keyword_variants: list[str],
+        *,
+        user_id: str,
+    ) -> list[MemoryRecord] | None:
+        """尝试用 FTS5 索引生成关键词候选；返回 None 表示走全表扫描。
+
+        单字 CJK 与类别标记通道在打分层不要求共享查询词，term 索引无法
+        为它们生成完整候选，出现时整体回退，保证召回不缩水。
+        """
+        all_terms: set[str] = set()
+        for variant in keyword_variants:
+            keyword_query = _keyword_query_text(variant)
+            if _single_cjk_keyword(keyword_query) is not None:
+                return None
+            query_lower = keyword_query.lower()
+            compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_lower)
+            if _keyword_category_markers(
+                query_lower=query_lower,
+                compact_query=compact_query,
+            ):
+                return None
+            all_terms |= _terms(keyword_query)
+        if not all_terms:
+            return None
+        try:
+            return self.store.keyword_candidate_memories(
+                user_id=user_id,
+                terms=sorted(all_terms),
+            )
+        except Exception:
+            # 索引层任何故障都不能影响检索本身；回退全表扫描。
+            return None
 
     def _finalize_hits(
         self,
@@ -825,48 +941,46 @@ class MemorySearchService:
             self._cache_embedding(l1_key, query_embedding, now)
         return query_embedding
 
-    def _rank_hits(
+    async def _sentence_embeddings(
         self,
+        sentences: list[str],
         *,
-        memories: list[MemoryRecord],
-        query: str,
-        query_embedding: list[float] | None,
-        embedding_space_id: str,
-        limit: int,
-    ) -> list[MemorySearchHit]:
-        now = datetime.now(UTC)
-        temporal_mode = temporal_query_mode(query, now=now)
-        temporal_window = temporal_query_window(query)
-        combined: dict[str, MemorySearchHit] = {}
-        memories = [
-            memory
-            for memory in memories
-            if memory_matches_temporal_mode(
-                memory,
-                mode=temporal_mode,
-                now=now,
-                query_window=temporal_window,
-            )
-            and not _query_memory_subject_conflict(query, memory)
-        ]
-
-        if query_embedding:
-            for topic_score, memory in self._score_by_embedding(
-                memories,
-                query_embedding,
-                embedding_space_id=embedding_space_id,
-            )[:_RECALL_LIMIT]:
-                _upsert_hit(combined, memory, topic_score, "embedding", now=now)
-
-        for topic_score, memory in self._score_by_keywords(memories, query)[:_RECALL_LIMIT]:
-            _upsert_hit(combined, memory, topic_score, "keyword", now=now)
-
-        hits = list(combined.values())
-        hits.sort(
-            key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
-            reverse=True,
-        )
-        return hits[:limit]
+        user_id: str,
+        now: float,
+    ) -> list[list[float]]:
+        """为多意图子句取向量；逐句复用 L1 缓存，未命中的批量请求。"""
+        embedding_space_id = embedding_space_id_for(self.embedding_client)
+        if not embedding_space_id or isinstance(
+            self.embedding_client, NullEmbeddingClient
+        ):
+            return []
+        vectors: list[list[float] | None] = [None] * len(sentences)
+        pending: list[tuple[int, str]] = []
+        for index, sentence in enumerate(sentences):
+            l1_key = (user_id, embedding_space_id, _normalize_query(sentence))
+            if self.enable_cache:
+                with _EMBEDDING_CACHE_LOCK:
+                    cached = _EMBEDDING_CACHE.get(l1_key)
+                if cached is not None and now < cached[0]:
+                    vectors[index] = cached[1]
+                    continue
+            pending.append((index, sentence))
+        if pending:
+            with model_usage_scope(user_id=user_id, operation="memory_search"):
+                fetched = await self.embedding_client.embed_many(
+                    [_semantic_query_text(sentence) for _, sentence in pending]
+                )
+            for (index, sentence), vector in zip(pending, fetched, strict=True):
+                if not vector:
+                    continue
+                vectors[index] = vector
+                if self.enable_cache:
+                    self._cache_embedding(
+                        (user_id, embedding_space_id, _normalize_query(sentence)),
+                        vector,
+                        now,
+                    )
+        return [vector for vector in vectors if vector]
 
     def _cached_search_hits(
         self,
@@ -1020,11 +1134,11 @@ class MemorySearchService:
     def _score_by_embedding(
         self,
         memories: list[MemoryRecord],
-        query_embedding: list[float],
+        query_embeddings: list[list[float]],
         *,
         embedding_space_id: str,
     ) -> list[tuple[float, MemoryRecord]]:
-        if not embedding_space_id:
+        if not embedding_space_id or not query_embeddings:
             return []
         scored: list[tuple[float, MemoryRecord]] = []
         for memory in memories:
@@ -1034,7 +1148,11 @@ class MemorySearchService:
             )
             if memory_embedding is None:
                 continue
-            cosine = cosine_similarity(query_embedding, memory_embedding)
+            # 多意图消息按子句取最高相似度，避免整句向量稀释单个意图。
+            cosine = max(
+                cosine_similarity(query_embedding, memory_embedding)
+                for query_embedding in query_embeddings
+            )
             score = cosine * 100.0
             if cosine >= EMBEDDING_MIN_COSINE:
                 scored.append((score, memory))
@@ -1175,14 +1293,15 @@ class MemorySearchService:
     ) -> list[MemorySearchHit]:
         if not record_usage:
             return hits
+        activated = hits[:ACTIVATION_LIMIT]
         used_at = self.store.mark_memories_used(
-            memory_ids=[hit.memory.id for hit in hits],
+            memory_ids=[hit.memory.id for hit in activated],
             user_id=user_id,
             time_ripple_delta=self.time_ripple_delta,
             time_ripple_window_hours=self.time_ripple_window_hours,
         )
         if used_at:
-            for hit in hits:
+            for hit in activated:
                 hit.memory.usage_count += 1
                 hit.memory.last_used_at = used_at
                 _refresh_hit_decay(hit)

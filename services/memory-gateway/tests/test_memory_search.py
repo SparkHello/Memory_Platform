@@ -4,7 +4,14 @@ import json
 
 import pytest
 
-from app.memory.search import MemorySearchService, NullEmbeddingClient, SEARCH_CACHE
+from app.memory.search import (
+    ACTIVATION_LIMIT,
+    EmbeddingClient,
+    MemorySearchService,
+    NullEmbeddingClient,
+    SEARCH_CACHE,
+    _query_sentences,
+)
 from app.memory.store import MemoryStore
 from app.memory.temporal import (
     memory_matches_temporal_mode,
@@ -1219,6 +1226,248 @@ def test_surface_memories_excludes_sensitive_and_derived_by_default(
 
     assert default_ids == [normal.id]
     assert set(opted_in_ids) == {normal.id, sensitive.id}
+
+
+def test_query_sentences_splits_multi_intent_messages() -> None:
+    sentences = _query_sentences("我今天领养了一只小猫叫豆豆。对了我一般周几去打羽毛球？")
+    assert sentences == ["我今天领养了一只小猫叫豆豆", "对了我一般周几去打羽毛球"]
+
+    english = _query_sentences(
+        "I adopted a cat named Bobo. Which days do I usually play badminton?"
+    )
+    assert english == [
+        "I adopted a cat named Bobo",
+        "Which days do I usually play badminton",
+    ]
+
+
+def test_query_sentences_skips_single_intent_and_fragments() -> None:
+    # 单句消息不启用多路召回。
+    assert _query_sentences("我一般周几去打羽毛球？") == []
+    # 过短碎片（"好的"）被过滤后只剩一句，同样不启用。
+    assert _query_sentences("好的。帮我记住明天下午要开项目会。") == []
+    # 子句数量有上限，防止长消息放大 embedding 成本。
+    many = _query_sentences(
+        "我喜欢黑咖啡。我喜欢爵士乐。我住在杭州。我养了一只猫。"
+        "我每周跑步三次。我最近在学法语。"
+    )
+    assert len(many) == 4
+
+
+@pytest.mark.asyncio
+async def test_multi_intent_query_recalls_sub_question_via_keywords(
+    memory_store: MemoryStore,
+) -> None:
+    badminton = memory_store.create_memory(
+        user_id="default",
+        content="用户每周三和周六晚上去打羽毛球。",
+        type="semantic",
+        importance=5,
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡和爵士乐。",
+        type="emotional",
+        importance=3,
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    hits = await service.search_hits(
+        query="我今天领养了一只小猫叫豆豆。对了我一般周几去打羽毛球？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+
+    assert badminton.id in [hit.memory.id for hit in hits]
+
+
+class MappedEmbeddingClient(EmbeddingClient):
+    """按文本内容返回固定向量，模拟子句与整句语义不同的场景。"""
+
+    embedding_space_id = "test-space"
+
+    def __init__(self, mapping: list[tuple[str, list[float]]]):
+        self.mapping = mapping
+        self.texts: list[str] = []
+
+    def _vector_for(self, text: str) -> list[float] | None:
+        self.texts.append(text)
+        for needle, vector in self.mapping:
+            if needle in text:
+                return vector
+        return None
+
+    async def embed(self, text: str) -> list[float] | None:
+        return self._vector_for(text)
+
+    async def embed_many(
+        self,
+        texts: list[str],
+        *,
+        screen_sensitivity: bool = True,
+    ) -> list[list[float] | None]:
+        return [self._vector_for(text) for text in texts]
+
+
+@pytest.mark.asyncio
+async def test_multi_intent_query_recalls_sub_question_via_embedding(
+    memory_store: MemoryStore,
+) -> None:
+    schedule = memory_store.create_memory(
+        user_id="default",
+        content="用户固定在周三和周六晚上运动。",
+        type="semantic",
+        importance=5,
+        embedding_json=json.dumps([0.0, 1.0]),
+        embedding_space_id="test-space",
+    )
+    # 整句（含"豆豆"）映射到与记忆正交的向量：单靠整句召回不到；
+    # 拆出的提问子句映射到记忆同向量，多路召回应命中。
+    client = MappedEmbeddingClient(
+        [("豆豆", [1.0, 0.0]), ("羽毛球", [0.0, 1.0])]
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=client)
+
+    hits = await service.search_hits(
+        query="我今天领养了一只小猫叫豆豆。对了我一般周几去打羽毛球？",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+
+    matched = [hit for hit in hits if hit.memory.id == schedule.id]
+    assert matched
+    assert "embedding" in matched[0].channels
+
+
+@pytest.mark.asyncio
+async def test_record_usage_activates_only_top_hits(memory_store: MemoryStore) -> None:
+    created = [
+        memory_store.create_memory(
+            user_id="default",
+            content=f"用户喜欢咖啡，记录编号{index}。",
+            type="semantic",
+            importance=5,
+        )
+        for index in range(ACTIVATION_LIMIT + 2)
+    ]
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    hits = await service.search_hits(
+        query="咖啡",
+        user_id="default",
+        limit=len(created),
+    )
+
+    assert len(hits) == len(created)
+    activated = [hit for hit in hits if hit.memory.usage_count > 0]
+    assert len(activated) == ACTIVATION_LIMIT
+    # 激活的必须是排序后的头部命中，而不是任意子集。
+    assert [hit.memory.id for hit in activated] == [
+        hit.memory.id for hit in hits[:ACTIVATION_LIMIT]
+    ]
+    refreshed_counts = [
+        memory_store.get_memory(memory_id=memory.id, user_id="default").usage_count
+        for memory in created
+    ]
+    assert sum(1 for count in refreshed_counts if count > 0) == ACTIVATION_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_fts_candidate_path_matches_and_stays_fresh(
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    from app.memory.store import fts as fts_mod
+
+    monkeypatch.setattr(fts_mod, "FTS_MIN_CORPUS_ROWS", 5)
+    badminton = memory_store.create_memory(
+        user_id="default",
+        content="用户每周三和周六晚上去打羽毛球。",
+        type="semantic",
+        importance=5,
+    )
+    for index in range(8):
+        memory_store.create_memory(
+            user_id="default",
+            content=f"用户喜欢咖啡，记录编号{index}。",
+            type="semantic",
+            importance=4,
+        )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    hits = await service.search_hits(
+        query="羽毛球安排",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+    )
+    assert badminton.id in [hit.memory.id for hit in hits]
+
+    # 直接验证走的是 FTS 候选路径而不是全表扫描回退。
+    candidates = memory_store.keyword_candidate_memories(
+        user_id="default",
+        terms=["羽毛", "毛球", "羽毛球"],
+    )
+    assert candidates is not None
+    assert [memory.id for memory in candidates] == [badminton.id]
+
+    # 编辑后水位增量刷新：新内容可检索，旧内容不再命中。
+    memory_store.update_memory(
+        memory_id=badminton.id,
+        user_id="default",
+        content="用户改打乒乓球，每周二晚上训练。",
+        type="semantic",
+        importance=5,
+        confidence=0.9,
+        valence=0.5,
+        arousal=0.3,
+    )
+    updated = memory_store.keyword_candidate_memories(
+        user_id="default", terms=["乒乓", "乓球"]
+    )
+    assert updated is not None
+    assert [memory.id for memory in updated] == [badminton.id]
+    stale = memory_store.keyword_candidate_memories(
+        user_id="default", terms=["羽毛", "毛球"]
+    )
+    assert stale == []
+
+    # 归档后索引同步，候选不再包含该记忆。
+    memory_store.archive_memory(memory_id=badminton.id, user_id="default")
+    after_archive = memory_store.keyword_candidate_memories(
+        user_id="default", terms=["乒乓", "乓球"]
+    )
+    assert after_archive == []
+
+
+@pytest.mark.asyncio
+async def test_fts_candidates_fall_back_for_small_or_special_queries(
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    from app.memory.store import fts as fts_mod
+
+    monkeypatch.setattr(fts_mod, "FTS_MIN_CORPUS_ROWS", 5)
+    coffee = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡和爵士乐。",
+        type="emotional",
+        importance=3,
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    # 小库：keyword_candidate_memories 返回 None，检索走全表扫描且行为不变。
+    assert (
+        memory_store.keyword_candidate_memories(user_id="default", terms=["咖啡"])
+        is None
+    )
+    results = await service.search(query="咖啡", user_id="default", limit=1)
+    assert [memory.id for memory in results] == [coffee.id]
+
+    # 单字 CJK 查询依赖 substring 通道，必须回退全表扫描。
+    assert service._fts_keyword_candidates(["茶"], user_id="default") is None
 
 
 def _set_memory_times(

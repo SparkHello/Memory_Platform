@@ -23,6 +23,11 @@ from app.cli_config import (
     read_env_file,
     write_env_atomic,
 )
+from app.schema_versions import (
+    AUTH_SCHEMA_VERSION,
+    KNOWLEDGE_SCHEMA_VERSION,
+    MEMORY_SCHEMA_VERSION,
+)
 
 
 STACK_BACKUP_VERSION = 2
@@ -64,9 +69,12 @@ _V2_COMPONENTS = {
     "model_gateway_config": ("model-gateway/config.json", True),
     "model_gateway_usage": ("model-gateway/usage.db", False),
 }
-_SUPPORTED_MEMORY_SCHEMA_VERSION = 4
-_SUPPORTED_KNOWLEDGE_SCHEMA_VERSION = 2
-_SUPPORTED_AUTH_SCHEMA_VERSION = 1
+# Latest schema versions come from the shared single source of truth so this
+# module cannot silently fall behind a store migration. Backups written by any
+# older release (down to version 1 / pre-versioned 0) stay restorable.
+_SUPPORTED_MEMORY_SCHEMA_VERSION = MEMORY_SCHEMA_VERSION
+_SUPPORTED_KNOWLEDGE_SCHEMA_VERSION = KNOWLEDGE_SCHEMA_VERSION
+_SUPPORTED_AUTH_SCHEMA_VERSION = AUTH_SCHEMA_VERSION
 
 
 def default_model_gateway_home() -> Path:
@@ -89,9 +97,17 @@ def create_stack_backup(
     memory_database: Path,
     knowledge_database: Path,
     auth_database: Path,
-    model_gateway_home: Path,
+    model_gateway_home: Path | None = None,
+    model_config_override: Path | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
+    """Create a portable stack zip.
+
+    Prefer a local ``model_gateway_home`` (CLI / co-located install). When the
+    Model volume is not mounted (split Docker), callers may pass a temporary
+    ``model_config_override`` obtained via the Model admin portable export.
+    Provider secrets are never included.
+    """
     destination = destination.expanduser().resolve()
     if destination.exists() and not force:
         raise ValueError(f"备份文件已存在：{destination}；使用 --force 可替换")
@@ -99,13 +115,32 @@ def create_stack_backup(
     _require_file(memory_database, "Memory 数据库")
     _require_file(knowledge_database, "Knowledge 数据库")
     _require_file(auth_database, "Auth 数据库")
-    _require_file(model_gateway_home / "config.json", "Model Gateway 配置")
+    model_config_path = (
+        Path(model_config_override).expanduser()
+        if model_config_override is not None
+        else (
+            Path(model_gateway_home).expanduser() / "config.json"
+            if model_gateway_home is not None
+            else None
+        )
+    )
+    if model_config_path is None:
+        raise ValueError(
+            "缺少 Model Gateway 配置：请提供 MODEL_GATEWAY_HOME，"
+            "或通过 admin 便携导出传入 model_config_override"
+        )
+    _require_file(model_config_path, "Model Gateway 配置")
+    model_home_for_estimate = (
+        Path(model_gateway_home).expanduser()
+        if model_gateway_home is not None
+        else model_config_path.parent
+    )
     estimated_payload_bytes = _estimated_backup_payload_bytes(
         paths=paths,
         memory_database=memory_database,
         knowledge_database=knowledge_database,
         auth_database=auth_database,
-        model_gateway_home=model_gateway_home,
+        model_gateway_home=model_home_for_estimate,
     )
     _ensure_backup_space(destination.parent, estimated_payload_bytes)
 
@@ -114,7 +149,7 @@ def create_stack_backup(
         memory_database=memory_database,
         knowledge_database=knowledge_database,
         auth_database=auth_database,
-        model_gateway_home=model_gateway_home,
+        model_gateway_home=model_home_for_estimate,
     )
     files: dict[str, dict[str, Any]] = {}
     descriptor, temporary_archive_name = tempfile.mkstemp(
@@ -142,13 +177,19 @@ def create_stack_backup(
             _stage_file(paths.models, staged, "memory/models.json")
             _stage_file(paths.routes, staged, "memory/routes.json")
             _stage_file(paths.pricing, staged, "memory/pricing.json")
-            _stage_file(model_gateway_home / "config.json", staged, "model-gateway/config.json")
-            _stage_sqlite(
-                model_gateway_home / "usage.db",
-                temporary / "usage.db",
-                staged,
-                "model-gateway/usage.db",
-            )
+            # Copy override into the staging tree so a temp file can be unlinked
+            # after packaging without holding an external path open.
+            staged_model_config = temporary / "model-config.json"
+            shutil.copy2(model_config_path, staged_model_config)
+            os.chmod(staged_model_config, 0o600)
+            staged["model-gateway/config.json"] = staged_model_config
+            if model_gateway_home is not None:
+                _stage_sqlite(
+                    Path(model_gateway_home).expanduser() / "usage.db",
+                    temporary / "usage.db",
+                    staged,
+                    "model-gateway/usage.db",
+                )
 
             safe_settings: dict[str, str] = {}
             for name, value in read_env_file(paths.settings_env).items():
@@ -938,7 +979,7 @@ def _validate_auth_database(path: Path) -> None:
                 "revoked_at",
             },
         },
-        minimum_user_version=_SUPPORTED_AUTH_SCHEMA_VERSION,
+        minimum_user_version=1,
         maximum_user_version=_SUPPORTED_AUTH_SCHEMA_VERSION,
     )
 

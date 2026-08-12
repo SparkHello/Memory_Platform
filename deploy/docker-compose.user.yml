@@ -43,11 +43,8 @@ services:
     environment:
       MODEL_GATEWAY_HOME: /data
       MODEL_GATEWAY_SECRETS_PATH: /secrets/secrets.env
-    # Only this container has a non-internal network. A fixed raw TCP relay
-    # forwards the public Memory port over `backend`; Model port 2030 remains
-    # private and the relay never parses or logs HTTP bytes.
-    ports:
-      - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
+    # Model port 2030 is never published to the host; only Memory Gateway
+    # reaches it over the internal `backend` network.
     volumes:
       - model-data:/data
       # The Model control plane atomically rotates provider/admin candidates in
@@ -71,10 +68,8 @@ services:
         max-size: 10m
         max-file: "3"
     healthcheck:
-      # Verify both the fixed ingress listener and Model liveness. The relay
-      # target starts after this service becomes healthy, so this only probes
-      # its local listener; cross-service acceptance uses Memory /readyz.
-      test: ["CMD", "python", "-c", "import socket,sys,urllib.request; s=socket.create_connection(('127.0.0.1',2026),timeout=3); s.close(); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2030/health',timeout=3).status==200 else 1)"]
+      # Local Model liveness only; cross-service acceptance uses Memory /readyz.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:2030/health',timeout=3).status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -93,11 +88,16 @@ services:
       MEMGW_HOME: /data/config
       MEMGW_SETTINGS_PATH: /secrets/settings.env
       MEMGW_PROJECT_ROOT: /app/services/memory-gateway
+    # Memory Gateway publishes the host port directly. `ingress` is its only
+    # non-internal network; the Model wiring stays on the internal `backend`.
+    ports:
+      - "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
     volumes:
       - memory-data:/data
       - memory-secrets:/secrets:ro
     networks:
       - backend
+      - ingress
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
@@ -150,6 +150,7 @@ services:
 networks:
   backend:
     internal: true
+  ingress: {}
   provider-egress: {}
 
 volumes:

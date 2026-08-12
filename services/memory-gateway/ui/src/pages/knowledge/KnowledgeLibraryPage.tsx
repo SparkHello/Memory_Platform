@@ -280,7 +280,13 @@ function KnowledgeListPage({
         {!loading && !error && documents?.length === 0 && (
           <EmptyBlock
             label={tab === "deleted" ? "回收站为空" : submittedQuery ? "没有匹配的文档" : "知识库还是空的"}
-            hint={tab === "deleted" ? "软删除的文档会保留在这里，直到你永久清理。" : submittedQuery ? "换一个标题或来源关键词试试。" : "添加项目文档、笔记或需要精确引用的长文本。"}
+            hint={
+              tab === "deleted"
+                ? "软删除的文档会保留在这里，直到你永久清理。"
+                : submittedQuery
+                  ? "换一个标题或来源关键词试试。"
+                  : "添加项目文档、笔记或需要精确引用的长文本。导入后不会自动进入普通聊天；需要 MCP、检索调试或知识检索才会用到这些文档。"
+            }
             action={tab === "active" && !submittedQuery ? { label: "添加第一个文档", onClick: () => setShowUpload(true) } : undefined}
           />
         )}
@@ -693,7 +699,7 @@ function KnowledgeDetailPage({
               <span className="muted">{selectedVersion && knowledgeVersionSha(selectedVersion) ? `SHA-256 ${knowledgeVersionSha(selectedVersion).slice(0, 12)}…` : document.source_name || "本地知识文档"}</span>
             </div>
             <div className="button-row">
-              {selectedVersionRef && <button className="secondary-button compact" type="button" onClick={() => void copyText(selectedVersionRef).then(() => notify("版本引用已复制", "success"))}><Clipboard size={14} />复制引用</button>}
+              {selectedVersionRef && <button className="secondary-button compact" type="button" onClick={() => void copyText(selectedVersionRef).then(() => notify("版本引用已复制", "success")).catch((cause) => notify(`复制失败：${errorMessage(cause)}`, "error"))}><Clipboard size={14} />复制引用</button>}
               {selectedVersionRef && document.status !== "deleted" && (
                 <button className="secondary-button compact" type="button" disabled={downloading} onClick={() => void downloadVersionText()}>
                   <Download size={14} />{downloading ? "正在下载" : "下载此版本正文"}

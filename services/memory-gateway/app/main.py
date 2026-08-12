@@ -1,5 +1,7 @@
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
+import os
 from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI
@@ -66,6 +68,15 @@ def _resolve_ui_dist_dir(settings) -> Path:
     return UI_DIST_DIR
 
 
+async def _daily_usage_prune(store: UsageStore) -> None:
+    while True:
+        try:
+            await asyncio.to_thread(store.prune)
+        except Exception:
+            logger.exception("usage 保留策略执行失败；将在下个周期重试。")
+        await asyncio.sleep(24 * 60 * 60)
+
+
 def _normalized_ui_request_path(path: str) -> str | None:
     candidate = PurePosixPath(path)
     if any(part == ".." or part.startswith(".") for part in candidate.parts):
@@ -123,16 +134,65 @@ def create_app() -> FastAPI:
         except Exception as exc:  # knowledge failure must not take memory/MCP offline
             app.state.knowledge_init_error = str(exc)
             logger.exception("知识库初始化失败；长期记忆服务将继续启动。")
-        # mount 的子应用不会被 FastAPI 触发 lifespan，MCP 的 session manager 在这里启动
-        async with mcp.session_manager.run():
-            yield
+        # Replay durable chat finalize jobs in the background: once right
+        # after startup (crash recovery) and then periodically, so leftover
+        # jobs drain without blocking startup or waiting for the next chat.
+        drainer_task: asyncio.Task | None = None
+        try:
+            from app.api.chat_gateway import chat_finalize_outbox_drainer
+            from app.api.deps import get_embedding_client, get_llm_client
 
+            drainer_task = asyncio.create_task(
+                chat_finalize_outbox_drainer(
+                    store=MemoryStore(settings.database_path),
+                    embedding_client=get_embedding_client(settings=settings),
+                    llm_client=get_llm_client(settings=settings),
+                    settings=settings,
+                )
+            )
+        except Exception:
+            logger.exception("启动聊天 finalize outbox drainer 失败；服务继续运行。")
+        # Apply the usage retention policy daily so always-on deployments do
+        # not depend on restarts to bound the events table.
+        usage_prune_task = asyncio.create_task(
+            _daily_usage_prune(UsageStore(settings.database_path))
+        )
+        try:
+            # mount 的子应用不会被 FastAPI 触发 lifespan，MCP 的 session manager 在这里启动
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            for background_task in (drainer_task, usage_prune_task):
+                if background_task is not None:
+                    background_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await background_task
+
+    # OpenAPI/docs are off by default for LAN personal deploys (reduces unauth
+    # recon). Set MEMGW_ENABLE_OPENAPI=1 for local API exploration.
+    openapi_enabled = os.environ.get("MEMGW_ENABLE_OPENAPI", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     app = FastAPI(
         title="memory-gateway",
         version="0.2.0",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
+        docs_url="/docs" if openapi_enabled else None,
+        redoc_url="/redoc" if openapi_enabled else None,
+        openapi_url="/openapi.json" if openapi_enabled else None,
     )
+    if not openapi_enabled:
+        # Without these routes, unknown paths fall through to the root MCP
+        # mount and return 401. Explicit 404 keeps the surface closed and clear.
+        @app.get("/docs", include_in_schema=False)
+        @app.get("/redoc", include_in_schema=False)
+        @app.get("/openapi.json", include_in_schema=False)
+        def _openapi_disabled() -> JSONResponse:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
     app.add_middleware(RouteAwareRequestBodyLimitMiddleware)
     app.add_middleware(RequestTargetLimitMiddleware)
     # Starlette executes the most recently added middleware first. Auth is

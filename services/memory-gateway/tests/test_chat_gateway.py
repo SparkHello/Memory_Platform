@@ -263,6 +263,49 @@ def test_memory_context_preserves_stable_system_prefix_for_prompt_cache() -> Non
     assert injected[3] == messages[2]
 
 
+def test_read_only_chat_token_clamps_read_write_mode(
+    client: TestClient,
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    from app.auth.tokens import AuthTokenStore
+    from app.config import get_settings
+
+    store = AuthTokenStore(get_settings().auth_database_path)
+    store.init_db()
+    created = store.create_token(
+        name="read only phone",
+        user_id="default",
+        role="chat",
+        memory_access="read",
+    )
+    headers = {"Authorization": f"Bearer {created.token}"}
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        type="semantic",
+        importance=8,
+        confidence=0.9,
+        source_message="我喜欢黑咖啡",
+    )
+    before = len(memory_store.list_decision_logs(user_id="default"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**headers, "X-Memory-Mode": "read-write"},
+        json={
+            "model": "memory-auto",
+            "messages": [{"role": "user", "content": "我还喜欢抹茶"}],
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "read"
+    # No new extract decision for a write request under read-only token.
+    after = len(memory_store.list_decision_logs(user_id="default"))
+    assert after == before
+
+
 def test_memory_mode_off_is_a_transparent_no_side_effect_proxy(
     client: TestClient,
     auth_headers: dict[str, str],

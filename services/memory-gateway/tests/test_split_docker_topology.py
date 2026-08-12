@@ -111,14 +111,15 @@ def test_long_lived_services_use_distinct_users_mounts_and_networks():
     assert memory["read_only"] is True and model["read_only"] is True
     assert memory["cap_drop"] == ["ALL"]
     assert model["cap_drop"] == ["ALL"]
-    assert "ports" not in memory
-    assert model["ports"] == [
+    assert "ports" not in model
+    assert memory["ports"] == [
         "${MEMORY_HOST:-127.0.0.1}:${MEMORY_PORT:-2026}:2026"
     ]
     assert compose["networks"]["backend"]["internal"] is True
-    assert set(memory["networks"]) == {"backend"}
+    assert set(memory["networks"]) == {"backend", "ingress"}
     assert set(model["networks"]) == {"backend", "provider-egress"}
-    assert set(compose["networks"]) == {"backend", "provider-egress"}
+    assert set(compose["networks"]) == {"backend", "ingress", "provider-egress"}
+    assert compose["networks"]["ingress"] == {}
     assert compose["networks"]["provider-egress"] == {}
     assert "provider-egress" not in memory["networks"]
     assert "/health" in " ".join(model["healthcheck"]["test"])
@@ -143,7 +144,7 @@ def test_signed_compose_runtime_validator_accepts_only_the_split_isolation_contr
 
     internal_override = tmp_path / "internal.yml"
     internal_override.write_text(
-        "services:\n  model-gateway:\n    ports: !reset []\n",
+        "services:\n  memory-gateway:\n    ports: !reset []\n",
         encoding="utf-8",
     )
     environment = {
@@ -178,7 +179,7 @@ def test_signed_compose_runtime_validator_accepts_only_the_split_isolation_contr
         check=True,
     )
     internal = json.loads(internal_result.stdout)
-    assert not internal["services"]["model-gateway"].get("ports")
+    assert not internal["services"]["memory-gateway"].get("ports")
     _load_compose_validator().validate_compose(
         internal,
         **images,
@@ -190,9 +191,9 @@ def test_signed_compose_runtime_validator_accepts_only_the_split_isolation_contr
 
     unsafe_variants = []
     published_model = copy.deepcopy(rendered)
-    published_model["services"]["model-gateway"]["ports"].append(
+    published_model["services"]["model-gateway"]["ports"] = [
         {"target": 2030, "published": "2030", "protocol": "tcp"}
-    )
+    ]
     unsafe_variants.append(published_model)
 
     memory_egress = copy.deepcopy(rendered)
@@ -312,7 +313,7 @@ def test_release_compose_and_dockerfile_never_use_main_latest_or_mutable_bases()
     assert "pip install --require-hashes" in dockerfile
     assert "gosu" not in dockerfile
     assert "deploy/validate_compose.py" in dockerfile
-    assert "deploy/ingress_relay.py" in dockerfile
+    assert "ingress_relay" not in dockerfile
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for secret_pattern in (
         ".env",
@@ -339,19 +340,13 @@ def test_release_compose_and_dockerfile_never_use_main_latest_or_mutable_bases()
         assert secret_pattern in gitignore
 
 
-def test_model_entrypoint_supervises_a_fixed_raw_ingress_relay() -> None:
+def test_model_entrypoint_runs_a_single_gateway_process_without_a_relay() -> None:
     entrypoint = (ROOT / "deploy" / "model-entrypoint.sh").read_text()
-    relay = (ROOT / "deploy" / "ingress_relay.py").read_text()
-    assert "/usr/local/libexec/memory-platform/ingress_relay.py" in entrypoint
-    assert 'TARGET_HOST = "memory-gateway"' in relay
-    assert "TARGET_PORT = 2026" in relay
-    assert "MAX_CONNECTIONS = 128" in relay
-    assert "IDLE_TIMEOUT_SECONDS" in relay
-    assert "reader.read(CHUNK_BYTES)" in relay
-    assert "write_eof()" in relay
-    assert "print(" not in relay
-    assert "import logging" not in relay
-    assert "logger." not in relay
+    assert not (ROOT / "deploy" / "ingress_relay.py").exists()
+    assert "ingress_relay" not in entrypoint
+    assert "exec modelgw serve" in entrypoint
+    assert "trap" not in entrypoint
+    assert "wait " not in entrypoint
 
 
 def test_release_workflow_is_pinned_and_scans_each_split_image():
@@ -377,7 +372,7 @@ def test_release_workflow_is_pinned_and_scans_each_split_image():
     assert "publish-compose-signature" in workflow
     assert "cosign sign-blob --yes" in workflow
     assert "docker-compose.user.yml.sigstore.json" in workflow
-    assert "Verify provider egress is Model-only" in workflow
+    assert "Verify split network topology" in workflow
 
 
 def test_installer_does_not_accept_or_print_secret_values():
@@ -392,24 +387,27 @@ def test_installer_does_not_accept_or_print_secret_values():
     assert "migrate_legacy.py" in installer
     assert "restore_split.py" in installer
     assert "MEMORY_BACKUP_RETENTION" in installer
-    assert "remove_volume_backup" in installer
+    assert "create_quiesced_backup" in installer
     assert "prune_host_backups" in installer
+    # 国内可达性：验签默认跳过 + registry 主机可覆盖（digest 固定不变）。
+    assert "MEMORY_VERIFY_SIGNATURES" in installer
+    assert "MEMORY_IMAGE_REGISTRY" in installer
     assert 'if [ "$LAYOUT" != fresh ]; then' in installer
     assert 'curl -fsS "http://127.0.0.1:$PORT/readyz"' in installer
     assert "OLD_READY" not in installer
     assert "verify-blob" in installer
     assert "--certificate-identity" in installer
     assert "docker.yml@refs/tags/$RELEASE" in installer
-    assert "/usr/local/libexec/memory-platform/validate_compose.py" in installer
+    # 完整拓扑校验已移入 CI（validate_compose.py 门禁），安装路径不再内联执行。
+    assert "validate_compose.py" in installer
     assert "commit_cutover_journal" in installer
     assert "legacy_targets_absent" in installer
     assert "cleanup_legacy_transaction_volumes" in installer
     assert "Console token:" in installer
     assert "ports: !reset []" in installer
-    assert "validate_internal_candidate_topology" in installer
     assert "mark_cutover_committed" in installer
     assert installer.index("mark_cutover_committed") < installer.index(
-        'up -d --no-deps --force-recreate model-gateway'
+        'up -d --no-deps --force-recreate memory-gateway'
     )
 
 
@@ -494,7 +492,7 @@ def test_completed_init_repairs_credential_mode_and_missing_file_fails_closed(
     )
 
     (roots["CREDENTIALS"] / "gateway.key").unlink()
-    with pytest.raises(RuntimeError, match="missing"):
+    with pytest.raises(RuntimeError, match="credentials/gateway.key 缺失"):
         module.main()
 
 

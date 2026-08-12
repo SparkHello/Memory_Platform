@@ -74,7 +74,7 @@ schema v1 升级时，原有短 client key 会以显式 `allow_legacy_weak_secre
 - `adapter`；
 - 允许透传的请求 Header 白名单、`connect/read/write/pool` 四项超时、响应字节上限和 429 冷却时间。
 
-远程 Base URL 必须使用 HTTPS；HTTP 默认仅允许本机回环地址。需要调用私有 IP 上游时，必须在 `allowed_private_networks` 写入最小 CIDR 后才允许该地址；RFC 2544 `198.18.0.0/15` 仅为显式沙箱/透明 egress 映射兼容，仍默认拒绝，通常只能配置实际解析地址的单个 `/32`。userinfo、query、fragment、异常端口、控制字符、dot segment、编码后的结构分隔符和危险鉴权/逐跳转发 Header 都会被拒绝。代理不继承环境 HTTP 代理，也不跟随上游 redirect，避免把凭据带到另一个 origin。v2 新 connection 的 connect/read/write/pool 默认分别为 10/120/60/10 秒，非流响应和流式累计响应上限默认 16 MiB；从 v1 迁移的显式旧超时与 64 MiB 上限保留原语义。discovery 另有 2 MiB、1,000 个模型和可打印模型 ID 上限。数据面会复用按超时配置分组的 `AsyncClient` 连接池，服务关闭时统一释放。
+远程 Base URL 必须使用 HTTPS；HTTP 默认仅允许本机回环地址。需要调用私有 IP 上游时，必须在 `allowed_private_networks` 写入最小 CIDR 后才允许该地址；RFC 2544 `198.18.0.0/15`（Clash/Surge TUN fake-ip 常用）仍默认拒绝，但可在渠道中**显式**写入 `/32`、子网或整个 `198.18.0.0/15`。未列入的私网地址继续拒绝。userinfo、query、fragment、异常端口、控制字符、dot segment、编码后的结构分隔符和危险鉴权/逐跳转发 Header 都会被拒绝。代理不继承环境 HTTP 代理，也不跟随上游 redirect，避免把凭据带到另一个 origin。v2 新 connection 的 connect/read/write/pool 默认分别为 10/120/60/10 秒，非流响应和流式累计响应上限默认 16 MiB；从 v1 迁移的显式旧超时与 64 MiB 上限保留原语义。discovery 另有 2 MiB、1,000 个模型和可打印模型 ID 上限。数据面会复用按超时配置分组的 `AsyncClient` 连接池，服务关闭时统一释放。
 
 运行时熔断按故障作用域处理：401/402/429 暂停整个 connection；结构化 `model_not_found` 只暂停对应 deployment；连续三次 5xx 才短暂暂停该 deployment。每次真正发送前都会重新检查，渠道密钥轮换成功后会立即清除该 connection 的旧熔断。
 

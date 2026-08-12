@@ -54,6 +54,34 @@ def test_admin_configuration_is_filtered_and_never_returns_secrets(gateway_home)
     assert len(payload["revision"]) == 64
 
 
+def test_admin_portable_config_exports_schema_without_secret_values(
+    gateway_home,
+) -> None:
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    with TestClient(app) as client:
+        denied = client.get(
+            "/admin/portable-config",
+            headers={"authorization": "Bearer local-client-token"},
+        )
+        assert denied.status_code == 403
+
+        response = client.get(
+            "/admin/portable-config",
+            headers={"authorization": "Bearer admin-token"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] >= 1
+    assert "connections" in payload
+    assert "official-secret" not in response.text
+    assert "admin-token" not in response.text
+    assert "local-client-token" not in response.text
+
+
 def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home) -> None:
     app = create_app(
         paths=gateway_home,
@@ -434,6 +462,89 @@ def test_service_preserves_complete_sse_bytes_and_records_usage(gateway_home) ->
         ).fetchone()
     assert row == (1, "actual", 3)
     assert attempt == (1, "actual", 3)
+
+
+def test_client_disconnect_still_records_stream_usage() -> None:
+    """断连（生成器被取消）时，上游关闭与用量记账仍必须恰好执行一次。"""
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from model_gateway.service import _streaming_response
+    from model_gateway.usage import UsageMetadata
+
+    recorded: list[dict] = []
+
+    class _FakeUsageStore:
+        def record(self, **kwargs):
+            recorded.append(kwargs)
+
+    class _FakeStream:
+        def __init__(self):
+            self.closed = 0
+            self.response = SimpleNamespace(status_code=200)
+            self.headers = {"content-type": "text/event-stream"}
+            self.attempts = 1
+            self.attempt_traces = ()
+            self.target = SimpleNamespace(deployment=SimpleNamespace(id="d"))
+            self.active_trace = SimpleNamespace(
+                outcome="success",
+                failure_class="",
+                billable_unknown=False,
+                response_complete=False,
+                capture=None,
+                latency_ms=0,
+            )
+            self.attempt_started_monotonic = time.monotonic()
+
+        async def aiter_raw(self):
+            yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            await asyncio.sleep(3600)
+
+        async def aclose(self):
+            self.closed += 1
+
+    stream = _FakeStream()
+    response = _streaming_response(
+        stream,  # type: ignore[arg-type]
+        usage_store=_FakeUsageStore(),  # type: ignore[arg-type]
+        client=SimpleNamespace(id="local-client"),  # type: ignore[arg-type]
+        kind="chat",
+        route_id="memory.chat",
+        started=time.monotonic(),
+        pricing_id="",
+        pricing=None,
+        pricing_catalog={},
+        metadata=UsageMetadata(),
+        storage_monitor=SimpleNamespace(mark_unavailable=lambda: None),  # type: ignore[arg-type]
+    )
+
+    async def scenario() -> None:
+        iterator = response.body_iterator
+
+        async def consume() -> None:
+            async for _ in iterator:
+                pass
+
+        task = asyncio.ensure_future(consume())
+        await asyncio.sleep(0.05)  # 让第一块 chunk 流出并挂起在上游
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # 等待被 shield 的记账任务完成。
+        for _ in range(100):
+            if recorded:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+
+    assert stream.closed == 1
+    assert len(recorded) == 1
+    assert recorded[0]["complete"] is False
+    assert recorded[0]["status_code"] == 200
 
 
 def test_routing_time_affinity_error_uses_stable_protocol_code(gateway_home) -> None:

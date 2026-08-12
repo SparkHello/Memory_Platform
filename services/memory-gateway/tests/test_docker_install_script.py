@@ -73,11 +73,13 @@ case "$*" in
   *" config"*) exit 0 ;;
   *" pull"*) exit 0 ;;
   *" ps -q model-gateway"*) printf 'synthetic-model\n'; exit 0 ;;
-  *".compose.internal."*" port model-gateway 2026"*) exit 0 ;;
-  *" port model-gateway 2026"*)
+  *" ps -q memory-gateway"*) printf 'synthetic-memory\n'; exit 0 ;;
+  *".compose.internal."*" port memory-gateway 2026"*) exit 0 ;;
+  *" port memory-gateway 2026"*)
     test -f "$MEMORY_PLATFORM_DIR/.test-ingress-published" && printf '127.0.0.1:3026\n'
     exit 0
     ;;
+  "port synthetic-memory"|"port synthetic-model") exit 0 ;;
   *".compose.internal."*" up -d"*)
     mkdir -p "$MEMORY_PLATFORM_DIR/credentials"
     printf 'synthetic-gateway-value\n' > "$MEMORY_PLATFORM_DIR/credentials/gateway.key"
@@ -85,7 +87,7 @@ case "$*" in
     chmod 600 "$MEMORY_PLATFORM_DIR/credentials/"*.key
     exit 0
     ;;
-  *" up -d --no-deps --force-recreate model-gateway"*)
+  *" up -d --no-deps --force-recreate memory-gateway"*)
     : > "$MEMORY_PLATFORM_DIR/.test-ingress-published"
     candidate_port=$(awk -F= '$1=="MEMORY_PORT" { value=$2 } END { print value }' "$MEMORY_PLATFORM_DIR/.env")
     candidate_host=$(awk -F= '$1=="MEMORY_HOST" { value=$2 } END { print value }' "$MEMORY_PLATFORM_DIR/.env")
@@ -437,7 +439,8 @@ if [ "$1" = "run" ]; then
     *'/usr/local/libexec/memory-platform/restore_split.py'*)
       printf 'restore:%s\n' "$*" >> '{events}'
       ;;
-    *) printf 'topology-validated\n' >> '{events}' ;;
+    *'stack backup'*) printf 'backup\n' >> '{events}' ;;
+    *) printf 'container-run\n' >> '{events}' ;;
   esac
   exit 0
 fi
@@ -448,13 +451,11 @@ case "$*" in
   *' ps -aq model-gateway') printf 'old-model\n'; exit 0 ;;
   *' ps -aq memory-gateway') printf 'old-memory\n'; exit 0 ;;
   *' port memory-gateway 2026') exit 0 ;;
-  *'--profile maintenance run'*'stack backup'*) printf 'backup\n' >> '{events}'; exit 0 ;;
   *' config') exit 0 ;;
   *' pull') exit 0 ;;
-  *' exec -T'*'stack backup'*) printf 'backup\n' >> '{events}'; exit 0 ;;
   *' exec -T'*'/readyz'*) exit 1 ;;
   *' exec -T'*) exit 0 ;;
-  *' stop') exit 0 ;;
+  *' stop') printf 'stop\n' >> '{events}'; exit 0 ;;
   *' up -d --pull never'*)
     awk '/^MEMORY_PLATFORM_(INIT|MODEL|MEMORY)_IMAGE=/' "$MEMORY_PLATFORM_DIR/.env" >> '{events}'
     printf 'process-images:%s|%s|%s\n' \
@@ -492,7 +493,9 @@ exit 0
         + "3" * 64
     ) in event_text
     assert "ghcr.io/sparkhello/memory-platform-init@sha256:" + "a" * 64 not in event_text
-    assert event_text.index("backup") < event_text.index("download")
+    # 单一停写备份：旧栈 stop 之后、数据可能变化之前创建一致性备份。
+    assert event_text.index("stop") < event_text.index("backup")
+    assert event_text.index("backup") < event_text.index("restore:")
     assert next((install_dir / "backups").glob("pre-upgrade-*.zip")).read_text() == (
         "verified-backup"
     )
@@ -718,7 +721,8 @@ def test_signature_failure_is_fail_closed_before_live_cutover(tmp_path: Path) ->
         "#!/bin/sh\n[ \"$1\" = verify-blob ] && exit 0\nexit 1\n",
     )
 
-    result = _run(tmp_path, install_dir, fake_bin)
+    # 验签默认跳过，需显式开启后才应 fail-closed。
+    result = _run(tmp_path, install_dir, fake_bin, MEMORY_VERIFY_SIGNATURES="1")
 
     assert result.returncode != 0
     assert "发布镜像签名无效" in result.stderr
@@ -861,7 +865,10 @@ def test_interrupted_cutover_is_recovered_before_new_candidate_work(
     if expect_restore:
         assert "--network none" in event_text
         assert "sha256:" + "1" * 64 in event_text
-    assert event_text.index("recover-stop") < event_text.index("backup")
+    # 恢复先于任何新候选工作；新流程只在旧栈停写后才创建备份，
+    # 而本例在下载候选时即失败，因此不应出现任何备份事件。
+    assert "stack backup" not in event_text
+    assert event_text.index("recover-stop") < event_text.index("recover-up")
 
 
 def _assert_old_live_image_refs_for_journal(install_dir: Path) -> None:

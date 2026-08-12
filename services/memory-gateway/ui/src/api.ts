@@ -155,12 +155,18 @@ export class MemoryApi {
   async createAuthToken(
     name: string,
     role: "chat" | "mcp",
-    signal?: AbortSignal
+    options: { memoryAccess?: "read" | "read-write"; signal?: AbortSignal } = {}
   ): Promise<AuthTokenCreateResult> {
     return this.request("/auth/tokens", {
       method: "POST",
-      body: { name, role },
-      signal
+      body: {
+        name,
+        role,
+        ...(role === "chat" && options.memoryAccess
+          ? { memory_access: options.memoryAccess }
+          : {})
+      },
+      signal: options.signal
     });
   }
 
@@ -187,6 +193,17 @@ export class MemoryApi {
 
   async providersStatus(signal?: AbortSignal): Promise<ProvidersStatus> {
     return this.request("/providers/status", { signal });
+  }
+
+  async liveUpstreamProbe(signal?: AbortSignal): Promise<{
+    ok: boolean;
+    code: string;
+    message: string;
+    latency_ms?: number;
+    cached?: boolean;
+    route?: string;
+  }> {
+    return this.request("/providers/live-probe", { method: "POST", signal });
   }
 
   async checkProviderAdminKey(
@@ -919,6 +936,29 @@ export class MemoryApi {
     return this.request("/memories/export?format=obsidian_markdown&include_deleted=true", {
       blob: true,
       signal
+    });
+  }
+
+  /**
+   * Portable stack zip (memory + knowledge + auth + model config, no secrets).
+   * On split Docker, pass the Model Gateway admin key so Memory can fetch config.
+   */
+  async exportStackBackup(
+    options: { modelGatewayAdminKey?: string } = {},
+    signal?: AbortSignal
+  ): Promise<Blob> {
+    const headers: Record<string, string> = {};
+    const adminKey = options.modelGatewayAdminKey?.trim();
+    if (adminKey) {
+      headers["X-Model-Gateway-Admin-Key"] = adminKey;
+    }
+    return this.request("/memories/stack-backup", {
+      method: "POST",
+      blob: true,
+      headers,
+      signal,
+      timeoutMs: 120000,
+      timeoutMessage: "整栈备份超时；数据量较大时可稍后重试或使用 CLI"
     });
   }
 

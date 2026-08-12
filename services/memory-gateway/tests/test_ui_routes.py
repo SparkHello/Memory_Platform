@@ -67,6 +67,31 @@ def test_ui_entrypoints_redirect_or_fall_back_to_index(tmp_path, monkeypatch):
         assert "must not be served" not in response.text
         assert "Memory Studio" in response.text
 
+        # OpenAPI surface is off by default for LAN personal deploys.
+        for path in ["/docs", "/redoc", "/openapi.json"]:
+            assert client.get(path).status_code == 404
+
+    get_settings.cache_clear()
+
+
+def test_openapi_can_be_enabled_with_env(tmp_path, monkeypatch):
+    ui_dist = tmp_path / "dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<!doctype html><title>Memory Studio</title>", encoding="utf-8")
+    (ui_dist / "assets").mkdir()
+    monkeypatch.setattr(main, "UI_DIST_DIR", ui_dist)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setenv("KNOWLEDGE_DATABASE_PATH", str(tmp_path / "knowledge.db"))
+    monkeypatch.setenv("EVAL_DIR", str(tmp_path / "eval"))
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-gateway-key")
+    monkeypatch.setenv("MEMGW_ENABLE_OPENAPI", "1")
+    get_settings.cache_clear()
+
+    with TestClient(main.create_app()) as client:
+        assert client.get("/openapi.json").status_code == 200
+        assert client.get("/docs").status_code == 200
+
+    monkeypatch.delenv("MEMGW_ENABLE_OPENAPI", raising=False)
     get_settings.cache_clear()
 
 

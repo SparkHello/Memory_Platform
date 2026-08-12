@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -100,7 +101,17 @@ def create_app(
         )
     admin_write_lock = asyncio.Lock()
 
-    app = FastAPI(title="Model Gateway", version="0.2.0")
+    # OpenAPI is off by default; Model port is internal but still avoid free recon.
+    openapi_enabled = os.environ.get(
+        "MODEL_GATEWAY_ENABLE_OPENAPI", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    app = FastAPI(
+        title="Model Gateway",
+        version="0.2.0",
+        docs_url="/docs" if openapi_enabled else None,
+        redoc_url="/redoc" if openapi_enabled else None,
+        openapi_url="/openapi.json" if openapi_enabled else None,
+    )
     app.add_middleware(StorageErrorMiddleware, monitor=storage_monitor)
     app.state.config_manager = manager
     app.state.router = router
@@ -109,11 +120,40 @@ def create_app(
     app.state.storage_monitor = storage_monitor
     app.router.add_event_handler("shutdown", proxy.aclose)
 
+    # init_db prunes once at startup; long-lived deployments that never
+    # restart also need the retention policy applied periodically.
+    usage_prune_task: dict[str, asyncio.Task | None] = {"task": None}
+
+    async def _daily_usage_prune() -> None:
+        while True:
+            await asyncio.sleep(24 * 60 * 60)
+            try:
+                await asyncio.to_thread(usage_store.prune, vacuum=False)
+            except (OSError, sqlite3.Error) as exc:
+                _LOGGER.warning(
+                    "periodic usage prune failed (%s)", type(exc).__name__
+                )
+
+    def _start_usage_prune() -> None:
+        usage_prune_task["task"] = asyncio.create_task(_daily_usage_prune())
+
+    async def _stop_usage_prune() -> None:
+        task = usage_prune_task["task"]
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.router.add_event_handler("startup", _start_usage_prune)
+    app.router.add_event_handler("shutdown", _stop_usage_prune)
+
     @app.get("/health")
     @app.get("/healthz")
     async def health() -> dict[str, object]:
         try:
-            config, _ = manager.snapshot()
+            config, _ = await manager.snapshot_async()
         except Exception as exc:
             return {"status": "error", "detail": type(exc).__name__}
         return {
@@ -134,7 +174,7 @@ def create_app(
     @app.get("/readyz")
     async def ready() -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
         except Exception as exc:
             return JSONResponse(
                 {"status": "not_ready", "detail": type(exc).__name__},
@@ -178,7 +218,7 @@ def create_app(
     @app.get("/admin/configuration")
     async def admin_configuration(request: Request) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -193,10 +233,38 @@ def create_app(
             )
         )
 
+    @app.get("/admin/portable-config")
+    async def admin_portable_config(request: Request) -> Response:
+        """Return full GatewayConfig JSON without secrets for stack backup.
+
+        Provider/admin secret values stay in secrets.env and are never included.
+        """
+        try:
+            config, secrets = await manager.snapshot_async()
+            client = _authenticate(request, config=config, secrets=secrets)
+        except ConfigError:
+            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
+        except AuthenticationError as exc:
+            return _error(401, str(exc))
+        forbidden = _require_admin(client)
+        if forbidden is not None:
+            return forbidden
+        del secrets
+        payload = config.model_dump(mode="json", exclude_none=False)
+        body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        return Response(
+            content=body.encode("utf-8"),
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="model-gateway-config.json"',
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.post("/admin/routes/validate")
     async def validate_admin_routes(request: Request) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -217,7 +285,7 @@ def create_app(
         if payload.revision != current_revision:
             return _error(
                 409,
-                "配置已经被其他操作修改；请刷新页面后重新调整",
+                "配置已经被其他操作修改；请重新读取当前 revision 后重试",
                 error_type="model_gateway_config_stale",
             )
         try:
@@ -241,7 +309,7 @@ def create_app(
     async def apply_admin_routes(request: Request) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -262,7 +330,7 @@ def create_app(
             if payload.revision != current_revision:
                 return _error(
                     409,
-                    "配置已经被其他操作修改；请刷新页面后重新调整",
+                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
                     error_type="model_gateway_config_stale",
                 )
             try:
@@ -296,7 +364,7 @@ def create_app(
     async def create_admin_connection(request: Request) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -317,7 +385,7 @@ def create_app(
             if payload.revision != current_revision:
                 return _error(
                     409,
-                    "配置已经被其他操作修改；请刷新页面后重新调整",
+                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
                     error_type="model_gateway_config_stale",
                 )
             try:
@@ -355,7 +423,7 @@ def create_app(
     async def apply_admin_deployments(request: Request) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -376,7 +444,7 @@ def create_app(
             if payload.revision != current_revision:
                 return _error(
                     409,
-                    "配置已经被其他操作修改；请刷新页面后重新调整",
+                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
                     error_type="model_gateway_config_stale",
                 )
             try:
@@ -430,7 +498,7 @@ def create_app(
     ) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -447,6 +515,7 @@ def create_app(
                 limit=config.server.body_limit_bytes,
                 model=SecretUpdateRequest,
                 label="密钥",
+                detail_fields=False,
             )
             if isinstance(payload, Response):
                 return payload
@@ -507,7 +576,7 @@ def create_app(
     @app.post("/admin/discover")
     async def discover_admin_candidate(request: Request) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -521,6 +590,7 @@ def create_app(
             limit=config.server.body_limit_bytes,
             model=CandidateDiscoverRequest,
             label="渠道发现",
+            detail_fields=False,
         )
         if isinstance(payload, Response):
             return payload
@@ -629,7 +699,7 @@ def create_app(
 
     async def _handle_admin_bundle(request: Request, *, apply: bool) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -643,6 +713,7 @@ def create_app(
             limit=config.server.body_limit_bytes,
             model=BundleApplyRequest,
             label="原子渠道 bundle",
+            detail_fields=False,
         )
         if isinstance(payload, Response):
             return payload
@@ -723,7 +794,7 @@ def create_app(
     ) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -780,7 +851,7 @@ def create_app(
     ) -> Response:
         async with admin_write_lock:
             try:
-                config, secrets = manager.snapshot()
+                config, secrets = await manager.snapshot_async()
                 client = _authenticate(request, config=config, secrets=secrets)
             except ConfigError:
                 return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -838,7 +909,7 @@ def create_app(
         request: Request,
     ) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -864,7 +935,7 @@ def create_app(
     @app.get("/v1/models")
     async def list_models(request: Request) -> Response:
         try:
-            config, secrets = manager.snapshot()
+            config, secrets = await manager.snapshot_async()
             client = _authenticate(request, config=config, secrets=secrets)
         except ConfigError:
             return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -942,7 +1013,7 @@ def create_app(
 
     @app.get("/v1/usage/events")
     async def usage_events(request: Request) -> Response:
-        authenticated = _usage_query_client(request, manager)
+        authenticated = await _usage_query_client(request, manager)
         if isinstance(authenticated, Response):
             return authenticated
         client, _ = authenticated
@@ -965,7 +1036,7 @@ def create_app(
 
     @app.get("/v1/usage/summary")
     async def usage_summary(request: Request) -> Response:
-        authenticated = _usage_query_client(request, manager)
+        authenticated = await _usage_query_client(request, manager)
         if isinstance(authenticated, Response):
             return authenticated
         client, _ = authenticated
@@ -994,7 +1065,7 @@ async def _proxy_request(
     storage_monitor: StorageFaultMonitor,
 ) -> Response:
     try:
-        config, secrets = manager.snapshot()
+        config, secrets = await manager.snapshot_async()
         client = _authenticate(request, config=config, secrets=secrets)
     except ConfigError:
         return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -1171,6 +1242,11 @@ async def _proxy_request(
     )
 
 
+# Strong references keep shielded accounting tasks alive after the client
+# disconnects and the owning generator is torn down.
+_STREAM_FINALIZE_TASKS: set[asyncio.Task] = set()
+
+
 def _streaming_response(
     stream: ProxyUpstreamStream,
     *,
@@ -1187,6 +1263,55 @@ def _streaming_response(
 ) -> StreamingResponse:
     capture = UsageCapture()
 
+    async def finalize(complete: bool) -> None:
+        try:
+            await stream.aclose()
+        except httpx.HTTPError as exc:
+            stream.active_trace.outcome = "ambiguous_failure"
+            stream.active_trace.failure_class = "other_network"
+            stream.active_trace.billable_unknown = True
+            stream.active_trace.response_complete = False
+            _LOGGER.warning(
+                "upstream stream close failed (%s)",
+                type(exc).__name__,
+            )
+        stream.active_trace.capture = capture
+        stream.active_trace.latency_ms = int(
+            (time.monotonic() - stream.attempt_started_monotonic) * 1000
+        )
+        if (
+            not stream.active_trace.response_complete
+            and stream.active_trace.outcome == "success"
+        ):
+            stream.active_trace.outcome = "ambiguous_failure"
+            stream.active_trace.failure_class = "read_error"
+            stream.active_trace.billable_unknown = True
+        try:
+            await asyncio.to_thread(
+                usage_store.record,
+                client_id=client.id,
+                kind=kind,
+                route_id=route_id,
+                target=stream.target,
+                status_code=stream.response.status_code,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                attempts=stream.attempts,
+                complete=complete,
+                capture=capture,
+                pricing_id=pricing_id,
+                pricing=pricing,
+                attempt_traces=stream.attempt_traces,
+                pricing_catalog=pricing_catalog,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            if is_storage_exhausted(exc) or isinstance(exc, StorageCapacityError):
+                storage_monitor.mark_unavailable()
+            _LOGGER.warning(
+                "usage recording failed after stream (%s)",
+                type(exc).__name__,
+            )
+
     async def body() -> Any:
         complete = False
         try:
@@ -1195,53 +1320,13 @@ def _streaming_response(
                 yield chunk
             complete = capture.saw_done and not capture.malformed
         finally:
-            try:
-                await stream.aclose()
-            except httpx.HTTPError as exc:
-                stream.active_trace.outcome = "ambiguous_failure"
-                stream.active_trace.failure_class = "other_network"
-                stream.active_trace.billable_unknown = True
-                stream.active_trace.response_complete = False
-                _LOGGER.warning(
-                    "upstream stream close failed (%s)",
-                    type(exc).__name__,
-                )
-            stream.active_trace.capture = capture
-            stream.active_trace.latency_ms = int(
-                (time.monotonic() - stream.attempt_started_monotonic) * 1000
-            )
-            if (
-                not stream.active_trace.response_complete
-                and stream.active_trace.outcome == "success"
-            ):
-                stream.active_trace.outcome = "ambiguous_failure"
-                stream.active_trace.failure_class = "read_error"
-                stream.active_trace.billable_unknown = True
-            try:
-                await asyncio.to_thread(
-                    usage_store.record,
-                    client_id=client.id,
-                    kind=kind,
-                    route_id=route_id,
-                    target=stream.target,
-                    status_code=stream.response.status_code,
-                    latency_ms=int((time.monotonic() - started) * 1000),
-                    attempts=stream.attempts,
-                    complete=complete,
-                    capture=capture,
-                    pricing_id=pricing_id,
-                    pricing=pricing,
-                    attempt_traces=stream.attempt_traces,
-                    pricing_catalog=pricing_catalog,
-                    metadata=metadata,
-                )
-            except Exception as exc:
-                if is_storage_exhausted(exc) or isinstance(exc, StorageCapacityError):
-                    storage_monitor.mark_unavailable()
-                _LOGGER.warning(
-                    "usage recording failed after stream (%s)",
-                    type(exc).__name__,
-                )
+            # A client disconnect cancels this generator mid-yield. Shield the
+            # upstream close + usage accounting so the ledger records the
+            # (incomplete) event exactly once instead of losing it.
+            finalize_task = asyncio.ensure_future(finalize(complete))
+            _STREAM_FINALIZE_TASKS.add(finalize_task)
+            finalize_task.add_done_callback(_STREAM_FINALIZE_TASKS.discard)
+            await asyncio.shield(finalize_task)
 
     headers = _usage_response_headers(
         stream.headers,
@@ -1351,11 +1436,11 @@ def _usage_metadata_from_request(
     return UsageMetadata(**values)
 
 
-def _usage_query_client(
+async def _usage_query_client(
     request: Request, manager: ConfigManager
 ) -> tuple[AuthenticatedClient, dict[str, str]] | Response:
     try:
-        config, secrets = manager.snapshot()
+        config, secrets = await manager.snapshot_async()
         client = _authenticate(request, config=config, secrets=secrets)
     except ConfigError:
         return _error(503, "本地网关配置无效；请运行 modelgw doctor")
@@ -1433,6 +1518,7 @@ async def _validated_admin_body(
     limit: int,
     model: Any,
     label: str,
+    detail_fields: bool = True,
 ) -> Any:
     raw = await _read_limited_body(request, limit)
     if raw is None:
@@ -1443,9 +1529,12 @@ async def _validated_admin_body(
         return _error(400, f"{label}请求必须是 UTF-8 JSON")
     try:
         return model.model_validate(payload)
-    except ValidationError:
-        # ValidationError may include the submitted input, which is unacceptable
-        # for one-way secret writes. Keep all admin body errors value-free.
+    except ValidationError as exc:
+        # Never echo submitted values. Non-secret endpoints get value-free
+        # field paths so the caller can act; one-way secret writes keep the
+        # fully generic message.
+        if detail_fields:
+            return _error(400, f"{label}请求格式无效：{_safe_validation_message(exc)}")
         return _error(400, f"{label}请求格式无效")
 
 
@@ -1516,7 +1605,7 @@ def _error(
 def _config_stale_error() -> JSONResponse:
     return _error(
         409,
-        "配置已经被其他操作修改；请刷新页面后重新调整",
+        "配置已经被其他操作修改；请重新读取当前 revision 后重试",
         error_type="model_gateway_config_stale",
     )
 

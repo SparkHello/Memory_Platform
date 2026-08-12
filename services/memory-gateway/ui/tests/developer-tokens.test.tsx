@@ -92,9 +92,17 @@ describe("device-token integration page", () => {
     await user.type(screen.getByLabelText("设备或客户端名称"), "Alice phone");
     await user.click(screen.getByRole("button", { name: "创建 chat token" }));
 
-    expect(createAuthToken).toHaveBeenCalledWith("Alice phone", "chat");
-    expect(await screen.findByText(rawToken)).toBeInTheDocument();
-    expect(screen.getByText("只显示这一次")).toBeInTheDocument();
+    expect(createAuthToken).toHaveBeenCalledWith("Alice phone", "chat", {
+      memoryAccess: "read-write"
+    });
+    // 一次性 token 默认掩码，点击「显示 token」后才出现明文。
+    expect(await screen.findByText("只显示这一次")).toBeInTheDocument();
+    expect(screen.queryByText(rawToken)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(`${rawToken.slice(0, 12)}…${rawToken.slice(-4)}`)
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "显示 token" }));
+    expect(screen.getByText(rawToken)).toBeInTheDocument();
 
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
