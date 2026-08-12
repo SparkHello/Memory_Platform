@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-12
+
 ### Fixed
 
 - 渠道向导「复制客户端配置」不再误用 Console token：apply 成功后自动创建 chat token，仅复制该设备密钥。
