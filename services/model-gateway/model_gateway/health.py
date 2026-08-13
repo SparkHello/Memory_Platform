@@ -17,7 +17,6 @@ from model_gateway.http_safety import (
     upstream_url,
 )
 from model_gateway.models import (
-    RESTRICTED_PLAN_TYPES,
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,
@@ -252,10 +251,8 @@ async def _check_connection(
 def _blocked_for_workload(connection: ConnectionConfig, client_kind: str) -> bool:
     if client_kind == "interactive":
         return False
-    return (
-        connection.usage_scope == "interactive_only"
-        or connection.billing_plan.type in RESTRICTED_PLAN_TYPES
-    )
+    # Only honor explicit usage_scope; plan type no longer blocks backend.
+    return connection.usage_scope == "interactive_only"
 
 
 async def _check_discovery(
@@ -314,14 +311,25 @@ async def _check_discovery(
             level="error",
             detail="无法连接 provider 的 models endpoint",
         )
-    except (HealthResponseTooLarge, ValueError):
+    except HealthResponseTooLarge:
         return _uniform_result(
             connection_id,
             connection,
             deployments,
             status="invalid_response",
             level="error",
-            detail="provider 的 models 响应超过安全上限或 URL 无效",
+            detail="provider 的 models 响应超过安全上限",
+        )
+    except ValueError as exc:
+        # SSRF / fake-ip / URL policy errors carry actionable text for the UI.
+        detail = str(exc).strip() or "provider URL 未通过安全校验"
+        return _uniform_result(
+            connection_id,
+            connection,
+            deployments,
+            status="invalid_response",
+            level="error",
+            detail=detail[:500],
         )
 
     if not response.is_success:

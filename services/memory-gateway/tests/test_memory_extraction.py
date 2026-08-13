@@ -30,6 +30,52 @@ def _extraction_json(**overrides) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+_PROJECT_PREFERENCE_SOURCE = (
+    "我维护的演示项目叫「青岚计划-812」。"
+    "我偏好该项目的周报先给三行摘要，再列风险。"
+)
+_PROJECT_MEMORY = "用户维护的演示项目叫「青岚计划-812」。"
+_PROJECT_PREFERENCE_MEMORY = "用户偏好该项目的周报先给三行摘要，再列风险。"
+
+
+def _project_preference_extraction_json(*, preference_entities: list[str]) -> str:
+    return json.dumps(
+        {
+            "memories": [
+                {
+                    "action": "create",
+                    "memory": _PROJECT_MEMORY,
+                    "type": "semantic",
+                    "importance": 8,
+                    "confidence": 0.9,
+                    "stability": "medium",
+                    "sensitivity": "normal",
+                    "topics": ["项目"],
+                    "entities": ["青岚计划-812"],
+                    "reason": "用户明确陈述了长期项目名称",
+                    "source_quote": "我维护的演示项目叫「青岚计划-812」",
+                },
+                {
+                    "action": "create",
+                    "memory": _PROJECT_PREFERENCE_MEMORY,
+                    "type": "procedural",
+                    "importance": 7,
+                    "confidence": 0.9,
+                    "stability": "stable",
+                    "sensitivity": "normal",
+                    "topics": ["偏好", "工作流程"],
+                    "entities": preference_entities,
+                    "reason": "用户明确表达了周报格式偏好",
+                    "source_quote": "我偏好该项目的周报先给三行摘要，再列风险",
+                },
+            ],
+            "reason_code": "has_candidates",
+            "reason": "拆分出项目事实和独立的周报格式偏好",
+        },
+        ensure_ascii=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_sensitive_ingest_is_blocked_before_remote_extraction(
     memory_store: MemoryStore,
@@ -516,6 +562,73 @@ def test_rest_ingest_splits_raw_text(
     logs = memory_store.list_decision_logs(conversation_id="rest-conv")
     assert len(logs) == 2
     assert {json.loads(log.candidate_json)["source"] for log in logs} == {"rest_ingest"}
+
+
+def test_batch_prompt_keeps_project_fact_and_pronoun_preference_atomic(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _project_preference_extraction_json(
+        preference_entities=[],
+    )
+
+    response = _post_ingest(
+        client,
+        auth_headers,
+        _PROJECT_PREFERENCE_SOURCE,
+        conversation_id="atomic-project-preference",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 2
+    assert response.json()["ignored"] == 0
+    memories = {
+        memory.content: memory
+        for memory in memory_store.list_memories(user_id="default")
+    }
+    assert memories[_PROJECT_MEMORY].type == "semantic"
+    assert memories[_PROJECT_MEMORY].entities == ["青岚计划-812"]
+    assert memories[_PROJECT_PREFERENCE_MEMORY].type == "procedural"
+    assert memories[_PROJECT_PREFERENCE_MEMORY].entities == []
+
+    system_prompt = fake_llm.extraction_messages[0]["content"]
+    assert "entities 是“当前候选局部”标签" in system_prompt
+    assert "entities 必须为空数组，不得根据相邻内容自行补全" in system_prompt
+    assert "type 只根据当前这一条原子候选选择" in system_prompt
+    assert _PROJECT_PREFERENCE_SOURCE in system_prompt
+    assert '"entities": []' in system_prompt
+
+
+def test_batch_ingest_rejects_entity_borrowed_from_adjacent_candidate(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _project_preference_extraction_json(
+        preference_entities=["青岚计划-812"],
+    )
+
+    response = _post_ingest(
+        client,
+        auth_headers,
+        _PROJECT_PREFERENCE_SOURCE,
+        conversation_id="invalid-cross-candidate-entity",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 1
+    assert response.json()["ignored"] == 1
+    memories = memory_store.list_memories(user_id="default")
+    assert [memory.content for memory in memories] == [_PROJECT_MEMORY]
+    logs = memory_store.list_decision_logs(
+        conversation_id="invalid-cross-candidate-entity",
+    )
+    assert len(logs) == 2
+    rejected = next(log for log in logs if log.decision == "ignore")
+    assert rejected.reason == "candidate.entities 中有值未出现在 source_quote，疑似模型编造"
 
 
 def test_rest_ingest_persists_temporal_fields(

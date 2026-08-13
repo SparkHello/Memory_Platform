@@ -1,5 +1,6 @@
 import {
   Activity,
+  ChevronDown,
   ClipboardCheck,
   Database,
   FileText,
@@ -22,7 +23,12 @@ import {
 import { useId, useState, type ReactNode } from "react";
 import { NAV_SECTIONS, PAGE_META, SIMPLE_NAV_SECTIONS, sectionForPage } from "../navigation";
 import { useDialogA11y } from "../hooks/useDialogA11y";
-import type { ThemeMode, UiMode } from "../storage";
+import {
+  loadCollapsedNavSections,
+  saveCollapsedNavSections,
+  type ThemeMode,
+  type UiMode
+} from "../storage";
 import type { ConnectionSettings, PageKey } from "../types";
 import { scrollWorkspaceToTop } from "../utils/scroll";
 
@@ -60,6 +66,7 @@ export function AppShell({
   serviceStatus,
   theme,
   uiMode,
+  needsCredentialSetup = false,
   signals = {},
   onToggleTheme,
   onToggleUiMode,
@@ -76,6 +83,8 @@ export function AppShell({
   };
   theme: ThemeMode;
   uiMode: UiMode;
+  /** 无密钥或密钥失效：隐藏主导航，只做连接设置。 */
+  needsCredentialSetup?: boolean;
   signals?: NavSignals;
   onToggleTheme: () => void;
   onToggleUiMode: () => void;
@@ -84,10 +93,25 @@ export function AppShell({
   children: ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
-  const configured = Boolean(settings.apiKey);
+  // 专家模式导航有 15 个入口，分组可折叠；折叠偏好跨会话保留。
+  const [collapsedSections, setCollapsedSections] = useState<string[]>(() =>
+    loadCollapsedNavSections()
+  );
+  // 配好密钥且鉴权有效后才展示日常导航；连接设置本身在简洁模式里不进侧栏。
+  const showMainNav = Boolean(settings.apiKey) && !needsCredentialSetup;
   const userId = settings.userId || "default";
   const activeSection = sectionForPage(activePage);
   const navSections = uiMode === "expert" ? NAV_SECTIONS : SIMPLE_NAV_SECTIONS;
+
+  const toggleSection = (key: string) => {
+    setCollapsedSections((current) => {
+      const next = current.includes(key)
+        ? current.filter((item) => item !== key)
+        : [...current, key];
+      saveCollapsedNavSections(next);
+      return next;
+    });
+  };
 
   const go = (nextPage: PageKey) => {
     setMoreOpen(false);
@@ -99,7 +123,7 @@ export function AppShell({
   };
 
   return (
-    <div className={`app-shell ${!configured ? "setup-shell" : ""}`}>
+    <div className={`app-shell ${!showMainNav ? "setup-shell" : ""}`}>
       <div className="ambient-field" aria-hidden="true">
         <i className="af-a" />
         <i className="af-b" />
@@ -107,7 +131,7 @@ export function AppShell({
         <i className="af-glow" />
         <i className="af-grain" />
       </div>
-      {configured && (
+      {showMainNav && (
         <aside className="sidebar">
           <div className="brand" aria-label="Memory Console">
             <div className="brand-mark">M</div>
@@ -118,31 +142,56 @@ export function AppShell({
           </div>
 
           <nav className="nav-list" aria-label="Memory Console">
-            {navSections.map((section) => (
-              <div className="nav-group" key={section.key}>
-                <span className="nav-group-label">{section.label}</span>
-                {section.items.map((key) => {
-                  const Icon = PAGE_ICONS[key];
-                  const badge = signals[key];
-                  const isActive = activePage === key;
-                  return (
+            {navSections.map((section) => {
+              // 含当前页面的分组永远展开，避免折叠后丢失位置感。
+              const collapsible = uiMode === "expert";
+              const collapsed =
+                collapsible &&
+                collapsedSections.includes(section.key) &&
+                !section.items.includes(activePage);
+              const hasSignal = section.items.some((key) => signals[key]);
+              return (
+                <div className="nav-group" key={section.key}>
+                  {collapsible ? (
                     <button
-                      key={key}
-                      className={`nav-item ${isActive ? "active" : ""}`}
+                      className="nav-group-label nav-group-toggle"
                       type="button"
-                      onClick={() => go(key)}
-                      aria-current={isActive ? "page" : undefined}
+                      aria-expanded={!collapsed}
+                      onClick={() => toggleSection(section.key)}
                     >
-                      <Icon size={16} />
-                      <span>{PAGE_META[key].label}</span>
-                      {badge && (
-                        <em className={`nav-badge nav-badge-${badge.tone}`}>{badge.text}</em>
+                      <span>{section.label}</span>
+                      {collapsed && hasSignal && (
+                        <i className="nav-group-signal" aria-hidden="true" />
                       )}
+                      <ChevronDown size={12} className={collapsed ? "" : "open"} />
                     </button>
-                  );
-                })}
-              </div>
-            ))}
+                  ) : (
+                    <span className="nav-group-label">{section.label}</span>
+                  )}
+                  {!collapsed &&
+                    section.items.map((key) => {
+                      const Icon = PAGE_ICONS[key];
+                      const badge = signals[key];
+                      const isActive = activePage === key;
+                      return (
+                        <button
+                          key={key}
+                          className={`nav-item ${isActive ? "active" : ""}`}
+                          type="button"
+                          onClick={() => go(key)}
+                          aria-current={isActive ? "page" : undefined}
+                        >
+                          <Icon size={16} />
+                          <span>{PAGE_META[key].label}</span>
+                          {badge && (
+                            <em className={`nav-badge nav-badge-${badge.tone}`}>{badge.text}</em>
+                          )}
+                        </button>
+                      );
+                    })}
+                </div>
+              );
+            })}
           </nav>
           <button
             className="nav-item nav-mode-toggle"
@@ -160,10 +209,16 @@ export function AppShell({
       <main className="workspace">
         <header className="topbar">
           <div className="topbar-page">
-            {!configured && <span className="topbar-brand-mark">M</span>}
+            {!showMainNav && <span className="topbar-brand-mark">M</span>}
             <div className="topbar-title">
-              {configured && <span>{activeSection.label}</span>}
-              <strong>{configured ? PAGE_META[activePage].label : "Memory Console 初始设置"}</strong>
+              {showMainNav && <span>{activeSection.label}</span>}
+              <strong>
+                {showMainNav
+                  ? PAGE_META[activePage].label
+                  : needsCredentialSetup && settings.apiKey
+                    ? "重新配置访问密钥"
+                    : "Memory Console 初始设置"}
+              </strong>
             </div>
           </div>
           <div className="topbar-right">
@@ -196,13 +251,17 @@ export function AppShell({
             >
               {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
             </button>
-            {configured && (
+            {showMainNav && (
               <button
                 className="avatar-chip"
                 type="button"
                 onClick={() => go("settings")}
-                title={`用户 ${userId} · 打开设置`}
-                aria-label={`用户 ${userId} · 打开设置`}
+                title={
+                  uiMode === "simple"
+                    ? `连接设置（访问密钥）· 用户 ${userId}`
+                    : `用户 ${userId} · 打开连接设置`
+                }
+                aria-label={`连接设置 · 用户 ${userId}`}
               >
                 {userId.slice(0, 1).toUpperCase()}
               </button>
@@ -213,7 +272,7 @@ export function AppShell({
         <section className="content-area">{children}</section>
       </main>
 
-      {configured && (
+      {showMainNav && (
         <nav className="mobile-bottom-nav" aria-label="移动端导航">
           {MOBILE_PRIMARY_PAGES.map((page) => {
             const Icon = PAGE_ICONS[page];
@@ -242,7 +301,7 @@ export function AppShell({
         </nav>
       )}
 
-      {configured && moreOpen && (
+      {showMainNav && moreOpen && (
         <MobileMoreSheet
           activePage={activePage}
           uiMode={uiMode}

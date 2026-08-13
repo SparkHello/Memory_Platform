@@ -29,6 +29,10 @@ MODEL_SECRETS = Path("/model-secrets")
 CREDENTIALS = Path("/credentials")
 MEMORY_MARKER = MEMORY_DATA / ".stack-installed-v2"
 MODEL_MARKER = MODEL_DATA / ".stack-installed-v2"
+# Prefer .txt so macOS Finder does not open credentials as Keynote presentations
+# (UTI com.apple.iwork.keynote.sffkey). Legacy .key remains accepted for upgrades.
+GATEWAY_CREDENTIAL_NAMES = ("gateway.txt", "gateway.key")
+ADMIN_CREDENTIAL_NAMES = ("admin.txt", "admin.key")
 
 
 def main() -> int:
@@ -139,7 +143,7 @@ def main() -> int:
     _provision_first_console_token(
         settings_path=paths.settings_env,
         auth_database_path=MEMORY_DATA / "auth.db",
-        credential_path=CREDENTIALS / "gateway.key",
+        credential_path=_credential_write_path(GATEWAY_CREDENTIAL_NAMES),
     )
     model_paths = gateway_paths(MODEL_DATA)
     config = load_config(model_paths.config)
@@ -154,7 +158,7 @@ def main() -> int:
         print("初始化未生成完整凭据；拒绝发布半成品标记。", file=sys.stderr)
         return 3
 
-    _deliver_once(CREDENTIALS / "admin.key", admin_key)
+    _deliver_once(_credential_write_path(ADMIN_CREDENTIAL_NAMES), admin_key)
     # settings.env.bak can contain live backend/gateway material and is not a
     # supported recovery mechanism; the portable backup intentionally excludes
     # secrets.  Remove this convenience copy before publishing the volumes.
@@ -170,7 +174,10 @@ def main() -> int:
     _secure_tree(MODEL_DATA, MODEL_UID)
     _secure_tree(MODEL_SECRETS, MODEL_UID)
     _secure_credentials()
-    print("离线初始化完成；访问凭据已写入宿主机私有文件。")
+    print(
+        "离线初始化完成；访问凭据已写入 Compose 工作目录下的 "
+        "credentials/gateway.txt 与 credentials/admin.txt。"
+    )
     return 0
 
 
@@ -266,6 +273,27 @@ def _secure_tree(root: Path, owner: int) -> None:
             path.chmod(0o700 if path.is_dir() else 0o600)
 
 
+def _credential_write_path(names: tuple[str, ...]) -> Path:
+    """Preferred new path (.txt first). Does not require the file to exist."""
+    return CREDENTIALS / names[0]
+
+
+def _resolve_credential_path(names: tuple[str, ...]) -> Path | None:
+    """First non-empty regular file among preferred and legacy names."""
+    for name in names:
+        path = CREDENTIALS / name
+        if _is_nonempty_regular_no_follow(path):
+            return path
+    return None
+
+
+def _require_credential_path(names: tuple[str, ...], *, label: str) -> Path:
+    path = _resolve_credential_path(names)
+    if path is None:
+        raise RuntimeError(_missing_credential_message(label))
+    return path
+
+
 def _secure_credentials() -> None:
     uid = _bounded_id(os.getenv("HOST_UID", ""))
     gid = _bounded_id(os.getenv("HOST_GID", ""))
@@ -275,27 +303,32 @@ def _secure_credentials() -> None:
     CREDENTIALS.chmod(0o700)
     if uid is not None and gid is not None:
         os.chown(CREDENTIALS, uid, gid)
-    for path in (CREDENTIALS / "gateway.key", CREDENTIALS / "admin.key"):
-        try:
-            descriptor = _open_regular_no_follow(path, os.O_RDONLY)
-        except FileNotFoundError as exc:
-            raise RuntimeError(_missing_credential_message(path)) from exc
-        try:
-            metadata = os.fstat(descriptor)
-            if metadata.st_size <= 0:
-                raise RuntimeError(_missing_credential_message(path))
-            os.fchmod(descriptor, 0o600)
-            if uid is not None and gid is not None:
-                os.fchown(descriptor, uid, gid)
-        finally:
-            os.close(descriptor)
+    for names, label in (
+        (GATEWAY_CREDENTIAL_NAMES, "gateway"),
+        (ADMIN_CREDENTIAL_NAMES, "admin"),
+    ):
+        path = _require_credential_path(names, label=label)
+        # Harden every present alias (.txt and legacy .key) so neither stays world-readable.
+        for name in names:
+            candidate = CREDENTIALS / name
+            if not _is_nonempty_regular_no_follow(candidate):
+                continue
+            descriptor = _open_regular_no_follow(candidate, os.O_RDONLY)
+            try:
+                os.fchmod(descriptor, 0o600)
+                if uid is not None and gid is not None:
+                    os.fchown(descriptor, uid, gid)
+            finally:
+                os.close(descriptor)
+        _ = path  # ensure resolve succeeded
 
 
-def _missing_credential_message(path: Path) -> str:
+def _missing_credential_message(label: str) -> str:
     return (
-        f"数据卷已初始化，但宿主 credentials/{path.name} 缺失。"
-        "数据没有丢：把原安装目录中的 credentials/gateway.key 和 "
-        "credentials/admin.key 放回安装目录的 credentials/ 后重跑同一条安装命令即可。"
+        f"数据卷已初始化，但宿主 credentials/ 缺少 {label} 凭据文件"
+        f"（优先 {label}.txt，兼容旧版 {label}.key）。"
+        "数据没有丢：把原安装目录中的 credentials/gateway.txt（或 gateway.key）和 "
+        "credentials/admin.txt（或 admin.key）放回安装目录的 credentials/ 后重跑同一条安装命令即可。"
         "两枚密钥都遗失时参见 docs/stack-operations.md 的密钥重设章节。"
     )
 
@@ -310,11 +343,12 @@ def _validate_published_credentials() -> None:
         directory.st_uid != uid or directory.st_gid != gid
     ):
         raise RuntimeError("published credential directory ownership is invalid")
-    for path in (CREDENTIALS / "gateway.key", CREDENTIALS / "admin.key"):
-        try:
-            descriptor = _open_regular_no_follow(path, os.O_RDONLY)
-        except FileNotFoundError as exc:
-            raise RuntimeError(_missing_credential_message(path)) from exc
+    for names, label in (
+        (GATEWAY_CREDENTIAL_NAMES, "gateway"),
+        (ADMIN_CREDENTIAL_NAMES, "admin"),
+    ):
+        path = _require_credential_path(names, label=label)
+        descriptor = _open_regular_no_follow(path, os.O_RDONLY)
         try:
             metadata = os.fstat(descriptor)
             if metadata.st_size <= 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
@@ -335,14 +369,17 @@ def _bounded_id(value: str) -> int | None:
 
 
 def _installation_complete() -> bool:
-    required = (
+    required_paths = (
         MEMORY_SECRETS / "settings.env",
         MODEL_DATA / "config.json",
         MODEL_SECRETS / "secrets.env",
-        CREDENTIALS / "gateway.key",
-        CREDENTIALS / "admin.key",
     )
-    return all(_is_nonempty_regular_no_follow(path) for path in required)
+    if not all(_is_nonempty_regular_no_follow(path) for path in required_paths):
+        return False
+    return (
+        _resolve_credential_path(GATEWAY_CREDENTIAL_NAMES) is not None
+        and _resolve_credential_path(ADMIN_CREDENTIAL_NAMES) is not None
+    )
 
 
 _MAX_CREDENTIAL_BYTES = 512

@@ -174,7 +174,7 @@
 .usage-day time {
   overflow: hidden;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--text-micro);
   text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;

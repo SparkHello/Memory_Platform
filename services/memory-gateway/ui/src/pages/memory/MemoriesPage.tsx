@@ -5,7 +5,6 @@ import {
   ChevronRight,
   Columns3,
   Download,
-  RefreshCcw,
   Search,
   ShieldAlert,
   SlidersHorizontal,
@@ -110,6 +109,13 @@ export function MemoriesPage({
     () => new Set(["classification", "typeStatus", "importance", "updated"])
   );
   const [filters, setFilters] = useState<MemoryFilters>({ ...DEFAULT_FILTERS });
+  const [spaceManagerOpen, setSpaceManagerOpen] = useState(false);
+  const [newSpaceName, setNewSpaceName] = useState("");
+  const [newSpaceColor, setNewSpaceColor] = useState("");
+  const [spaceBusy, setSpaceBusy] = useState(false);
+  const [embeddingReady, setEmbeddingReady] = useState(false);
+  const [missingVectorCount, setMissingVectorCount] = useState(0);
+  const [reembedBusy, setReembedBusy] = useState(false);
   const filterDrawerRef = useDialogA11y<HTMLElement>(
     () => setFiltersOpen(false),
     filtersOpen
@@ -133,11 +139,27 @@ export function MemoriesPage({
                   signal
                 )
               : api.listMemories({ redactSensitive: true, status: "all" }, signal);
-        const [memories, loadedSpaces] = await Promise.all([
+        const [memories, loadedSpaces, health, providers] = await Promise.all([
           memoryPromise,
-          api.listMemorySpaces(signal)
+          api.listMemorySpaces({ includeArchived: true, signal }),
+          typeof api.memoryHealth === "function"
+            ? api.memoryHealth(signal).catch(() => null)
+            : Promise.resolve(null),
+          typeof api.providersStatus === "function"
+            ? api.providersStatus(signal).catch(() => null)
+            : Promise.resolve(null)
         ]);
         setSpaces(loadedSpaces);
+        const ready = providers?.embedding.state === "ready";
+        setEmbeddingReady(Boolean(ready));
+        const missing = ready && health
+          ? health.issues.filter((issue) =>
+              issue.type === "embedding_missing" ||
+              issue.type === "embedding_invalid" ||
+              issue.type === "embedding_dimension_mismatch"
+            ).length
+          : 0;
+        setMissingVectorCount(missing);
         setState({ loading: false, error: null, data: memories });
       } catch (error) {
         // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
@@ -382,15 +404,8 @@ export function MemoriesPage({
     <div className="page-stack">
       <PageHeader
         title="记忆库"
-        subtitle="查看、搜索和筛选记忆；点任意一条打开它的档案。"
-        action={
-          <div className="button-row">
-            <button className="secondary-button" type="button" onClick={() => load(tab)}>
-              <RefreshCcw size={16} />
-              刷新
-            </button>
-          </div>
-        }
+        subtitle="点一条记忆打开档案。"
+        showTitle={false}
       />
 
       <div className="tabs">
@@ -414,6 +429,204 @@ export function MemoriesPage({
         <ShieldAlert size={16} />
         当前为遮罩视图，私密和敏感正文只在档案里显式查看后显示。
       </div>
+
+      {tab === "active" && embeddingReady && missingVectorCount > 0 && (
+        <div className="notice warning" role="status">
+          <ShieldAlert size={16} />
+          <span className="notice-text">
+            有 {missingVectorCount} 条记忆没有当前空间的向量，语义召回找不到它们。
+          </span>
+          <button
+            className="secondary-button compact"
+            type="button"
+            disabled={reembedBusy}
+            onClick={() => {
+              void (async () => {
+                setReembedBusy(true);
+                try {
+                  const result = await api.reEmbedMemories({ scan: true });
+                  notify(
+                    result.re_embedded > 0
+                      ? `已为 ${result.re_embedded} 条记忆补齐向量`
+                      : "没有需要补齐的记忆向量",
+                    "success"
+                  );
+                  void load(tab);
+                } catch (error) {
+                  notify(errorMessage(error), "error");
+                } finally {
+                  setReembedBusy(false);
+                }
+              })();
+            }}
+          >
+            {reembedBusy ? "正在补齐…" : "补齐向量"}
+          </button>
+        </div>
+      )}
+
+      <section className="panel space-manager-panel">
+        <div className="panel-header">
+          <h2>空间管理</h2>
+          <button
+            type="button"
+            className="ghost-button compact"
+            onClick={() => setSpaceManagerOpen((open) => !open)}
+          >
+            {spaceManagerOpen ? "收起" : "展开"}
+          </button>
+        </div>
+        {spaceManagerOpen && (
+          <div className="space-manager-body">
+            <p className="muted">
+              创建、改名、着色或归档空间。归档后默认筛选不再显示；删除仅允许空空间。
+            </p>
+            <div className="button-row space-manager-create">
+              <input
+                value={newSpaceName}
+                onChange={(event) => setNewSpaceName(event.target.value)}
+                placeholder="新空间名称"
+                maxLength={80}
+              />
+              <input
+                value={newSpaceColor}
+                onChange={(event) => setNewSpaceColor(event.target.value)}
+                placeholder="#4F46E5"
+                maxLength={7}
+                aria-label="颜色 #RRGGBB"
+                style={{ width: "7rem" }}
+              />
+              <button
+                type="button"
+                className="primary-button"
+                disabled={spaceBusy || !newSpaceName.trim()}
+                onClick={() => {
+                  void (async () => {
+                    setSpaceBusy(true);
+                    try {
+                      await api.createMemorySpace({
+                        name: newSpaceName.trim(),
+                        color: newSpaceColor.trim() || null
+                      });
+                      setNewSpaceName("");
+                      setNewSpaceColor("");
+                      notify("空间已创建", "success");
+                      void load(tab);
+                    } catch (error) {
+                      notify(errorMessage(error), "error");
+                    } finally {
+                      setSpaceBusy(false);
+                    }
+                  })();
+                }}
+              >
+                创建空间
+              </button>
+            </div>
+            <ul className="space-manager-list">
+              {spaces.map((space) => (
+                <li key={space.id}>
+                  <span
+                    className="space-color-dot"
+                    style={{
+                      background: space.color || "var(--border-strong, #94a3b8)"
+                    }}
+                    aria-hidden
+                  />
+                  <strong>{space.name}</strong>
+                  <span className="muted">
+                    {space.active_memory_count ?? 0} 条
+                    {space.archived ? " · 已归档" : ""}
+                  </span>
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      className="ghost-button compact"
+                      disabled={spaceBusy}
+                      onClick={() => {
+                        void (async () => {
+                          const next = window.prompt("新的空间名称", space.name);
+                          if (!next || next.trim() === space.name) return;
+                          setSpaceBusy(true);
+                          try {
+                            await api.updateMemorySpace(space.id, { name: next.trim() });
+                            notify("已改名", "success");
+                            void load(tab);
+                          } catch (error) {
+                            notify(errorMessage(error), "error");
+                          } finally {
+                            setSpaceBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      改名
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button compact"
+                      disabled={spaceBusy}
+                      onClick={() => {
+                        void (async () => {
+                          setSpaceBusy(true);
+                          try {
+                            if (space.archived) {
+                              await api.unarchiveMemorySpace(space.id);
+                              notify("已取消归档", "success");
+                            } else {
+                              await api.archiveMemorySpace(space.id);
+                              notify("已归档空间", "success");
+                            }
+                            void load(tab);
+                          } catch (error) {
+                            notify(errorMessage(error), "error");
+                          } finally {
+                            setSpaceBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      {space.archived ? "取消归档" : "归档"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button compact danger-text"
+                      disabled={spaceBusy}
+                      onClick={() => {
+                        void (async () => {
+                          const ok = await confirm({
+                            title: "删除空空间？",
+                            message: `将删除「${space.name}」。若仍绑定记忆会失败，请先解绑或改归档。`,
+                            confirmLabel: "删除",
+                            tone: "danger"
+                          });
+                          if (!ok) return;
+                          setSpaceBusy(true);
+                          try {
+                            await api.deleteMemorySpace(space.id);
+                            notify("空间已删除", "success");
+                            if (filters.spaceId === space.id) {
+                              setFilters({ ...filters, spaceId: "all" });
+                            }
+                            void load(tab);
+                          } catch (error) {
+                            notify(errorMessage(error), "error");
+                          } finally {
+                            setSpaceBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </li>
+              ))}
+              {spaces.length === 0 && <li className="muted">还没有空间</li>}
+            </ul>
+          </div>
+        )}
+      </section>
 
       <div className="memory-layout">
         {filtersOpen && (
@@ -480,7 +693,9 @@ export function MemoriesPage({
               onChange={(event) => setFilters({ ...filters, spaceId: event.target.value })}
             >
               <option value="all">全部</option>
-              {spaces.map((space) => (
+              {spaces
+                .filter((space) => !space.archived)
+                .map((space) => (
                 <option key={space.id} value={space.id}>
                   {space.name}
                 </option>
@@ -711,7 +926,12 @@ export function MemoriesPage({
                           onKeyDown={(event) => event.stopPropagation()}
                         />
                       </td>
-                      <td className="content-cell">{memory.content}</td>
+                      <td className="content-cell">
+                        {memory.content}
+                        {embeddingReady && !memory.embedding_space_id && (
+                          <span className="table-badge muted">无向量</span>
+                        )}
+                      </td>
                       {visibleColumns.has("classification") && <td className="classification-cell">{classificationSummary(memory, spaces)}</td>}
                       {visibleColumns.has("typeStatus") && <td><div className="table-badge-stack">{badge(memory.type)}{badge(memory.status || "dynamic")}</div></td>}
                       {visibleColumns.has("importance") && <td>
@@ -753,7 +973,10 @@ export function MemoriesPage({
                     onClick={() => openMemory(memory.id)}
                   >
                     <span className="memory-card-kicker">{badge(memory.type)} {badge(memory.status || "dynamic")}</span>
-                    <strong>{memory.content}</strong>
+                    <strong>
+                      {memory.content}
+                      {embeddingReady && !memory.embedding_space_id ? " · 无向量" : ""}
+                    </strong>
                     <span className="memory-card-classification">{classificationSummary(memory, spaces)}</span>
                     <span className="memory-card-meta"><b>重要度 {memory.importance}</b><span>{dateText(memory.updated_at)}</span></span>
                   </button>

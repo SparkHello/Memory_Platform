@@ -17,6 +17,7 @@ from app.api.memories import (  # noqa: F401
     evaluation,
     export,
     graph,
+    import_conversations,
     purge,
     review,
     search,

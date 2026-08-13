@@ -861,12 +861,90 @@ class MemoryStore:
         return _spaces.list_memory_spaces(self, user_id=user_id, include_archived=include_archived)
 
 
-    def list_memory_space_summaries(self, *, user_id: str) -> list[dict]:
-        return _spaces.list_memory_space_summaries(self, user_id=user_id)
+    def list_memory_space_summaries(
+        self,
+        *,
+        user_id: str,
+        include_archived: bool = False,
+    ) -> list[dict]:
+        return _spaces.list_memory_space_summaries(
+            self, user_id=user_id, include_archived=include_archived
+        )
 
 
-    def get_memory_space(self, *, user_id: str, space_id: str) -> MemorySpace | None:
-        return _spaces.get_memory_space(self, user_id=user_id, space_id=space_id)
+    def get_memory_space(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        include_archived: bool = False,
+    ) -> MemorySpace | None:
+        return _spaces.get_memory_space(
+            self,
+            user_id=user_id,
+            space_id=space_id,
+            include_archived=include_archived,
+        )
+
+    def create_memory_space(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+        sort_order: int | None = None,
+    ) -> MemorySpace:
+        return _spaces.create_memory_space(
+            self,
+            user_id=user_id,
+            name=name,
+            color=color,
+            description=description,
+            sort_order=sort_order,
+        )
+
+    def update_memory_space(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        name: str | None = None,
+        color: str | None = None,
+        description: str | None = None,
+        sort_order: int | None = None,
+        update_name: bool = False,
+        update_color: bool = False,
+        update_description: bool = False,
+        update_sort_order: bool = False,
+    ) -> MemorySpace | None:
+        return _spaces.update_memory_space(
+            self,
+            user_id=user_id,
+            space_id=space_id,
+            name=name,
+            color=color,
+            description=description,
+            sort_order=sort_order,
+            update_name=update_name,
+            update_color=update_color,
+            update_description=update_description,
+            update_sort_order=update_sort_order,
+        )
+
+    def set_memory_space_archived(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        archived: bool,
+    ) -> MemorySpace | None:
+        return _spaces.set_memory_space_archived(
+            self, user_id=user_id, space_id=space_id, archived=archived
+        )
+
+    def delete_memory_space(self, *, user_id: str, space_id: str) -> str:
+        return _spaces.delete_memory_space(self, user_id=user_id, space_id=space_id)
 
 
     def list_memories_for_space(

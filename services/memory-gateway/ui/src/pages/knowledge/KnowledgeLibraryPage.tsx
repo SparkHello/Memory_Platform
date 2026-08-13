@@ -1,7 +1,6 @@
 import {
   ArchiveRestore,
   ArrowLeft,
-  BookOpenText,
   ChevronDown,
   Clipboard,
   Download,
@@ -220,24 +219,15 @@ function KnowledgeListPage({
     <div className="page-stack knowledge-page">
       <PageHeader
         title="知识库"
-        subtitle="保存不适合一次提交的长文本。知识与长期记忆物理隔离，只会在 AI 明确调用知识工具时检索。"
+        subtitle="长文放这里，不会自动进聊天。"
+        showTitle={false}
         action={
-          <div className="button-row">
-            <button className="secondary-button" type="button" onClick={() => void load()}>
-              <RefreshCcw size={16} /> 刷新
-            </button>
-            <button className="primary-button" type="button" onClick={() => setShowUpload((current) => !current)} aria-expanded={showUpload}>
-              {showUpload ? <X size={16} /> : <FilePlus2 size={16} />}
-              {showUpload ? "收起" : "添加文档"}
-            </button>
-          </div>
+          <button className="primary-button" type="button" onClick={() => setShowUpload((current) => !current)} aria-expanded={showUpload}>
+            {showUpload ? <X size={16} /> : <FilePlus2 size={16} />}
+            {showUpload ? "收起" : "添加文档"}
+          </button>
         }
       />
-
-      <div className="notice knowledge-boundary-note">
-        <BookOpenText size={17} />
-        <span>这里的内容不参与记忆 RAG、自动上下文、活跃度统计或记忆衰减。</span>
-      </div>
 
       {showUpload && (
         <section className="panel knowledge-compose-panel" aria-label="添加知识文档">
@@ -285,7 +275,7 @@ function KnowledgeListPage({
                 ? "软删除的文档会保留在这里，直到你永久清理。"
                 : submittedQuery
                   ? "换一个标题或来源关键词试试。"
-                  : "添加项目文档、笔记或需要精确引用的长文本。导入后不会自动进入普通聊天；需要 MCP、检索调试或知识检索才会用到这些文档。"
+                  : "项目文档、笔记或需要精确引用的长文本。"
             }
             action={tab === "active" && !submittedQuery ? { label: "添加第一个文档", onClick: () => setShowUpload(true) } : undefined}
           />
@@ -334,6 +324,7 @@ function KnowledgeListPage({
         )}
       </section>
 
+      {documents && documents.length > 0 && (
       <section className="panel knowledge-backup-panel">
         <div className="panel-header">
           <div>
@@ -357,6 +348,7 @@ function KnowledgeListPage({
           )}
         </div>
       </section>
+      )}
 
       {purgeTarget && (
         <PurgeKnowledgeDialog

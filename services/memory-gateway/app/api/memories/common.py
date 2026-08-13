@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from app.config import Settings, get_settings
 from app.api.deps import (
-    embedding_runtime_enabled,
     get_embedding_client,
     get_llm_client,
     get_memory_search_service,
@@ -243,6 +242,20 @@ class MemorySpacesUpdateRequest(BaseModel):
     space_ids: list[str] = Field(default_factory=list)
     create_space_names: list[str] = Field(default_factory=list)
     expected_revision: int | None = Field(default=None, ge=1)
+
+
+class MemorySpaceCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    color: str | None = Field(default=None, max_length=7)
+    description: str | None = Field(default=None, max_length=500)
+    sort_order: int | None = Field(default=None, ge=0, le=9999)
+
+
+class MemorySpaceUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    color: str | None = Field(default=None, max_length=7)
+    description: str | None = Field(default=None, max_length=500)
+    sort_order: int | None = Field(default=None, ge=0, le=9999)
 
 class CoreMemoryUpdateRequest(BaseModel):
     content: str | None = Field(default=None, max_length=MEMORY_TEXT_MAX_CHARS)
@@ -690,4 +703,3 @@ def _find_memories_needing_embedding(
 # Domain route modules use ``from .common import *``. Include private helpers
 # (``_memory_to_response`` etc.) so star-import does not hide them.
 __all__ = [name for name in globals() if not name.startswith("__")]
-

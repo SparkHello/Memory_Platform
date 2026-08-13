@@ -935,8 +935,9 @@ if [ "$LAYOUT" = fresh ]; then
       || { SPLIT_VOLUMES_PRESENT=0; break; }
   done
   if [ "$SPLIT_VOLUMES_PRESENT" = 1 ] \
-    && { [ ! -s credentials/gateway.key ] || [ ! -s credentials/admin.key ]; }; then
-    fail "检测到 project '$PROJECT' 的四个数据卷仍在，但 $INSTALL_DIR/credentials/ 缺少 gateway.key 或 admin.key。数据没有丢：把原安装目录里的 credentials/gateway.key 和 credentials/admin.key 放回 $INSTALL_DIR/credentials/ 后重跑同一条安装命令即可接回旧数据。若两枚密钥确实遗失，参见 docs/stack-operations.md 的密钥重置章节。"
+    && { { [ ! -s credentials/gateway.txt ] && [ ! -s credentials/gateway.key ]; } \
+      || { [ ! -s credentials/admin.txt ] && [ ! -s credentials/admin.key ]; }; }; then
+    fail "检测到 project '$PROJECT' 的四个数据卷仍在，但 $INSTALL_DIR/credentials/ 缺少 gateway/admin 凭据（优先 .txt，兼容旧版 .key）。数据没有丢：把原安装目录里的 credentials/gateway.txt（或 gateway.key）和 credentials/admin.txt（或 admin.key）放回 $INSTALL_DIR/credentials/ 后重跑同一条安装命令即可接回旧数据。若两枚密钥确实遗失，参见 docs/stack-operations.md 的密钥重置章节。"
   fi
 fi
 
@@ -1463,25 +1464,38 @@ if [ "$LAYOUT" != fresh ]; then
   done
 fi
 
-credentials_accepted=1
-for credential in gateway.key admin.key; do
-  if [ ! -s "$INSTALL_DIR/credentials/$credential" ] \
-    || ! chmod 600 "$INSTALL_DIR/credentials/$credential"; then
-    credentials_accepted=0
-    break
+# Prefer .txt (double-click opens as text). Legacy .key remains accepted.
+resolve_credential() {
+  # $1 = role: gateway | admin
+  if [ -s "$INSTALL_DIR/credentials/$1.txt" ]; then
+    printf '%s\n' "$INSTALL_DIR/credentials/$1.txt"
+  elif [ -s "$INSTALL_DIR/credentials/$1.key" ]; then
+    printf '%s\n' "$INSTALL_DIR/credentials/$1.key"
+  else
+    return 1
   fi
-done
+}
+
+credentials_accepted=1
+GATEWAY_CRED_FILE=""
+ADMIN_CRED_FILE=""
+if ! GATEWAY_CRED_FILE=$(resolve_credential gateway) \
+  || ! ADMIN_CRED_FILE=$(resolve_credential admin); then
+  credentials_accepted=0
+else
+  chmod 600 "$GATEWAY_CRED_FILE" "$ADMIN_CRED_FILE" || credentials_accepted=0
+fi
 if [ "$credentials_accepted" -eq 1 ]; then
   if ! compose_internal exec -T memory-gateway python -c \
       'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2026/auth/tokens",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
-      <"$INSTALL_DIR/credentials/gateway.key" >/dev/null 2>&1; then
+      <"$GATEWAY_CRED_FILE" >/dev/null 2>&1; then
     credentials_accepted=0
   fi
 fi
 if [ "$credentials_accepted" -eq 1 ]; then
   if ! compose_internal exec -T model-gateway python -c \
       'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2030/admin/configuration",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
-      <"$INSTALL_DIR/credentials/admin.key" >/dev/null 2>&1; then
+      <"$ADMIN_CRED_FILE" >/dev/null 2>&1; then
     credentials_accepted=0
   fi
 fi
@@ -1565,14 +1579,17 @@ if [ "$HOST" != 127.0.0.1 ]; then
     say "  局域网/手机:  http://<本机局域网IP>:$PORT/v1（macOS 用 ipconfig getifaddr en0、Linux 用 hostname -I 查询）"
   fi
 fi
-say "  Console token: $INSTALL_DIR/credentials/gateway.key"
-say "  Admin key:    $INSTALL_DIR/credentials/admin.key"
+GATEWAY_CRED_REPORT=$(resolve_credential gateway 2>/dev/null || printf '%s\n' "$INSTALL_DIR/credentials/gateway.txt")
+ADMIN_CRED_REPORT=$(resolve_credential admin 2>/dev/null || printf '%s\n' "$INSTALL_DIR/credentials/admin.txt")
+say "  Console token: $GATEWAY_CRED_REPORT"
+say "  Admin key:    $ADMIN_CRED_REPORT"
+say "（纯文本 .txt，可用文本编辑器打开；旧版 .key 仍兼容）"
 say "密钥值没有进入本脚本输出、Compose 环境或 Docker 日志。"
 if [ "$HOST" != 127.0.0.1 ]; then
   say "已监听可信局域网；请确认路由器没有把端口映射到公网。"
 fi
 if [ "$LAYOUT" = legacy ]; then
-  say "gateway.key 仅在迁移兼容期保留 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
+  say "Console 凭据在迁移兼容期可能仍是 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
   say "旧单卷仍保留用于观察期回滚；完成客户端/备份验证后再显式删除。"
 fi
 if [ -n "$BACKUP_PATH" ]; then

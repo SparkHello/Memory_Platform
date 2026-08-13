@@ -14,7 +14,7 @@ Memory Platform 自己不产生回答，背后需要至少一个模型渠道的 
 
 具体价格、额度和可用模型以各渠道官方页面为准。quickstart 选定预设后会自动列出当前 key 实际可用的模型让你挑，不用手抄模型 ID。
 
-**语义搜索（embedding）是可选的**。不配也能用，检索会自动回退关键词模式；配了效果更好。想零成本体验可以用硅基流动（[siliconflow.cn](https://siliconflow.cn)）的 `BAAI/bge-m3`（免费政策以其官网为准），作为自定义渠道填入。两个最常踩的坑：base URL 必须完整写成 `https://api.siliconflow.cn/v1`（末尾 `/v1` 漏了会 404），模型名必须带 `BAAI/` 前缀（只写 `bge-m3` 会报模型不存在）。
+**语义搜索（embedding）是可选的**。不创建或关闭 `memory.embedding` route 即明确使用关键词模式；创建并启用它才表示同意向量化。Memory 的 space 默认留空，会自动采用 route 声明的唯一空间和维度。想零成本体验可以用硅基流动（[siliconflow.cn](https://siliconflow.cn)）的 `BAAI/bge-m3`（免费政策以其官网为准），作为自定义渠道填入。两个最常踩的坑：base URL 必须完整写成 `https://api.siliconflow.cn/v1`（末尾 `/v1` 漏了会 404），模型名必须带 `BAAI/` 前缀（只写 `bge-m3` 会报模型不存在）。
 
 ## 推荐路径：当作 OpenAI 兼容网关用
 
@@ -28,10 +28,10 @@ API Key:  为这台设备创建的 chat token
 
 要点：
 
-- **每台设备用自己的 chat token**。在 Web Console「接入信息」创建，明文只显示一次；服务端 Auth DB 只保存不可逆 SHA-256。Docker 全新安装交付到 `credentials/gateway.key` 的是 Console-only 初始 token；迁移旧卷时该文件才暂存 legacy key。两者都不应复制给聊天设备。
+- **每台设备用自己的 chat token**。在 Web Console「接入信息」创建，明文只显示一次；服务端 Auth DB 只保存不可逆 SHA-256。Docker 全新安装交付到 `credentials/gateway.txt` 的是 Console-only 初始 token（旧安装可能为 `gateway.key`）；迁移旧卷时该文件才暂存 legacy key。两者都不应复制给聊天设备。
 - **聊天、MCP、Console 权限分开**。聊天客户端只拿 chat token；MCP 客户端只拿 MCP token；Model Gateway admin key 仅在电脑浏览器中临时解锁渠道配置，绝不能填进聊天或 MCP 客户端。
 - **丢一台设备只撤销这一枚 token**。在 Console 撤销，或运行 `scripts/memgw token revoke <token-id>`；其他设备不用重配。不要为了好记而自定义低熵密码，也不要经聊天软件或跨设备剪贴板传递 token。
-- **Docker 初始密钥不在日志或环境变量里**。安装器只报告宿主机 `credentials/gateway.key` 与 `credentials/admin.key` 路径；文件应保持仅当前用户可读。不要再用 `GATEWAY_API_KEY=...` 环境变量运行安装器。
+- **Docker 初始密钥不在日志或环境变量里**。安装器只报告宿主机 `credentials/gateway.txt` 与 `credentials/admin.txt` 路径（旧安装兼容 `.key`）；文件应保持仅当前用户可读。不要再用 `GATEWAY_API_KEY=...` 环境变量运行安装器。
 - **模型名固定填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」。以后换渠道、换模型只改服务端，客户端不用动。
 - **关闭 Responses API / 使用 Chat Completions**。如果客户端有「API 类型」选项，选 `Chat Completions`（大多数客户端默认就是）。
 
@@ -104,7 +104,7 @@ token 会固定绑定创建时的用户，调用方不能改写命名空间；�
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
 | 设备 token 找不回了 | 明文只显示一次；撤销该 token 并为这台设备新建一枚，其他设备不受影响 |
-| 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.key`；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
+| 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.txt`（旧版为 `admin.key`）；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
 | 模型名不知道填什么 | 固定 `memory-auto`；以后换渠道换模型只改服务端，客户端不动 |
 | 聊了但什么都没记住 | 记忆只在**完整**最终回答后写入；中途断开、被截断、内容被过滤都不会写 |
 | 担心渠道 key 被发给客户端 | 不会。供应商 key 只存在 Model Gateway 的隔离 secret volume，客户端只拿固定角色的设备 token |

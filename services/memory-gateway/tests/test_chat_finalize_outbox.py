@@ -231,3 +231,52 @@ def test_prune_caps_terminal_rows_per_user(memory_store: MemoryStore) -> None:
     assert keep_pending in remaining
     assert set(ids[-2:]).issubset(remaining)
     assert not set(ids[:3]) & remaining
+
+
+@pytest.mark.asyncio
+async def test_drainer_resolves_fresh_embedding_client_for_each_pass(
+    monkeypatch,
+) -> None:
+    clients = [object(), object()]
+    resolved: list[object] = []
+    sleep_calls = 0
+
+    def fake_get_embedding_client(*, settings):
+        assert settings is test_settings
+        return clients[len(resolved)]
+
+    async def fake_recover(*, embedding_client, **kwargs):
+        del kwargs
+        resolved.append(embedding_client)
+        return 0
+
+    async def fake_run_sync(function, *args):
+        del function, args
+        return 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleep_calls
+        assert seconds == 30.0
+        sleep_calls += 1
+        if sleep_calls == 2:
+            raise RuntimeError("stop after two passes")
+
+    test_settings = _settings()
+    monkeypatch.setattr(chat_gateway, "get_embedding_client", fake_get_embedding_client)
+    monkeypatch.setattr(
+        chat_gateway,
+        "recover_pending_chat_finalize_jobs",
+        fake_recover,
+    )
+    monkeypatch.setattr(chat_gateway.anyio.to_thread, "run_sync", fake_run_sync)
+    monkeypatch.setattr(chat_gateway.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError, match="stop after two passes"):
+        await chat_gateway.chat_finalize_outbox_drainer(
+            store=SimpleNamespace(prune_chat_finalize_jobs=lambda: 0),
+            llm_client=None,
+            settings=test_settings,
+            interval_seconds=0.0,
+        )
+
+    assert resolved == clients

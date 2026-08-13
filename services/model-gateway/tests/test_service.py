@@ -733,7 +733,7 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
         assert invalid.status_code == 400
         assert "HTTPS" in invalid.json()["error"]["message"]
 
-        restricted = client.post(
+        plan_connection = client.post(
             "/admin/connections",
             headers={"authorization": "Bearer admin-token"},
             json={
@@ -743,7 +743,9 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
                 "plan": "token_plan",
             },
         )
-        assert restricted.status_code == 400
+        assert plan_connection.status_code == 200, plan_connection.text
+        assert plan_connection.json()["connection_id"] == "plan-vendor-account"
+        assert plan_connection.json()["applied"] is True
 
         updated = client.put(
             "/admin/connections/newvendor-account/secret",

@@ -23,8 +23,133 @@ def list_memories(
 def list_memory_spaces(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
+    include_archived: bool = Query(default=False),
 ) -> dict[str, list[dict]]:
-    return {"data": store.list_memory_space_summaries(user_id=user_id)}
+    return {
+        "data": store.list_memory_space_summaries(
+            user_id=user_id,
+            include_archived=include_archived,
+        )
+    }
+
+
+@router.post("/spaces", status_code=status.HTTP_201_CREATED)
+def create_memory_space(
+    body: MemorySpaceCreateRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    try:
+        space = store.create_memory_space(
+            user_id=user_id,
+            name=body.name,
+            color=body.color,
+            description=body.description,
+            sort_order=body.sort_order,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return {"space": space.model_dump()}
+
+
+@router.patch("/spaces/{space_id}")
+def update_memory_space(
+    space_id: str,
+    body: MemorySpaceUpdateRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    fields = body.model_fields_set
+    if not fields:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="至少提供一个要更新的字段",
+        )
+    try:
+        space = store.update_memory_space(
+            user_id=user_id,
+            space_id=space_id,
+            name=body.name,
+            color=body.color,
+            description=body.description,
+            sort_order=body.sort_order,
+            update_name="name" in fields,
+            update_color="color" in fields,
+            update_description="description" in fields,
+            update_sort_order="sort_order" in fields,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if space is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="空间不存在",
+        )
+    return {"space": space.model_dump()}
+
+
+@router.post("/spaces/{space_id}/archive")
+def archive_memory_space(
+    space_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    space = store.set_memory_space_archived(
+        user_id=user_id, space_id=space_id, archived=True
+    )
+    if space is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="空间不存在",
+        )
+    return {"space": space.model_dump()}
+
+
+@router.post("/spaces/{space_id}/unarchive")
+def unarchive_memory_space(
+    space_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    space = store.set_memory_space_archived(
+        user_id=user_id, space_id=space_id, archived=False
+    )
+    if space is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="空间不存在",
+        )
+    return {"space": space.model_dump()}
+
+
+@router.delete("/spaces/{space_id}")
+def delete_memory_space(
+    space_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    store: Annotated[MemoryStore, Depends(get_memory_store)],
+) -> dict:
+    result = store.delete_memory_space(user_id=user_id, space_id=space_id)
+    if result == "not_found":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="空间不存在",
+        )
+    if result == "not_empty":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "space_not_empty",
+                "message": "空间仍绑定记忆，请先解绑后再删除，或改为归档",
+            },
+        )
+    return {"deleted": True, "space_id": space_id}
+
 
 @router.get("/spaces/{space_id}")
 def get_memory_space(
@@ -33,8 +158,13 @@ def get_memory_space(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     limit: int = Query(default=200, ge=1, le=1000),
     redact_sensitive: bool = False,
+    include_archived: bool = Query(default=False),
 ) -> dict:
-    space = store.get_memory_space(user_id=user_id, space_id=space_id)
+    space = store.get_memory_space(
+        user_id=user_id,
+        space_id=space_id,
+        include_archived=include_archived,
+    )
     if space is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

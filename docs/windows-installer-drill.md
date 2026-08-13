@@ -11,7 +11,7 @@ Memory Platform（双容器 Docker 栈：memory-gateway + model-gateway）即将
 ## 红线（先读，违反即演练作废）
 
 1. **不修改任何仓库代码或安装器副本来"修复"或"绕过"问题**，包括为了命中中断窗口给安装器加 `Start-Sleep`。发现问题只记录进报告。
-2. **报告、日志、截图、聊天记录中不得出现真实密钥值**：`credentials\*.key` 内容、任何 Bearer token、provider API key。需要比对时只输出布尔结果或哈希前缀。安装器本身设计为不打印密钥；如果任何输出里出现了密钥值，直接记为 P0。
+2. **报告、日志、截图、聊天记录中不得出现真实密钥值**：`credentials\*.txt`（以及旧版 `*.key`）内容、任何 Bearer token、provider API key。需要比对时只输出布尔结果或哈希前缀。安装器本身设计为不打印密钥；如果任何输出里出现了密钥值，直接记为 P0。
 3. **只使用独立演练目录**（本文档统一为 `$env:USERPROFILE\memory-platform-drill`）和它对应的 Compose project、四个 Docker 卷。不碰机器上任何已有安装、容器、卷、镜像。卸载时只精确删除该 project 的对象；**禁止** `docker system prune`、`docker volume prune` 等无差别清理命令。
 4. 若机器上已存在 Memory Platform 安装（安装器会通过运行中容器标签自动发现），先停下来向机主确认；继续时必须显式设置 `MEMORY_PLATFORM_DIR` 指向演练目录（安装器检测到多套安装会拒绝："检测到多套安装；请显式设置 MEMORY_PLATFORM_DIR。"）。
 5. provider API key 只有机主明确提供时才使用，且只通过 Web Console 界面或 `modelgw secret set --stdin` 输入。演练默认不产生任何真实推理调用（`/health`、`/readyz` 都是本地检查），除机主另行允许。
@@ -108,22 +108,22 @@ Select-String -Path "$InstallDir\.env" -Pattern "GATEWAY_API_KEY|MEMORY_CONSOLE_
 docker compose -f "$InstallDir\docker-compose.user.yml" config | Select-String "GATEWAY_API_KEY|MEMORY_CONSOLE_ADMIN_KEY"   # 预期 0 命中
 
 # 6. 凭据文件存在且非空（不要输出内容）
-(Get-Item "$InstallDir\credentials\gateway.key").Length -gt 0
-(Get-Item "$InstallDir\credentials\admin.key").Length -gt 0
+(Get-Item "$InstallDir\credentials\gateway.txt").Length -gt 0
+(Get-Item "$InstallDir\credentials\admin.txt").Length -gt 0
 ```
 
 ### 已知正确行为（实现依据）
 
-- **全新安装只验收 `/health`，不验收 `/readyz`**：安装器的宿主就绪等待为 `/health` 恒等 + `/readyz` 仅在非 fresh 布局时等待（`Invoke-MemoryPlatformInstall` 末尾的 `($script:Layout -ne "fresh" -and ...)` 条件）。`/readyz` 要求八条稳定 route 全部可用（`services/memory-gateway/app/api/health.py`），首次安装、尚未配置任何渠道时返回 503 `{"status":"not_ready","code":...}` 是**设计如此**。判定 bug 的方向相反：未配置模型时 `/readyz` 返回 200 才是 P0（"看似就绪、实际不可用"）。
-- 若机主提供了 provider key：打开 `http://127.0.0.1:2026/ui/`，用 `credentials\gateway.key` 里的 Console token 登录，按模型向导完成渠道配置（向导只做只读 `/models` 发现，不自动发起推理）。配置完成后 `/readyz` 应在短时间内变为 200。**优先使用 Console 向导**，它会同步 Memory 侧的 route/embedding 契约；不要用容器内 `modelgw` 手工新增 embedding 配置（空间 ID 与 Memory 设置失配会导致 `/readyz` 报 `model_gateway_embedding_contract_mismatch`，该路径不是安装器覆盖面）。
-- 密钥只经 `credentials\gateway.key`、`credentials\admin.key` 两个文件交付（离线 `stack-init` 容器经 bind mount 写入），不进入终端输出、Compose 环境或 Docker 日志。
+- **全新安装只验收 `/health`，不验收 `/readyz`**：安装器的宿主就绪等待为 `/health` 恒等 + `/readyz` 仅在非 fresh 布局时等待（`Invoke-MemoryPlatformInstall` 末尾的 `($script:Layout -ne "fresh" -and ...)` 条件）。`/health` 只证明进程与首次配置 UI 可访问；`/readyz` 还检查数据库、磁盘、Model Gateway 接线、必需聊天 route 与 embedding 契约。首次安装、尚未配置任何渠道时返回 503 `{"status":"not_ready","code":...}` 是**设计如此**。
+- 若机主提供了 provider key：打开 `http://127.0.0.1:2026/ui/`，用 `credentials\gateway.txt` 里的 Console token 登录，按模型向导完成渠道配置（向导只做只读 `/models` 发现，不自动发起推理）。配置完成后 `/readyz` 应在短时间内变为 200。embedding 可选：不创建或关闭 `memory.embedding` route 表示明确 `off`，关键词检索仍可用且不阻断 readiness；启用该 route 表示同意使用语义向量，Memory 的 space 留空会自动采用 route 的唯一 space/dimensions。只有需要锁定既有索引时才固定 space；启用 route 畸形、不可用或与固定契约不匹配时，`/readyz` 应返回 503。
+- 密钥只经 `credentials\gateway.txt`、`credentials\admin.txt` 两个文件交付（旧安装兼容 `.key`；离线 `stack-init` 容器经 bind mount 写入），不进入终端输出、Compose 环境或 Docker 日志。
 - `stack-init` 是一次性离线初始化容器，`network_mode: none`，完成后退出；`stack-maintenance` 只在显式 `--profile maintenance` 时运行。
 
 ### 负向快速检查（每个都应在改动任何状态之前失败、exit 1、旧状态不变）
 
 ```powershell
 $env:GATEWAY_API_KEY = "x"; & .\install-memory-platform.ps1; $LASTEXITCODE; Remove-Item Env:GATEWAY_API_KEY
-# 预期：安装失败：新版安装器不接受环境变量中的密钥；请让离线初始化写入 credentials\*.key。
+# 预期：安装失败：新版安装器不接受环境变量中的密钥；请让离线初始化写入 credentials\*.txt。
 
 $env:MEMORY_HOST = "1.2.3.4"; & .\install-memory-platform.ps1; $LASTEXITCODE; Remove-Item Env:MEMORY_HOST
 # 预期：安装失败：MEMORY_HOST 只允许 127.0.0.1 或 0.0.0.0。
@@ -148,8 +148,8 @@ $env:MEMORY_PLATFORM_VERSION = $Version   # 恢复
 ```powershell
 $targets = @(
   "$InstallDir\credentials",
-  "$InstallDir\credentials\gateway.key",
-  "$InstallDir\credentials\admin.key",
+  "$InstallDir\credentials\gateway.txt",
+  "$InstallDir\credentials\admin.txt",
   "$InstallDir\.env",
   "$InstallDir\.memory-platform-install.lock",
   "$InstallDir\backups"
@@ -166,7 +166,7 @@ foreach ($p in $targets) {
   }
 } | Format-List
 
-icacls "$InstallDir\credentials\gateway.key"
+icacls "$InstallDir\credentials\gateway.txt"
 icacls "$InstallDir\credentials"
 whoami
 ```
@@ -361,10 +361,10 @@ Stop-Process -Id $proc.Id -Force
 ### F1 造种子数据并记录基线
 
 ```powershell
-$gw = [IO.File]::ReadAllText("$InstallDir\credentials\gateway.key").Trim()   # 只进变量，禁止外发
+$gw = [IO.File]::ReadAllText("$InstallDir\credentials\gateway.txt").Trim()   # 只进变量，禁止外发
 
 # 保存第一份 Console token，供 F6 正反核对（只存本地 drill-artifacts，F7 统一删除，报告不得包含）
-Copy-Item "$InstallDir\credentials\gateway.key" "$env:USERPROFILE\drill-artifacts\gateway-first.key"
+Copy-Item "$InstallDir\credentials\gateway.txt" "$env:USERPROFILE\drill-artifacts\gateway-first.txt"
 
 # 创建一个 chat scope token（写入 auth.db，随备份迁移）
 curl.exe -s -X POST -H "Authorization: Bearer $gw" -H "Content-Type: application/json" `
@@ -402,14 +402,14 @@ docker volume ls --filter "label=com.docker.compose.project=$project"   # 确认
 docker volume rm "${project}_memory-data" "${project}_memory-secrets" "${project}_model-data" "${project}_model-secrets"
 Pop-Location
 # 删目录前确认 F1/F2 的产物已在目录外
-Test-Path "$env:USERPROFILE\drill-artifacts\gateway-first.key"   # 预期 True
+Test-Path "$env:USERPROFILE\drill-artifacts\gateway-first.txt"   # 预期 True
 Test-Path "$env:USERPROFILE\drill-artifacts\drill-backup.zip"    # 预期 True
 Remove-Item -LiteralPath $InstallDir -Recurse -Force   # 仅限演练目录
 ```
 
 ### F4 全新安装
 
-重设场景 A 的环境变量后重跑安装器（同场景 A 命令），验证 `/health` 200。记录新装的 `credentials\gateway.key` 路径存在（值同样不进报告）。
+重设场景 A 的环境变量后重跑安装器（同场景 A 命令），验证 `/health` 200。记录新装的 `credentials\gateway.txt` 路径存在（值同样不进报告）。
 
 ### F5 恢复
 
@@ -428,12 +428,12 @@ Pop-Location
 ### F6 一致性核对
 
 ```powershell
-$gwOld = [IO.File]::ReadAllText("$env:USERPROFILE\drill-artifacts\gateway-first.key").Trim()   # 禁止外发
+$gwOld = [IO.File]::ReadAllText("$env:USERPROFILE\drill-artifacts\gateway-first.txt").Trim()   # 禁止外发
 ```
 
 - **Auth 迁移（核心检查）**：备份只含 token 哈希。恢复后 auth.db 被备份内容替换，因此：
-  - 用**第一次安装**交付的 `gateway.key`（F3 删目录前应已把它安全复制到 `drill-artifacts`，或提前用变量保存）：`curl.exe -s -o NUL -w "%{http_code}" -H "Authorization: Bearer $gwOld" http://127.0.0.1:2026/auth/tokens` → 预期 200，且返回列表包含 F1 记录的 `drill-chat` token_id；
-  - 用**新安装**交付的 `gateway.key` 调同一接口 → 预期 401（新 token 的哈希不在恢复回来的 auth.db 里）。这一正一反直接证明"token 哈希随备份迁移、新设备不自动获得旧凭据"。
+  - 用**第一次安装**交付的 `gateway.txt`（F3 删目录前应已把它安全复制到 `drill-artifacts`，或提前用变量保存）：`curl.exe -s -o NUL -w "%{http_code}" -H "Authorization: Bearer $gwOld" http://127.0.0.1:2026/auth/tokens` → 预期 200，且返回列表包含 F1 记录的 `drill-chat` token_id；
+  - 用**新安装**交付的 `gateway.txt` 调同一接口 → 预期 401（新 token 的哈希不在恢复回来的 auth.db 里）。这一正一反直接证明"token 哈希随备份迁移、新设备不自动获得旧凭据"。
   - 按官方口径在新设备补发 Console token（主机 CLI）：
     ```powershell
     docker compose -f "$InstallDir\docker-compose.user.yml" exec -T memory-gateway memgw token create --role console --name drill-recovered --user default

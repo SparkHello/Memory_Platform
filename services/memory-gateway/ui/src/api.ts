@@ -16,6 +16,8 @@ import type {
   ModelGatewayBundleResult,
   ModelGatewayChannelDiscoverBody,
   ModelGatewayChannelDiscoverResult,
+  ModelGatewayCapabilityProbeBody,
+  ModelGatewayCapabilityProbeResult,
   ModelGatewayChannelBundleBody,
   ModelGatewayConnectionCheck,
   ModelGatewayConnectionCreateBody,
@@ -59,6 +61,9 @@ import type {
   ReviewRiskTag,
   ReviewSeverity,
   RestoreResult,
+  StackBackupValidationResult,
+  ConversationImportPreviewResult,
+  ConversationImportCommitResult,
   ReviewResult,
   SearchFeedbackValue,
   SurfaceMode,
@@ -111,18 +116,22 @@ export class ApiError extends Error {
   detail: string;
   code?: string;
   data?: Record<string, unknown>;
+  /** Request path (no query), used by errorMessage for credential-aware copy. */
+  path?: string;
 
   constructor(
     status: number,
     detail: string,
     code?: string,
-    data?: Record<string, unknown>
+    data?: Record<string, unknown>,
+    path?: string
   ) {
     super(detail);
     this.status = status;
     this.detail = detail;
     this.code = code;
     this.data = data;
+    this.path = path;
   }
 }
 
@@ -239,6 +248,21 @@ export class MemoryApi {
       signal,
       timeoutMs: 30000,
       timeoutMessage: "渠道模型发现超时，请确认供应商 API 地址可以访问"
+    });
+  }
+
+  async probeProviderChannelCapabilities(
+    body: ModelGatewayCapabilityProbeBody,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayCapabilityProbeResult> {
+    return this.request("/providers/channels/probe-capabilities", {
+      method: "POST",
+      body,
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal,
+      timeoutMs: 120000,
+      timeoutMessage: "能力探测超时；请确认供应商可达，或减少探测项后重试"
     });
   }
 
@@ -653,9 +677,80 @@ export class MemoryApi {
     return payload.data || [];
   }
 
-  async listMemorySpaces(signal?: AbortSignal): Promise<MemorySpace[]> {
-    const payload = await this.request<{ data: MemorySpace[] }>("/memories/spaces", { signal });
+  async listMemorySpaces(
+    options: { includeArchived?: boolean; signal?: AbortSignal } = {}
+  ): Promise<MemorySpace[]> {
+    const params = new URLSearchParams();
+    if (options.includeArchived) params.set("include_archived", "true");
+    const query = params.toString();
+    const payload = await this.request<{ data: MemorySpace[] }>(
+      `/memories/spaces${query ? `?${query}` : ""}`,
+      { signal: options.signal }
+    );
     return payload.data || [];
+  }
+
+  async createMemorySpace(
+    body: {
+      name: string;
+      color?: string | null;
+      description?: string | null;
+      sort_order?: number | null;
+    },
+    signal?: AbortSignal
+  ): Promise<{ space: MemorySpace }> {
+    return this.request("/memories/spaces", {
+      method: "POST",
+      body,
+      signal
+    });
+  }
+
+  async updateMemorySpace(
+    spaceId: string,
+    body: {
+      name?: string;
+      color?: string | null;
+      description?: string | null;
+      sort_order?: number | null;
+    },
+    signal?: AbortSignal
+  ): Promise<{ space: MemorySpace }> {
+    return this.request(`/memories/spaces/${encodeURIComponent(spaceId)}`, {
+      method: "PATCH",
+      body,
+      signal
+    });
+  }
+
+  async archiveMemorySpace(
+    spaceId: string,
+    signal?: AbortSignal
+  ): Promise<{ space: MemorySpace }> {
+    return this.request(`/memories/spaces/${encodeURIComponent(spaceId)}/archive`, {
+      method: "POST",
+      signal
+    });
+  }
+
+  async unarchiveMemorySpace(
+    spaceId: string,
+    signal?: AbortSignal
+  ): Promise<{ space: MemorySpace }> {
+    return this.request(`/memories/spaces/${encodeURIComponent(spaceId)}/unarchive`, {
+      method: "POST",
+      signal
+    });
+  }
+
+  async deleteMemorySpace(
+    spaceId: string,
+    signal?: AbortSignal
+  ): Promise<{ deleted: boolean; space_id: string }> {
+    return this.request(`/memories/spaces/${encodeURIComponent(spaceId)}`, {
+      method: "DELETE",
+      signal
+    });
   }
 
   async memorySpace(
@@ -962,6 +1057,54 @@ export class MemoryApi {
     });
   }
 
+  /**
+   * Dry-run validate a portable stack zip. Does not restore or write DBs.
+   */
+  async validateStackBackup(
+    file: File | Blob,
+    signal?: AbortSignal
+  ): Promise<StackBackupValidationResult> {
+    const body = new FormData();
+    body.append("file", file, file instanceof File ? file.name : "memory-stack.zip");
+    return this.request("/memories/stack-backup/validate", {
+      method: "POST",
+      rawBody: body,
+      signal,
+      timeoutMs: 120000,
+      timeoutMessage: "备份校验超时；文件较大时可稍后重试"
+    });
+  }
+
+  async previewConversationImport(
+    content: string,
+    options: { maxTurns?: number; signal?: AbortSignal } = {}
+  ): Promise<ConversationImportPreviewResult> {
+    return this.request("/memories/import/conversations/preview", {
+      method: "POST",
+      body: {
+        content,
+        max_turns: options.maxTurns
+      },
+      signal: options.signal
+    });
+  }
+
+  async commitConversationImport(
+    content: string,
+    options: { maxTurns?: number; signal?: AbortSignal } = {}
+  ): Promise<ConversationImportCommitResult> {
+    return this.request("/memories/import/conversations/commit", {
+      method: "POST",
+      body: {
+        content,
+        max_turns: options.maxTurns
+      },
+      signal: options.signal,
+      timeoutMs: 300000,
+      timeoutMessage: "对话导入超时；可减少轮数后重试"
+    });
+  }
+
   async restoreFromExport(
     data: MemoryExport,
     overwrite: boolean,
@@ -1084,6 +1227,31 @@ export class MemoryApi {
 
   async memoryHealth(signal?: AbortSignal): Promise<DatabaseHealthResult> {
     return this.request("/memories/health", { signal });
+  }
+
+  async reEmbedMemories(
+    options: {
+      scan?: boolean;
+      memoryIds?: string[];
+      includeSensitive?: boolean;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<{ re_embedded: number; memory_ids: string[]; failed_ids: string[] }> {
+    const memoryIds = options.memoryIds?.filter(Boolean) || [];
+    return this.request("/memories/re-embed", {
+      method: "POST",
+      body: memoryIds.length
+        ? {
+            memory_ids: memoryIds,
+            include_sensitive: options.includeSensitive ?? false
+          }
+        : {
+            scan: true,
+            include_sensitive: options.includeSensitive ?? false
+          },
+      signal: options.signal,
+      timeoutMs: 120000
+    });
   }
 
   async evaluationDiagnosis(signal?: AbortSignal): Promise<MechanismDiagnosisResult> {
@@ -1247,7 +1415,12 @@ export class MemoryApi {
     const headers = new Headers();
     const auth = options.auth !== false;
     if (options.rawBody !== undefined) {
-      headers.set("Content-Type", options.contentType || "application/octet-stream");
+      // FormData must omit Content-Type so the runtime can set the multipart boundary.
+      if (options.contentType) {
+        headers.set("Content-Type", options.contentType);
+      } else if (!(options.rawBody instanceof FormData)) {
+        headers.set("Content-Type", "application/octet-stream");
+      }
     } else if (options.body !== undefined) {
       headers.set("Content-Type", "application/json; charset=utf-8");
     }
@@ -1289,7 +1462,14 @@ export class MemoryApi {
 
       if (!response.ok) {
         const error = await readError(response);
-        throw new ApiError(response.status, error.message, error.code, error.data);
+        const pathOnly = path.split("?")[0] || path;
+        throw new ApiError(
+          response.status,
+          error.message,
+          error.code,
+          error.data,
+          pathOnly
+        );
       }
 
       if (response.status === 204) {

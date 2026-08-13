@@ -324,6 +324,20 @@ button:disabled {
   color: var(--muted);
 }
 
+.page-header.is-compact {
+  align-items: center;
+}
+
+.page-header.is-compact p {
+  margin: 0;
+  max-width: 62ch;
+}
+
+.page-header.is-compact:not(:has(.page-actions)):not(:has(p)) {
+  margin: 0;
+  min-height: 0;
+}
+
 .page-action,
 .page-actions {
   display: flex;

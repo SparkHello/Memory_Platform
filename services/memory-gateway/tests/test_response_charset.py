@@ -16,4 +16,8 @@ def test_json_responses_declare_utf8_charset(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/json; charset=utf-8"
+
+    favicon = client.get("/favicon.ico")
+    assert favicon.status_code == 204
+
     get_settings.cache_clear()

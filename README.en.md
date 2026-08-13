@@ -35,7 +35,7 @@ Memory stays on your own device, where you can inspect, edit, delete, and back i
 | **Does it lock me to a model?** | No. Clients use `memory-auto`; provider and model changes stay on the server. |
 | **What is the fastest path?** | Start Docker → configure a model in the browser → enter a Base URL, API key, and model name in your client. |
 
-Memory Platform is not a new chat client and does not include a model. Embeddings are optional; keyword retrieval works without them.
+Memory Platform is not a new chat client and does not include a model. The embedding route is optional; leaving it absent or disabled explicitly selects keyword retrieval.
 
 > [!IMPORTANT]
 > **Local-first does not mean no network traffic.** Memory, knowledge documents, and configuration stay on your device by default. If you choose a cloud model provider, the current message you send and the context permitted for that turn are sent to that provider for inference. The default deployment targets a personal machine or trusted home network; do not expose it unauthenticated to the public internet.
@@ -90,16 +90,18 @@ irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deplo
 
 After installation, remember two credential files and three steps:
 
-1. Sign in to the Web Console at `http://127.0.0.1:2026/ui/` with the token in `credentials/gateway.key`;
-2. Open Models & Routes and enter the admin key from `credentials/admin.key` to configure a model channel;
+1. Sign in to the Web Console at `http://127.0.0.1:2026/ui/` with the token in `credentials/gateway.txt` (legacy installs may use `gateway.key`);
+2. Open Models & Routes and enter the admin key from `credentials/admin.txt` (legacy `admin.key`) to configure a model channel;
 3. Create a chat token in the Web Console and paste it into your chat client.
 
-First start takes 1–2 minutes; chat works once a model channel is configured. Credential values are never printed to Docker logs or passed through Compose environment variables — they live only in owner-only files under `credentials/`.
+First start takes 1–2 minutes; chat works once a model channel is configured. Before first-run setup, `/health` returning 200 while `/readyz` returns 503 is expected: liveness keeps the setup UI reachable, while readiness means the stack is operationally configured. Credential values are never printed to Docker logs or passed through Compose environment variables — they live only in owner-only files under `credentials/`.
+
+To uninstall, see [Stack operations · Uninstall a Docker install](docs/stack-operations.en.md#uninstall-a-docker-install). Do not run `docker system prune`.
 
 <details>
 <summary>Installer implementation details (digest pinning, backup and upgrade strategy)</summary>
 
-The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. Re-running the same release installer finds the existing installation; on upgrade it stops the old stack, creates and verifies a single consistent backup, then rolls back automatically if the new stack regresses. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows. Sigstore signature verification is skipped by default (images are already digest-pinned); set `MEMORY_VERIFY_SIGNATURES=1` to enable it.
+The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. Re-running the same release installer finds the existing installation; on upgrade it stops the old stack, creates and verifies a single consistent backup, then rolls back automatically if an already configured stack regresses at `/readyz`. A fresh install requires only `/health` so that onboarding remains reachable. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows. Sigstore signature verification is skipped by default (images are already digest-pinned); set `MEMORY_VERIFY_SIGNATURES=1` to enable it.
 
 If GHCR or GitHub is unreachable from your network, set an HTTPS proxy before re-running the script, or set `MEMORY_IMAGE_REGISTRY=<ghcr-mirror-host>` to pull the images through a GHCR mirror (only the registry host changes; repository paths and digest pinning stay identical).
 
@@ -118,14 +120,14 @@ The release Compose file starts separate Memory, Model, and one-shot initializer
 First start takes 1–2 minutes of offline initialization, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Generated credentials are host files, not log output:
 
 ```bash
-ls -l credentials/gateway.key credentials/admin.key
+ls -l credentials/gateway.txt credentials/admin.txt
 ```
 
-On a fresh install, `gateway.key` contains the sole Console-scoped `first-console` token. Only migrated legacy volumes retain a one-version all-scope bootstrap key. The Web Console can create separate chat and MCP device tokens after login. `admin.key` is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
+On a fresh install, `gateway.txt` contains the sole Console-scoped `first-console` token. Only migrated legacy volumes retain a one-version all-scope bootstrap key; older installations may still use `gateway.key`. The Web Console can create separate chat and MCP device tokens after login. `admin.txt` (legacy `admin.key`) is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
 
 Then:
 
-1. Open `http://127.0.0.1:2026/ui/` and connect with the value in `credentials/gateway.key`.
+1. Open `http://127.0.0.1:2026/ui/` and connect with the value in `credentials/gateway.txt` (or legacy `gateway.key`).
 2. Open Models & Routes and use the admin key to unlock this configuration session.
 3. Add a channel, enter the provider API key, and choose a model from the discovered list.
 4. Follow [Connecting clients](#-connecting-clients) below for the Base URL, API key, and model name.
@@ -209,7 +211,7 @@ You do not need to append “remember this” to each message. The system conser
 - **Long-term memory and governance:** verifiable source text, lifecycles, timelines, topic links, recall explanations, edit, merge, soft delete, restore, permanent deletion, and export.
 - **Isolated knowledge base:** text, Markdown, PDF, DOCX, and EPUB with full-text/vector hybrid retrieval, immutable document versions, and exact passage citations.
 - **Models, failover, and usage:** purpose-based model selection and fallback, with channel, model, token, latency, and price snapshots but no prompts, replies, tool arguments, or knowledge content in usage logs.
-- **Safe fallback:** embedding space or dimension mismatches fall back to keyword retrieval; sensitive content is excluded from remote extraction, embeddings, AI review, and the knowledge agent by default.
+- **Optional, strict vector capability:** a missing or disabled `memory.embedding` route uses keyword retrieval. Enabling it opts into semantic vectors; a blank space setting automatically adopts the route contract, while an invalid, unavailable, or pin-mismatched contract makes `/readyz` fail instead of mixing old vector spaces. Sensitive content is excluded from remote extraction, embeddings, AI review, and the knowledge agent by default.
 
 The complete interface and behavior contracts are documented in [Memory Gateway](services/memory-gateway/README.md) and [Model Gateway](services/model-gateway/README.md).
 

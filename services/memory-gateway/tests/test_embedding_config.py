@@ -6,6 +6,10 @@ from app.api.deps import (
     get_knowledge_search_agent,
 )
 from app.config import Settings, get_settings
+from app.llm.embedding_contract import (
+    clear_embedding_contract_cache,
+    resolve_embedding_contract,
+)
 from app.memory.search import NullEmbeddingClient, OpenAICompatibleEmbeddingClient
 from app.usage.attribution import (
     MODEL_GATEWAY_CORRELATION_HEADER,
@@ -13,6 +17,53 @@ from app.usage.attribution import (
     MODEL_GATEWAY_USER_TAG_HEADER,
 )
 from app.usage.context import model_usage_scope
+
+
+@pytest.fixture(autouse=True)
+def _clear_embedding_contract_snapshots() -> None:
+    clear_embedding_contract_cache()
+    yield
+    clear_embedding_contract_cache()
+
+
+def _resolve_test_embedding(
+    settings: Settings,
+    *,
+    space_id: str,
+    dimensions: int,
+) -> None:
+    resolve_embedding_contract(
+        settings,
+        {
+            "connections": [
+                {
+                    "id": "central",
+                    "enabled": True,
+                    "configured": True,
+                    "usage_scope": "backend_allowed",
+                }
+            ],
+            "deployments": [
+                {
+                    "id": "embed",
+                    "connection": "central",
+                    "upstream_model": "vendor/embed",
+                    "kind": "embedding",
+                    "enabled": True,
+                    "dimensions": dimensions,
+                    "embedding_space": space_id,
+                }
+            ],
+            "routes": [
+                {
+                    "id": settings.model_gateway_embedding_model,
+                    "kind": "embedding",
+                    "enabled": True,
+                    "targets": ["embed"],
+                }
+            ],
+        },
+    )
 
 
 def test_embedding_client_requires_model_gateway(monkeypatch) -> None:
@@ -43,6 +94,7 @@ def test_embedding_client_uses_central_runtime_and_never_direct_fallback(tmp_pat
         MODEL_GATEWAY_EMBEDDING_SPACE_ID="",
         **common,
     )
+    _resolve_test_embedding(configured, space_id="space-v1", dimensions=3)
 
     client = get_embedding_client(configured)
 
@@ -56,6 +108,33 @@ def test_embedding_client_uses_central_runtime_and_never_direct_fallback(tmp_pat
     assert embedding_runtime_enabled(configured) is True
     assert isinstance(get_embedding_client(missing_space), NullEmbeddingClient)
     assert embedding_runtime_enabled(missing_space) is False
+
+
+def test_auto_embedding_client_uses_effective_route_dimensions(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="central-key",
+        MODEL_GATEWAY_EMBEDDING_MODEL="memory.embedding",
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="",
+        # Auto mode must ignore this local compatibility default.
+        EMBEDDING_DIMENSIONS=1024,
+        DATABASE_PATH=str(tmp_path / "memory.db"),
+        KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+    )
+    _resolve_test_embedding(
+        settings,
+        space_id="route-space-v2",
+        dimensions=768,
+    )
+
+    client = get_embedding_client(settings)
+
+    assert isinstance(client, OpenAICompatibleEmbeddingClient)
+    assert client.dimensions == 768
+    assert client.expected_space_id == "route-space-v2"
+    assert client.embedding_space_id == "route-space-v2"
+    assert embedding_runtime_enabled(settings) is True
 
 
 def test_knowledge_agent_uses_same_central_runtime_and_ignores_direct_routes(

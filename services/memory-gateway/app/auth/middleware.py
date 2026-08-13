@@ -272,6 +272,7 @@ def _is_irreversible(scope: Scope) -> bool:
             in {
                 "/providers/routes/validate",
                 "/providers/channels/discover",
+                "/providers/channels/probe-capabilities",
                 "/providers/channel-bundles/validate",
                 # 只读连通性探测：不修改任何配置，不应占用不可逆操作预算。
                 "/providers/live-probe",

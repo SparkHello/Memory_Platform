@@ -9,7 +9,7 @@
 - 请求 JSON 的未知字段必须保留；成功上游响应正文与 SSE chunk 必须原样转发。
 - 流式请求只允许在下游响应开始前故障切换；首个成功流建立后禁止重试，避免重复输出。
 - embedding 路由中的 deployment 必须使用相同 `embedding_space` 和 `dimensions`，避免混用不兼容向量空间。
-- `token_plan`、`coding_plan` 和 `direct_tool_only` 连接不得供 backend client 使用；改变这一限制需要先核对官方使用条款。
+- 套餐类型不再强制 `interactive_only`；仅当连接显式 `usage_scope=interactive_only` 时 backend client 不可路由到它。提供商条款由使用者自行遵守。
 - `pricing research` 只能读取用户明确给出的渠道官方 HTTPS 页面，并使用显式 `backend_allowed` chat deployment；页面是不可信资料，默认候选不写配置，应用必须明确确认。
 - 价格研究的模型调用要记录 metadata-only `pricing.research` 用量和研究 deployment 的价格快照，但不得把页面、提示词、证据或回复写入 `usage.db`。
 - 测试只能使用 `httpx.MockTransport` 和临时目录，不调用真实 provider。

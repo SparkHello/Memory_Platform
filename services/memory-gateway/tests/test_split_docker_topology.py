@@ -383,7 +383,8 @@ def test_installer_does_not_accept_or_print_secret_values():
     assert "logs --no-log-prefix" not in installer
     assert "GATEWAY_KEY=" not in installer
     assert "ADMIN_KEY=" not in installer
-    assert "credentials/gateway.key" in installer
+    assert "credentials/gateway.txt" in installer
+    assert "credentials/gateway.key" in installer  # legacy fallback
     assert "migrate_legacy.py" in installer
     assert "restore_split.py" in installer
     assert "MEMORY_BACKUP_RETENTION" in installer
@@ -417,7 +418,7 @@ def test_fresh_init_delivers_one_scoped_console_token_and_disables_legacy(
     module = _load_initializer()
     settings_path = tmp_path / "settings.env"
     auth_path = tmp_path / "auth.db"
-    credential_path = tmp_path / "credentials" / "gateway.key"
+    credential_path = tmp_path / "credentials" / "gateway.txt"
     credential_path.parent.mkdir(mode=0o700)
     write_env_atomic(
         settings_path,
@@ -480,7 +481,7 @@ def test_completed_init_repairs_credential_mode_and_missing_file_fails_closed(
     monkeypatch.setattr(module.os, "chown", lambda *_args: None)
     module.MEMORY_MARKER.write_text("a" * 32 + "\n", encoding="ascii")
     module.MODEL_MARKER.write_text("a" * 32 + "\n", encoding="ascii")
-    for name in ("gateway.key", "admin.key"):
+    for name in ("gateway.txt", "admin.txt"):
         path = roots["CREDENTIALS"] / name
         path.write_text(f"synthetic-{name}\n", encoding="ascii")
         path.chmod(0o644)
@@ -488,12 +489,18 @@ def test_completed_init_repairs_credential_mode_and_missing_file_fails_closed(
     assert module.main() == 0
     assert all(
         (roots["CREDENTIALS"] / name).stat().st_mode & 0o777 == 0o600
-        for name in ("gateway.key", "admin.key")
+        for name in ("gateway.txt", "admin.txt")
     )
 
-    (roots["CREDENTIALS"] / "gateway.key").unlink()
-    with pytest.raises(RuntimeError, match="credentials/gateway.key 缺失"):
+    (roots["CREDENTIALS"] / "gateway.txt").unlink()
+    with pytest.raises(RuntimeError, match="缺少 gateway 凭据文件"):
         module.main()
+
+    legacy_gateway = roots["CREDENTIALS"] / "gateway.key"
+    legacy_gateway.write_text("synthetic-legacy-gateway\n", encoding="ascii")
+    legacy_gateway.chmod(0o644)
+    assert module.main() == 0
+    assert legacy_gateway.stat().st_mode & 0o777 == 0o600
 
 
 def test_initializer_rejects_symlinked_or_hardlinked_credential(tmp_path):

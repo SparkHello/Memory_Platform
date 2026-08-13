@@ -1751,7 +1751,6 @@ async def recover_pending_chat_finalize_jobs(
 async def chat_finalize_outbox_drainer(
     *,
     store: MemoryStore,
-    embedding_client: EmbeddingClient,
     llm_client: OpenAICompatibleClient,
     settings: Settings,
     interval_seconds: float = 300.0,
@@ -1766,7 +1765,10 @@ async def chat_finalize_outbox_drainer(
         try:
             recovered = await recover_pending_chat_finalize_jobs(
                 store=store,
-                embedding_client=embedding_client,
+                # Route configuration can change while this long-lived task is
+                # sleeping. Resolve a client from the latest authoritative
+                # contract for every pass instead of pinning startup state.
+                embedding_client=get_embedding_client(settings=settings),
                 llm_client=llm_client,
                 settings=settings,
                 limit=batch_limit,

@@ -144,6 +144,7 @@ Settings.model_config = {**Settings.model_config, "env_file": None}
 
 from app.api import deps
 from app.api.chat_gateway import clear_chat_gateway_state
+from app.llm.embedding_contract import clear_embedding_contract_cache
 from app.knowledge.store import KnowledgeStore
 from app.main import create_app
 from app.memory.search import NullEmbeddingClient
@@ -174,6 +175,32 @@ def isolate_test_runtime(tmp_path) -> Iterator[None]:
         if _is_memory_runtime_environment(name)
     }
     sandbox = pytest.MonkeyPatch()
+
+    async def no_network_embedding_refresh(settings):
+        del settings
+        return None
+
+    async def no_network_embedding_refresh_loop(
+        settings,
+        *,
+        interval_seconds=30.0,
+    ):
+        del settings, interval_seconds
+        import asyncio
+
+        await asyncio.Event().wait()
+
+    # Some tests construct TestClient directly instead of using the shared
+    # ``client`` fixture. Keep every application lifespan away from a real
+    # developer/LAN Model Gateway; resolver tests inject MockTransport directly.
+    sandbox.setattr(
+        "app.main.refresh_embedding_contract",
+        no_network_embedding_refresh,
+    )
+    sandbox.setattr(
+        "app.main.embedding_contract_refresh_loop",
+        no_network_embedding_refresh_loop,
+    )
     for name in original_environment:
         sandbox.setenv(name, "")
 
@@ -223,11 +250,13 @@ def isolate_test_runtime(tmp_path) -> Iterator[None]:
         sandbox.setenv(name, value)
 
     get_settings.cache_clear()
+    clear_embedding_contract_cache()
 
     try:
         yield
     finally:
         get_settings.cache_clear()
+        clear_embedding_contract_cache()
         sandbox.undo()
         # Direct os.environ writes and a test-local monkeypatch.undo() cannot
         # escape this independent sandbox's exact teardown restoration.
@@ -606,6 +635,7 @@ def client(
     monkeypatch.setenv("CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES", "65536")
     get_settings.cache_clear()
     clear_chat_gateway_state()
+    clear_embedding_contract_cache()
 
     # MCP 的 session manager 不允许重复启动，每个测试都构建全新应用实例
     app = create_app()
@@ -619,6 +649,7 @@ def client(
         yield test_client
 
     app.dependency_overrides.clear()
+    clear_embedding_contract_cache()
     get_settings.cache_clear()
 
 

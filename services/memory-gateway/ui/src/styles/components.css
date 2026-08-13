@@ -277,7 +277,7 @@
 /* 高级筛选：右侧滑出的玻璃抽屉 */
 .filter-panel.filter-drawer {
   position: fixed;
-  z-index: 160;
+  z-index: var(--z-drawer);
   top: 16px;
   right: 16px;
   bottom: 16px;
@@ -307,7 +307,7 @@
 
 .filter-drawer-scrim {
   position: fixed;
-  z-index: 150;
+  z-index: var(--z-scrim);
   inset: 0;
   padding: 0;
   border: 0;
@@ -436,7 +436,7 @@
 
 .column-picker {
   position: absolute;
-  z-index: 60;
+  z-index: var(--z-popover);
   top: calc(100% + 8px);
   right: 0;
   display: grid;
@@ -545,7 +545,7 @@
     padding: 10px 7px;
     border-right: 1px solid var(--border);
     color: var(--muted);
-    font-size: 10px;
+    font-size: var(--text-micro);
     cursor: pointer;
   }
 
@@ -847,6 +847,17 @@
   color: var(--muted);
   font-size: 13px;
   font-weight: 650;
+}
+
+.field-block .field-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 500;
+}
+
+.field-block .field-hint code {
+  font-size: 0.92em;
 }
 
 .field-block input,
@@ -1459,6 +1470,30 @@
   flex: none;
 }
 
+/* 混排句子（文本 + 行内 code）必须包成单个 .notice-text，
+   否则每段文本会成为独立 flex item，被压成一行一两个字的竖条 */
+.notice .notice-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.7;
+}
+
+.notice code {
+  display: inline;
+  padding: 2px 6px;
+  font-size: 0.92em;
+}
+
+.table-badge.muted {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  color: var(--text-muted, #64748b);
+  background: var(--surface-muted, #f1f5f9);
+}
+
 .notice.warning {
   padding: 9px 12px;
   border: 1px solid rgba(221, 184, 106, 0.3);
@@ -2017,7 +2052,7 @@ code {
 
 .toast {
   position: fixed;
-  z-index: 50;
+  z-index: var(--z-toast);
   right: 24px;
   bottom: 24px;
   display: flex;
@@ -2080,7 +2115,7 @@ code {
 
 .modal-backdrop {
   position: fixed;
-  z-index: 40;
+  z-index: var(--z-modal);
   inset: 0;
   display: grid;
   place-items: center;

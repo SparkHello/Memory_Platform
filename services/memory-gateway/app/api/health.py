@@ -12,6 +12,11 @@ import httpx
 
 from app.config import Settings, get_settings
 from app.disk_capacity import disk_readiness_code
+from app.llm.embedding_contract import (
+    embedding_contract_generation,
+    resolve_embedding_contract,
+    set_embedding_contract_failure,
+)
 from app.llm.runtime import (
     ModelRuntimeConfigurationError,
     resolve_model_runtime,
@@ -50,14 +55,18 @@ async def readiness(
     unauthenticated high-frequency probes cannot amplify the SQLite quick_check
     and model control-plane calls.
     """
-    fingerprint = _readyz_cache_fingerprint(settings)
     async with _readyz_lock:
+        fingerprint = _readyz_cache_fingerprint(settings)
         now = time.monotonic()
         cached = _readyz_cache.get(fingerprint)
         if cached is not None and cached[0] > now:
             _, status_code, content = cached
         else:
             status_code, content = await _readiness_result(settings)
+            # Contract resolution can advance the snapshot generation while a
+            # miss is being computed. Store under the resulting fingerprint so
+            # the very next probe can reuse this verdict.
+            fingerprint = _readyz_cache_fingerprint(settings)
             _readyz_cache.pop(fingerprint, None)
             _readyz_cache[fingerprint] = (
                 now + READYZ_CACHE_TTL_SECONDS,
@@ -85,6 +94,7 @@ async def _readiness_result(settings: Settings) -> tuple[int, dict[str, Any]]:
     model_code = await _central_model_readiness_code(settings, runtime)
     if model_code:
         return _not_ready(model_code)
+    runtime = resolve_model_runtime(settings)
     return 200, {
         "status": "ready",
         "model_runtime": runtime.mode,
@@ -124,6 +134,7 @@ def _readyz_cache_fingerprint(settings: Settings) -> str:
         str(settings.request_timeout_seconds),
         str(settings.disk_soft_reserve_bytes),
         str(settings.disk_hard_reserve_bytes),
+        str(embedding_contract_generation(settings)),
     )
     return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
 
@@ -184,31 +195,80 @@ async def _central_model_readiness_code(settings: Settings, runtime: Any) -> str
                 },
             )
     except httpx.HTTPError:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_unavailable",
+        )
         return "model_gateway_unavailable"
     if ready.status_code != 200:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_not_ready",
+        )
         return "model_gateway_not_ready"
     try:
         ready_payload = ready.json()
     except ValueError:
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
         return "model_gateway_invalid_response"
     if not isinstance(ready_payload, dict) or ready_payload.get("status") != "ready":
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_not_ready",
+        )
         return "model_gateway_not_ready"
     if control.status_code in {401, 403}:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_backend_auth_failed",
+        )
         return "model_gateway_backend_auth_failed"
     if control.status_code != 200:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_control_unavailable",
+        )
         return "model_gateway_control_unavailable"
     if len(control.content) > _MAX_CONTROL_RESPONSE_BYTES:
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
         return "model_gateway_invalid_response"
     try:
         payload = control.json()
     except ValueError:
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
         return "model_gateway_invalid_response"
     if not isinstance(payload, dict):
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
         return "model_gateway_invalid_response"
-    return _central_contract_code(payload, runtime)
+    return _central_contract_code(payload, runtime, settings)
 
 
-def _central_contract_code(payload: dict[str, Any], runtime: Any) -> str:
+def _central_contract_code(
+    payload: dict[str, Any],
+    runtime: Any,
+    settings: Settings,
+) -> str:
     expected_kinds = {
         runtime.route_for("chat"): "chat",
         runtime.route_for("memory.extract"): "chat",
@@ -217,21 +277,31 @@ def _central_contract_code(payload: dict[str, Any], runtime: Any) -> str:
         runtime.route_for("memory.review"): "chat",
         runtime.route_for("knowledge.fast"): "chat",
         runtime.route_for("knowledge.pro"): "chat",
-        runtime.route_for("memory.embedding"): "embedding",
     }
-    if len(expected_kinds) != 8:
+    embedding_route_id = runtime.route_for("memory.embedding")
+    if len(expected_kinds) != 7 or embedding_route_id in expected_kinds:
         return "model_gateway_route_contract_invalid"
     raw_routes = payload.get("routes")
     raw_deployments = payload.get("deployments")
     raw_connections = payload.get("connections")
     if not all(isinstance(items, list) for items in (raw_routes, raw_deployments, raw_connections)):
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
         return "model_gateway_invalid_response"
+    embedding_contract = resolve_embedding_contract(settings, payload)
     routes = {
         str(item.get("id")): item
         for item in raw_routes
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
-    if set(routes) != set(expected_kinds):
+    visible_routes = set(routes)
+    if visible_routes not in (
+        set(expected_kinds),
+        set(expected_kinds) | {embedding_route_id},
+    ):
         return "model_gateway_route_visibility_mismatch"
     deployments = {
         str(item.get("id")): item
@@ -260,18 +330,15 @@ def _central_contract_code(payload: dict[str, Any], runtime: Any) -> str:
             if not deployment or deployment.get("kind") != expected_kind:
                 return "model_gateway_route_contract_invalid"
             connection = connections.get(str(deployment.get("connection") or ""))
-            if expected_kind == "embedding" and (
-                not runtime.embedding.enabled
-                or deployment.get("embedding_space") != runtime.embedding.space_id
-                or deployment.get("dimensions") != runtime.embedding.dimensions
-            ):
-                return "model_gateway_embedding_contract_mismatch"
             usable = usable or bool(
                 deployment.get("enabled") is True
                 and connection
                 and connection.get("enabled") is True
                 and connection.get("configured") is True
+                and connection.get("usage_scope") == "backend_allowed"
             )
         if not usable:
             return "model_gateway_route_unavailable"
+    if embedding_contract.state in {"invalid", "unavailable"}:
+        return embedding_contract.code
     return ""

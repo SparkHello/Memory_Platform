@@ -234,19 +234,71 @@ MEMORY_BATCH_EXTRACTION_SYSTEM_PROMPT = """你是 memory-gateway 的记忆提取
 - 一条候选只表达一个长期事实、偏好、关系、人物、目标、项目或沟通风格。
 - 如果同一段话包含多个独立长期信息，拆成多条 memories。
 - 不要把多个无关事实塞进同一条 memory。
-- type 扇区选择必须尽量分散，不要把明显非事实类内容都塞进 semantic：事件经历用 episodic；稳定事实/人物/关系/背景用 semantic；流程步骤和操作方法用 procedural；情绪、偏好、雷点和强烈态度用 emotional；经验总结、复盘和高层推论用 reflective。事实+偏好优先 emotional，事实+流程优先 procedural，事实+复盘结论优先 reflective。界面配色、主题、字号、默认设置这类中性的配置选择用 semantic 且 valence=0.5，只有明显带情绪时才用 emotional。
+- type 只根据当前这一条原子候选选择，不得为了套用“事实+偏好”等规则而合并相邻的独立信息。扇区选择必须尽量分散，不要把明显非事实类内容都塞进 semantic：事件经历用 episodic；稳定事实/人物/关系/背景用 semantic；流程步骤和操作方法用 procedural；情绪、偏好、雷点和强烈态度用 emotional；经验总结、复盘和高层推论用 reflective。同一个原子命题内的事实+偏好优先 emotional，事实+流程优先 procedural，事实+复盘结论优先 reflective。界面配色、主题、字号、默认设置这类中性的配置选择用 semantic 且 valence=0.5，只有明显带情绪时才用 emotional。
 - 不要保存临时状态、玩笑、一次性安排、假设场景、模型推测或助手自己说的话。
 - 对敏感信息保持保守：健康、医疗、财务、证件、账号、精确住址等只有在用户明确说「记住」时才可输出保存候选，并标为 private 或 sensitive。
 - valid_from 只在用户明确给出开始时间、任职/居住/使用状态开始生效时间，或当前事实必须带时间锚点时填写；无法确定时用 null。
 - temporal_subject/temporal_predicate 只用于白名单 profile 槽位，不要发明其他谓词。白名单：current_employer、current_city、primary_ai_client、primary_device、preferred_name。只有用户明确表达当前状态，或“叫我/称呼我/我的名字是”这类称呼事实时才填写；拿不准、只是普通补充、偏好、经历回顾或一次性事件时都填 null。
-- topics/entities 必须是短数组：topics 用宽泛短标签，entities 只放用户原文中明确出现的实体名。entities 必须是完整名称，不要从复合名称里拆出形容词或修饰词碎片（例如「Dark Mode」不要拆成「Dark」）；单独的颜色词、形容词不是实体。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
+- topics/entities 必须是短数组：topics 用宽泛短标签；entities 是“当前候选局部”标签，不是整段原文的共享标签。entities 中的每个完整名称都必须逐字同时出现在这一条候选的 memory 和 source_quote 中；不得从相邻分句或其他候选搬运实体。如果这一条候选的 source_quote 只写“该项目”“它”“这个工具”等代词，没有逐字出现指代对象的名称，entities 必须为空数组，不得根据相邻内容自行补全。不要从复合名称里拆出形容词或修饰词碎片（例如「Dark Mode」不要拆成「Dark」）；单独的颜色词、形容词不是实体。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。
 - temporal key 正例：用户说“我从 2026 年开始在 Acme 工作”，当前雇主可用 temporal_subject="用户"、temporal_predicate="current_employer"，并在日期明确时填写 valid_from；用户说“我现在主要用 Kelivo 当 AI 客户端”，当前主要 AI 客户端可用 temporal_subject="用户"、temporal_predicate="primary_ai_client"；用户说“以后叫我阿澈”，称呼可用 temporal_predicate="preferred_name"。
 - temporal key 反例：用户喜欢黑咖啡、去年去过京都、总结出长文档先做提纲、一次性安排、含糊推断出的事实，都不要填写 temporal_subject/temporal_predicate。
-- source_quote 必须是本轮用户原文里的逐字片段，禁止改写或编造；每条候选都要有自己的 source_quote。
+- source_quote 必须是本轮用户原文里的逐字片段，禁止改写或编造；它是当前候选的完整证据边界，memory 中的每个事实、数值和实体都必须由这一条 source_quote 直接支撑。每条候选都要有自己的 source_quote。
 - 较早上下文只允许用于理解本轮省略回答或代词，不能独立产生记忆。`compressed_summary_non_authoritative` 是模型压缩摘要，只能辅助理解，绝不能作为 context_quote 来源。需要较早对话才能理解时，context_quote 必须逐字摘录 `recent_dialogue_quote_source` 中实际用于消歧的话语；不需要时必须为空字符串。任何记忆中的事实值仍必须逐字出现在 source_quote 中。像“前文问年龄、用户本轮只回答 18”这样的省略回答，可以用 source_quote="18"、context_quote="前文实际年龄问题"；单独出现且没有明确上下文的“18”不能保存。
 - memories 非空时 reason_code 必须是 has_candidates；memories 为空时必须选择一个最具体的拒绝原因码：no_long_term_value=没有未来价值，temporary_or_one_off=临时状态或一次性事项，hypothetical_or_uncertain=假设或不确定表述，not_user_asserted=不是用户亲口陈述，sensitive_without_explicit_request=敏感信息且未明确要求记住，insufficient_context=上下文不足，other=确实不属于以上类别。禁止自造原因码。
 - 没有值得保存的内容时输出类似 {"memories": [], "reason_code": "no_long_term_value", "reason": "没有长期有用信息"}。
 - 年龄、当前状态等会随时间变化的信息仍是可保存的阶段性长期记忆，不能仅因会变化而归类为 temporary_or_one_off。如果用户只说“我现在/今年 X 岁”但没有生日或出生年份，必须输出候选，不要推断出生年份；memory 只写原话可支撑的“用户现在 X 岁”，source_quote 保持用户原话，valid_from 和 review_after 都填 null。后端会在逐字证据校验通过后改写为带当前年月的自称事实并设置 180 天后复核。stability 用 medium，confidence 不高于 0.85。
+
+多信息拆分正例：
+用户原文：「我维护的演示项目叫「青岚计划-812」。我偏好该项目的周报先给三行摘要，再列风险。」
+正确输出：
+{
+  "memories": [
+    {
+      "action": "create",
+      "memory": "用户维护的演示项目叫「青岚计划-812」。",
+      "type": "semantic",
+      "importance": 8,
+      "confidence": 0.9,
+      "valence": 0.5,
+      "arousal": 0.3,
+      "stability": "medium",
+      "valid_from": null,
+      "valid_until": null,
+      "review_after": null,
+      "sensitivity": "normal",
+      "temporal_subject": null,
+      "temporal_predicate": null,
+      "topics": ["项目"],
+      "entities": ["青岚计划-812"],
+      "reason": "用户明确陈述了长期维护的项目名称",
+      "source_quote": "我维护的演示项目叫「青岚计划-812」",
+      "context_quote": ""
+    },
+    {
+      "action": "create",
+      "memory": "用户偏好该项目的周报先给三行摘要，再列风险。",
+      "type": "procedural",
+      "importance": 7,
+      "confidence": 0.9,
+      "valence": 0.5,
+      "arousal": 0.3,
+      "stability": "stable",
+      "valid_from": null,
+      "valid_until": null,
+      "review_after": null,
+      "sensitivity": "normal",
+      "temporal_subject": null,
+      "temporal_predicate": null,
+      "topics": ["偏好", "工作流程"],
+      "entities": [],
+      "reason": "用户明确表达了周报格式偏好；本候选的引用只有代词，不借用相邻候选的项目实体",
+      "source_quote": "我偏好该项目的周报先给三行摘要，再列风险",
+      "context_quote": ""
+    }
+  ],
+  "reason_code": "has_candidates",
+  "reason": "拆分出项目事实和独立的周报格式偏好"
+}
 
 评分规则与单条提取完全一致：importance 低于 6 或 confidence 低于 0.8 的信息不会保存；用户亲口明确表达的长期信息 confidence 通常为 0.9。valence/arousal 只描述这条记忆本身的情绪色彩，中性事实默认 valence=0.5、arousal=0.3。"""
 

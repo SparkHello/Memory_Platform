@@ -9,7 +9,7 @@ import {
   TriangleAlert,
   X
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { MemoryApi } from "../../api";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import { loadSettings } from "../../storage";
@@ -27,6 +27,8 @@ import type {
   ModelGatewayUsageScope
 } from "../../types";
 import { copyText } from "../../utils/files";
+import { channelUrlKey, distinctEmbeddingBaseUrl } from "../../utils/channelUrl";
+import { filterDiscoveredChatModels } from "../../utils/discoveredModels";
 import { errorMessage } from "../../utils/format";
 
 type Feedback = { tone: "success" | "warning" | "error"; message: string };
@@ -43,7 +45,7 @@ export const ROUTE_LABELS: Record<string, string> = {
   "pricing.research": "价格信息研究"
 };
 
-const CHAT_ROUTE_IDS = [
+export const CHAT_ROUTE_IDS = [
   "memory.chat",
   "memory.extract",
   "memory.compact",
@@ -62,16 +64,29 @@ const CHANNEL_PRESETS = [
     base_url: "https://api.deepseek.com",
     adapter: "deepseek",
     plan: "payg",
-    usage_scope: "backend_allowed"
+    usage_scope: "backend_allowed",
+    auth_type: "bearer" as const
   },
   {
-    id: "kimi-code",
-    label: "Kimi Code 订阅",
-    channel_operator: "kimi-code",
-    base_url: "https://api.kimi.com/coding/v1",
-    adapter: "kimi",
-    plan: "coding_plan",
-    usage_scope: "interactive_only"
+    id: "claude",
+    label: "Anthropic Claude",
+    channel_operator: "anthropic",
+    // OpenAI-compatible base URL if you use a relay; official Messages API is not this path.
+    base_url: "https://api.anthropic.com/v1",
+    adapter: "generic",
+    plan: "payg",
+    usage_scope: "backend_allowed",
+    auth_type: "x-api-key" as const
+  },
+  {
+    id: "gemini",
+    label: "Google Gemini（OpenAI 兼容）",
+    channel_operator: "google",
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    adapter: "generic",
+    plan: "payg",
+    usage_scope: "backend_allowed",
+    auth_type: "bearer" as const
   },
   {
     id: "dashscope-cn",
@@ -80,16 +95,8 @@ const CHANNEL_PRESETS = [
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     adapter: "dashscope_openai",
     plan: "payg",
-    usage_scope: "backend_allowed"
-  },
-  {
-    id: "dashscope-token-plan",
-    label: "阿里云 Token Plan",
-    channel_operator: "dashscope-token-plan",
-    base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-    adapter: "dashscope_openai",
-    plan: "token_plan",
-    usage_scope: "interactive_only"
+    usage_scope: "backend_allowed",
+    auth_type: "bearer" as const
   }
 ] as const satisfies ReadonlyArray<{
   id: string;
@@ -99,9 +106,20 @@ const CHANNEL_PRESETS = [
   adapter: ModelGatewayAdapter;
   plan: ModelGatewayPlan;
   usage_scope: ModelGatewayUsageScope;
+  auth_type: "bearer" | "x-api-key";
 }>;
 
 type PresetId = (typeof CHANNEL_PRESETS)[number]["id"] | "custom";
+
+/** Empty fields when user picks 自定义 — do not inherit the previous preset. */
+const CUSTOM_CHANNEL_DEFAULTS = {
+  channel_operator: "",
+  base_url: "",
+  adapter: "generic" as ModelGatewayAdapter,
+  plan: "payg" as ModelGatewayPlan,
+  usage_scope: "backend_allowed" as ModelGatewayUsageScope,
+  auth_type: "bearer" as const
+};
 
 const ADAPTER_OPTIONS: ModelGatewayAdapter[] = [
   "generic",
@@ -114,8 +132,8 @@ const PLAN_OPTIONS: Array<{ value: ModelGatewayPlan; label: string }> = [
   { value: "payg", label: "按量计费" },
   { value: "subscription", label: "普通订阅" },
   { value: "free_tier", label: "免费额度" },
-  { value: "token_plan", label: "Token Plan" },
-  { value: "coding_plan", label: "Coding Plan" },
+  { value: "token_plan", label: "Token Plan（自管）" },
+  { value: "coding_plan", label: "Coding Plan（自管）" },
   { value: "direct_tool_only", label: "仅官方工具直连" },
   { value: "custom", label: "自定义" }
 ];
@@ -135,7 +153,24 @@ const CAPABILITY_OPTIONS: Array<{
 /** Clash/Surge TUN fake-ip range; only applied when the user opts in. */
 const FAKE_IP_CIDR = "198.18.0.0/15";
 
-function suggestEmbeddingSpace(operator: string, model: string, dimensions: string): string {
+function embeddingHostSlug(embeddingUrl: string, chatUrl: string): string {
+  const embed = channelUrlKey(embeddingUrl);
+  const chat = channelUrlKey(chatUrl);
+  if (!embed || !chat || embed === chat) return "";
+  try {
+    return new URL(embed).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function suggestEmbeddingSpace(
+  operator: string,
+  model: string,
+  dimensions: string,
+  embeddingUrl = "",
+  chatUrl = ""
+): string {
   const slug = model
     .trim()
     .toLowerCase()
@@ -143,8 +178,10 @@ function suggestEmbeddingSpace(operator: string, model: string, dimensions: stri
     .replace(/^[-._:]+|[-._:]+$/g, "");
   if (!slug) return "";
   const owner = operator.trim().toLowerCase() || "channel";
+  const host = embeddingHostSlug(embeddingUrl, chatUrl);
+  const prefix = host ? `${owner}.${host}` : owner;
   const dims = dimensions.trim();
-  return `${owner}.${slug}${dims ? `:${dims}` : ""}`;
+  return `${prefix}.${slug}${dims ? `:${dims}` : ""}`;
 }
 
 function parseCidrList(value: string): string[] {
@@ -160,6 +197,32 @@ function joinCidrList(items: string[]): string {
 
 function cidrListIncludesFakeIp(items: string[]): boolean {
   return items.some((item) => item === FAKE_IP_CIDR || item.startsWith("198.18."));
+}
+
+export function looksLikeFakeIpDetail(detail: string): boolean {
+  return /198\.18|fake-ip/i.test(detail);
+}
+
+function FakeIpOptIn({
+  checked,
+  disabled,
+  onChange
+}: {
+  checked: boolean;
+  disabled: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  return (
+    <label className="inline-check">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        disabled={disabled}
+      />
+      使用 Clash/Surge 等 TUN fake-ip（写入 198.18.0.0/15）
+    </label>
+  );
 }
 
 function routePolicy(
@@ -191,19 +254,20 @@ export function NewChannelWizard({
   onClose: () => void;
   onCompleted: () => Promise<void> | void;
 }) {
-  const initialPreset = CHANNEL_PRESETS[0];
-  const [preset, setPreset] = useState<PresetId>(initialPreset.id);
-  const [operator, setOperator] = useState<string>(initialPreset.channel_operator);
-  const [baseUrl, setBaseUrl] = useState<string>(initialPreset.base_url);
-  const [adapter, setAdapter] = useState<ModelGatewayAdapter>(initialPreset.adapter);
-  const [plan, setPlan] = useState<ModelGatewayPlan>(initialPreset.plan);
-  const [usageScope, setUsageScope] = useState<ModelGatewayUsageScope>(initialPreset.usage_scope);
-  const [authType, setAuthType] = useState<"bearer" | "x-api-key">("bearer");
+  const [preset, setPreset] = useState<PresetId | "">("");
+  const [operator, setOperator] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [adapter, setAdapter] = useState<ModelGatewayAdapter>(CUSTOM_CHANNEL_DEFAULTS.adapter);
+  const [plan, setPlan] = useState<ModelGatewayPlan>(CUSTOM_CHANNEL_DEFAULTS.plan);
+  const [usageScope, setUsageScope] = useState<ModelGatewayUsageScope>(CUSTOM_CHANNEL_DEFAULTS.usage_scope);
+  const [authType, setAuthType] = useState<"bearer" | "x-api-key">(CUSTOM_CHANNEL_DEFAULTS.auth_type);
   const [allowedPrivateNetworks, setAllowedPrivateNetworks] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [discovery, setDiscovery] = useState<ModelGatewayChannelDiscoverResult | null>(null);
   const [chatModel, setChatModel] = useState("");
+  const [chatModelQuery, setChatModelQuery] = useState("");
+  const [showFakeIpOptIn, setShowFakeIpOptIn] = useState(false);
   const [modelAuthor, setModelAuthor] = useState("");
   const [adapterProfile, setAdapterProfile] = useState<"inherit" | "dashscope_deepseek_v4">("inherit");
   const [reasoningDefault, setReasoningDefault] = useState<"inherit" | "enabled" | "disabled">("inherit");
@@ -212,22 +276,31 @@ export function NewChannelWizard({
   const [embeddingEnabled, setEmbeddingEnabled] = useState(false);
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [embeddingDimensions, setEmbeddingDimensions] = useState("");
+  const [embeddingBaseUrl, setEmbeddingBaseUrl] = useState("");
+  const [embeddingBaseUrlEdited, setEmbeddingBaseUrlEdited] = useState(false);
   const [embeddingSpace, setEmbeddingSpace] = useState("");
   const [embeddingSpaceEdited, setEmbeddingSpaceEdited] = useState(false);
   const [embeddingRouteOperation, setEmbeddingRouteOperation] = useState<ModelGatewayRouteOperation>("keep");
   const [validated, setValidated] = useState(false);
-  const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply">("");
+  const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply" | "probe">("");
+  const [probeNote, setProbeNote] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [done, setDone] = useState(false);
   const [appliedSummary, setAppliedSummary] = useState({ deployments: 0, routes: 0 });
   /** One-time chat token minted after successful apply; never Console key. */
   const [clientChatToken, setClientChatToken] = useState<string | null>(null);
   const [clientTokenError, setClientTokenError] = useState<string | null>(null);
+  const [clientTokenReused, setClientTokenReused] = useState(false);
+  const [reembedNote, setReembedNote] = useState<string | null>(null);
   const [showClientToken, setShowClientToken] = useState(false);
   const [clientTokenCopied, setClientTokenCopied] = useState(false);
 
   const hasAdminKey = Boolean(adminKey.trim());
   const models = discovery?.models || [];
+  const visibleChatModels = useMemo(
+    () => filterDiscoveredChatModels(models, chatModelQuery),
+    [models, chatModelQuery]
+  );
   const discoveryCheck = discovery?.report.connections[0];
   const canAssignBackendRoutes = usageScope === "backend_allowed";
   const embeddingRoute = control.routes.find((route) => route.id === EMBEDDING_ROUTE_ID);
@@ -240,6 +313,10 @@ export function NewChannelWizard({
   );
   const fakeIpEnabled = cidrListIncludesFakeIp(privateNetworkList);
   const clientBaseUrl = `${loadSettings().apiBaseUrl.replace(/\/+$/, "")}/v1`;
+
+  useEffect(() => {
+    if (!embeddingBaseUrlEdited) setEmbeddingBaseUrl(baseUrl);
+  }, [baseUrl, embeddingBaseUrlEdited]);
 
   const missingChatRoutes = useMemo(
     () => CHAT_ROUTE_IDS.filter((id) => !control.routes.some((route) => route.id === id)),
@@ -259,13 +336,24 @@ export function NewChannelWizard({
 
   const selectPreset = (id: PresetId) => {
     setPreset(id);
-    const found = CHANNEL_PRESETS.find((item) => item.id === id);
-    if (found) {
-      setOperator(found.channel_operator);
-      setBaseUrl(found.base_url);
-      setAdapter(found.adapter);
-      setPlan(found.plan);
-      setUsageScope(found.usage_scope);
+    if (id === "custom") {
+      // Always blank generic form — never leave a previous preset's URL/operator.
+      setOperator(CUSTOM_CHANNEL_DEFAULTS.channel_operator);
+      setBaseUrl(CUSTOM_CHANNEL_DEFAULTS.base_url);
+      setAdapter(CUSTOM_CHANNEL_DEFAULTS.adapter);
+      setPlan(CUSTOM_CHANNEL_DEFAULTS.plan);
+      setUsageScope(CUSTOM_CHANNEL_DEFAULTS.usage_scope);
+      setAuthType(CUSTOM_CHANNEL_DEFAULTS.auth_type);
+    } else {
+      const found = CHANNEL_PRESETS.find((item) => item.id === id);
+      if (found) {
+        setOperator(found.channel_operator);
+        setBaseUrl(found.base_url);
+        setAdapter(found.adapter);
+        setPlan(found.plan);
+        setUsageScope(found.usage_scope);
+        setAuthType(found.auth_type);
+      }
     }
     invalidateDiscovery();
   };
@@ -280,19 +368,31 @@ export function NewChannelWizard({
     invalidateBundle();
   };
 
+  const refreshSuggestedSpace = (
+    model = embeddingModel,
+    dimensions = embeddingDimensions,
+    embedUrl = embeddingBaseUrl
+  ) => {
+    if (embeddingSpaceEdited) return;
+    setEmbeddingSpace(suggestEmbeddingSpace(operator, model, dimensions, embedUrl, baseUrl));
+  };
+
   const updateEmbeddingModel = (value: string) => {
     setEmbeddingModel(value);
-    if (!embeddingSpaceEdited) {
-      setEmbeddingSpace(suggestEmbeddingSpace(operator, value, embeddingDimensions));
-    }
+    refreshSuggestedSpace(value);
     invalidateBundle();
   };
 
   const updateEmbeddingDimensions = (value: string) => {
     setEmbeddingDimensions(value);
-    if (!embeddingSpaceEdited) {
-      setEmbeddingSpace(suggestEmbeddingSpace(operator, embeddingModel, value));
-    }
+    refreshSuggestedSpace(embeddingModel, value);
+    invalidateBundle();
+  };
+
+  const updateEmbeddingBaseUrl = (value: string) => {
+    setEmbeddingBaseUrl(value);
+    setEmbeddingBaseUrlEdited(true);
+    refreshSuggestedSpace(embeddingModel, embeddingDimensions, value);
     invalidateBundle();
   };
 
@@ -305,7 +405,9 @@ export function NewChannelWizard({
     } else {
       setAllowedPrivateNetworks(joinCidrList(current));
     }
-    invalidateDiscovery();
+    setDiscovery(null);
+    setChatModel("");
+    setValidated(false);
   };
 
   const discover = async () => {
@@ -331,7 +433,10 @@ export function NewChannelWizard({
         throw new Error("模型发现响应没有确认零落盘，已停止后续配置");
       }
       setDiscovery(result);
-      if (result.models.length === 1) setChatModel(result.models[0].id);
+      setShowFakeIpOptIn(false);
+      setChatModelQuery("");
+      const chatIds = filterDiscoveredChatModels(result.models).map((model) => model.id);
+      if (chatIds.length === 1) setChatModel(chatIds[0]);
       setFeedback({
         tone: result.models.length ? "success" : "warning",
         message: result.models.length
@@ -340,15 +445,20 @@ export function NewChannelWizard({
       });
     } catch (cause) {
       setDiscovery(null);
-      const detail = errorMessage(cause);
+      const detail = errorMessage(cause, { credential: "admin" });
       // 只有明确命中 fake-ip 网段特征时才引导用户勾选 TUN 选项；
       // 泛化的"私网/安全校验"字样也会出现在与代理无关的错误里。
-      const looksLikeFakeIp = /198\.18|fake-ip/i.test(detail) && !fakeIpEnabled;
+      const looksLikeFakeIp = looksLikeFakeIpDetail(detail) && !fakeIpEnabled;
+      if (looksLikeFakeIp) setShowFakeIpOptIn(true);
+      const looksLikeAuth =
+        /401|403|鉴权|api.?key|密钥无效|unauthorized|invalid.?api/i.test(detail);
       setFeedback({
         tone: "error",
         message: looksLikeFakeIp
-          ? `${detail}；候选渠道、密钥和 deployment 均未保存。若本机使用 Clash/Surge TUN fake-ip，请勾选下方「使用 TUN fake-ip 代理」后重试发现。`
-          : `${detail}；候选渠道、密钥和 deployment 均未保存。`
+          ? `${detail} 密钥和渠道都还没保存。本机解析到了 TUN fake-ip：请勾选下方「使用 Clash/Surge 等 TUN fake-ip」后重试「只读发现模型」（与密钥是否正确无关）。`
+          : looksLikeAuth
+            ? `${detail} 密钥和渠道都还没保存。请核对 API Key 与 Base URL 是否属于同一渠道。`
+            : `${detail} 密钥和渠道都还没保存（这是只读检查失败，不是密钥已写入）。`
       });
     } finally {
       setBusy("");
@@ -402,6 +512,7 @@ export function NewChannelWizard({
     ) {
       return null;
     }
+    const embeddingUrl = distinctEmbeddingBaseUrl(baseUrl, embeddingBaseUrl);
     return {
       revision: control.revision,
       connection: {
@@ -414,6 +525,7 @@ export function NewChannelWizard({
         usage_scope: usageScope,
         allowed_private_networks: parseCidrList(allowedPrivateNetworks)
       },
+      ...(embeddingEnabled && embeddingUrl ? { embedding_base_url: embeddingUrl } : {}),
       deployments: [
         {
           upstream_model: chat,
@@ -440,6 +552,66 @@ export function NewChannelWizard({
     };
   };
 
+  const probeCapabilities = async () => {
+    if (!hasAdminKey || busy || !operator.trim() || !baseUrl.trim() || !apiKey.trim() || !chatModel.trim()) {
+      setFeedback({
+        tone: "error",
+        message: "请先完成渠道发现并填写聊天模型 ID，再探测能力。"
+      });
+      return;
+    }
+    setBusy("probe");
+    setFeedback(null);
+    setProbeNote(null);
+    try {
+      const result = await api.probeProviderChannelCapabilities(
+        {
+          revision: control.revision,
+          candidate_key: apiKey.trim(),
+          channel_operator: operator.trim(),
+          base_url: baseUrl.trim(),
+          adapter,
+          auth_type: authType,
+          allowed_private_networks: parseCidrList(allowedPrivateNetworks),
+          upstream_model: chatModel.trim(),
+          probes: ["chat", "streaming", "tools", "reasoning", "json_object"]
+        },
+        adminKey.trim()
+      );
+      if (result.persisted !== false) {
+        throw new Error("能力探测响应没有确认零落盘，已停止");
+      }
+      const next: ModelGatewayCapabilities = {
+        tools: Boolean(result.capabilities.tools),
+        parallel_tools: Boolean(result.capabilities.parallel_tools),
+        reasoning: Boolean(result.capabilities.reasoning),
+        multimodal_input: Boolean(result.capabilities.multimodal_input),
+        json_object: Boolean(result.capabilities.json_object),
+        json_schema: Boolean(result.capabilities.json_schema)
+      };
+      setCapabilities(next);
+      invalidateBundle();
+      const summary = CAPABILITY_OPTIONS.filter((option) => next[option.key])
+        .map((option) => option.label)
+        .join("、");
+      const chatOk = result.details.chat?.ok;
+      setProbeNote(result.note || null);
+      setFeedback({
+        tone: chatOk ? "success" : "error",
+        message: chatOk
+          ? `能力探测完成（会消耗少量额度，未保存密钥）。已勾选：${summary || "仅基础聊天/流式"}。可按需手工改勾选后再校验保存。`
+          : `基础聊天探测失败：${result.details.chat?.detail || "未知错误"}。能力未改写。`
+      });
+    } catch (cause) {
+      setFeedback({
+        tone: "error",
+        message: `${errorMessage(cause, { credential: "admin" })}；能力勾选未改，密钥未保存。`
+      });
+    } finally {
+      setBusy("");
+    }
+  };
+
   const validate = async () => {
     if (!discovery || busy) return;
     const bundle = buildBundle();
@@ -457,15 +629,20 @@ export function NewChannelWizard({
     try {
       const result = await api.validateProviderChannelBundle(bundle, adminKey.trim());
       setValidated(true);
+      const splitEmbedding =
+        Boolean(result.embedding_connection_id) &&
+        result.embedding_connection_id !== result.connection_id;
       setFeedback({
         tone: "success",
-        message: `完整配置校验通过：将创建 ${result.deployment_ids.length} 个 deployment，变更 ${result.changed_routes.length} 条路由。仍未写入任何配置或密钥。`
+        message: splitEmbedding
+          ? `配置检查通过：将保存 ${result.deployment_ids.length} 个模型；向量模型会走单独接入点并复用同一密钥。尚未写入。`
+          : `配置检查通过：将保存 ${result.deployment_ids.length} 个模型，变更 ${result.changed_routes.length} 条用途。尚未写入。`
       });
     } catch (cause) {
       setValidated(false);
       setFeedback({
         tone: "error",
-        message: `${errorMessage(cause)}；完整 bundle 未落盘，现有配置保持不变。`
+        message: `${errorMessage(cause, { credential: "admin" })}；完整 bundle 未落盘，现有配置保持不变。`
       });
     } finally {
       setBusy("");
@@ -483,6 +660,8 @@ export function NewChannelWizard({
     setFeedback(null);
     setClientChatToken(null);
     setClientTokenError(null);
+    setClientTokenReused(false);
+    setReembedNote(null);
     setShowClientToken(false);
     setClientTokenCopied(false);
     try {
@@ -499,16 +678,42 @@ export function NewChannelWizard({
         refreshFailed = true;
       }
 
-      // Mint a device chat token so "copy client config" never uses Console key.
       let tokenOk = false;
+      let reusedExisting = false;
       try {
-        const dateTag = new Date().toISOString().slice(0, 10);
-        const tokenName = `${operator.trim() || "渠道"}-客户端-${dateTag}`.slice(0, 100);
-        const created = await api.createAuthToken(tokenName, "chat");
-        setClientChatToken(created.token);
+        const tokens = await api.authTokens();
+        reusedExisting = tokens.data.some((token) => token.role === "chat" && !token.revoked_at);
+      } catch {
+        reusedExisting = false;
+      }
+      if (reusedExisting) {
+        setClientTokenReused(true);
         tokenOk = true;
-      } catch (tokenCause) {
-        setClientTokenError(errorMessage(tokenCause));
+      } else {
+        try {
+          const dateTag = new Date().toISOString().slice(0, 10);
+          const tokenName = `${operator.trim() || "渠道"}-客户端-${dateTag}`.slice(0, 100);
+          const created = await api.createAuthToken(tokenName, "chat");
+          setClientChatToken(created.token);
+          tokenOk = true;
+        } catch (tokenCause) {
+          setClientTokenError(errorMessage(tokenCause));
+        }
+      }
+
+      if (embeddingEnabled) {
+        try {
+          const reembed = await api.reEmbedMemories({ scan: true });
+          setReembedNote(
+            reembed.re_embedded > 0
+              ? `已为 ${reembed.re_embedded} 条缺少当前空间向量的记忆补齐向量。`
+              : "当前没有需要补齐的记忆向量。"
+          );
+        } catch (reembedCause) {
+          setReembedNote(
+            `渠道已保存，但自动补齐记忆向量失败：${errorMessage(reembedCause)}。请到「记忆库」手动点「补齐向量」。`
+          );
+        }
       }
 
       setDone(true);
@@ -516,13 +721,19 @@ export function NewChannelWizard({
         setFeedback({
           tone: "warning",
           message:
-            "原子提交已经成功，但页面刷新失败；请手动刷新确认最新 revision，不要重复提交。"
+            "配置已经保存，但页面刷新失败；请手动刷新确认最新状态，不要重复提交。"
         });
       } else if (!tokenOk) {
         setFeedback({
           tone: "warning",
           message:
             "渠道配置已生效，但自动创建 chat token 失败。请打开「接入信息」手动创建设备 token，切勿把 Console 密钥填进聊天客户端。"
+        });
+      } else if (reusedExisting) {
+        setFeedback({
+          tone: "success",
+          message:
+            "渠道已生效。已有可用的 chat token，请到「接入信息」使用现有客户端配置，不要把 Console 或 admin 密钥填进聊天应用。"
         });
       } else {
         setFeedback({
@@ -536,7 +747,7 @@ export function NewChannelWizard({
       setValidated(false);
       setFeedback({
         tone: "error",
-        message: `${errorMessage(cause)}；未收到成功确认。服务端不会留下半套配置，但超时或断线时整套提交可能已经生效；请先刷新配置确认，勿直接重试。`
+        message: `${errorMessage(cause, { credential: "admin" })}；未收到成功确认。服务端不会留下半套配置，但超时或断线时整套提交可能已经生效；请先刷新配置确认，勿直接重试。`
       });
     } finally {
       setBusy("");
@@ -618,7 +829,7 @@ export function NewChannelWizard({
           onClick={() => void requestClose()}
           disabled={busy === "apply"}
           aria-label="关闭新建渠道"
-          title={busy === "apply" ? "正在原子应用，暂不能关闭" : "关闭"}
+          title={busy === "apply" ? "正在保存，暂不能关闭" : "关闭"}
         >
           <X size={16} aria-hidden />
         </button>
@@ -631,14 +842,30 @@ export function NewChannelWizard({
             <span>{feedback.message}</span>
           </div>
         )}
+        {showFakeIpOptIn && !done && (
+          <div className="provider-feedback is-warning" role="note">
+            <label className="field-block provider-checkbox-field">
+              <span>TUN fake-ip 代理</span>
+              <FakeIpOptIn
+                checked={fakeIpEnabled}
+                disabled={Boolean(busy)}
+                onChange={setFakeIpEnabled}
+              />
+            </label>
+          </div>
+        )}
 
         {done ? (
           <div className="provider-wizard-step">
             <h3><CheckCircle2 size={18} aria-hidden /> 模型配置完成</h3>
             <p className="provider-wizard-hint">
-              已保存 {appliedSummary.deployments} 个 deployment，变更 {appliedSummary.routes} 条路由。
-              请用下方 <strong>chat token</strong> 连接 OpenAI 兼容客户端；Console / admin 密钥不能填进 Chatbox 等聊天应用。
+              已保存 {appliedSummary.deployments} 个模型，变更 {appliedSummary.routes} 条用途路由。
+              {clientTokenReused
+                ? "已有可用的 chat token，请到「接入信息」查看客户端三项填写。"
+                : "请用下方 chat token 连接 OpenAI 兼容客户端。"}
+              Console / admin 密钥不能填进 Chatbox 等聊天应用。
             </p>
+            {reembedNote && <p className="provider-wizard-hint">{reembedNote}</p>}
             <div className="client-config-summary">
               <span><small>类型</small><strong>OpenAI 兼容 · Chat Completions</strong></span>
               <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
@@ -651,6 +878,8 @@ export function NewChannelWizard({
                       ? clientChatToken
                       : `${clientChatToken.slice(0, 12)}…${clientChatToken.slice(-4)}`}
                   </code>
+                ) : clientTokenReused ? (
+                  <strong>请到「接入信息」使用已有 chat token</strong>
                 ) : (
                   <strong className="text-warning">未创建 — 请到「接入信息」手动创建</strong>
                 )}
@@ -710,7 +939,7 @@ export function NewChannelWizard({
                   onClick={() => selectPreset("custom")}
                   disabled={Boolean(busy)}
                 >
-                  <strong>自定义渠道</strong><span>填写官方 OpenAI 兼容地址</span>
+                  <strong>自定义渠道</strong><span>自行填写 OpenAI 兼容 Base URL（不会继承上一预设）</span>
                 </button>
               </div>
 
@@ -722,7 +951,7 @@ export function NewChannelWizard({
                       value={operator}
                       onChange={(event) => { setOperator(event.target.value); invalidateDiscovery(); }}
                       spellCheck={false}
-                      placeholder="例如 vendor-cn"
+                      placeholder="例如 my-proxy"
                       disabled={Boolean(busy)}
                     />
                   </label>
@@ -736,6 +965,9 @@ export function NewChannelWizard({
                       disabled={Boolean(busy)}
                     />
                   </label>
+                  <p className="muted" style={{ gridColumn: "1 / -1", margin: 0 }}>
+                    套餐条款与可用模型由你的提供商决定；本网关不再按 Token/Coding Plan 限制后台记忆任务。
+                  </p>
                 </div>
               )}
 
@@ -799,15 +1031,11 @@ export function NewChannelWizard({
                   </label>
                   <label className="field-block provider-checkbox-field">
                     <span>TUN fake-ip 代理</span>
-                    <label className="inline-check">
-                      <input
-                        type="checkbox"
-                        checked={fakeIpEnabled}
-                        onChange={(event) => setFakeIpEnabled(event.target.checked)}
-                        disabled={Boolean(busy)}
-                      />
-                      使用 Clash/Surge 等 TUN fake-ip（写入 198.18.0.0/15）
-                    </label>
+                    <FakeIpOptIn
+                      checked={fakeIpEnabled}
+                      disabled={Boolean(busy)}
+                      onChange={setFakeIpEnabled}
+                    />
                   </label>
                 </div>
                 <p className="provider-wizard-hint">
@@ -849,21 +1077,47 @@ export function NewChannelWizard({
                 <div className="provider-wizard-step">
                   <h3><span className="provider-step-index" aria-hidden>2</span>选择模型与路由</h3>
                   <div className="provider-field-grid">
-                    <label className="field-block">
+                    <div className="field-block">
                       <span>聊天模型</span>
                       {models.length > 0 ? (
-                        <select value={chatModel} onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }} disabled={Boolean(busy)}>
-                          <option value="">请选择一个模型</option>
-                          {models.map((model) => (
-                            <option key={model.id} value={model.id}>
-                              {model.id}{model.aliases.length ? `（别名：${model.aliases.join("、")}）` : ""}
-                            </option>
-                          ))}
-                        </select>
+                        <>
+                          {models.length > 8 && (
+                            <input
+                              value={chatModelQuery}
+                              onChange={(event) => setChatModelQuery(event.target.value)}
+                              spellCheck={false}
+                              placeholder="输入以筛选模型 ID"
+                              aria-label="过滤聊天模型"
+                              disabled={Boolean(busy)}
+                            />
+                          )}
+                          <select
+                            value={chatModel}
+                            onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }}
+                            disabled={Boolean(busy)}
+                            aria-label="聊天模型"
+                          >
+                            <option value="">请选择一个模型</option>
+                            {chatModel &&
+                              !visibleChatModels.some((model) => model.id === chatModel) && (
+                                <option value={chatModel}>{chatModel}</option>
+                              )}
+                            {visibleChatModels.map((model) => (
+                              <option key={model.id} value={model.id}>
+                                {model.id}{model.aliases.length ? `（别名：${model.aliases.join("、")}）` : ""}
+                              </option>
+                            ))}
+                          </select>
+                          {models.length !== visibleChatModels.length && !chatModelQuery.trim() && (
+                            <p className="provider-wizard-hint">
+                              已隐藏 {models.length - visibleChatModels.length} 个嵌入/语音/图像模型；向量模型请在下方单独填写。
+                            </p>
+                          )}
+                        </>
                       ) : (
-                        <input value={chatModel} onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }} spellCheck={false} placeholder="精确 upstream_model ID" disabled={Boolean(busy)} />
+                        <input value={chatModel} onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }} spellCheck={false} placeholder="精确 upstream_model ID" disabled={Boolean(busy)} aria-label="聊天模型" />
                       )}
-                    </label>
+                    </div>
                     <label className="field-block">
                       <span>现有文本路由</span>
                       <select
@@ -885,7 +1139,12 @@ export function NewChannelWizard({
                   )}
 
                   <details className="provider-inline-advanced">
-                    <summary>高级：模型能力与适配 profile</summary>
+                    <summary>模型能力与适配（不填会影响路由）</summary>
+                    <p className="provider-wizard-hint">
+                      <strong>未勾选 = 路由视为不支持</strong>
+                      ：例如没勾「工具调用」时，客户端带 tools 的请求不会用这个模型。
+                      流式默认开启。可用下方探测自动勾选（会向供应商发几次极短请求，消耗少量额度，密钥仍不落盘）。
+                    </p>
                     <div className="provider-field-grid">
                       <label className="field-block">
                         <span>模型作者</span>
@@ -908,7 +1167,7 @@ export function NewChannelWizard({
                       </label>
                     </div>
                     <fieldset className="provider-capability-field" disabled={Boolean(busy)}>
-                      <legend>只有服务商明确支持时才勾选</legend>
+                      <legend>声明此模型支持的能力</legend>
                       <div className="provider-capability-grid">
                         {CAPABILITY_OPTIONS.map((option) => (
                           <label key={option.key}>
@@ -918,6 +1177,22 @@ export function NewChannelWizard({
                         ))}
                       </div>
                     </fieldset>
+                    <div className="button-row" style={{ marginTop: "0.75rem" }}>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={
+                          Boolean(busy) ||
+                          !chatModel.trim() ||
+                          !apiKey.trim() ||
+                          !hasAdminKey
+                        }
+                        onClick={() => void probeCapabilities()}
+                      >
+                        {busy === "probe" ? "正在探测能力…" : "探测模型能力（少量额度）"}
+                      </button>
+                    </div>
+                    {probeNote && <p className="muted">{probeNote}</p>}
                   </details>
 
                   <label className="provider-route-toggle provider-embedding-toggle">
@@ -927,6 +1202,20 @@ export function NewChannelWizard({
 
                   {embeddingEnabled && (
                     <div className="provider-field-grid">
+                      <label className="field-block" style={{ gridColumn: "1 / -1" }}>
+                        <span>向量接入点</span>
+                        <input
+                          value={embeddingBaseUrl}
+                          onChange={(event) => updateEmbeddingBaseUrl(event.target.value)}
+                          spellCheck={false}
+                          placeholder="默认与聊天地址相同"
+                          aria-label="向量接入点"
+                          disabled={Boolean(busy)}
+                        />
+                        <p className="provider-wizard-hint">
+                          默认与聊天渠道相同。若向量接口在另一个 HTTPS 地址（独立端口或工作空间），在此填写；保存时会自动建一条只跑向量的渠道并复用同一密钥。
+                        </p>
+                      </label>
                       <label className="field-block">
                         <span>向量模型</span>
                         <input value={embeddingModel} onChange={(event) => updateEmbeddingModel(event.target.value)} list="new-channel-models" spellCheck={false} placeholder="精确 embedding 模型 ID" disabled={Boolean(busy)} />
@@ -968,9 +1257,9 @@ export function NewChannelWizard({
                 </div>
 
                 <div className="provider-wizard-step">
-                  <h3><span className="provider-step-index" aria-hidden>3</span>校验并原子应用</h3>
+                  <h3><span className="provider-step-index" aria-hidden>3</span>检查并保存</h3>
                   <p className="provider-wizard-hint">
-                    “校验完整配置”仍为零落盘；校验通过后才可执行一次 CAS 原子提交。revision 冲突会安全失败并要求刷新。
+                    先检查配置，通过后再保存。检查阶段不会写入密钥；保存失败不会改现有渠道。
                   </p>
                   <div className="provider-wizard-actions">
                     <button type="button" className="secondary-button" onClick={() => void validate()} disabled={!chatModel.trim() || Boolean(busy)}>
@@ -979,7 +1268,7 @@ export function NewChannelWizard({
                     </button>
                     <button type="button" className="primary-button" onClick={() => void apply()} disabled={!validated || Boolean(busy)}>
                       <Save size={16} aria-hidden />
-                      {busy === "apply" ? "正在原子应用" : "确认并原子应用"}
+                      {busy === "apply" ? "正在保存" : "确认并保存"}
                     </button>
                   </div>
                 </div>

@@ -33,6 +33,9 @@ MODEL_SECRETS = Path("/model-secrets")
 CREDENTIALS = Path("/credentials")
 MEMORY_MARKER = MEMORY_DATA / ".stack-installed-v2"
 MODEL_MARKER = MODEL_DATA / ".stack-installed-v2"
+# Match init_stack: .txt is preferred (macOS Keynote steals .key).
+GATEWAY_CREDENTIAL_NAMES = ("gateway.txt", "gateway.key")
+ADMIN_CREDENTIAL_NAMES = ("admin.txt", "admin.key")
 
 
 def main() -> int:
@@ -193,8 +196,8 @@ def main() -> int:
     if not hmac.compare_digest(backend_key.encode(), memory_backend_key.encode()):
         raise RuntimeError("legacy backend credential wiring is inconsistent")
 
-    _deliver_once(CREDENTIALS / "gateway.key", gateway_key)
-    _deliver_once(CREDENTIALS / "admin.key", admin_key)
+    _deliver_once(CREDENTIALS / GATEWAY_CREDENTIAL_NAMES[0], gateway_key)
+    _deliver_once(CREDENTIALS / ADMIN_CREDENTIAL_NAMES[0], admin_key)
     transaction = secrets.token_hex(16)
     _write_marker(MEMORY_MARKER, transaction)
     _write_marker(MODEL_MARKER, transaction)
@@ -467,6 +470,25 @@ def _secure_tree(root: Path, owner: int) -> None:
             child.chmod(0o700 if child.is_dir() else 0o600)
 
 
+def _is_nonempty_regular_no_follow(path: Path) -> bool:
+    try:
+        descriptor = _open_regular_no_follow(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        return os.fstat(descriptor).st_size > 0
+    finally:
+        os.close(descriptor)
+
+
+def _resolve_credential_path(names: tuple[str, ...]) -> Path | None:
+    for name in names:
+        path = CREDENTIALS / name
+        if _is_nonempty_regular_no_follow(path):
+            return path
+    return None
+
+
 def _secure_credentials() -> None:
     uid = _bounded_id(os.getenv("HOST_UID", ""))
     gid = _bounded_id(os.getenv("HOST_GID", ""))
@@ -476,19 +498,20 @@ def _secure_credentials() -> None:
     CREDENTIALS.chmod(0o700)
     if uid is not None and gid is not None:
         os.chown(CREDENTIALS, uid, gid)
-    for path in (CREDENTIALS / "gateway.key", CREDENTIALS / "admin.key"):
-        try:
+    for names in (GATEWAY_CREDENTIAL_NAMES, ADMIN_CREDENTIAL_NAMES):
+        if _resolve_credential_path(names) is None:
+            raise RuntimeError("published credential is missing")
+        for name in names:
+            path = CREDENTIALS / name
+            if not _is_nonempty_regular_no_follow(path):
+                continue
             descriptor = _open_regular_no_follow(path, os.O_RDONLY)
-        except FileNotFoundError as exc:
-            raise RuntimeError("published credential is missing") from exc
-        try:
-            if os.fstat(descriptor).st_size <= 0:
-                raise RuntimeError("published credential is missing")
-            os.fchmod(descriptor, 0o600)
-            if uid is not None and gid is not None:
-                os.fchown(descriptor, uid, gid)
-        finally:
-            os.close(descriptor)
+            try:
+                os.fchmod(descriptor, 0o600)
+                if uid is not None and gid is not None:
+                    os.fchown(descriptor, uid, gid)
+            finally:
+                os.close(descriptor)
 
 
 def _bounded_id(value: str) -> int | None:

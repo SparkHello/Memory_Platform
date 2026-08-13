@@ -6,6 +6,6 @@ cannot drift apart independently. Bump the constant together with the new
 migration in the owning store.
 """
 
-MEMORY_SCHEMA_VERSION = 5
+MEMORY_SCHEMA_VERSION = 6
 KNOWLEDGE_SCHEMA_VERSION = 2
 AUTH_SCHEMA_VERSION = 2

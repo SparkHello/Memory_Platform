@@ -35,7 +35,7 @@
 | **会绑定某个模型吗？** | 不会。客户端始终使用 `memory-auto`，以后更换渠道或模型只改服务端配置。 |
 | **最快怎么开始？** | 启动 Docker → 浏览器里配置模型 → 在客户端填写 Base URL、API Key 和模型名三项。 |
 
-Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜索使用的 embedding 模型是可选项；不配置也可以先使用关键词检索。
+Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜索使用的 embedding route 是可选项；不创建或关闭它即明确使用关键词检索。
 
 > [!IMPORTANT]
 > **“本地优先”不等于“永不联网”。** 记忆、知识文档和配置默认留在自己的设备上；如果使用云端模型渠道，你主动发送的当前消息，以及本轮允许使用的相关上下文，会发给该渠道完成推理。默认部署面向个人电脑或可信家庭网络，请不要把服务无鉴权暴露到公网。
@@ -81,18 +81,20 @@ MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 
 安装完成后记住两枚密钥文件、三步用法：
 
-1. 用 `credentials/gateway.key` 里的 token 登录网页控制台 `http://127.0.0.1:2026/ui/`；
-2. 在「模型与路由」输入 `credentials/admin.key` 里的 admin key，配置模型渠道；
+1. 用 `credentials/gateway.txt`（旧版为 `gateway.key`）里的 token 登录网页控制台 `http://127.0.0.1:2026/ui/`；
+2. 在「模型与路由」输入 `credentials/admin.txt`（旧版为 `admin.key`）里的 admin key，配置模型渠道；
 3. 在网页里生成聊天 key（chat token），填进你的聊天客户端。
 
-首次启动需要 1–2 分钟；配置完模型渠道后即可聊天。密钥值不会进入环境变量、命令参数或 Docker 日志，只写入安装目录 `credentials/` 下的 `0600` 文件；终端只报告文件路径。
+首次启动需要 1–2 分钟；配置完模型渠道后即可聊天。全新安装在配置模型前 `/health` 为 200、`/readyz` 为 503 是正常的：前者保证首次设置页面可访问，后者才表示业务运行就绪。密钥值不会进入环境变量、命令参数或 Docker 日志，只写入安装目录 `credentials/` 下的 `0600` 文件；终端只报告文件路径。
+
+卸载见[栈运维指南 · 卸载 Docker 安装](docs/stack-operations.md#卸载-docker-安装)。不要用 `docker system prune`。
 
 <details>
 <summary>安装器实现细节（digest 固定、备份与升级策略、离线迁移）</summary>
 
 脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或迁移 → 启动独立的 Memory/Model 容器。
 
-重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。`/readyz` 退化时自动恢复旧 Compose 和数据。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。
+重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。已有已配置安装升级后若 `/readyz` 退化，安装器会自动恢复旧 Compose 和数据；全新安装则只要求 `/health`，以便先打开设置页面。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。
 
 </details>
 
@@ -111,15 +113,15 @@ docker compose -f docker-compose.user.yml up -d
 Compose 拉取同一 semver 的 `memory-platform-memory`、`memory-platform-model` 和 `memory-platform-init` 镜像；正式安装器还会把 tag 固定成实际 digest。首次启动期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后查看密钥文件：
 
 ```bash
-cat credentials/gateway.key
-cat credentials/admin.key
+cat credentials/gateway.txt   # 或旧版 gateway.key
+cat credentials/admin.txt     # 或旧版 admin.key
 ```
 
 全新安装时，第一枚是仅有 Console scope 的 `first-console` token；旧卷迁移时才保留一个版本的 legacy all-scope key。登录后在「接入信息」为每台聊天客户端/MCP 客户端创建独立 token。第二枚 admin key 只用于修改模型渠道与路由。端口 2026 被占用时，在 `.env` 增加 `MEMORY_PORT=3026` 后重启即可。
 
 接下来：
 
-1. 打开 `http://127.0.0.1:2026/ui/`，用 `credentials/gateway.key` 中的初始 Console token 连接（迁移旧卷时该文件暂为 legacy key）。
+1. 打开 `http://127.0.0.1:2026/ui/`，用 `credentials/gateway.txt`（或旧版 `gateway.key`）中的初始 Console token 连接（迁移旧卷时该文件暂为 legacy key）。
 2. 进入「模型与路由」，用 admin key 解锁本次配置操作。
 3. 新建渠道、填写供应商 API Key，并从自动发现的列表中选择模型。
 4. 在「接入信息」创建命名的 chat token，再按下方的[客户端接入](#-客户端接入)填写 Base URL、token 和模型名。
@@ -203,7 +205,7 @@ http://127.0.0.1:2026/mcp
 - **长期记忆与治理**：保存可核对的原文来源，支持生命周期、时间线、主题关联、召回解释、编辑、合并、软删除、恢复、永久删除和导出。
 - **独立知识库**：支持文本、Markdown、PDF、DOCX 和 EPUB，提供全文与向量混合检索、不可变文档版本和精确片段引用。
 - **模型、故障切换与用量**：按用途选择模型和备用顺序，记录渠道、模型、Token、耗时和价格快照，但不记录 Prompt、回复、工具参数或知识正文。
-- **安全回退**：embedding 空间或维度不匹配时回退关键词检索；敏感内容默认不进入远程记忆提取、embedding、AI 体检或知识代理。
+- **可选且严格的向量能力**：`memory.embedding` route 缺失或关闭时使用关键词检索；启用即表示选择语义向量，空白 space 配置会自动采用 route 契约，畸形、不可用或与显式固定值不匹配时 `/readyz` 报错，绝不混用旧空间。敏感内容默认不进入远程记忆提取、embedding、AI 体检或知识代理。
 
 完整接口和行为契约见 [Memory Gateway](services/memory-gateway/README.md) 与 [Model Gateway](services/model-gateway/README.md)。
 

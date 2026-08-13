@@ -40,8 +40,10 @@ def test_windows_installer_never_accepts_or_recovers_secret_values_from_logs() -
     assert '@("GATEWAY_API_KEY", "MEMORY_CONSOLE_ADMIN_KEY")' in text
     assert "Test-ComposeEnvKey" in text
     assert "Update-ComposeEnvironment" in text
-    assert 'Join-Path $credentialDirectory "gateway.key"' in text
-    assert 'Join-Path $credentialDirectory "admin.key"' in text
+    assert "function Resolve-CredentialFile" in text
+    assert 'foreach ($extension in @("txt", "key"))' in text
+    assert 'Resolve-CredentialFile $credentialDirectory "gateway"' in text
+    assert 'Resolve-CredentialFile $credentialDirectory "admin"' in text
     assert "Protect-PrivatePath $credential" in text
     assert "Find-GeneratedKey" not in text
     assert "logs --no-log-prefix" not in text

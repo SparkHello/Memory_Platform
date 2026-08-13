@@ -39,6 +39,7 @@ import type {
   SurfaceMode,
   TraversalResponse
 } from "../types";
+import { friendlyIngestSkipReason } from "../utils/decisionReason";
 import { downloadFile } from "../utils/files";
 import {
   MEMORY_TYPES,
@@ -53,6 +54,7 @@ import {
   percent,
   shortId
 } from "../utils/format";
+import { isProviderSetupReady } from "../utils/providerSetup";
 import type { Notify } from "./pageTypes";
 
 type EvalProgress = {
@@ -190,7 +192,7 @@ export function DashboardPage({
       const density =
         NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) ||
         NETWORK_DENSITY_OPTIONS[0];
-      const [health, report, review, logs, surfaced, network, spaces, workbench, providers, tokens] =
+      const [health, report, review, logs, surfaced, network, spaces, providers, tokens] =
         await Promise.all([
           api.health(signal),
           api.memoryReport(signal),
@@ -211,8 +213,7 @@ export function DashboardPage({
             arousalMax: nextFilters.arousalMax,
             redactSensitive: true
           }, signal),
-          api.listMemorySpaces(signal),
-          api.recallEvaluationWorkbench({}, signal).catch(() => null),
+          api.listMemorySpaces({ signal }),
           api.providersStatus(signal).catch(() => null),
           api.authTokens(signal).catch(() => null)
         ]);
@@ -227,7 +228,7 @@ export function DashboardPage({
           surfaced,
           network,
           spaces,
-          evalProgress: summarizeEvalProgress(workbench),
+          evalProgress: null,
           setup: providers?.setup || null,
           legacyKeyEnabled: Boolean(tokens?.legacy_key_enabled),
           authenticatedWithLegacyKey: Boolean(tokens?.authenticated_with_legacy_key),
@@ -409,14 +410,20 @@ export function DashboardPage({
                 <span className="greeting-date">{todayText}</span>
               </div>
               <div className="studio-head-side">
-                <span className="studio-health">
-                  <span className={`status-dot ${data.health === "ok" ? "ok" : "bad"}`} />
-                  {data.health === "ok"
-                    ? data.setup && !data.setup.chat_ready
-                      ? "服务在线 · 模型待配置"
-                      : "聊天配置已就绪"
-                    : data.health}
-                </span>
+                {!(
+                  data.health === "ok" &&
+                  (!data.setup || isProviderSetupReady(data.setup))
+                ) && (
+                  <span className="studio-health">
+                    <span className={`status-dot ${data.health === "ok" ? "ok" : "bad"}`} />
+                    {data.health === "ok"
+                      ? data.setup &&
+                        (data.setup.state === "configuration_error" || !data.setup.service_ready)
+                        ? "服务在线 · 配置需修复"
+                        : "服务在线 · 模型待配置"
+                      : data.health}
+                  </span>
+                )}
                 <button
                   className="icon-button"
                   type="button"
@@ -438,10 +445,6 @@ export function DashboardPage({
                 </button>
               </div>
             </div>
-            <span className="hero-note">
-              <ShieldAlert size={13} />
-              遮罩视图 · 私密与敏感正文已隐藏
-            </span>
           </header>
 
           <section className="action-band" aria-label="今日待办">
@@ -473,42 +476,24 @@ export function DashboardPage({
             )}
           </section>
 
-          {data.setup?.chat_ready &&
+          {data.setup && !isProviderSetupReady(data.setup) && (
+            <SetupNextStepCard
+              setup={data.setup}
+              onConfigureModel={() => setPage("providers")}
+            />
+          )}
+
+          {data.setup &&
+            isProviderSetupReady(data.setup) &&
             data.setup.next_action === "connect_client" &&
             data.hasChatToken === false && (
               <ConnectClientCard api={api} settings={settings} notify={notify} />
             )}
 
-          <MetricStrip metrics={metrics} />
-
-          {recentIgnores.length > 0 && (
-            <section className="panel panel--quiet ingest-skip-panel" aria-label="最近未写入记忆">
-              <div className="panel-header">
-                <h2>
-                  <ShieldAlert size={18} />
-                  最近未写入记忆
-                </h2>
-                <button className="ghost-button compact" type="button" onClick={() => setPage("logs")}>
-                  打开决策日志
-                </button>
-              </div>
-              <p className="muted ingest-skip-hint">
-                系统保守保存：不是所有对话都会落库。下面是最近几条被跳过的原因，便于确认「没记住」是设计而非故障。
-              </p>
-              <ul className="ingest-skip-list">
-                {recentIgnores.map((log) => (
-                  <li key={log.id}>
-                    <time dateTime={log.created_at}>{dateText(log.created_at)}</time>
-                    <span>{log.reason || "未记录原因"}</span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-
           <div className="studio-grid">
             <div className="studio-main">
-            <section className="panel surfaced-panel" aria-busy={surfaceLoading}>              <div className="panel-header">
+            <section className="panel surfaced-panel" aria-busy={surfaceLoading}>
+              <div className="panel-header">
                 <h2>
                   <Sparkles size={18} />
                   浮现记忆
@@ -564,7 +549,6 @@ export function DashboardPage({
                   ))}
                 </div>
               )}
-              <VitalityTrack memories={data.surfaced} loading={surfaceLoading} />
             </section>
 
             <section className="panel panel--quiet spaces-panel">
@@ -580,45 +564,43 @@ export function DashboardPage({
               <SpaceOverview spaces={data.spaces} onOpenMemories={() => setPage("memories")} />
             </section>
             </div>
-
-            <div className="studio-side">
-              <section className="panel panel--quiet emotion-panel">
-              <div className="panel-header">
-                <h2>
-                  <Brain size={18} />
-                  情绪分布
-                </h2>
-              </div>
-              {emotion ? (
-                <>
-                  <EmotionQuadrant valence={emotion.valence} arousal={emotion.arousal} />
-                  <div className="emotion-stats">
-                    <div>
-                      <span>平均正向度</span>
-                      <strong>{percent(emotion.valence)}</strong>
-                    </div>
-                    <div>
-                      <span>平均唤起度</span>
-                      <strong>{percent(emotion.arousal)}</strong>
-                    </div>
-                    <div>
-                      <span>偏积极</span>
-                      <strong>{emotion.positive}</strong>
-                    </div>
-                    <div>
-                      <span>高唤起</span>
-                      <strong>{emotion.highArousal}</strong>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <EmptyBlock label="暂无记忆节点，无法统计情绪分布" compact />
-              )}
-            </section>
-            </div>
           </div>
 
-          <section className="panel panel--quiet network-panel">
+          <details className="panel studio-explore">
+            <summary>探索情绪、网络与计数</summary>
+            <MetricStrip metrics={metrics} />
+            <div className="studio-explore-grid">
+              <section className="emotion-panel" aria-label="情绪分布">
+                <h3>情绪分布</h3>
+                {emotion ? (
+                  <>
+                    <EmotionQuadrant valence={emotion.valence} arousal={emotion.arousal} />
+                    <div className="emotion-stats">
+                      <div>
+                        <span>平均正向度</span>
+                        <strong>{percent(emotion.valence)}</strong>
+                      </div>
+                      <div>
+                        <span>平均唤起度</span>
+                        <strong>{percent(emotion.arousal)}</strong>
+                      </div>
+                      <div>
+                        <span>偏积极</span>
+                        <strong>{emotion.positive}</strong>
+                      </div>
+                      <div>
+                        <span>高唤起</span>
+                        <strong>{emotion.highArousal}</strong>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <EmptyBlock label="暂无记忆节点，无法统计情绪分布" compact />
+                )}
+              </section>
+              <VitalityTrack memories={data.surfaced} loading={surfaceLoading} />
+            </div>
+          <section className="network-panel">
             <div className="panel-header network-panel-header">
               <h2>记忆网络</h2>
               <div className="network-header-actions">
@@ -668,10 +650,37 @@ export function DashboardPage({
                 spaces={data.spaces}
                 api={api}
                 onOpenMemory={() => selectedNode && openMemory(selectedNode.id)}
-                onDeveloper={() => setPage("developer")}
+                onBrowseMemories={() => setPage("memories")}
               />
             </div>
           </section>
+          </details>
+
+          {recentIgnores.length > 0 && (
+            <section className="panel panel--quiet ingest-skip-panel" aria-label="最近未写入记忆">
+              <div className="panel-header">
+                <h2>
+                  <ShieldAlert size={18} />
+                  最近未写入记忆
+                </h2>
+                <button className="ghost-button compact" type="button" onClick={() => setPage("logs")}>
+                  打开决策日志
+                </button>
+              </div>
+              <p className="muted ingest-skip-hint">
+                系统保守保存：不是所有对话都会落库。下面是最近几条被跳过的原因，便于确认「没记住」是设计而非故障。
+              </p>
+              <ul className="ingest-skip-list">
+                {recentIgnores.map((log) => (
+                  <li key={log.id}>
+                    <time dateTime={log.created_at}>{dateText(log.created_at)}</time>
+                    {/* 展示白话翻译；原始审计文本在决策日志页可查 */}
+                    <span>{friendlyIngestSkipReason(log.reason || "")}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
         </>
       )}
     </div>
@@ -909,13 +918,13 @@ function NetworkDetail({
   spaces,
   api,
   onOpenMemory,
-  onDeveloper
+  onBrowseMemories
 }: {
   node: MemoryNetworkNode | null;
   spaces: MemorySpace[];
   api: MemoryApi;
   onOpenMemory: () => void;
-  onDeveloper: () => void;
+  onBrowseMemories: () => void;
 }) {
   const [traverse, setTraverse] = useState<{
     loading: boolean;
@@ -933,9 +942,8 @@ function NetworkDetail({
         <strong>节点档案</strong>
         <p>关系、正文和情绪线索会在这里展开。</p>
         <div className="button-row">
-          <button className="secondary-button compact" type="button" onClick={onDeveloper}>
-            <Wrench size={15} />
-            接入
+          <button className="secondary-button compact" type="button" onClick={onBrowseMemories}>
+            打开记忆库
           </button>
         </div>
       </aside>
@@ -1087,6 +1095,54 @@ function EmotionQuadrant({ valence, arousal }: { valence: number; arousal: numbe
   );
 }
 
+function SetupNextStepCard({
+  setup,
+  onConfigureModel
+}: {
+  setup: NonNullable<DashboardData["setup"]>;
+  onConfigureModel: () => void;
+}) {
+  const isRepair = setup.next_action === "repair_model_gateway" || setup.state === "configuration_error";
+  return (
+    <section className="panel connect-client-panel" aria-labelledby="setup-next-step-title">
+      <div className="panel-header">
+        <h2 id="setup-next-step-title">
+          <Wrench size={18} />
+          {isRepair ? "修复模型网关配置" : "下一步：配置模型渠道"}
+        </h2>
+      </div>
+      <p className="muted">
+        {isRepair
+          ? "记忆服务在线，但与 Model Gateway 的接线或路由配置有问题。到「模型与路由」用 credentials/admin.txt（旧版 admin.key）解锁并按提示修复后，才能正常聊天。"
+          : "你已登录 Console。还差一步：用安装时保存的 credentials/admin.txt（旧版 admin.key）解锁「模型与路由」，添加渠道并选择聊天模型。完成后回到这里生成 chat token。"}
+      </p>
+      {!isRepair && setup.missing_chat_routes?.length > 0 && (
+        <p className="muted">
+          尚未就绪的用途路由：
+          <code>{setup.missing_chat_routes.join(", ")}</code>
+        </p>
+      )}
+      <div className="provider-wizard-actions">
+        <button type="button" className="primary-button" onClick={onConfigureModel}>
+          <SlidersHorizontal size={16} aria-hidden />
+          {isRepair ? "打开模型与路由" : "去配置模型渠道"}
+        </button>
+      </div>
+      <ol className="muted setup-key-legend">
+        <li>
+          <strong>gateway.txt</strong>：登录本网页的 Console token（你已经在用；旧安装可能是 gateway.key）
+        </li>
+        <li>
+          <strong>admin.txt</strong>：只在「模型与路由」页粘贴，用于改渠道与路由
+        </li>
+        <li>
+          <strong>chat token</strong>：模型就绪后在本页生成，填进 Chatbox 等客户端
+        </li>
+      </ol>
+    </section>
+  );
+}
+
 function ConnectClientCard({
   api,
   settings,
@@ -1194,7 +1250,7 @@ function ConnectClientCard({
 
 function buildStudioActions(data: DashboardData): StudioAction[] {
   const list: StudioAction[] = [];
-  if (data.setup && !data.setup.chat_ready) {
+  if (data.setup && !isProviderSetupReady(data.setup)) {
     list.push({
       key: "model-setup",
       tone: "warning",

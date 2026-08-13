@@ -22,6 +22,13 @@ import httpx
 
 from app.api.deps import get_settings, require_api_key
 from app.config import Settings
+from app.llm.embedding_contract import (
+    embedding_contract_mode,
+    invalidate_embedding_contract,
+    refresh_embedding_contract,
+    resolve_embedding_contract,
+    set_embedding_contract_failure,
+)
 from app.llm.runtime import (
     ModelRuntime,
     ModelRuntimeConfigurationError,
@@ -39,6 +46,7 @@ _LIVE_PROBE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _LIVE_PROBE_INFLIGHT: dict[str, "asyncio.Task[dict[str, Any]]"] = {}
 _LIVE_PROBE_TTL_SECONDS = 60.0
 _LIVE_PROBE_TIMEOUT_SECONDS = 12.0
+_MAX_CONTROL_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 ROUTE_DESCRIPTIONS: dict[str, str] = {
@@ -88,7 +96,7 @@ async def providers_status(
     try:
         model_runtime = resolve_model_runtime(settings)
     except ModelRuntimeConfigurationError as exc:
-        payload = _invalid_runtime_status(str(exc))
+        payload = _invalid_runtime_status(str(exc), settings)
         model_runtime = None
     else:
         payload = await _model_gateway_status(settings, model_runtime)
@@ -185,6 +193,25 @@ async def discover_provider_channel(
         admin_key=admin_key,
         method="POST",
         path="/admin/channels/discover",
+        payload=payload,
+    )
+
+
+@router.post("/channels/probe-capabilities")
+async def probe_provider_channel_capabilities(
+    payload: dict[str, Any],
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin_key: Annotated[
+        str | None,
+        Header(alias="X-Model-Gateway-Admin-Key"),
+    ] = None,
+) -> JSONResponse:
+    """Proxy live capability probes; Model Gateway never persists the secret."""
+    return await _proxy_admin_request(
+        settings=settings,
+        admin_key=admin_key,
+        method="POST",
+        path="/admin/channels/probe-capabilities",
         payload=payload,
     )
 
@@ -416,6 +443,12 @@ async def _model_gateway_status(
             base_url=model_runtime.base_url,
         )
     except httpx.HTTPError as exc:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code="model_gateway_unavailable",
+        )
+        model_runtime = resolve_model_runtime(settings)
         return {
             "runtime": runtime,
             "embedding": _runtime_embedding_status(model_runtime),
@@ -428,6 +461,16 @@ async def _model_gateway_status(
             ),
         }
     if not response.is_success:
+        set_embedding_contract_failure(
+            settings,
+            state="unavailable",
+            code=(
+                "model_gateway_backend_auth_failed"
+                if response.status_code in {401, 403}
+                else "model_gateway_control_unavailable"
+            ),
+        )
+        model_runtime = resolve_model_runtime(settings)
         detail, _ = _remote_error(response)
         return {
             "runtime": runtime,
@@ -437,9 +480,30 @@ async def _model_gateway_status(
             "control": None,
             "config_error": f"独立 Model Gateway 拒绝读取配置：{detail}",
         }
+    if len(response.content) > _MAX_CONTROL_RESPONSE_BYTES:
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
+        model_runtime = resolve_model_runtime(settings)
+        return {
+            "runtime": runtime,
+            "embedding": _runtime_embedding_status(model_runtime),
+            "providers": [],
+            "routes": [],
+            "control": None,
+            "config_error": "独立 Model Gateway 配置接口响应过大",
+        }
     try:
         control = response.json()
     except ValueError:
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
+        model_runtime = resolve_model_runtime(settings)
         return {
             "runtime": runtime,
             "embedding": _runtime_embedding_status(model_runtime),
@@ -449,6 +513,12 @@ async def _model_gateway_status(
             "config_error": "独立 Model Gateway 配置接口返回了无效 JSON",
         }
     if not isinstance(control, dict):
+        set_embedding_contract_failure(
+            settings,
+            state="invalid",
+            code="model_gateway_invalid_response",
+        )
+        model_runtime = resolve_model_runtime(settings)
         return {
             "runtime": runtime,
             "embedding": _runtime_embedding_status(model_runtime),
@@ -457,6 +527,8 @@ async def _model_gateway_status(
             "control": None,
             "config_error": "独立 Model Gateway 配置接口返回格式无效",
         }
+    resolve_embedding_contract(settings, control)
+    model_runtime = resolve_model_runtime(settings)
     return _status_from_control(runtime, control, model_runtime)
 
 
@@ -527,6 +599,7 @@ def _status_from_control(
                 and connection
                 and connection.get("enabled", True)
                 and connection.get("configured")
+                and connection.get("usage_scope") == "backend_allowed"
             )
             targets.append(
                 {
@@ -553,34 +626,6 @@ def _status_from_control(
         )
 
     embedding = _runtime_embedding_status(model_runtime)
-    embedding_route = next(
-        (
-            route
-            for route in routes
-            if isinstance(route, dict)
-            and route.get("kind") == "embedding"
-            and route.get("id") == model_runtime.embedding.model
-        ),
-        None,
-    )
-    if embedding_route and embedding_route.get("targets"):
-        deployment = deployment_by_id.get(str(embedding_route["targets"][0]))
-        if deployment:
-            embedding = {
-                **embedding,
-                "model": str(deployment.get("upstream_model") or embedding_route.get("id") or ""),
-                "base_url": model_runtime.base_url,
-                "dimensions": int(
-                    deployment.get("dimensions")
-                    or model_runtime.embedding.dimensions
-                ),
-                "configured": model_runtime.embedding.enabled
-                and bool(
-                    connection_by_id.get(
-                        str(deployment.get("connection") or ""), {}
-                    ).get("configured")
-                ),
-            }
 
     return {
         "runtime": runtime,
@@ -595,16 +640,19 @@ def _status_from_control(
 def _runtime_embedding_status(model_runtime: ModelRuntime) -> dict[str, Any]:
     embedding = model_runtime.embedding
     return {
-        "model": embedding.model,
+        "model": embedding.status_model or embedding.model,
         "base_url": embedding.base_url,
         "dimensions": embedding.dimensions,
         "configured": embedding.enabled,
         "space_id": embedding.space_id,
         "model_gateway_mode": embedding.model_gateway_mode,
+        "mode": embedding.mode,
+        "state": embedding.state,
+        "code": embedding.code,
     }
 
 
-def _invalid_runtime_status(error: str) -> dict[str, Any]:
+def _invalid_runtime_status(error: str, settings: Settings) -> dict[str, Any]:
     return {
         "runtime": {
             "model_gateway_enabled": False,
@@ -623,6 +671,9 @@ def _invalid_runtime_status(error: str) -> dict[str, Any]:
             "configured": False,
             "space_id": "",
             "model_gateway_mode": False,
+            "mode": embedding_contract_mode(settings),
+            "state": "unavailable",
+            "code": "model_runtime_configuration_error",
         },
         "providers": [],
         "routes": [],
@@ -657,7 +708,16 @@ def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
     missing = [route_id for route_id in required_routes if route_id not in usable]
     config_error = str(payload.get("config_error") or "")
     model_gateway_connected = bool(runtime.get("model_gateway_enabled"))
-    if config_error:
+    embedding = (
+        payload.get("embedding")
+        if isinstance(payload.get("embedding"), dict)
+        else {}
+    )
+    embedding_error = str(embedding.get("state") or "unavailable") in {
+        "invalid",
+        "unavailable",
+    }
+    if config_error or embedding_error:
         state = "configuration_error"
         next_action = "repair_model_gateway"
     elif missing:
@@ -668,7 +728,7 @@ def _setup_summary(payload: dict[str, Any]) -> dict[str, Any]:
         next_action = "connect_client"
     return {
         "state": state,
-        "service_ready": not config_error,
+        "service_ready": not config_error and not embedding_error,
         "model_gateway_connected": model_gateway_connected,
         "chat_ready": not missing and not config_error,
         "required_chat_routes": required_routes,
@@ -857,7 +917,15 @@ async def _proxy_admin_request(
     if not normalized_key:
         return JSONResponse(
             status_code=401,
-            content={"detail": "请输入 Model Gateway admin 客户端密钥后再执行配置操作"},
+            content={
+                "detail": {
+                    "message": (
+                        "请输入 Model Gateway admin 客户端密钥后再执行配置操作"
+                        "（credentials/admin.txt；与登录网页的 Console token 不是同一把钥匙）"
+                    ),
+                    "code": "admin_key_required",
+                }
+            },
         )
     if not _admin_transport_is_safe(
         model_runtime.base_url,
@@ -873,15 +941,32 @@ async def _proxy_admin_request(
                 )
             },
         )
+    mutates_configuration = _is_configuration_mutation(method, path)
+    if mutates_configuration:
+        invalidate_embedding_contract(settings)
     try:
-        response = await _model_gateway_control_request(
-            settings=settings,
-            method=method,
-            path=path,
-            api_key=normalized_key,
-            payload=payload,
-            base_url=model_runtime.base_url,
-        )
+        try:
+            response = await _model_gateway_control_request(
+                settings=settings,
+                method=method,
+                path=path,
+                api_key=normalized_key,
+                payload=payload,
+                base_url=model_runtime.base_url,
+            )
+        finally:
+            if mutates_configuration:
+                # The write may have reached Model Gateway even when its
+                # response was lost. Refresh with the separate backend key;
+                # never reuse the user-supplied admin credential here.
+                try:
+                    await refresh_embedding_contract(settings)
+                except Exception:
+                    set_embedding_contract_failure(
+                        settings,
+                        state="unavailable",
+                        code="model_gateway_control_unavailable",
+                    )
     except httpx.HTTPError as exc:
         return JSONResponse(
             status_code=502,
@@ -902,10 +987,29 @@ async def _proxy_admin_request(
             )
         return JSONResponse(status_code=response.status_code, content=data)
     message, code = _remote_error(response)
+    if response.status_code == 401 and not code:
+        code = "admin_auth_failed"
+        if not message or message.upper().startswith("HTTP "):
+            message = (
+                "Model Gateway 拒绝了 admin 密钥。"
+                "请确认粘贴的是 credentials/admin.txt，"
+                "而不是登录网页用的 Console token（gateway.txt）"
+            )
     detail: dict[str, Any] = {"message": message}
     if code:
         detail["code"] = code
     return JSONResponse(status_code=response.status_code, content={"detail": detail})
+
+
+def _is_configuration_mutation(method: str, path: str) -> bool:
+    normalized_method = method.upper()
+    if normalized_method in {"PUT", "PATCH", "DELETE"}:
+        return True
+    return normalized_method == "POST" and path in {
+        "/admin/channel-bundles/apply",
+        "/admin/connections",
+        "/admin/deployments",
+    }
 
 
 async def _model_gateway_control_request(
@@ -979,4 +1083,23 @@ def _remote_error(response: httpx.Response) -> tuple[str, str]:
     detail = payload.get("detail")
     if isinstance(detail, str):
         return detail, ""
+    if isinstance(detail, dict) and detail.get("message"):
+        return str(detail["message"]), str(detail.get("code") or "")
+    # Channel discovery returns valid/persisted/report without an error envelope.
+    if payload.get("persisted") is False and isinstance(payload.get("report"), dict):
+        connections = payload["report"].get("connections")
+        if isinstance(connections, list) and connections:
+            first = connections[0]
+            if isinstance(first, dict):
+                conn_detail = first.get("detail") or first.get("status")
+                if conn_detail:
+                    return (
+                        str(conn_detail),
+                        str(first.get("status") or "channel_discovery_failed"),
+                    )
+        if payload.get("valid") is False:
+            return (
+                "渠道只读发现未通过（密钥、地址、网络或 /models 响应有问题）",
+                "channel_discovery_failed",
+            )
     return f"HTTP {response.status_code}", ""

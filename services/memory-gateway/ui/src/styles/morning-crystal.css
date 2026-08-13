@@ -79,7 +79,7 @@ button {
 /* 层级侧栏：分区 caption + 页面条目 + 待办角标 */
 .sidebar {
   position: fixed;
-  z-index: 80;
+  z-index: var(--z-sidebar);
   top: 16px;
   bottom: 16px;
   left: 16px;
@@ -144,7 +144,7 @@ button {
 
 .brand-copy span {
   color: var(--crystal-muted);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   letter-spacing: 0.1em;
 }
 
@@ -165,10 +165,52 @@ button {
 .nav-group-label {
   padding: 0 8px 5px;
   color: var(--crystal-muted);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 750;
   letter-spacing: 0.16em;
   text-transform: uppercase;
+}
+
+/* 专家模式分组可折叠：label 变成按钮，含当前页的分组不折叠 */
+.nav-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-group-toggle > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.nav-group-toggle svg {
+  flex: none;
+  opacity: 0.55;
+  transform: rotate(-90deg);
+  transition: transform var(--t-fast) var(--ease);
+}
+
+.nav-group-toggle svg.open {
+  transform: rotate(0deg);
+}
+
+.nav-group-toggle:hover {
+  color: var(--sidebar-text);
+}
+
+/* 折叠时如果组内有待办信号，用一个小点提示 */
+.nav-group-signal {
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--warning);
 }
 
 .nav-item {
@@ -243,7 +285,7 @@ button {
   min-width: 20px;
   padding: 1px 6px;
   border-radius: 999px;
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   font-style: normal;
   font-weight: 750;
   text-align: center;
@@ -284,7 +326,7 @@ button {
 
 .topbar {
   position: relative;
-  z-index: 50;
+  z-index: var(--z-sticky);
   display: flex;
   min-height: 72px;
   align-items: center;
@@ -330,7 +372,7 @@ button {
 
 .topbar-title > span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 750;
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -426,7 +468,7 @@ button {
 .page-eyebrow,
 .panel-kicker {
   color: var(--primary);
-  font-size: 10px;
+  font-size: var(--text-micro);
   letter-spacing: 0.16em;
 }
 
@@ -743,10 +785,9 @@ button {
   color: var(--success);
 }
 
-/* 浮现主区 + 右侧辅助栏 */
 .studio-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.7fr);
+  grid-template-columns: 1fr;
   gap: 16px;
   align-items: start;
 }
@@ -870,9 +911,8 @@ button {
   fill: var(--muted-strong);
 }
 
-/* 统一浮层：拉开景深，后面的世界退成雾 */
+/* 统一浮层：拉开景深，后面的世界退成雾（z-index 由 components.css 的 --z-modal 提供） */
 .modal-backdrop {
-  z-index: 180;
   padding: 24px;
   background: rgba(9, 6, 12, 0.52);
   backdrop-filter: blur(12px) saturate(1.1);
@@ -885,10 +925,10 @@ button {
   to { opacity: 1; }
 }
 
-/* 记忆档案：导航第三级。右侧抽屉，永久删除确认弹窗（180）浮于其上。 */
+/* 记忆档案：导航第三级。右侧抽屉，永久删除确认弹窗（--z-modal）浮于其上。 */
 .memory-profile-layer {
   position: fixed;
-  z-index: 150;
+  z-index: var(--z-scrim);
   inset: 0;
 }
 
@@ -968,7 +1008,7 @@ button {
   border-radius: 999px;
   background: rgba(227, 154, 166, 0.14);
   color: var(--danger);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-style: normal;
   letter-spacing: 0.06em;
 }
@@ -1204,7 +1244,6 @@ button {
 }
 
 .toast {
-  z-index: 220;
   border: 1px solid var(--crystal-border);
   border-radius: 14px;
   background: var(--crystal-bg);
@@ -1240,7 +1279,7 @@ button {
 
 .mobile-more-layer {
   position: fixed;
-  z-index: 190;
+  z-index: var(--z-sheet);
   inset: 0;
   display: grid;
   align-items: end;
@@ -1289,7 +1328,7 @@ button {
 
 .mobile-more-label {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 750;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -1501,7 +1540,7 @@ button {
 
   .mobile-bottom-nav {
     position: fixed;
-    z-index: 120;
+    z-index: var(--z-bottom-nav);
     right: 10px;
     bottom: max(10px, env(safe-area-inset-bottom));
     left: 10px;
@@ -1526,7 +1565,7 @@ button {
     border-radius: 14px;
     background: transparent;
     color: var(--muted);
-    font-size: 10px;
+    font-size: var(--text-micro);
   }
 
   .mobile-bottom-nav button.active {

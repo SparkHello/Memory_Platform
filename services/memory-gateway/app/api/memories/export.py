@@ -6,17 +6,22 @@ from functools import partial
 import os
 from pathlib import Path
 import tempfile
+import zipfile
 
 import anyio.to_thread
 import httpx
-from fastapi import Header
+from fastapi import File, Header, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from app.api.memories.common import *  # noqa: F403
 from app.cli_config import cli_paths
 from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
-from app.stack_backup import create_stack_backup, default_model_gateway_home
+from app.stack_backup import (
+    create_stack_backup,
+    default_model_gateway_home,
+    validate_stack_backup,
+)
 
 @router.get("/report", response_model=None)
 def get_memory_report(
@@ -204,6 +209,66 @@ async def download_stack_backup(
     finally:
         if override_cleanup is not None:
             override_cleanup.unlink(missing_ok=True)
+
+
+@router.post("/stack-backup/validate")
+async def validate_uploaded_stack_backup(
+    file: UploadFile = File(..., description="便携整栈备份 zip"),
+) -> dict:
+    """Dry-run validate a portable stack backup without writing production data.
+
+    Console-only (via /memories auth). Does not restore or stop services.
+    """
+    suffix = Path(file.filename or "backup.zip").suffix.lower()
+    if suffix and suffix != ".zip":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "stack_backup_invalid_type",
+                "message": "请上传 .zip 格式的整栈便携备份",
+            },
+        )
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="stack-backup-validate-",
+        suffix=".zip",
+        delete=False,
+    )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        try:
+            return await anyio.to_thread.run_sync(
+                partial(validate_stack_backup, archive_path=temp_path)
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "stack_backup_invalid",
+                    "message": str(exc),
+                    "ok": False,
+                    "restorable": False,
+                },
+            ) from exc
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "stack_backup_invalid",
+                    "message": "不是有效的 zip 备份文件",
+                    "ok": False,
+                    "restorable": False,
+                },
+            ) from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+        await file.close()
 
 
 async def _fetch_model_portable_config(

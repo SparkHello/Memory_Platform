@@ -280,6 +280,12 @@ def prepare_memory_space_import(
         return None
     source_id = str(data.get("id") or "").strip()
     now = utc_now_iso()
+    try:
+        sort_order = int(data.get("sort_order") or 0)
+    except (TypeError, ValueError):
+        sort_order = 0
+    color_raw = data.get("color")
+    description_raw = data.get("description")
     return {
         "source_id": source_id,
         "requested_id": source_id or new_memory_id(),
@@ -287,6 +293,9 @@ def prepare_memory_space_import(
         "normalized_name": display_name.casefold(),
         "created_at": str(data.get("created_at") or now),
         "archived": 1 if data.get("archived") else 0,
+        "color": str(color_raw).strip() if color_raw else None,
+        "description": str(description_raw).strip() if description_raw else None,
+        "sort_order": max(0, min(9999, sort_order)),
     }
 
 
@@ -368,6 +377,12 @@ def import_memory_space(
             ).fetchone()
             return "updated", store._row_to_memory_space(updated), old_id or space_id
 
+        try:
+            sort_order = int(data.get("sort_order") or 0)
+        except (TypeError, ValueError):
+            sort_order = 0
+        color = data.get("color")
+        description = data.get("description")
         space = MemorySpace(
             id=space_id,
             user_id=user_id,
@@ -376,13 +391,17 @@ def import_memory_space(
             created_at=str(data.get("created_at") or now),
             updated_at=now,
             archived=1 if data.get("archived") else 0,
+            color=str(color).strip() if color else None,
+            description=str(description).strip() if description else None,
+            sort_order=max(0, min(9999, sort_order)),
         )
         connection.execute(
             """
             INSERT INTO memory_spaces (
-                id, user_id, name, normalized_name, created_at, updated_at, archived
+                id, user_id, name, normalized_name, created_at, updated_at, archived,
+                color, description, sort_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 space.id,
@@ -392,6 +411,9 @@ def import_memory_space(
                 space.created_at,
                 space.updated_at,
                 space.archived,
+                space.color,
+                space.description,
+                space.sort_order,
             ),
         )
     return "created", space, old_id or space_id
@@ -819,6 +841,9 @@ def _plan_memory_space_imports_on_connection(
                         "normalized_name": normalized_name,
                         "updated_at": now,
                         "archived": int(prepared["archived"]),
+                        "color": prepared.get("color"),
+                        "description": prepared.get("description"),
+                        "sort_order": int(prepared.get("sort_order") or 0),
                     }
                 )
                 by_name.pop(old_normalized_name, None)
@@ -833,6 +858,9 @@ def _plan_memory_space_imports_on_connection(
                     created_at=str(prepared["created_at"]),
                     updated_at=now,
                     archived=int(prepared["archived"]),
+                    color=prepared.get("color"),
+                    description=prepared.get("description"),
+                    sort_order=int(prepared.get("sort_order") or 0),
                 )
                 action = "created"
                 operation = "insert"
@@ -864,9 +892,10 @@ def _apply_memory_space_import_plan_on_connection(
         connection.execute(
             """
             INSERT INTO memory_spaces (
-                id, user_id, name, normalized_name, created_at, updated_at, archived
+                id, user_id, name, normalized_name, created_at, updated_at, archived,
+                color, description, sort_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 space.id,
@@ -876,6 +905,9 @@ def _apply_memory_space_import_plan_on_connection(
                 space.created_at,
                 space.updated_at,
                 space.archived,
+                space.color,
+                space.description,
+                space.sort_order,
             ),
         )
     elif operation == "update_name":
@@ -891,7 +923,8 @@ def _apply_memory_space_import_plan_on_connection(
         connection.execute(
             """
             UPDATE memory_spaces
-            SET name = ?, normalized_name = ?, updated_at = ?, archived = ?
+            SET name = ?, normalized_name = ?, updated_at = ?, archived = ?,
+                color = ?, description = ?, sort_order = ?
             WHERE id = ? AND user_id = ?
             """,
             (
@@ -899,6 +932,9 @@ def _apply_memory_space_import_plan_on_connection(
                 space.normalized_name,
                 space.updated_at,
                 space.archived,
+                space.color,
+                space.description,
+                space.sort_order,
                 space.id,
                 user_id,
             ),

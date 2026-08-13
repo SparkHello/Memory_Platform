@@ -24,7 +24,6 @@ from model_gateway.models import (
     GatewayConfig,
     PricingConfig,
     PricingTier,
-    RESTRICTED_PLAN_TYPES,
 )
 from model_gateway.proxy import prepare_payload
 from model_gateway.routing import RouteTarget
@@ -730,8 +729,6 @@ def _validate_research_deployment(
         raise PricingResearchError("research deployment 必须是 chat 类型")
     if not researcher.enabled or not connection.enabled:
         raise PricingResearchError("research deployment 与 connection 必须已启用")
-    if connection.billing_plan.type in RESTRICTED_PLAN_TYPES:
-        raise PricingResearchError("Token/Coding/direct_tool_only 套餐不得用于价格研究")
     if connection.usage_scope != "backend_allowed":
         raise PricingResearchError(
             f"research deployment {deployment_id} 不是 backend_allowed"

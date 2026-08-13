@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from model_gateway.admin import (
     BundleApplyRequest,
     CandidateDiscoverRequest,
+    CapabilityProbeRequest,
     ConnectionCreateRequest,
     DeploymentApplyRequest,
     EnabledUpdateRequest,
@@ -29,6 +30,11 @@ from model_gateway.admin import (
     deployment_candidate,
     public_configuration,
     route_candidate,
+)
+from model_gateway.capability_probe import (
+    build_probe_connection,
+    build_probe_deployment,
+    probe_chat_capabilities,
 )
 from model_gateway.auth import (
     AuthenticationError,
@@ -686,6 +692,76 @@ def create_app(
             status_code=200 if _candidate_discovery_ok(report) else 400,
         )
 
+    @app.post("/admin/channels/probe-capabilities")
+    async def probe_admin_candidate_capabilities(request: Request) -> Response:
+        """Run cheap live probes; never persists connection or secret."""
+        try:
+            config, secrets = await manager.snapshot_async()
+            client = _authenticate(request, config=config, secrets=secrets)
+        except ConfigError:
+            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
+        except AuthenticationError as exc:
+            return _error(401, str(exc))
+        forbidden = _require_admin(client)
+        if forbidden is not None:
+            return forbidden
+        payload = await _validated_admin_body(
+            request,
+            limit=config.server.body_limit_bytes,
+            model=CapabilityProbeRequest,
+            label="能力探测",
+            detail_fields=True,
+        )
+        if isinstance(payload, Response):
+            return payload
+        if payload.revision != configuration_revision(paths.config):
+            return _config_stale_error()
+        try:
+            connection = build_probe_connection(
+                channel_operator=payload.channel_operator,
+                base_url=payload.base_url,
+                adapter=payload.adapter,
+                auth_type=payload.auth_type,
+                allowed_private_networks=list(payload.allowed_private_networks),
+            )
+            deployment = build_probe_deployment(
+                connection_id="capability-probe",
+                upstream_model=payload.upstream_model,
+            )
+            graph = config.model_dump(mode="python", exclude_none=False)
+            graph["connections"] = {
+                **graph["connections"],
+                "capability-probe": connection.model_dump(
+                    mode="python", exclude_none=False
+                ),
+            }
+            probe_config = GatewayConfig.model_validate(graph)
+            probe_secrets = dict(secrets)
+            probe_secrets[connection.auth.secret_ref] = payload.candidate_key
+            validate_secret_domains(config=probe_config, secrets=probe_secrets)
+        except (ValueError, ValidationError) as exc:
+            return _error(
+                400,
+                "能力探测草稿未通过安全校验：" + _safe_validation_message(exc),
+                error_type="model_gateway_config_invalid",
+            )
+        result = await probe_chat_capabilities(
+            connection=connection,
+            deployment=deployment,
+            secret=payload.candidate_key,
+            probes=tuple(payload.probes),  # type: ignore[arg-type]
+            timeout_seconds=25.0,
+            transport=transport,
+        )
+        return JSONResponse(
+            {
+                "persisted": False,
+                "revision": payload.revision,
+                "upstream_model": payload.upstream_model,
+                **result,
+            }
+        )
+
     @app.post("/admin/channel-bundles/validate")
     @app.post("/admin/bundles/validate")
     async def validate_admin_bundle(request: Request) -> Response:
@@ -720,9 +796,14 @@ def create_app(
         if payload.revision != configuration_revision(paths.config):
             return _config_stale_error()
         try:
-            candidate, connection_id, secret_ref, deployment_ids, changed_routes = (
-                bundle_candidate(config, payload)
-            )
+            (
+                candidate,
+                connection_id,
+                secret_ref,
+                deployment_ids,
+                changed_routes,
+                embedding_connection_id,
+            ) = bundle_candidate(config, payload)
             candidate_secrets = dict(secrets)
             candidate_secrets[secret_ref] = payload.connection.secret
             validate_secret_domains(config=candidate, secrets=candidate_secrets)
@@ -761,11 +842,14 @@ def create_app(
             manager.force_reload()
             revision = commit.revision
             router.runtime_health.clear_connection(connection_id, deployment_ids)
+            if embedding_connection_id != connection_id:
+                router.runtime_health.clear_connection(embedding_connection_id)
         return JSONResponse(
             {
                 "valid": True,
                 "applied": apply,
                 "connection_id": connection_id,
+                "embedding_connection_id": embedding_connection_id,
                 "deployment_ids": deployment_ids,
                 "changed_routes": changed_routes,
                 "revision": revision,

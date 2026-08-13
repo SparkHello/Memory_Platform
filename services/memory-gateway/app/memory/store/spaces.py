@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import re
 import sqlite3
 from typing import TYPE_CHECKING, Any
 
@@ -12,6 +13,42 @@ from app.memory.store.helpers import _ordered_unique
 
 if TYPE_CHECKING:
     from app.memory.store._monolith import MemoryStore
+
+_SPACE_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_SPACE_DESCRIPTION_MAX = 500
+_SPACE_SORT_ORDER_MAX = 9999
+
+
+def normalize_space_color(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if not _SPACE_COLOR_RE.fullmatch(text):
+        raise ValueError("color 须为 #RRGGBB 十六进制颜色，或留空")
+    return text.upper()
+
+
+def normalize_space_description(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > _SPACE_DESCRIPTION_MAX:
+        raise ValueError(f"description 最多 {_SPACE_DESCRIPTION_MAX} 个字符")
+    return text
+
+
+def normalize_space_sort_order(value: int | None) -> int:
+    if value is None:
+        return 0
+    order = int(value)
+    if order < 0 or order > _SPACE_SORT_ORDER_MAX:
+        raise ValueError(f"sort_order 须在 0..{_SPACE_SORT_ORDER_MAX}")
+    return order
+
 
 def upsert_memory_space(store: MemoryStore, *, user_id: str, name: str) -> MemorySpace:
     display_name = normalize_classification_name(name, field_name="space")
@@ -62,13 +99,17 @@ def _upsert_memory_space_on_connection(
         created_at=now,
         updated_at=now,
         archived=0,
+        color=None,
+        description=None,
+        sort_order=0,
     )
     connection.execute(
         """
         INSERT INTO memory_spaces (
-            id, user_id, name, normalized_name, created_at, updated_at, archived
+            id, user_id, name, normalized_name, created_at, updated_at, archived,
+            color, description, sort_order
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             space.id,
@@ -78,9 +119,219 @@ def _upsert_memory_space_on_connection(
             space.created_at,
             space.updated_at,
             space.archived,
+            space.color,
+            space.description,
+            space.sort_order,
         ),
     )
     return space
+
+
+def create_memory_space(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    name: str,
+    color: str | None = None,
+    description: str | None = None,
+    sort_order: int | None = None,
+) -> MemorySpace:
+    display_name = normalize_classification_name(name, field_name="space")
+    color_value = normalize_space_color(color)
+    description_value = normalize_space_description(description)
+    order_value = normalize_space_sort_order(sort_order)
+    now = utc_now_iso()
+    with store._connect() as connection:
+        existing = connection.execute(
+            """
+            SELECT id FROM memory_spaces
+            WHERE user_id = ? AND normalized_name = ?
+            """,
+            (user_id, display_name.casefold()),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError("同名空间已存在")
+        space = MemorySpace(
+            id=new_memory_id(),
+            user_id=user_id,
+            name=display_name,
+            normalized_name=display_name.casefold(),
+            created_at=now,
+            updated_at=now,
+            archived=0,
+            color=color_value,
+            description=description_value,
+            sort_order=order_value,
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_spaces (
+                id, user_id, name, normalized_name, created_at, updated_at, archived,
+                color, description, sort_order
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                space.id,
+                space.user_id,
+                space.name,
+                space.normalized_name,
+                space.created_at,
+                space.updated_at,
+                space.archived,
+                space.color,
+                space.description,
+                space.sort_order,
+            ),
+        )
+        return space
+
+
+def update_memory_space(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    space_id: str,
+    name: str | None = None,
+    color: str | None = None,
+    description: str | None = None,
+    sort_order: int | None = None,
+    update_name: bool = False,
+    update_color: bool = False,
+    update_description: bool = False,
+    update_sort_order: bool = False,
+) -> MemorySpace | None:
+    """Update space metadata. Only fields with update_*=True are written."""
+    with store._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM memory_spaces
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, space_id),
+        ).fetchone()
+        if row is None:
+            return None
+        current = store._row_to_memory_space(row)
+        display_name = current.name
+        normalized_name = current.normalized_name
+        if update_name:
+            if name is None or not str(name).strip():
+                raise ValueError("name 不能为空")
+            display_name = normalize_classification_name(name, field_name="space")
+            normalized_name = display_name.casefold()
+            clash = connection.execute(
+                """
+                SELECT id FROM memory_spaces
+                WHERE user_id = ? AND normalized_name = ? AND id != ?
+                """,
+                (user_id, normalized_name, space_id),
+            ).fetchone()
+            if clash is not None:
+                raise ValueError("同名空间已存在")
+        next_color = (
+            normalize_space_color(color) if update_color else current.color
+        )
+        next_description = (
+            normalize_space_description(description)
+            if update_description
+            else current.description
+        )
+        next_order = (
+            normalize_space_sort_order(sort_order)
+            if update_sort_order
+            else current.sort_order
+        )
+        now = utc_now_iso()
+        connection.execute(
+            """
+            UPDATE memory_spaces
+            SET name = ?, normalized_name = ?, color = ?, description = ?,
+                sort_order = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                display_name,
+                normalized_name,
+                next_color,
+                next_description,
+                next_order,
+                now,
+                space_id,
+                user_id,
+            ),
+        )
+        updated = connection.execute(
+            "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
+            (space_id, user_id),
+        ).fetchone()
+        return store._row_to_memory_space(updated) if updated else None
+
+
+def set_memory_space_archived(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    space_id: str,
+    archived: bool,
+) -> MemorySpace | None:
+    with store._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id FROM memory_spaces
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, space_id),
+        ).fetchone()
+        if row is None:
+            return None
+        now = utc_now_iso()
+        connection.execute(
+            """
+            UPDATE memory_spaces
+            SET archived = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (1 if archived else 0, now, space_id, user_id),
+        )
+        updated = connection.execute(
+            "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
+            (space_id, user_id),
+        ).fetchone()
+        return store._row_to_memory_space(updated) if updated else None
+
+
+def delete_memory_space(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    space_id: str,
+) -> str:
+    """Delete an empty space. Returns 'deleted', 'not_found', or 'not_empty'."""
+    with store._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id FROM memory_spaces
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, space_id),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        link_count = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM memory_space_links
+            WHERE user_id = ? AND space_id = ?
+            """,
+            (user_id, space_id),
+        ).fetchone()
+        if int(link_count["n"] if link_count else 0) > 0:
+            return "not_empty"
+        connection.execute(
+            "DELETE FROM memory_spaces WHERE user_id = ? AND id = ?",
+            (user_id, space_id),
+        )
+        return "deleted"
 
 
 def list_memory_spaces(
@@ -93,16 +344,22 @@ def list_memory_spaces(
     params: list[object] = [user_id]
     if not include_archived:
         query += " AND archived = 0"
-    query += " ORDER BY updated_at DESC, name ASC"
+    query += " ORDER BY sort_order ASC, name ASC, updated_at DESC"
     with store._connect() as connection:
         rows = connection.execute(query, params).fetchall()
     return [store._row_to_memory_space(row) for row in rows]
 
 
-def list_memory_space_summaries(store: MemoryStore, *, user_id: str) -> list[dict]:
+def list_memory_space_summaries(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    include_archived: bool = False,
+) -> list[dict]:
+    archived_clause = "" if include_archived else "AND s.archived = 0"
     with store._connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 s.*,
                 COUNT(m.id) AS active_memory_count,
@@ -114,9 +371,9 @@ def list_memory_space_summaries(store: MemoryStore, *, user_id: str) -> list[dic
                 ON m.user_id = s.user_id
                 AND m.id = l.memory_id
                 AND m.archived = 0
-            WHERE s.user_id = ? AND s.archived = 0
+            WHERE s.user_id = ? {archived_clause}
             GROUP BY s.id
-            ORDER BY active_memory_count DESC, s.updated_at DESC, s.name ASC
+            ORDER BY s.sort_order ASC, active_memory_count DESC, s.name ASC
             """,
             (user_id,),
         ).fetchall()
@@ -130,15 +387,30 @@ def list_memory_space_summaries(store: MemoryStore, *, user_id: str) -> list[dic
     return summaries
 
 
-def get_memory_space(store: MemoryStore, *, user_id: str, space_id: str) -> MemorySpace | None:
+def get_memory_space(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    space_id: str,
+    include_archived: bool = False,
+) -> MemorySpace | None:
     with store._connect() as connection:
-        row = connection.execute(
-            """
-            SELECT * FROM memory_spaces
-            WHERE user_id = ? AND id = ? AND archived = 0
-            """,
-            (user_id, space_id),
-        ).fetchone()
+        if include_archived:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_spaces
+                WHERE user_id = ? AND id = ?
+                """,
+                (user_id, space_id),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_spaces
+                WHERE user_id = ? AND id = ? AND archived = 0
+                """,
+                (user_id, space_id),
+            ).fetchone()
     return store._row_to_memory_space(row) if row else None
 
 
@@ -366,6 +638,17 @@ def _validate_space_ids(
 
 
 def _row_to_memory_space(row: sqlite3.Row) -> MemorySpace:
-    return MemorySpace(**dict(row))
+    payload = dict(row)
+    # Tolerate pre-migration rows and NULL metadata.
+    if payload.get("color") is not None:
+        payload["color"] = str(payload["color"]) or None
+    if payload.get("description") is not None:
+        text = str(payload["description"]).strip()
+        payload["description"] = text or None
+    try:
+        payload["sort_order"] = int(payload.get("sort_order") or 0)
+    except (TypeError, ValueError):
+        payload["sort_order"] = 0
+    return MemorySpace(**payload)
 
 

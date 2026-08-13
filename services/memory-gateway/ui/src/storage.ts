@@ -5,6 +5,7 @@ const API_KEY_KEY = "memory-console.gatewayApiKey";
 const USER_ID_KEY = "memory-console.userId";
 const THEME_KEY = "memory-console.theme";
 const UI_MODE_KEY = "memory-console.uiMode";
+const NAV_COLLAPSED_KEY = "memory-console.navCollapsed";
 
 export type ThemeMode = "dark" | "light";
 export type UiMode = "simple" | "expert";
@@ -27,6 +28,19 @@ export function loadUiMode(): UiMode {
 
 export function saveUiMode(mode: UiMode) {
   localStorage.setItem(UI_MODE_KEY, mode);
+}
+
+export function loadCollapsedNavSections(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(NAV_COLLAPSED_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveCollapsedNavSections(keys: string[]) {
+  localStorage.setItem(NAV_COLLAPSED_KEY, JSON.stringify(keys));
 }
 
 export function normalizeBaseUrl(value: string): string {

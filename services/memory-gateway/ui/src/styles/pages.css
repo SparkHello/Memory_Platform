@@ -69,8 +69,35 @@
 
 .studio-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+  grid-template-columns: 1fr;
   gap: 16px;
+}
+
+.studio-explore {
+  display: grid;
+  gap: 16px;
+}
+
+.studio-explore > summary {
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+}
+
+.studio-explore > summary::-webkit-details-marker {
+  display: none;
+}
+
+.studio-explore-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 900px) {
+  .studio-explore-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ---- 浮现记忆：索引卡 ---- */
@@ -239,7 +266,8 @@
 
 .eq-label {
   fill: var(--muted);
-  font-size: 9px;
+  /* SVG 单位随 220 viewBox 缩放渲染，10 单位在常规面板宽度下 ≥ 12px 物理像素 */
+  font-size: 10px;
   letter-spacing: 0.04em;
 }
 
@@ -1539,11 +1567,38 @@
   margin-top: 8px;
 }
 
-.ingest-skip-panel {
-  margin-bottom: 16px;
+/*
+ * 工作室区块主次：今日待办与浮现记忆是主视线，
+ * quiet 面板（空间概览 / 情绪分布 / 记忆网络 / 未写入说明）标题降一级。
+ */
+.studio-page .surfaced-panel .panel-header h2 {
+  font-size: 17px;
+}
+
+.studio-page .panel--quiet .panel-header h2 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted-strong);
+  letter-spacing: 0.01em;
+}
+
+.studio-page .panel--quiet .panel-header h2 svg {
+  width: 15px;
+  height: 15px;
+  opacity: 0.7;
 }
 
 /* 首登引导卡：模型就绪但还没有任何 chat token 时的一次性引导。 */
+.connect-client-panel .setup-key-legend {
+  margin: 0.75rem 0 0;
+  padding-left: 1.25rem;
+  line-height: 1.55;
+}
+
+.connect-client-panel .setup-key-legend li + li {
+  margin-top: 0.25rem;
+}
+
 .connect-client-panel {
   border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
 }
@@ -1590,6 +1645,99 @@
   font-size: 13.5px;
   line-height: 1.45;
   color: var(--text);
+}
+
+.stack-backup-panel .stack-restore-guide {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+}
+
+.stack-backup-panel .stack-restore-guide h3,
+.stack-backup-panel .stack-restore-guide h4 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.stack-backup-panel .restore-advanced {
+  margin-top: 1rem;
+}
+
+.stack-backup-panel .restore-advanced > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.stack-backup-panel .restore-command-block {
+  margin-top: 0.85rem;
+}
+
+.stack-backup-panel .command-pre {
+  margin: 0.4rem 0 0;
+  padding: 0.75rem 0.9rem;
+  overflow-x: auto;
+  font-size: var(--text-caption);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 8px;
+  background: var(--surface-muted, rgba(0, 0, 0, 0.04));
+}
+
+.stack-backup-panel .stack-validation-result {
+  margin-top: 0.75rem;
+}
+
+.conversation-import-panel .conversation-import-input {
+  width: 100%;
+  min-height: 10rem;
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+  resize: vertical;
+}
+
+.conversation-import-panel .import-sample-list {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.space-manager-panel .space-manager-create {
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.space-manager-panel .space-manager-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.space-manager-panel .space-manager-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.space-manager-panel .space-color-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.space-manager-panel .danger-text {
+  color: var(--danger, #b91c1c);
 }
 
 .stack-backup-panel .field-block {

@@ -9,7 +9,8 @@ This guide holds the daily operations, advanced model configuration, security bo
 | Purpose | URL |
 | --- | --- |
 | Web Console | `http://127.0.0.1:2026/ui/` |
-| Memory Gateway health | `http://127.0.0.1:2026/health` |
+| Memory Gateway liveness | `http://127.0.0.1:2026/health` |
+| Memory Gateway operational readiness | `http://127.0.0.1:2026/readyz` |
 | MCP | `http://127.0.0.1:2026/mcp` |
 | OpenAI-compatible Memory base URL | `http://127.0.0.1:2026/v1` |
 | Model Gateway base URL (inside Docker only) | `http://model-gateway:2030/v1`; no host port is published |
@@ -36,12 +37,31 @@ The one-line installer stores the Compose file in `~/memory-platform` by default
 
 ```bash
 docker compose -f docker-compose.user.yml ps
-docker compose -f docker-compose.user.yml exec memory-gateway memgw stack doctor
+curl -fsS http://127.0.0.1:2026/health
+curl -fsS http://127.0.0.1:2026/readyz
 
 docker compose -f docker-compose.user.yml restart
 docker compose -f docker-compose.user.yml stop
 docker compose -f docker-compose.user.yml start
 ```
+
+`/health` means that the Memory process and first-run setup UI are reachable; it is also the Compose container healthcheck. A fresh, unconfigured install therefore correctly appears `healthy`. `/readyz` checks disk headroom, Model Gateway wiring, required chat routes, and any explicitly enabled embedding contract, returning only a stable, secret-free reason code. It may return 503 before first-run setup is complete and should return 200 afterwards.
+
+## Uninstall a Docker install
+
+From the install directory (default `~/memory-platform`, or the repo `deploy/` folder for a local self-build), tear down only that Compose project’s containers, networks, and four data volumes. Do **not** run `docker system prune` or `docker volume prune`:
+
+```bash
+cd ~/memory-platform
+docker compose -f docker-compose.user.yml down --volumes --remove-orphans
+
+# or
+sh /path/to/Memory_Platform/deploy/uninstall.sh
+```
+
+Volume names are usually `<project>_memory-data`, `<project>_memory-secrets`, `<project>_model-data`, and `<project>_model-secrets`. `credentials/` and `backups/` stay on disk until you delete them. Source installs use `scripts/memgw stack stop`; do not run that against Docker volumes.
+
+Do not run `docker compose exec memory-gateway memgw stack doctor` in the split stack. The long-lived Memory container intentionally cannot see Model data or secrets, so the source-stack local-path checks would report misleading failures. Diagnose Docker with the two HTTP endpoints above, `docker compose ps`, and container logs; use `scripts/memgw stack doctor` only for a source installation.
 
 Follow later logs (generated credentials are never written there) with:
 
@@ -100,13 +120,13 @@ The stack has several keys with separate responsibilities. Do not reuse them:
 | --- | --- | --- |
 | Per-device chat token | One chat client accessing `/v1` | Auth SQLite stores only SHA-256; plaintext is shown once |
 | Per-device MCP token | One MCP client accessing `/mcp` | Same, independently revocable |
-| Console token | Management REST and Web Console | A fresh install delivers the initial token to `credentials/gateway.key`; later Console tokens are local-CLI-only |
-| Legacy Gateway key | One-version all-scope credential for migrated volumes only | Host `credentials/gateway.key` and Memory secret volume; disable after migration |
+| Console token | Management REST and Web Console | A fresh install delivers the initial token to `credentials/gateway.txt` (legacy installs may use `gateway.key`); later Console tokens are local-CLI-only |
+| Legacy Gateway key | One-version all-scope credential for migrated volumes only | Host `credentials/gateway.txt` / `gateway.key` and Memory secret volume; disable after migration |
 | Model Gateway backend key | Memory Gateway calling the eight exact configured chat/memory/knowledge/embedding routes | Each service's isolated secret file |
 | Model Gateway admin key | Changing channel secrets and route configuration | Admin-side only; never persisted by Memory Gateway |
 | Provider API key | Calling the real upstream provider | Model Gateway `secrets.env` outside the repository |
 
-A fresh Docker initialization creates one `first-console` token in the Auth DB, disables legacy authentication, and writes that Console token plus the Model admin credential to host `credentials/gateway.key` and `credentials/admin.key` with owner-only permissions. Values never enter daemon logs or the long-lived process environment. A migrated legacy volume retains its old key for one transition version. Create normal device tokens after the first Console login:
+A fresh Docker initialization creates one `first-console` token in the Auth DB, disables legacy authentication, and writes that Console token plus the Model admin credential to host `credentials/gateway.txt` and `credentials/admin.txt` with owner-only permissions (legacy installs may still have `.key` files). Values never enter daemon logs or the long-lived process environment. A migrated legacy volume retains its old key for one transition version. Create normal device tokens after the first Console login:
 
 ```bash
 scripts/memgw token create --role chat --name <device> --user <user>
@@ -173,7 +193,8 @@ It reads only `/models`. Use `--live` only when you explicitly accept a real inf
 - `ALLOW_SENSITIVE_EGRESS=false` blocks locally classified private or sensitive content from remote memory extraction, embeddings, AI review, and the knowledge agent by default.
 - It does not intercept the current message a user deliberately sends to the chat provider through `/v1`.
 - `redact_sensitive=true` masks only the current response. It does not rewrite SQLite content or make backups redacted.
-- Memory and knowledge embeddings must carry a trusted, consistent space ID. Missing or mismatched IDs fall back to keyword/FTS retrieval instead of assuming old vectors belong to the current space.
+- A blank `MODEL_GATEWAY_EMBEDDING_SPACE_ID` means automatically adopting the immutable space and dimensions declared by the `memory.embedding` route; a nonblank value strictly pins that contract.
+- Creating and enabling `memory.embedding` is explicit consent to turn on semantic vectors. A missing or disabled route is `off`: keyword/FTS remains available and `/readyz` is not blocked. If an enabled route is unavailable, declares an invalid space or dimensions, or conflicts with a pin, `/readyz` returns 503 rather than guessing that old vectors belong to the current space. Sensitive-text egress remains separately controlled by `ALLOW_SENSITIVE_EGRESS`.
 - The knowledge agent orchestrates the local index and selects citations; it does not execute instructions found inside documents.
 
 The default deployment target is a personal computer or trusted home network:
@@ -212,6 +233,8 @@ scripts/memgw stack backup --output memory-stack.zip
 Backup v2 requires the memory database, knowledge database, Auth token hash database, redacted Model configuration, and a manifest that explicitly marks usage present or absent. It excludes provider, admin, backend, legacy Gateway, and device-token plaintext secrets.
 
 The stack backup (including the Console "Reports & backup" download button and `POST /memories/stack-backup`) is a **whole-instance** export: it contains the complete data of every user on the deployment, not only the requesting identity.
+
+The Console can upload a zip for **dry-run validation** (`POST /memories/stack-backup/validate`): it checks the manifest hashes, schema ranges, and SQLite integrity and **does not write production databases or restore online**. The page shows copyable stop-then-restore commands; real replacement still requires the CLI or maintenance container with services stopped.
 
 Even without keys, the archive contains complete private memory and knowledge content. Treat it as a sensitive file.
 
@@ -257,7 +280,7 @@ The portable archive never brings in or overwrites a target's secret volumes. Au
 
 Deleting the install directory (default `~/memory-platform`) does not lose data: the four Docker volumes live independently of it. To recover:
 
-1. Recreate the install directory and put `credentials/gateway.key` and `credentials/admin.key` back into its `credentials/` folder (if you kept copies elsewhere).
+1. Recreate the install directory and put `credentials/gateway.txt` (or `gateway.key`) and `credentials/admin.txt` (or `admin.key`) back into its `credentials/` folder if you kept copies elsewhere.
 2. Re-run the same one-line install command. The installer detects the four project volumes and reattaches to the old data.
 
 If both credential files are truly lost, the volumes are still intact but the credentials must be reset: create a new Console token with the maintenance container (`--profile maintenance run --rm stack-maintenance token create --role console ...`) and reset the admin key with `modelgw secret set memory-console-admin --stdin`. When the installer sees "four volumes present but credentials missing", it refuses to continue as a fresh install to avoid accidental re-initialization.

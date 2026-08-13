@@ -281,6 +281,9 @@ class MemorySpace(BaseModel):
     created_at: str
     updated_at: str
     archived: int = 0
+    color: str | None = None
+    description: str | None = None
+    sort_order: int = 0
 
 
 class CoreMemorySection(BaseModel):

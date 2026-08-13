@@ -275,6 +275,7 @@ export interface MemoryRecord {
   source_message?: string | null;
   source_conversation_id?: string | null;
   last_used_at?: string | null;
+  embedding_space_id?: string | null;
   usage_count: number;
   stability: MemoryStability;
   valid_from?: string | null;
@@ -336,6 +337,9 @@ export interface MemorySpace {
   created_at: string;
   updated_at: string;
   archived?: number;
+  color?: string | null;
+  description?: string | null;
+  sort_order?: number;
   active_memory_count?: number;
   last_memory_updated_at?: string | null;
 }
@@ -791,6 +795,63 @@ export interface RestoreResult {
   include_deleted: boolean;
   overwrite: boolean;
   dry_run: boolean;
+}
+
+export interface StackBackupValidationResult {
+  ok: boolean;
+  restorable: boolean;
+  format?: string;
+  version?: number;
+  secrets_included?: boolean;
+  components?: Record<string, { status?: string; required?: boolean }>;
+  files?: Array<{ path: string; size_bytes?: number | null }>;
+  stats?: {
+    memory_users?: number | null;
+    active_memories?: number | null;
+    deleted_memories?: number | null;
+    knowledge_documents?: number | null;
+    auth_token_hashes?: number | null;
+  };
+  restore_requires_stopped_services?: boolean;
+  message?: string;
+}
+
+export interface ConversationImportPreviewResult {
+  format: string;
+  turn_count: number;
+  total_chars: number;
+  truncated: boolean;
+  warnings: string[];
+  sample_turns: Array<{
+    index: number;
+    user_text: string;
+    assistant_text?: string | null;
+    user_chars: number;
+    assistant_chars: number;
+  }>;
+  will_not_auto_pin: boolean;
+  note?: string;
+}
+
+export interface ConversationImportCommitResult {
+  batch_id: string;
+  format: string;
+  turn_count: number;
+  truncated: boolean;
+  warnings: string[];
+  created: number;
+  updated: number;
+  ignored: number;
+  turns: Array<{
+    index: number;
+    status: string;
+    reason?: string;
+    error?: string;
+    created: number;
+    updated: number;
+    ignored: number;
+    memory_ids?: string[];
+  }>;
 }
 
 export interface MemorySurfaceRecord extends MemoryRecord {
@@ -1319,6 +1380,39 @@ export interface ModelGatewayChannelDiscoverResult {
   report: ModelGatewayConnectionCheck;
 }
 
+export interface ModelGatewayCapabilityProbeBody {
+  revision: string;
+  candidate_key: string;
+  channel_operator: string;
+  base_url: string;
+  adapter?: ModelGatewayAdapter;
+  auth_type?: "bearer" | "x-api-key";
+  allowed_private_networks?: string[];
+  upstream_model: string;
+  probes?: Array<"chat" | "streaming" | "tools" | "reasoning" | "json_object">;
+}
+
+export interface ModelGatewayCapabilityProbeResult {
+  persisted: false;
+  revision: string;
+  upstream_model: string;
+  ok: boolean;
+  capabilities: ModelGatewayCapabilities & {
+    streaming?: boolean;
+    tools?: boolean;
+    parallel_tools?: boolean;
+    reasoning?: boolean;
+    multimodal_input?: boolean;
+    json_object?: boolean;
+    json_schema?: boolean;
+  };
+  details: Record<
+    string,
+    { ok: boolean; http_status?: number | null; detail?: string }
+  >;
+  note?: string;
+}
+
 export interface ModelGatewayConnectionCreateResult {
   valid: boolean;
   applied: boolean;
@@ -1378,6 +1472,8 @@ export interface ModelGatewayBundleConnectionInput {
 export interface ModelGatewayChannelBundleBody {
   revision: string;
   connection: ModelGatewayBundleConnectionInput;
+  /** Distinct HTTPS URL for embedding; omitted when it matches the chat channel. */
+  embedding_base_url?: string;
   deployments?: ModelGatewayDeploymentDraftInput[];
   pricing?: Array<{ id: string; value: Omit<ModelGatewayPricingInfo, "id"> }>;
   routes?: ModelGatewayRouteAssignmentInput[];
@@ -1387,6 +1483,7 @@ export interface ModelGatewayBundleResult {
   valid: boolean;
   applied: boolean;
   connection_id: string;
+  embedding_connection_id?: string;
   deployment_ids: string[];
   changed_routes: string[];
   revision: string;
@@ -1437,6 +1534,10 @@ export interface ProvidersStatus {
     base_url: string;
     dimensions: number;
     configured: boolean;
+    mode: "auto" | "pinned";
+    state: "ready" | "off" | "invalid" | "unavailable";
+    code: string;
+    space_id?: string;
   };
   providers: ProviderInfo[];
   routes: RouteInfo[];

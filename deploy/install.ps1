@@ -200,6 +200,18 @@ function Release-InstallerLock {
     }
 }
 
+function Resolve-CredentialFile([string] $CredentialDirectory, [string] $Role) {
+    # Prefer .txt so Windows/macOS open plain text; accept legacy .key.
+    foreach ($extension in @("txt", "key")) {
+        $candidate = Join-Path $CredentialDirectory "$Role.$extension"
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+            (Get-Item -LiteralPath $candidate).Length -gt 0) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
 function Protect-PrivatePath([string] $Path) {
     try {
         $item = Get-Item -LiteralPath $Path -Force
@@ -1710,16 +1722,12 @@ function Invoke-MemoryPlatformInstall {
             }
         }
         if ($splitVolumesPresent) {
-            $gatewayKeyPath = Join-Path $credentialDirectory "gateway.key"
-            $adminKeyPath = Join-Path $credentialDirectory "admin.key"
-            $gatewayKeyMissing = -not (Test-Path -LiteralPath $gatewayKeyPath -PathType Leaf) -or
-                (Get-Item -LiteralPath $gatewayKeyPath).Length -le 0
-            $adminKeyMissing = -not (Test-Path -LiteralPath $adminKeyPath -PathType Leaf) -or
-                (Get-Item -LiteralPath $adminKeyPath).Length -le 0
-            if ($gatewayKeyMissing -or $adminKeyMissing) {
+            $gatewayCred = Resolve-CredentialFile $credentialDirectory "gateway"
+            $adminCred = Resolve-CredentialFile $credentialDirectory "admin"
+            if (-not $gatewayCred -or -not $adminCred) {
                 Stop-Install ("检测到 project '$($script:ProjectName)' 的四个数据卷仍在，" +
-                    "但 $installDirectory\credentials\ 缺少 gateway.key 或 admin.key。" +
-                    "数据没有丢：把原安装目录里的 credentials\gateway.key 和 credentials\admin.key " +
+                    "但 $installDirectory\credentials\ 缺少 gateway/admin 凭据（优先 .txt，兼容旧版 .key）。" +
+                    "数据没有丢：把原安装目录里的 credentials\gateway.txt（或 gateway.key）和 credentials\admin.txt（或 admin.key） " +
                     "放回 $installDirectory\credentials\ 后重跑同一条安装命令即可接回旧数据。" +
                     "若两枚密钥确实遗失，参见 docs/stack-operations.md 的密钥重置章节。")
             }
@@ -2132,19 +2140,16 @@ function Invoke-MemoryPlatformInstall {
         }
     }
 
-    $gatewayCredential = Join-Path $credentialDirectory "gateway.key"
-    $adminCredential = Join-Path $credentialDirectory "admin.key"
-    foreach ($credential in @($gatewayCredential, $adminCredential)) {
-        if (-not (Test-Path -LiteralPath $credential -PathType Leaf) -or
-            (Get-Item -LiteralPath $credential).Length -le 0) {
-            if ($script:Layout -ne "fresh" -and (Invoke-Rollback)) {
-                Stop-Install "新栈未交付完整 credentials 文件；旧服务和数据已恢复。"
-            }
-            if ($script:Layout -eq "fresh") {
-                & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
-            }
-            Stop-Install "离线初始化没有交付完整 credentials 文件；未从日志读取或显示密钥。"
+    $gatewayCredential = Resolve-CredentialFile $credentialDirectory "gateway"
+    $adminCredential = Resolve-CredentialFile $credentialDirectory "admin"
+    if (-not $gatewayCredential -or -not $adminCredential) {
+        if ($script:Layout -ne "fresh" -and (Invoke-Rollback)) {
+            Stop-Install "新栈未交付完整 credentials 文件；旧服务和数据已恢复。"
         }
+        if ($script:Layout -eq "fresh") {
+            & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
+        }
+        Stop-Install "离线初始化没有交付完整 credentials 文件；未从日志读取或显示密钥。"
     }
     try {
         foreach ($credential in @($gatewayCredential, $adminCredential)) {
@@ -2220,10 +2225,11 @@ function Invoke-MemoryPlatformInstall {
     }
     Write-Host "  Console token: $gatewayCredential"
     Write-Host "  Admin key:    $adminCredential"
+    Write-Host "（纯文本 .txt，可用文本编辑器打开；旧版 .key 仍兼容）"
     Write-Host "密钥值没有进入脚本输出、Compose 环境或 Docker 日志。"
     Write-Host "Model Gateway 2030 仅位于 Docker 内部网络，没有发布宿主端口。"
     if ($script:Layout -eq "legacy") {
-        Write-Host "gateway.key 仅在迁移兼容期保留 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
+        Write-Host "Console 凭据在迁移兼容期可能仍是 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
         Write-Host "旧单卷仍保留用于观察期回滚；确认新栈与备份后再显式删除。"
     }
     if (-not [string]::IsNullOrWhiteSpace($script:BackupPath)) {

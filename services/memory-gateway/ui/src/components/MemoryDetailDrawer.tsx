@@ -134,7 +134,7 @@ export function MemoryDetailDrawer({
       setState({ loading: false, error: null, memory, deleted });
 
       void api
-        .listMemorySpaces(signal)
+        .listMemorySpaces({ signal })
         .then((value) => {
           if (alive()) setSpaces(value);
         })
@@ -446,6 +446,10 @@ export function MemoryDetailDrawer({
                 <span>最近使用</span>
                 <strong>{dateText(memory.last_used_at) || "-"}</strong>
               </div>
+              <div>
+                <span>向量空间</span>
+                <strong>{memory.embedding_space_id || "无向量"}</strong>
+              </div>
             </div>
 
             <div className="drawer-actions profile-actions">
@@ -618,7 +622,7 @@ export function MemoryDetailDrawer({
             </label>
             {editDraft.content.trim() !== memory.content && (
               <div className="notice warning">
-                修改内容后，旧 embedding 会失效；后续版本可提供重建 embedding。
+                修改正文后，这条记忆的语义索引会过期，语义搜索可能暂时找不到它；重新写入或等待后台重建后恢复。
               </div>
             )}
             <div className="classification-edit-grid">

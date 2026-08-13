@@ -394,7 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
     connection_add.add_argument(
         "--scope",
         choices=["backend_allowed", "interactive_only", "disabled"],
-        help="省略时普通连接为 backend_allowed，Token/Coding Plan 为 interactive_only",
+        help="省略时默认为 backend_allowed（含 Token/Coding Plan；需限制时请显式传 --scope）",
     )
     models_endpoint = connection_add.add_mutually_exclusive_group()
     models_endpoint.add_argument("--models-endpoint", default="/models")
@@ -1717,12 +1717,7 @@ def _cmd_connection_add(args: argparse.Namespace) -> int:
         args.secret_name or _default_secret_ref("CONNECTION", connection_id),
         "secret_ref",
     )
-    restricted = args.billing_type in {
-        "token_plan",
-        "coding_plan",
-        "direct_tool_only",
-    }
-    scope = args.scope or ("interactive_only" if restricted else "backend_allowed")
+    scope = args.scope or "backend_allowed"
     connection = ConnectionConfig(
         channel_operator=args.channel_operator,
         adapter=args.adapter,

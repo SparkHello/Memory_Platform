@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.llm.embedding_contract import resolve_embedding_contract
 from app.llm.model_gateway import (
     MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
     MODEL_GATEWAY_CONNECTION_HEADER,
@@ -263,6 +264,38 @@ def test_runtime_resolver_prefers_complete_central_configuration_without_fallbac
         EMBEDDING_DIMENSIONS=3,
         DATABASE_PATH=str(tmp_path / "memory.db"),
         KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+    )
+    resolve_embedding_contract(
+        settings,
+        {
+                "connections": [
+                    {
+                        "id": "central",
+                        "enabled": True,
+                        "configured": True,
+                        "usage_scope": "backend_allowed",
+                    }
+                ],
+            "deployments": [
+                {
+                    "id": "embed",
+                    "connection": "central",
+                    "upstream_model": "vendor/embed",
+                    "kind": "embedding",
+                    "enabled": True,
+                    "dimensions": 3,
+                    "embedding_space": "space-v1",
+                }
+            ],
+            "routes": [
+                {
+                    "id": "custom.embedding",
+                    "kind": "embedding",
+                    "enabled": True,
+                    "targets": ["embed"],
+                }
+            ],
+        },
     )
 
     runtime = resolve_model_runtime(settings)

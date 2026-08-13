@@ -22,7 +22,7 @@ from app.schema_migrations import enable_wal_with_retry
 from app.usage.store import UsageStore
 
 
-_LATEST_MEMORY_SCHEMA_VERSION = 5
+_LATEST_MEMORY_SCHEMA_VERSION = 6
 
 
 def _initialize_memory_store_in_process(db_path: str, start, results) -> None:

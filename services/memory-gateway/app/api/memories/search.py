@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.api.memories.common import *  # noqa: F403
+from app.llm.runtime import resolve_model_runtime
 
 @router.get("/cache-stats")
 def memory_search_cache_stats(
@@ -73,10 +74,11 @@ def memory_database_health(
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
+    embedding_runtime = resolve_model_runtime(settings).embedding
     checker = MemoryHealthChecker(
         store=store,
-        expected_embedding_dimensions=settings.embedding_dimensions,
-        embedding_enabled=embedding_runtime_enabled(settings),
+        expected_embedding_dimensions=embedding_runtime.dimensions,
+        embedding_enabled=embedding_runtime.enabled,
     )
     return checker.check(user_id=user_id).model_dump()
 
@@ -108,6 +110,13 @@ async def re_embed_memories(
         )
 
     memory_ids: list[str] = []
+    expected_dimensions = getattr(embedding_client, "dimensions", 0)
+    if (
+        isinstance(expected_dimensions, bool)
+        or not isinstance(expected_dimensions, int)
+        or not 1 <= expected_dimensions <= 65536
+    ):
+        expected_dimensions = resolve_model_runtime(settings).embedding.dimensions
     if body.memory_ids:
         memory_ids = list(dict.fromkeys(body.memory_ids))  # 去重保序
         if not memory_ids:
@@ -119,7 +128,7 @@ async def re_embed_memories(
         memory_ids = _find_memories_needing_embedding(
             store=store,
             user_id=user_id,
-            expected_dimensions=settings.embedding_dimensions,
+            expected_dimensions=expected_dimensions,
             expected_space_id=embedding_space_id,
         )
     else:

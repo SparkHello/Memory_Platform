@@ -281,6 +281,145 @@ def create_stack_backup(
     }
 
 
+def validate_stack_backup(*, archive_path: Path) -> dict[str, Any]:
+    """Dry-run validation of a portable stack zip.
+
+    Opens the archive, verifies the manifest, hashes, SQLite integrity and
+    schema ranges, then returns a non-sensitive summary. Never writes to
+    production database paths or settings.
+    """
+    archive_path = archive_path.expanduser().resolve()
+    if not archive_path.is_file():
+        raise ValueError(f"找不到备份文件：{archive_path}")
+
+    with tempfile.TemporaryDirectory(prefix=".memgw-stack-backup-validate-") as temporary_name:
+        os.chmod(temporary_name, 0o700)
+        staging = Path(temporary_name)
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = _validated_manifest(archive)
+            extracted = _verified_payloads(archive, manifest, staging)
+        # Reuse the same payload validators as restore, with dummy target paths
+        # (validators only inspect the staged payload file).
+        dummy = Path(temporary_name)
+        validation_targets: dict[str, tuple[Path, Callable[[Path], None] | None]] = {
+            "memory/memory.db": (dummy, _validate_memory_database),
+            "memory/knowledge.db": (dummy, _validate_knowledge_database),
+            "memory/auth.db": (dummy, _validate_auth_database),
+            "memory/models.json": (dummy, _validate_json_object),
+            "memory/routes.json": (dummy, _validate_json_object),
+            "memory/pricing.json": (dummy, _validate_json_object),
+            "model-gateway/config.json": (dummy, _validate_json_object),
+            "model-gateway/usage.db": (dummy, _validate_model_usage_database),
+        }
+        _validate_restore_payloads(extracted, validation_targets)
+
+        file_rows: list[dict[str, Any]] = []
+        files_meta = manifest.get("files")
+        if isinstance(files_meta, dict):
+            for name, meta in sorted(files_meta.items()):
+                size = meta.get("size") if isinstance(meta, dict) else None
+                file_rows.append(
+                    {
+                        "path": name,
+                        "size_bytes": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                    }
+                )
+
+        components_out: dict[str, Any] = {}
+        raw_components = manifest.get("components")
+        if isinstance(raw_components, dict):
+            for key, meta in raw_components.items():
+                if isinstance(meta, dict):
+                    components_out[key] = {
+                        "status": meta.get("status"),
+                        "required": meta.get("required"),
+                    }
+                else:
+                    components_out[key] = {"status": "unknown"}
+
+        stats = _stack_backup_content_stats(extracted)
+
+    return {
+        "ok": True,
+        "restorable": True,
+        "format": manifest.get("format"),
+        "version": manifest.get("version"),
+        "secrets_included": False,
+        "components": components_out,
+        "files": file_rows,
+        "stats": stats,
+        "restore_requires_stopped_services": True,
+        "message": (
+            "备份校验通过。Console 不会在线替换运行中的数据库；"
+            "请先停止服务，再用 CLI 或维护容器执行恢复。"
+        ),
+    }
+
+
+def _stack_backup_content_stats(extracted: dict[str, Path]) -> dict[str, Any]:
+    """Non-sensitive aggregate counts for UI validation feedback."""
+    stats: dict[str, Any] = {}
+    memory_db = extracted.get("memory/memory.db")
+    if memory_db is not None:
+        stats.update(_sqlite_scalar_stats(
+            memory_db,
+            {
+                "memory_users": "SELECT COUNT(DISTINCT user_id) FROM memories",
+                "active_memories": (
+                    "SELECT COUNT(*) FROM memories "
+                    "WHERE COALESCE(archived, 0) = 0"
+                ),
+                "deleted_memories": (
+                    "SELECT COUNT(*) FROM memories "
+                    "WHERE COALESCE(archived, 0) != 0"
+                ),
+            },
+        ))
+    knowledge_db = extracted.get("memory/knowledge.db")
+    if knowledge_db is not None:
+        stats.update(_sqlite_scalar_stats(
+            knowledge_db,
+            {
+                "knowledge_documents": (
+                    "SELECT COUNT(*) FROM knowledge_documents"
+                ),
+            },
+        ))
+    auth_db = extracted.get("memory/auth.db")
+    if auth_db is not None:
+        stats.update(_sqlite_scalar_stats(
+            auth_db,
+            {
+                "auth_token_hashes": "SELECT COUNT(*) FROM auth_tokens",
+            },
+        ))
+    return stats
+
+
+def _sqlite_scalar_stats(
+    path: Path,
+    queries: dict[str, str],
+) -> dict[str, int | None]:
+    result: dict[str, int | None] = {key: None for key in queries}
+    try:
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+    except sqlite3.Error:
+        return result
+    try:
+        for key, sql in queries.items():
+            try:
+                row = connection.execute(sql).fetchone()
+                result[key] = int(row[0]) if row and row[0] is not None else 0
+            except sqlite3.Error:
+                result[key] = None
+    finally:
+        connection.close()
+    return result
+
+
 def restore_stack_backup(
     *,
     archive_path: Path,

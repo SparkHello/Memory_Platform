@@ -65,8 +65,8 @@ jobs:
             exec -T model-gateway sh -ec \
             'test "$(id -u)" = 10002; test ! -e /secrets/settings.env; test ! -e /memory-data'
           test -z "$(docker port memory-platform-ci-model-gateway-1 2030/tcp)"
-          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/gateway.key")" = 600
-          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/admin.key")" = 600
+          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/gateway.txt")" = 600
+          test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/admin.txt")" = 600
 
       - name: Verify split network topology
         run: |
@@ -87,7 +87,7 @@ jobs:
           docker compose -p memory-platform-ci -f deploy/docker-compose.yml logs --no-color \
             > "$RUNNER_TEMP/memory-platform.log"
           python3 - "$RUNNER_TEMP/memory-platform.log" \
-            "$MEMORY_CREDENTIAL_DIR/gateway.key" "$MEMORY_CREDENTIAL_DIR/admin.key" <<'PY'
+            "$MEMORY_CREDENTIAL_DIR/gateway.txt" "$MEMORY_CREDENTIAL_DIR/admin.txt" <<'PY'
           import pathlib
           import sys
 

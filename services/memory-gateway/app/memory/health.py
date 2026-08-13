@@ -257,7 +257,11 @@ class MemoryHealthChecker:
                     )
                 )
                 continue
-            if len(vector) != self.expected_embedding_dimensions:
+            if (
+                self.embedding_enabled
+                and self.expected_embedding_dimensions > 0
+                and len(vector) != self.expected_embedding_dimensions
+            ):
                 issues.append(
                     _issue(
                         issue_type="embedding_dimension_mismatch",

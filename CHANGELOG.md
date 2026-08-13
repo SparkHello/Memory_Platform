@@ -4,6 +4,46 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-13
+
+### Changed
+
+- Console 去杂：顶栏已显示页名时不再重复大标题；工作室把情绪/网络/计数收到「探索」；知识空态只留添加文档；模型页无草稿时隐藏校验按钮，替换密钥收入展开项；报告页恢复命令收进高级；向导能力默认收起。
+
+### Fixed
+
+- 启用语义搜索后可补齐缺少当前空间向量的旧记忆：向导保存 embedding 路由后自动 `scan` 重嵌，记忆库对无向量条目给出条幅和「补齐向量」。
+- 「用户只喝美式」这类饮食事实不再被「我喜欢喝什么」问句的主语门误排除，文档里的咖啡验收路径可以召回。
+- 渠道发现命中 Clash/Surge TUN fake-ip 时，在错误条下方直接提供同一勾选，不必打开高级设置。
+- 渠道保存成功后刷新顶栏就绪状态，避免仍显示「待配置模型」。
+- 向导不再在已有 chat token 时重复签发；聊天下拉去掉嵌入/语音/图像模型并支持筛选。
+- `/favicon.ico` 不再掉进 MCP 鉴权返回 401。
+- 工作室与导航不再预取未初始化的召回评测 workbench（避免控制台 404）。
+- Console 401 错误不再一律引导「核对 Console token」：按请求路径/错误码区分 admin key、Console token 与供应商密钥，并保留服务端具体说明。
+- 工作台在模型未就绪时展示「下一步：配置模型渠道」卡片与三钥说明（gateway.key / admin.key / chat token），与「生成 chat token」接入卡衔接。
+- 未配置或访问密钥失效时强制进入「连接设置」并隐藏日常导航（简洁模式也不例外）；密钥有效后连接设置仍只在专家模式侧栏与头像入口。文案明确访问密钥 = `credentials/gateway.txt`（兼容旧版 `gateway.key`）的 Console token。
+- Docker 凭据交付改用 `gateway.txt` / `admin.txt`（纯文本，避免 macOS 把 `.key` 当成 Keynote 演示文稿）；读取仍兼容旧的 `*.key`。
+
+### Added
+
+- `POST /memories/stack-backup/validate`：上传便携整栈 zip 做 dry-run 校验（清单哈希、schema、SQLite），返回组件与聚合计数，**不写生产库**。
+- Console「报告与备份」支持校验备份 Zip，并展示源码 / Docker 可复制的停服恢复命令。
+- 记忆空间工作台：`POST/PATCH/DELETE /memories/spaces`、归档/取消归档；支持 `color`（#RRGGBB）、`description`、`sort_order`；列表可 `include_archived`。记忆库页可展开管理空间。
+- 历史对话批量导入：`POST /memories/import/conversations/preview|commit`，支持 OpenAI messages JSON 与 User/Assistant 角色行文本；提交后走同源提取门控。Console「报告与备份」提供预览与确认导入。
+- 已配置渠道可「添加模型」：复用已保存密钥列出模型，把新聊天模型追加为同渠道备用，不再要求再贴 Key、也不再新建第二条渠道。
+- 渠道向导可单独填写向量接入点：与聊天地址不同时，原子创建一条只跑 embedding 的渠道并复用同一密钥；相同或留空则仍挂在聊天渠道上。
+
+### Changed
+
+- 渠道向导打开时不再预选 DeepSeek；第三步文案改为「检查并保存」。
+- 本地 Compose 初始化结束句点名 `credentials/gateway.txt` 与 `credentials/admin.txt`。
+- 增加 Docker 卸载说明与 `deploy/uninstall.sh`（只拆当前 project，不 prune）。
+- `POST /providers/admin/*` 缺少 admin key 时返回结构化 `code=admin_key_required`；上游 401 映射为 `admin_auth_failed` 并给出可读中文原因。
+- 渠道向导预设：去掉 Kimi Code / 阿里云 Token Plan，改为 Anthropic Claude 与 Google Gemini（OpenAI 兼容）；「自定义渠道」不再继承上一预设的地址，改为空白表单。
+- Model Gateway 不再因 `token_plan` / `coding_plan` / 套餐域名强制 `interactive_only`；仅显式 `usage_scope=interactive_only` 时 backend 不可用。提供商条款由使用者自行遵守。
+- 渠道只读发现失败时透传真实原因（含 fake-ip / 网络策略文案），不再只显示裸 `HTTP 400`；TUN fake-ip 场景明确提示勾选代理选项。
+- 渠道向导支持「探测模型能力」：对聊天/流式/tools/推理/json_object 发极短试请求并自动勾选；说明未勾选会被路由视为不支持。
+
 ## 0.4.0 - 2026-08-12
 
 ### Fixed

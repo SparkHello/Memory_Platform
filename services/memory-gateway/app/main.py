@@ -5,7 +5,7 @@ import os
 from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Scope
@@ -23,6 +23,11 @@ from app.cli_config import cli_paths
 from app.config import get_settings
 from app.disk_capacity import DiskCapacityMiddleware
 from app.knowledge.store import KnowledgeStore
+from app.llm.embedding_contract import (
+    embedding_contract_refresh_loop,
+    refresh_embedding_contract,
+    set_embedding_contract_failure,
+)
 from app.llm.runtime import (
     MODEL_GATEWAY_REQUIRED_MESSAGE,
     ModelRuntimeConfigurationError,
@@ -137,15 +142,26 @@ def create_app() -> FastAPI:
         # Replay durable chat finalize jobs in the background: once right
         # after startup (crash recovery) and then periodically, so leftover
         # jobs drain without blocking startup or waiting for the next chat.
+        try:
+            await refresh_embedding_contract(settings)
+        except Exception:
+            set_embedding_contract_failure(
+                settings,
+                state="unavailable",
+                code="model_gateway_control_unavailable",
+            )
+            logger.exception("启动时读取 embedding route 契约失败；服务继续运行。")
+        embedding_refresh_task = asyncio.create_task(
+            embedding_contract_refresh_loop(settings, interval_seconds=30.0)
+        )
         drainer_task: asyncio.Task | None = None
         try:
             from app.api.chat_gateway import chat_finalize_outbox_drainer
-            from app.api.deps import get_embedding_client, get_llm_client
+            from app.api.deps import get_llm_client
 
             drainer_task = asyncio.create_task(
                 chat_finalize_outbox_drainer(
                     store=MemoryStore(settings.database_path),
-                    embedding_client=get_embedding_client(settings=settings),
                     llm_client=get_llm_client(settings=settings),
                     settings=settings,
                 )
@@ -162,7 +178,11 @@ def create_app() -> FastAPI:
             async with mcp.session_manager.run():
                 yield
         finally:
-            for background_task in (drainer_task, usage_prune_task):
+            for background_task in (
+                drainer_task,
+                usage_prune_task,
+                embedding_refresh_task,
+            ):
                 if background_task is not None:
                     background_task.cancel()
                     with suppress(asyncio.CancelledError, Exception):
@@ -240,6 +260,12 @@ def create_app() -> FastAPI:
     @app.get("/ui", include_in_schema=False)
     def redirect_ui_root() -> RedirectResponse:
         return RedirectResponse(url="/ui/")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> Response:
+        # Browsers request the site icon at the origin root. Without this
+        # route the catch-all MCP mount would 401 unauthenticated probes.
+        return Response(status_code=204)
 
     app.mount(
         "/ui",

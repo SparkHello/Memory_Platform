@@ -224,17 +224,16 @@ async def test_visible_prompt_injection_is_not_sent_to_research_model(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("plan_type", ["token_plan", "coding_plan", "direct_tool_only"])
-async def test_restricted_plan_cannot_be_research_deployment(plan_type: str) -> None:
+async def test_interactive_only_cannot_be_research_deployment() -> None:
     payload = config_payload()
     payload["connections"]["reseller"]["billing_plan"] = {
-        "type": plan_type,
-        "name": "restricted",
+        "type": "token_plan",
+        "name": "operator-managed",
     }
     payload["connections"]["reseller"]["usage_scope"] = "interactive_only"
     config = GatewayConfig.model_validate(payload)
 
-    with pytest.raises(PricingResearchError, match="Token/Coding/direct_tool_only"):
+    with pytest.raises(PricingResearchError, match="backend_allowed"):
         await research_pricing(
             config=config,
             secrets={"UPSTREAM_RESELLER": "restricted-secret"},

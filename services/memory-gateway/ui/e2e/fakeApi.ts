@@ -78,7 +78,10 @@ const providersStatus = {
     model: "memory.embedding",
     base_url: "http://model-gateway:2030/v1",
     dimensions: 1024,
-    configured: false
+    configured: false,
+    mode: "auto",
+    state: "off",
+    code: "embedding_route_off"
   },
   providers: [],
   routes: [],

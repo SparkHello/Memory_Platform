@@ -26,7 +26,9 @@ from model_gateway.http_safety import (
 
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
-RESTRICTED_PLAN_TYPES = {"token_plan", "coding_plan", "direct_tool_only"}
+# Historical label only: plan type no longer forces usage_scope. Operators who
+# want interactive-only may still set usage_scope explicitly.
+RESTRICTED_PLAN_TYPES: frozenset[str] = frozenset()
 FORBIDDEN_UPSTREAM_FORWARD_HEADERS = frozenset(
     {
         "api-key",
@@ -273,21 +275,6 @@ class ConnectionConfig(StrictModel):
         if value is None:
             return None
         return normalize_endpoint(value)
-
-    @model_validator(mode="after")
-    def restricted_plan_scope(self) -> "ConnectionConfig":
-        if (
-            self.billing_plan.type in RESTRICTED_PLAN_TYPES
-            and self.usage_scope == "backend_allowed"
-        ):
-            raise ValueError("受限套餐不能配置为 backend_allowed")
-        hostname = (urlparse(self.base_url).hostname or "").lower()
-        if (
-            "token-plan" in hostname or "coding.dashscope" in hostname
-        ) and self.usage_scope == "backend_allowed":
-            raise ValueError("检测到套餐专属端点，禁止后台使用")
-        return self
-
 
 def derive_embedding_space(
     connection: ConnectionConfig,

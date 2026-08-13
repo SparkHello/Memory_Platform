@@ -1,9 +1,31 @@
 import json
 
 import httpx
+import pytest
 
 from app.api import providers as providers_api
 from app.config import Settings, get_settings
+from app.llm.embedding_contract import clear_embedding_contract_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_embedding_contract_snapshots(monkeypatch) -> None:
+    async def no_network_refresh(settings):
+        del settings
+        return None
+
+    # Provider mutations refresh in ``finally``. Keep every test isolated from
+    # the developer's running Model Gateway; the dedicated ordering test below
+    # replaces this no-op with an observable fake.
+    monkeypatch.setattr(
+        providers_api,
+        "refresh_embedding_contract",
+        no_network_refresh,
+        raising=False,
+    )
+    clear_embedding_contract_cache()
+    yield
+    clear_embedding_contract_cache()
 
 
 def _gateway_settings() -> Settings:
@@ -75,6 +97,35 @@ def _control_snapshot() -> dict:
     }
 
 
+def _control_snapshot_with_embedding() -> dict:
+    snapshot = _control_snapshot()
+    snapshot["deployments"].append(
+        {
+            "id": "embedding-primary",
+            "connection": "official",
+            "upstream_model": "author/embed-v2",
+            "model_author": "author",
+            "model_family": "embedding",
+            "kind": "embedding",
+            "capabilities": {},
+            "dimensions": 768,
+            "embedding_space": "route-owned-space-v2",
+            "enabled": True,
+        }
+    )
+    snapshot["routes"].append(
+        {
+            "id": "memory.embedding",
+            "kind": "embedding",
+            "targets": ["embedding-primary"],
+            "required_capabilities": [],
+            "max_attempts": 3,
+            "enabled": True,
+        }
+    )
+    return snapshot
+
+
 def test_provider_status_defaults_to_model_gateway_without_control_plane(
     client, auth_headers, monkeypatch
 ) -> None:
@@ -123,6 +174,46 @@ def test_model_gateway_status_uses_backend_key_and_never_returns_it(
     assert calls[0]["path"] == "/admin/configuration"
 
 
+def test_provider_status_exposes_effective_embedding_contract_schema(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    async def fake_request(**kwargs):
+        del kwargs
+        return httpx.Response(200, json=_control_snapshot_with_embedding())
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    response = client.get("/providers/status", headers=auth_headers)
+
+    assert response.status_code == 200
+    embedding = response.json()["embedding"]
+    assert set(embedding) == {
+        "model",
+        "base_url",
+        "dimensions",
+        "configured",
+        "space_id",
+        "model_gateway_mode",
+        "mode",
+        "state",
+        "code",
+    }
+    assert embedding == {
+        "model": "author/embed-v2",
+        "base_url": "http://127.0.0.1:2030/v1",
+        "dimensions": 768,
+        "configured": True,
+        "space_id": "route-owned-space-v2",
+        "model_gateway_mode": True,
+        "mode": "auto",
+        "state": "ready",
+        "code": "ok",
+    }
+
+
 def test_setup_is_ready_only_when_every_chat_route_is_usable(
     client,
     auth_headers,
@@ -150,6 +241,17 @@ def test_setup_is_ready_only_when_every_chat_route_is_usable(
     response = client.get("/providers/status", headers=auth_headers)
 
     assert response.status_code == 200
+    assert response.json()["embedding"] == {
+        "model": "memory.embedding",
+        "base_url": "http://127.0.0.1:2030/v1",
+        "dimensions": 0,
+        "configured": False,
+        "space_id": "",
+        "model_gateway_mode": True,
+        "mode": "auto",
+        "state": "off",
+        "code": "embedding_route_off",
+    }
     assert response.json()["setup"] == {
         "state": "ready",
         "service_ready": True,
@@ -163,6 +265,79 @@ def test_setup_is_ready_only_when_every_chat_route_is_usable(
         "live_probe": None,
         "upstream_ready": None,
     }
+
+
+def test_setup_does_not_treat_interactive_only_routes_as_backend_ready(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    snapshot = _control_snapshot()
+    snapshot["connections"][0]["usage_scope"] = "interactive_only"
+    snapshot["routes"] = [
+        {
+            "id": route_id,
+            "kind": "chat",
+            "targets": ["chat-primary"],
+            "required_capabilities": [],
+            "max_attempts": 3,
+            "enabled": True,
+        }
+        for route_id in providers_api.REQUIRED_CHAT_ROUTES
+    ]
+
+    async def fake_request(**kwargs):
+        del kwargs
+        return httpx.Response(200, json=snapshot)
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    setup = client.get("/providers/status", headers=auth_headers).json()["setup"]
+
+    assert setup["state"] == "needs_model"
+    assert setup["service_ready"] is True
+    assert setup["chat_ready"] is False
+    assert setup["usable_chat_routes"] == []
+    assert setup["missing_chat_routes"] == list(providers_api.REQUIRED_CHAT_ROUTES)
+
+
+def test_setup_is_not_service_ready_for_invalid_embedding_contract(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    snapshot = _control_snapshot_with_embedding()
+    snapshot["routes"] = [
+        *[
+            {
+                "id": route_id,
+                "kind": "chat",
+                "targets": ["chat-primary"],
+                "required_capabilities": [],
+                "max_attempts": 3,
+                "enabled": True,
+            }
+            for route_id in providers_api.REQUIRED_CHAT_ROUTES
+        ],
+        snapshot["routes"][-1],
+    ]
+    snapshot["deployments"][-1]["dimensions"] = None
+
+    async def fake_request(**kwargs):
+        del kwargs
+        return httpx.Response(200, json=snapshot)
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    payload = client.get("/providers/status", headers=auth_headers).json()
+
+    assert payload["embedding"]["state"] == "invalid"
+    assert payload["embedding"]["code"] == "model_gateway_embedding_contract_mismatch"
+    assert payload["setup"]["chat_ready"] is True
+    assert payload["setup"]["service_ready"] is False
+    assert payload["setup"]["state"] == "configuration_error"
 
 
 def test_live_probe_respects_cache_and_explicit_force(
@@ -382,6 +557,49 @@ def test_model_gateway_control_error_is_normalized_for_the_web_client(
         "message": "配置已经被其他操作修改；请刷新页面后重新调整",
         "code": "model_gateway_config_stale",
     }
+
+
+def test_provider_mutation_invalidates_then_refreshes_even_on_remote_error(
+    client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    def fake_invalidate(settings):
+        del settings
+        events.append("invalidate")
+
+    async def fake_refresh(settings):
+        del settings
+        events.append("refresh")
+
+    async def fake_request(**kwargs):
+        del kwargs
+        events.append("request")
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "message": "stale",
+                    "type": "model_gateway_config_stale",
+                }
+            },
+        )
+
+    client.app.dependency_overrides[get_settings] = _gateway_settings
+    monkeypatch.setattr(providers_api, "invalidate_embedding_contract", fake_invalidate)
+    monkeypatch.setattr(providers_api, "refresh_embedding_contract", fake_refresh)
+    monkeypatch.setattr(providers_api, "_model_gateway_control_request", fake_request)
+
+    response = client.put(
+        "/providers/routes",
+        headers={**auth_headers, "X-Model-Gateway-Admin-Key": "admin-key"},
+        json={"revision": "a" * 64, "routes": []},
+    )
+
+    assert response.status_code == 409
+    assert events == ["invalidate", "request", "refresh"]
 
 
 def test_provider_writes_refuse_plain_http_to_a_remote_gateway(

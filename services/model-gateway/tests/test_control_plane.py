@@ -22,7 +22,7 @@ from model_gateway.config_store import (
     source_revision,
     write_secrets,
 )
-from model_gateway.models import GatewayConfig, RouteConfig
+from model_gateway.models import GatewayConfig, RouteConfig, derive_embedding_space
 from model_gateway.service import create_app
 
 
@@ -362,6 +362,7 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
         )
         assert applied.status_code == 200
         assert applied.json()["changed_routes"] == ["knowledge.fast"]
+        assert applied.json()["embedding_connection_id"] == applied.json()["connection_id"]
 
     config = load_config(gateway_home.config)
     assert config.schema_version == 2
@@ -380,6 +381,187 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
         "replacement-secret"
     )
     assert not gateway_home.journal.exists()
+
+
+def _new_channel_bundle(
+    *,
+    revision: str = "a" * 64,
+    embedding_base_url: str = "",
+    include_embedding: bool = True,
+) -> dict:
+    deployments: list[dict] = [
+        {
+            "upstream_model": "author/chat-next",
+            "kind": "chat",
+            "capabilities": {"tools": True, "reasoning": True},
+        }
+    ]
+    routes: list[dict] = [
+        {
+            "id": "memory.chat",
+            "operation": "replace",
+            "targets": ["$0"],
+            "fallback_scope": "none",
+        }
+    ]
+    if include_embedding:
+        deployments.append(
+            {
+                "upstream_model": "author/embed-v1",
+                "kind": "embedding",
+                "dimensions": 4,
+                "capabilities": {"streaming": False},
+            }
+        )
+        routes.append(
+            {
+                "id": "memory.embedding",
+                "operation": "replace",
+                "kind": "embedding",
+                "targets": ["$1"],
+                "fallback_scope": "none",
+            }
+        )
+    body: dict = {
+        "revision": revision,
+        "connection": {
+            "channel_operator": "dashscope",
+            "adapter": "dashscope_openai",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "secret": "sk-test-upstream-key",
+        },
+        "deployments": deployments,
+        "routes": routes,
+    }
+    if embedding_base_url:
+        body["embedding_base_url"] = embedding_base_url
+    return body
+
+
+def test_bundle_candidate_keeps_embedding_on_chat_when_url_matches() -> None:
+    from model_gateway.admin import BundleApplyRequest, bundle_candidate
+
+    config = GatewayConfig.model_validate(config_payload())
+    same = "https://dashscope.aliyuncs.com/compatible-mode/v1/"
+    candidate, chat_id, secret_ref, deployment_ids, _, embed_id = bundle_candidate(
+        config,
+        BundleApplyRequest.model_validate(
+            _new_channel_bundle(embedding_base_url=same)
+        ),
+    )
+    assert chat_id == embed_id == "dashscope-account"
+    assert deployment_ids[0] in candidate.deployments
+    assert candidate.deployments[deployment_ids[0]].connection == chat_id
+    assert candidate.deployments[deployment_ids[1]].connection == chat_id
+    assert candidate.connections[chat_id].auth.secret_ref == secret_ref
+
+
+def test_bundle_candidate_splits_embedding_onto_sibling_connection() -> None:
+    from model_gateway.admin import BundleApplyRequest, bundle_candidate
+
+    config = GatewayConfig.model_validate(config_payload())
+    embedding_url = "https://dashscope-embedding.example/v1"
+    candidate, chat_id, secret_ref, deployment_ids, _, embed_id = bundle_candidate(
+        config,
+        BundleApplyRequest.model_validate(
+            _new_channel_bundle(embedding_base_url=embedding_url)
+        ),
+    )
+    assert chat_id == "dashscope-account"
+    assert embed_id == "dashscope-embedding-account"
+    chat = candidate.connections[chat_id]
+    embed = candidate.connections[embed_id]
+    assert chat.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert embed.base_url == embedding_url
+    assert chat.auth.secret_ref == embed.auth.secret_ref == secret_ref
+    assert candidate.deployments[deployment_ids[0]].connection == chat_id
+    assert candidate.deployments[deployment_ids[1]].connection == embed_id
+    space = candidate.deployments[deployment_ids[1]].embedding_space
+    assert space.startswith("mgw-embedding-v1-4-")
+    chat_space = derive_embedding_space(chat, "author/embed-v1", 4)
+    embed_space = derive_embedding_space(embed, "author/embed-v1", 4)
+    assert space == embed_space
+    assert space != chat_space
+
+
+def test_bundle_candidate_rejects_embedding_url_without_embedding_model() -> None:
+    from model_gateway.admin import BundleApplyRequest, bundle_candidate
+
+    config = GatewayConfig.model_validate(config_payload())
+    request = BundleApplyRequest.model_validate(
+        _new_channel_bundle(
+            embedding_base_url="https://embed.example/v1",
+            include_embedding=False,
+        )
+    )
+    with pytest.raises(ValueError, match="仅在同时配置向量模型时有效"):
+        bundle_candidate(config, request)
+
+
+def test_bundle_candidate_rejects_invalid_embedding_url() -> None:
+    from model_gateway.admin import BundleApplyRequest, bundle_candidate
+
+    config = GatewayConfig.model_validate(config_payload())
+    request = BundleApplyRequest.model_validate(
+        _new_channel_bundle(embedding_base_url="http://public.example/v1")
+    )
+    with pytest.raises(ValueError, match="embedding_base_url 无效"):
+        bundle_candidate(config, request)
+
+
+def test_channel_bundle_apply_splits_embedding_and_discovers_chat_only(
+    gateway_home,
+) -> None:
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host or "")
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "author/chat-next"}, {"id": "author/embed-v1"}]},
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    embedding_url = "https://embed.example/v1"
+    with TestClient(app) as client:
+        revision = client.get(
+            "/admin/configuration",
+            headers={"authorization": "Bearer admin-token"},
+        ).json()["revision"]
+        applied = client.post(
+            "/admin/channel-bundles/apply",
+            headers={"authorization": "Bearer admin-token"},
+            json=_new_channel_bundle(
+                revision=revision,
+                embedding_base_url=embedding_url,
+            ),
+        )
+        assert applied.status_code == 200, applied.text
+        payload = applied.json()
+        assert payload["applied"] is True
+        assert payload["connection_id"] == "dashscope-account"
+        assert payload["embedding_connection_id"] == "dashscope-embedding-account"
+
+    config = load_config(gateway_home.config)
+    assert config.connections["dashscope-account"].base_url.endswith(
+        "compatible-mode/v1"
+    )
+    assert config.connections["dashscope-embedding-account"].base_url == embedding_url
+    assert (
+        config.connections["dashscope-account"].auth.secret_ref
+        == config.connections["dashscope-embedding-account"].auth.secret_ref
+    )
+    chat_dep = config.deployments[payload["deployment_ids"][0]]
+    embed_dep = config.deployments[payload["deployment_ids"][1]]
+    assert chat_dep.connection == "dashscope-account"
+    assert embed_dep.connection == "dashscope-embedding-account"
+    assert seen_hosts
+    assert "embed.example" not in seen_hosts
+    assert "dashscope.aliyuncs.com" in seen_hosts
+    secrets = read_secrets(gateway_home.secrets)
+    assert secrets[config.connections["dashscope-account"].auth.secret_ref] == (
+        "sk-test-upstream-key"
+    )
 
 
 def test_ready_requires_a_routable_configured_provider(tmp_path: Path, gateway_home) -> None:

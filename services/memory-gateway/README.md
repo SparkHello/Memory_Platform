@@ -36,7 +36,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - 历史分类回填：对旧库一次性补齐主题、实体和空间，执行前自动 SQLite backup，并写决策日志。
 - 评估闭环：机制诊断、真实数据库快照、人工标注、关键词/embedding 召回指标。
 - Temporal KG 基础：`valid_from`、`temporal_subject`、`temporal_predicate`、保守旧事实失效、时间线查询和恢复。
-- 可选向量检索：经 Model Gateway `memory.embedding` route 与 `MODEL_GATEWAY_EMBEDDING_SPACE_ID` 启用；未配置或与空间/维度 Header、实际向量长度不匹配时自动回退到关键词检索。
+- 可选向量检索：创建并启用 Model Gateway `memory.embedding` route 即表示开启；`MODEL_GATEWAY_EMBEDDING_SPACE_ID` 为空时自动采用 route 契约，非空时严格固定。route 缺失/关闭则使用关键词检索；已启用但契约无效、不可用或不匹配会令 `/readyz` 返回 503。
 - 独立长文本知识库：支持 UTF-8 文本/Markdown、PDF、DOCX、EPUB，不可变版本、标签/结构化元数据、FTS5 + chunk embedding 混合检索、精确片段引用、全文分页和独立备份恢复。
 - 模型调用统一经独立 Model Gateway：为聊天、记忆提取、压缩、核心整理、体检、知识 fast/pro 和 embedding 分别配置稳定 route，是唯一模型路径。知识代理始终只编排本地索引和选择引用，最终正文由本地存储逐字返回。
 
@@ -93,7 +93,7 @@ memgw stack install --model-gateway-source ../model-gateway --start
 memgw stack status
 ```
 
-如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建精确 route scope 的 backend client、独立 admin client 和仓库外密钥。Docker 全新安装会在 Auth DB 创建唯一 Console-only 初始 token，关闭 legacy 认证，并把它与 admin key 写入宿主 `credentials/*.key` 私有文件；旧卷迁移才保留一个版本的 legacy key。密钥不写 daemon 日志、Compose 环境或长期进程环境。日常客户端应创建按设备 chat/MCP token；以后只使用：
+如果 Model Gateway 已安装到 PATH，或仍位于默认相邻目录，可以省略 `--model-gateway-source`。安装过程会创建精确 route scope 的 backend client、独立 admin client 和仓库外密钥。Docker 全新安装会在 Auth DB 创建唯一 Console-only 初始 token，关闭 legacy 认证，并把它与 admin key 写入宿主 `credentials/gateway.txt`、`credentials/admin.txt` 私有文件（旧安装兼容 `.key`）；旧卷迁移才保留一个版本的 legacy key。密钥不写 daemon 日志、Compose 环境或长期进程环境。日常客户端应创建按设备 chat/MCP token；以后只使用：
 
 ```bash
 memgw stack start
@@ -161,7 +161,7 @@ scripts/memgw install-path
 ```bash
 memgw secret set gateway
 memgw secret set model-gateway
-# 仅在配置了 memory.embedding route 时填写它声明的精确空间 ID：
+# 可选：仅在必须固定既有向量空间时设置；留空会自动采用 route 契约。
 memgw config set MODEL_GATEWAY_EMBEDDING_SPACE_ID '<embedding-space-id>'
 memgw doctor
 memgw start
@@ -210,12 +210,11 @@ CHAT_GATEWAY_ENABLED=true
 CHAT_GATEWAY_DEFAULT_MEMORY_MODE=read-write
 ```
 
-需要语义检索时，在 Model Gateway 配好 `memory.embedding` route，再填写它的精确 immutable space 和维度；为空或与响应 Header/实际向量长度不一致时，会安全使用本地关键词/FTS：
+需要语义检索时，在 Model Gateway 创建并启用 `memory.embedding` route；这就是明确开启语义向量能力的开关。默认让 space 留空以自动采用 route 声明的 immutable space 和维度；只有需要锁定已有索引契约时才填写精确 space。route 缺失/关闭会使用本地关键词/FTS；已启用 route 的契约畸形、不可用或与固定值不匹配时 `/readyz` 返回 503：
 
 ```env
 MODEL_GATEWAY_EMBEDDING_MODEL=memory.embedding
-MODEL_GATEWAY_EMBEDDING_SPACE_ID=your-exact-embedding-space-id
-EMBEDDING_DIMENSIONS=1024
+MODEL_GATEWAY_EMBEDDING_SPACE_ID=
 ```
 
 启动后端：
@@ -255,7 +254,8 @@ npm run dev
 
 | 用途 | URL |
 | --- | --- |
-| 健康检查 | `http://localhost:2026/health` |
+| 存活检查（进程/UI 可访问） | `http://localhost:2026/health` |
+| 运行就绪检查（模型/磁盘/向量契约） | `http://localhost:2026/readyz` |
 | Web 控制台 | `http://localhost:2026/ui` |
 | MCP | `http://localhost:2026/mcp` |
 | OpenAI-compatible base URL | `http://localhost:2026/v1` |
@@ -279,16 +279,17 @@ tailscale ip -4
 
 源码服务默认只监听回环；仅在需要可信局域网访问时显式使用 `--host 0.0.0.0`。Windows 上需允许 Windows 防火墙在可信私有网络中访问端口 `2026`；macOS 若开启应用防火墙，首次启动时允许 Python/uvicorn 接受传入连接即可。不要把端口映射到公网；远程请求必须携带与入口匹配的 scoped token。
 
-除 `/health` 外，受保护接口都需要 Bearer token。chat、MCP、Console token 各自固定角色与 user，调用方不能通过 Header 改写命名空间：
+`/health` 与 `/readyz` 不需要 Bearer token，且只返回安全状态/原因码；其他受保护接口需要 Bearer token。chat、MCP、Console token 各自固定角色与 user，调用方不能通过 Header 改写命名空间：
 
 ```http
 Authorization: Bearer <mgw_... 设备 token>
 ```
 
-启动后可先做两步只读验证：
+启动后可先做三步只读验证：
 
 ```bash
 curl http://localhost:2026/health
+curl http://localhost:2026/readyz
 curl \
   -H "Authorization: Bearer <chat token>" \
   http://localhost:2026/v1/models
@@ -326,10 +327,10 @@ curl \
 | `MODEL_GATEWAY_CHAT_MODEL` | `memory.chat` | `/v1` 透明聊天使用的稳定 route。 |
 | `MODEL_GATEWAY_MEMORY_*_MODEL` | 见 `.env.example` | 提取、压缩、核心整理和体检分别使用 `memory.extract`、`memory.compact`、`memory.core`、`memory.review`。 |
 | `MODEL_GATEWAY_KNOWLEDGE_*_MODEL` | 见 `.env.example` | 知识代理 fast/pro 阶段的两个独立 route。每个多轮阶段会锁定首次实际 deployment。 |
-| `MODEL_GATEWAY_EMBEDDING_MODEL` | `memory.embedding` | 记忆与知识向量化 route。网关要求该 route 的所有 fallback 使用同一向量空间和维度。 |
-| `MODEL_GATEWAY_EMBEDDING_SPACE_ID` | 空 | 必须与 Model Gateway deployment 声明的 immutable `embedding_space` 完全相同；为空，或空间/维度 Header 与 `EMBEDDING_DIMENSIONS` 不匹配时禁用向量并回退关键词/FTS，绝不混用旧空间。 |
+| `MODEL_GATEWAY_EMBEDDING_MODEL` | `memory.embedding` | 记忆与知识向量化 route。创建并启用该 route 表示明确开启语义向量；缺失或关闭表示 `off`，继续使用关键词/FTS 且不阻断 `/readyz`。所有 fallback 必须使用同一向量空间和维度。 |
+| `MODEL_GATEWAY_EMBEDDING_SPACE_ID` | 空 | 空值为 `auto`，完全采用启用 route 声明的 immutable space 与 dimensions；非空为 `pinned`，space 与 `EMBEDDING_DIMENSIONS` 共同组成严格期望契约。启用 route 若畸形、不可用或不匹配会令 `/readyz` 返回 503，绝不混用旧空间。 |
 | `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 private/sensitive 的文本发送给远程提取、embedding、AI 体检或知识代理服务。仅在所有相关 provider 均获准处理敏感数据时开启。 |
-| `EMBEDDING_DIMENSIONS` | `1024` | 声明的 embedding 向量维度；与空间/维度 Header 或实际向量长度不匹配时禁用向量并回退关键词/FTS。 |
+| `EMBEDDING_DIMENSIONS` | `1024` | 仅在 `MODEL_GATEWAY_EMBEDDING_SPACE_ID` 非空（`pinned`）时参与严格期望契约；`auto` 模式忽略此本地值，完全采用 route 解析出的唯一维度。 |
 | `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
 | `KNOWLEDGE_DATABASE_PATH` | `data/knowledge.db` | 独立知识库 SQLite 路径；不得与 `DATABASE_PATH` 相同。 |
 | `DISK_SOFT_RESERVE_BYTES` | `67108864` | memory、knowledge、auth、usage 所在卷的就绪软保留量；低于阈值时 `/readyz` 返回安全原因码 `disk_low`。小于 1 GiB 的卷自动按容量上限适配，避免小型设备/tmpfs 永久不就绪。 |
@@ -782,4 +783,4 @@ Windows 服务辅助脚本：
 - 分支节点和长期记忆提取在完整最终回答后的后台任务中完成，属于最终一致；极快的并发下一轮可能暂时看不到刚结束的一轮。
 - 没有动态 conversation ID 时，短 TTL 内“完全相同的消息历史 + 完全相同的最终回答”无法与 HTTP 重试区分，会按重试去重；不同最终回答仍可独立 ingest。
 - 图遍历和 Time Ripple 保留为实验/兼容能力，不是默认产品路径。
-- 后续更适合优先做空间管理增强、近期对话批量导入、更丰富的版本历史、SDK 和外部连接器。
+- 空间管理增强（改名/颜色/描述/排序/归档）与历史对话批量导入（preview/commit）已落地；后续更适合优先做更丰富的版本历史、SDK 和外部连接器。

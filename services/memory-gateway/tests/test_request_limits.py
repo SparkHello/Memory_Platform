@@ -118,6 +118,12 @@ async def test_chunked_body_at_exact_limit_is_replayed_without_truncation() -> N
         ),
         ("/memories/restore", "POST", MEMORY_RESTORE_BODY_LIMIT, "memory_restore"),
         (
+            "/memories/stack-backup/validate",
+            "POST",
+            MEMORY_RESTORE_BODY_LIMIT,
+            "memory_restore",
+        ),
+        (
             "/knowledge/restore",
             "POST",
             KNOWLEDGE_RESTORE_BODY_LIMIT,

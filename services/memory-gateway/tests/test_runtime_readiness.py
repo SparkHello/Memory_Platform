@@ -14,6 +14,10 @@ from app.api import health as health_api
 from app.api.knowledge import _knowledge_runtime_status
 from app.auth.tokens import AuthTokenStore
 from app.config import Settings, get_settings
+from app.llm.embedding_contract import (
+    clear_embedding_contract_cache,
+    resolve_embedding_contract,
+)
 from app.llm.runtime import MODEL_GATEWAY_REQUIRED_MESSAGE
 
 
@@ -33,7 +37,12 @@ def _central_settings(memory_store, knowledge_store) -> Settings:
     )
 
 
-def _control_payload(settings: Settings) -> dict[str, object]:
+def _control_payload(
+    settings: Settings,
+    *,
+    embedding_space_id: str | None = None,
+    embedding_dimensions: int | None = None,
+) -> dict[str, object]:
     chat_routes = (
         settings.model_gateway_chat_model,
         settings.model_gateway_memory_extract_model,
@@ -49,6 +58,7 @@ def _control_payload(settings: Settings) -> dict[str, object]:
                 "id": "synthetic-channel",
                 "enabled": True,
                 "configured": True,
+                "usage_scope": "backend_allowed",
             }
         ],
         "deployments": [
@@ -65,8 +75,17 @@ def _control_payload(settings: Settings) -> dict[str, object]:
                 "connection": "synthetic-channel",
                 "kind": "embedding",
                 "enabled": True,
-                "dimensions": settings.embedding_dimensions,
-                "embedding_space": settings.model_gateway_embedding_space_id,
+                "dimensions": (
+                    embedding_dimensions
+                    if embedding_dimensions is not None
+                    else settings.embedding_dimensions
+                ),
+                "embedding_space": (
+                    embedding_space_id
+                    if embedding_space_id is not None
+                    else settings.model_gateway_embedding_space_id
+                    or "synthetic-auto-space"
+                ),
             },
         ],
         "routes": [
@@ -192,7 +211,7 @@ def test_readyz_rejects_auth_database_without_any_usable_credential(
     }
 
 
-def test_readyz_rejects_missing_backend_route(
+def test_readyz_rejects_missing_pinned_embedding_route(
     client,
     memory_store,
     knowledge_store,
@@ -212,7 +231,40 @@ def test_readyz_rejects_missing_backend_route(
     response = client.get("/readyz")
 
     assert response.status_code == 503
-    assert response.json()["code"] == "model_gateway_route_visibility_mismatch"
+    assert response.json()["code"] == "model_gateway_embedding_contract_mismatch"
+
+
+@pytest.mark.parametrize("route_state", ["absent", "disabled"])
+def test_readyz_auto_mode_accepts_embedding_route_off(
+    route_state,
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_embedding_space_id = ""
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    payload = _control_payload(settings)
+    if route_state == "absent":
+        payload["routes"] = payload["routes"][:-1]  # type: ignore[index]
+    else:
+        payload["routes"][-1]["enabled"] = False  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(200, json=payload)
+
+    _install_model_transport(monkeypatch, handler)
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "model_runtime": "central",
+        "embedding_enabled": False,
+    }
 
 
 def test_readyz_rejects_wrong_embedding_space_or_dimensions(
@@ -237,6 +289,101 @@ def test_readyz_rejects_wrong_embedding_space_or_dimensions(
 
     assert response.status_code == 503
     assert response.json()["code"] == "model_gateway_embedding_contract_mismatch"
+
+
+def test_readyz_rejects_mixed_embedding_target_contracts(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_embedding_space_id = ""
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    payload = _control_payload(settings)
+    payload["deployments"].append(  # type: ignore[union-attr]
+        {
+            "id": "synthetic-embedding-fallback",
+            "connection": "synthetic-channel",
+            "kind": "embedding",
+            "enabled": True,
+            "dimensions": 768,
+            "embedding_space": "other-space",
+        }
+    )
+    payload["routes"][-1]["targets"].append(  # type: ignore[index,union-attr]
+        "synthetic-embedding-fallback"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(200, json=payload)
+
+    _install_model_transport(monkeypatch, handler)
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "code": "model_gateway_embedding_contract_mismatch",
+    }
+
+
+def test_readyz_rejects_enabled_embedding_route_without_usable_target(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_embedding_space_id = ""
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    payload = _control_payload(settings)
+    payload["deployments"][-1]["enabled"] = False  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(200, json=payload)
+
+    _install_model_transport(monkeypatch, handler)
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "code": "model_gateway_route_unavailable",
+    }
+
+
+def test_readyz_rejects_chat_routes_on_interactive_only_connection(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.model_gateway_embedding_space_id = ""
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    payload = _control_payload(settings)
+    payload["connections"][0]["usage_scope"] = "interactive_only"  # type: ignore[index]
+    payload["routes"] = payload["routes"][:-1]  # type: ignore[index]
+    payload["deployments"] = payload["deployments"][:-1]  # type: ignore[index]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(200, json=payload)
+
+    _install_model_transport(monkeypatch, handler)
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "code": "model_gateway_route_unavailable",
+    }
 
 
 def test_readyz_requires_model_gateway_operational_ready(
@@ -325,6 +472,7 @@ def test_central_knowledge_status_uses_resolved_routes_and_embedding(
     knowledge_store,
 ) -> None:
     settings = _central_settings(memory_store, knowledge_store)
+    resolve_embedding_contract(settings, _control_payload(settings))
 
     status = _knowledge_runtime_status(settings)
 
@@ -339,8 +487,10 @@ def test_central_knowledge_status_uses_resolved_routes_and_embedding(
 @pytest.fixture(autouse=True)
 def _clear_readyz_cache() -> Iterator[None]:
     health_api._readyz_cache.clear()
+    clear_embedding_contract_cache()
     yield
     health_api._readyz_cache.clear()
+    clear_embedding_contract_cache()
 
 
 def _ready_central_settings(memory_store, knowledge_store) -> Settings:

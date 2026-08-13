@@ -2,6 +2,8 @@
 
 import json
 
+from app.config import Settings, get_settings
+from app.llm.embedding_contract import resolve_embedding_contract
 from app.memory.store import MemoryStore
 
 
@@ -931,10 +933,16 @@ class TestReEmbedEndpoint:
         """scan 模式重建维度正确但包含非有限数的损坏向量。"""
         import app.api.deps as deps
 
-        memory_store.create_memory(
+        damaged = memory_store.create_memory(
             user_id="default",
             content="需要重新生成向量的记忆",
             embedding_json="[NaN, 0.0, 0.0, 0.0]",
+        )
+        healthy = memory_store.create_memory(
+            user_id="default",
+            content="有效向量不应被扫描重建",
+            embedding_json="[0.1, 0.2, 0.3, 0.4]",
+            embedding_space_id="test-space",
         )
 
         class FakeEmbeddingClient:
@@ -956,13 +964,112 @@ class TestReEmbedEndpoint:
         assert response.status_code == 200
         payload = response.json()
         assert payload["re_embedded"] == 1
-        assert len(payload["memory_ids"]) == 1
+        assert payload["memory_ids"] == [damaged.id]
+        assert healthy.id not in payload["memory_ids"]
         refreshed = memory_store.get_memory(
             memory_id=payload["memory_ids"][0],
             user_id="default",
         )
         assert refreshed is not None
         assert refreshed.embedding_space_id == "test-space"
+
+    def test_re_embed_scan_selects_memories_without_space(self, client, auth_headers, memory_store):
+        import app.api.deps as deps
+
+        orphan = memory_store.create_memory(
+            user_id="default",
+            content="开启语义搜索前写下的记忆",
+        )
+        current = memory_store.create_memory(
+            user_id="default",
+            content="已在当前空间的记忆",
+            embedding_json="[0.1, 0.2, 0.3, 0.4]",
+            embedding_space_id="test-space",
+        )
+
+        class FakeEmbeddingClient:
+            def __init__(self) -> None:
+                self.dimensions = 4
+                self.embedding_space_id = "test-space"
+
+            async def embed(self, text: str) -> list[float]:
+                return [0.5, 0.4, 0.3, 0.2]
+
+        client.app.dependency_overrides[deps.get_embedding_client] = (
+            lambda: FakeEmbeddingClient()
+        )
+        response = client.post(
+            "/memories/re-embed",
+            json={"scan": True},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["re_embedded"] == 1
+        assert payload["memory_ids"] == [orphan.id]
+        assert current.id not in payload["memory_ids"]
+        refreshed = memory_store.get_memory(memory_id=orphan.id, user_id="default")
+        assert refreshed is not None
+        assert refreshed.embedding_space_id == "test-space"
+
+
+def test_memory_health_uses_authoritative_embedding_dimensions(
+    client,
+    auth_headers,
+    memory_store,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="test-gateway-key",
+        DATABASE_PATH=memory_store.database_path,
+        MODEL_GATEWAY_BASE_URL="http://127.0.0.1:2030/v1",
+        MODEL_GATEWAY_API_KEY="backend-key",
+        MODEL_GATEWAY_EMBEDDING_SPACE_ID="",
+        EMBEDDING_DIMENSIONS=1024,
+    )
+    resolve_embedding_contract(
+        settings,
+        {
+            "connections": [
+                {"id": "embedding-channel", "enabled": True, "configured": True}
+            ],
+            "deployments": [
+                {
+                    "id": "embedding-primary",
+                    "connection": "embedding-channel",
+                    "kind": "embedding",
+                    "enabled": True,
+                    "dimensions": 4,
+                    "embedding_space": "route-space",
+                }
+            ],
+            "routes": [
+                {
+                    "id": "memory.embedding",
+                    "kind": "embedding",
+                    "enabled": True,
+                    "targets": ["embedding-primary"],
+                }
+            ],
+        },
+    )
+    client.app.dependency_overrides[get_settings] = lambda: settings
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="route 契约维度为四维",
+        embedding_json="[0.1, 0.2, 0.3, 0.4]",
+        embedding_space_id="route-space",
+    )
+
+    response = client.get("/memories/health", headers=auth_headers)
+
+    assert response.status_code == 200
+    mismatched_ids = {
+        issue.get("related_id")
+        for issue in response.json()["issues"]
+        if issue["type"] == "embedding_dimension_mismatch"
+    }
+    assert memory.id not in mismatched_ids
 
 
 class TestArchiveExpiredEndpoint:

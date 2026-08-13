@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
+from app.llm.embedding_contract import (
+    EmbeddingMode,
+    EmbeddingState,
+    get_embedding_contract_snapshot,
+)
+
 
 class ModelRuntimeConfigurationError(ValueError):
     """Model routing configuration is incomplete or internally inconsistent."""
@@ -44,6 +50,10 @@ class EmbeddingRuntime:
     dimensions: int
     space_id: str
     model_gateway_mode: bool = True
+    mode: EmbeddingMode = "auto"
+    state: EmbeddingState = "unavailable"
+    code: str = "model_gateway_control_unavailable"
+    status_model: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +105,6 @@ def resolve_model_runtime(settings: Any) -> ModelRuntime:
     if not central_base_url:
         raise ModelRuntimeConfigurationError(MODEL_GATEWAY_REQUIRED_MESSAGE)
 
-    dimensions = _embedding_dimensions(settings)
     routes = {
         field_name: str(getattr(settings, field_name, "") or "").strip()
         for field_name in set(_OPERATION_ROUTE_FIELDS.values())
@@ -105,19 +114,19 @@ def resolve_model_runtime(settings: Any) -> ModelRuntime:
         raise ModelRuntimeConfigurationError(
             "中央模型网关缺少稳定 route 配置：" + ", ".join(missing_routes)
         )
-    embedding_space = " ".join(
-        str(
-            getattr(settings, "model_gateway_embedding_space_id", "") or ""
-        ).strip().split()
-    )
+    embedding_contract = get_embedding_contract_snapshot(settings)
     embedding = EmbeddingRuntime(
-        enabled=bool(embedding_space),
+        enabled=embedding_contract.configured,
         base_url=central_base_url,
         api_key=central_api_key,
         model=routes["model_gateway_embedding_model"],
-        dimensions=dimensions,
-        space_id=embedding_space,
+        dimensions=embedding_contract.dimensions,
+        space_id=embedding_contract.space_id,
         model_gateway_mode=True,
+        mode=embedding_contract.mode,
+        state=embedding_contract.state,
+        code=embedding_contract.code,
+        status_model=embedding_contract.upstream_model,
     )
     return ModelRuntime(
         mode="central",
@@ -126,16 +135,3 @@ def resolve_model_runtime(settings: Any) -> ModelRuntime:
         routes=MappingProxyType(routes),
         embedding=embedding,
     )
-
-
-def _embedding_dimensions(settings: Any) -> int:
-    raw_value = getattr(settings, "embedding_dimensions", 0)
-    if isinstance(raw_value, bool):
-        raise ModelRuntimeConfigurationError("EMBEDDING_DIMENSIONS 格式无效")
-    try:
-        dimensions = int(raw_value)
-    except (TypeError, ValueError) as exc:
-        raise ModelRuntimeConfigurationError("EMBEDDING_DIMENSIONS 格式无效") from exc
-    if not 1 <= dimensions <= 65536:
-        raise ModelRuntimeConfigurationError("EMBEDDING_DIMENSIONS 必须在 1 到 65536 之间")
-    return dimensions

@@ -111,7 +111,10 @@ const status: ProvidersStatus = {
     model: "memory.embedding",
     base_url: "http://model-gateway:2030/v1",
     dimensions: 1024,
-    configured: false
+    configured: false,
+    mode: "auto",
+    state: "off",
+    code: "embedding_route_off"
   },
   providers: [],
   routes: [],
@@ -130,6 +133,49 @@ const status: ProvidersStatus = {
 };
 
 describe("provider object management", () => {
+  it("shows an intentionally disabled automatic embedding route as keyword mode", async () => {
+    const api = {
+      providersStatus: vi.fn().mockResolvedValue(status)
+    } as unknown as MemoryApi;
+
+    render(<ProvidersPage api={api} expertMode />);
+
+    expect(await screen.findByText(/自动契约 · 已关闭（关键词检索）/)).toBeInTheDocument();
+    expect(screen.getByText(/embedding_route_off/)).toBeInTheDocument();
+  });
+
+  it("keeps the repair surface visible when chat works but the embedding contract is invalid", async () => {
+    const invalidStatus: ProvidersStatus = {
+      ...status,
+      embedding: {
+        ...status.embedding,
+        configured: false,
+        dimensions: 0,
+        state: "invalid",
+        code: "model_gateway_embedding_contract_mismatch"
+      },
+      setup: {
+        ...status.setup,
+        state: "configuration_error",
+        service_ready: false,
+        chat_ready: true,
+        next_action: "repair_model_gateway"
+      }
+    };
+    const api = {
+      providersStatus: vi.fn().mockResolvedValue(invalidStatus)
+    } as unknown as MemoryApi;
+
+    render(<ProvidersPage api={api} initialSetup expertMode />);
+
+    expect(
+      await screen.findByRole("heading", { name: "修复模型与向量配置" })
+    ).toBeInTheDocument();
+    expect(screen.getByText(/自动契约 · 契约无效/)).toBeInTheDocument();
+    expect(screen.getByText(/model_gateway_embedding_contract_mismatch/)).toBeInTheDocument();
+    expect(screen.queryByText("完成下面三步即可开始聊天")).not.toBeInTheDocument();
+  });
+
   it("loads the full admin graph and only enables delete for unreferenced objects", async () => {
     const user = userEvent.setup();
     const deleteProviderObject = vi.fn().mockResolvedValue({

@@ -82,9 +82,9 @@ case "$*" in
   "port synthetic-memory"|"port synthetic-model") exit 0 ;;
   *".compose.internal."*" up -d"*)
     mkdir -p "$MEMORY_PLATFORM_DIR/credentials"
-    printf 'synthetic-gateway-value\n' > "$MEMORY_PLATFORM_DIR/credentials/gateway.key"
-    printf 'synthetic-admin-value\n' > "$MEMORY_PLATFORM_DIR/credentials/admin.key"
-    chmod 600 "$MEMORY_PLATFORM_DIR/credentials/"*.key
+    printf 'synthetic-gateway-value\n' > "$MEMORY_PLATFORM_DIR/credentials/gateway.txt"
+    printf 'synthetic-admin-value\n' > "$MEMORY_PLATFORM_DIR/credentials/admin.txt"
+    chmod 600 "$MEMORY_PLATFORM_DIR/credentials/"*.txt
     exit 0
     ;;
   *" up -d --no-deps --force-recreate memory-gateway"*)
@@ -143,8 +143,8 @@ def test_fresh_install_pins_digests_and_delivers_only_credential_paths(tmp_path:
     assert "memory-platform-memory@sha256:" in env_text
     assert "synthetic-gateway-value" not in result.stdout + result.stderr
     assert "synthetic-admin-value" not in result.stdout + result.stderr
-    assert str(install_dir / "credentials" / "gateway.key") in result.stdout
-    assert (install_dir / "credentials" / "gateway.key").stat().st_mode & 0o777 == 0o600
+    assert str(install_dir / "credentials" / "gateway.txt") in result.stdout
+    assert (install_dir / "credentials" / "gateway.txt").stat().st_mode & 0o777 == 0o600
 
 
 def test_installer_rejects_secret_environment_without_echoing_value(tmp_path: Path):

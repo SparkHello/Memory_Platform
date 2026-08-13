@@ -7,7 +7,7 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
   expect(viewport).toEqual({ width: 1440, height: 900 });
 
   await page.goto("/ui/");
-  await expect(page.getByRole("heading", { name: "输入客户端访问密钥" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输入访问密钥" })).toBeVisible();
   await expect(page.getByLabel("服务地址")).toHaveCount(0);
   await expect(page.getByLabel("用户 ID")).toHaveCount(0);
 
@@ -31,6 +31,7 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
   await expect(page.getByRole("heading", { name: "新建渠道" })).toBeVisible();
 
   const candidateKey = "synthetic-provider-candidate-key-never-persisted";
+  await page.getByRole("radio", { name: /DeepSeek 官方/ }).click();
   await page.getByPlaceholder("sk-...").fill(candidateKey);
   await page.getByRole("button", { name: "只读发现模型" }).click();
   await expect(page.getByText(/候选渠道和密钥尚未保存/)).toBeVisible();

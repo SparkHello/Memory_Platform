@@ -84,6 +84,17 @@
   --space-5: 20px;
   --space-6: 24px;
 
+  /* ── 层级：语义化 z-index 阶梯，浮层只允许取这些档位 ── */
+  --z-sticky: 50;
+  --z-popover: 60;
+  --z-sidebar: 80;
+  --z-bottom-nav: 120;
+  --z-scrim: 150;
+  --z-drawer: 160;
+  --z-modal: 180;
+  --z-sheet: 190;
+  --z-toast: 220;
+
   /* ── 动效：指数缓出，不弹跳 ── */
   --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
@@ -101,6 +112,8 @@
   --text-title: clamp(24px, 2.2vw, 34px);
   --text-section: 15px;
   --text-caption: 12px;
+  /* 全站辅助文字的字号下限：中文在 11px 以下基本不可读 */
+  --text-micro: 11px;
 
   --tier1-bg: var(--surface);
   --tier1-border: var(--border);
@@ -143,22 +156,26 @@
 [data-theme="light"] {
   color-scheme: light;
 
-  /* ── 晨窗玻璃：清晨的光透过磨砂玻璃 ── */
-  --bg: #ebe6de;
-  --bg-deep: #e2dcd2;
-  --surface: rgba(255, 255, 255, 0.55);
-  --surface-muted: rgba(70, 56, 42, 0.05);
-  --surface-strong: rgba(70, 56, 42, 0.1);
-  --solid-bg: #fdfbf7;
-  --th-bg: rgba(250, 247, 241, 0.94);
-  --border: rgba(70, 56, 42, 0.1);
-  --border-strong: rgba(70, 56, 42, 0.2);
-  --text: #211c17;
-  --muted: #6c665c;
-  --muted-strong: #47423b;
+  /*
+   * ── 晨窗瓷白：清晨的白瓷桌面，暖意来自光场而不是底色 ──
+   * 底色刻意压到接近白（低色度），避免"奶油米黄"的糊感；
+   * muted 文字对底色 ≥ 6.5:1，语义色 ≥ 5:1（脚本验证过）。
+   */
+  --bg: #f6f4f1;
+  --bg-deep: #edeae4;
+  --surface: rgba(255, 255, 255, 0.6);
+  --surface-muted: rgba(62, 53, 40, 0.05);
+  --surface-strong: rgba(62, 53, 40, 0.09);
+  --solid-bg: #fdfcfa;
+  --th-bg: rgba(251, 250, 247, 0.94);
+  --border: rgba(62, 53, 40, 0.12);
+  --border-strong: rgba(62, 53, 40, 0.24);
+  --text: #201c15;
+  --muted: #5d574c;
+  --muted-strong: #3e3931;
   --primary: #7c5f28;
   --primary-hover: #6d5322;
-  --primary-soft: rgba(139, 111, 58, 0.1);
+  --primary-soft: rgba(124, 95, 40, 0.1);
   --on-primary: #ffffff;
   --mid: #8a6a33;
   --on-vivid: #ffffff;
@@ -168,23 +185,23 @@
   --warning: #78591a;
   --danger: #a84858;
   --info: #35606e;
-  --field-bg: rgba(255, 255, 255, 0.55);
+  --field-bg: rgba(255, 255, 255, 0.66);
   --field-bg-focus: #ffffff;
   --focus-ring: rgba(124, 95, 40, 0.35);
   --focus-outline: #6d5322;
 
-  --sidebar-text: #241f18;
-  --sidebar-muted: #6c665c;
-  --sidebar-surface: rgba(70, 56, 42, 0.07);
-  --glass-bg: rgba(255, 255, 255, 0.6);
-  --glass-border: rgba(70, 56, 42, 0.12);
+  --sidebar-text: #201c15;
+  --sidebar-muted: #5d574c;
+  --sidebar-surface: rgba(62, 53, 40, 0.06);
+  --glass-bg: rgba(255, 255, 255, 0.66);
+  --glass-border: rgba(62, 53, 40, 0.14);
   --glass-blur: blur(26px) saturate(1.5);
   --glass-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.85),
-    0 20px 48px -18px rgba(96, 74, 50, 0.28),
-    0 3px 12px rgba(96, 74, 50, 0.08);
-  --glass-panel-bg: linear-gradient(155deg, rgba(255, 255, 255, 0.74), rgba(255, 253, 248, 0.52));
-  --glass-panel-hover: linear-gradient(155deg, rgba(255, 255, 255, 0.85), rgba(255, 253, 248, 0.65));
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 20px 48px -18px rgba(96, 74, 50, 0.24),
+    0 3px 12px rgba(96, 74, 50, 0.07);
+  --glass-panel-bg: linear-gradient(155deg, rgba(255, 255, 255, 0.8), rgba(253, 252, 249, 0.58));
+  --glass-panel-hover: linear-gradient(155deg, rgba(255, 255, 255, 0.9), rgba(253, 252, 249, 0.7));
 
   --crystal-bg: var(--glass-panel-bg);
   --crystal-bg-hover: var(--glass-panel-hover);
@@ -193,11 +210,11 @@
   --crystal-border: var(--glass-border);
   --crystal-shadow: var(--glass-shadow);
 
-  --shadow-sm: 0 2px 8px rgba(96, 74, 50, 0.1);
-  --shadow-md: 0 24px 60px -14px rgba(96, 74, 50, 0.3);
-  --shadow-card: 0 1px 3px rgba(96, 74, 50, 0.07), 0 10px 26px -12px rgba(96, 74, 50, 0.16);
+  --shadow-sm: 0 2px 8px rgba(96, 74, 50, 0.09);
+  --shadow-md: 0 24px 60px -14px rgba(96, 74, 50, 0.26);
+  --shadow-card: 0 1px 3px rgba(96, 74, 50, 0.06), 0 10px 26px -12px rgba(96, 74, 50, 0.14);
 
-  --brand-bg: linear-gradient(150deg, #f3e6cf, #e7d5b6);
+  --brand-bg: linear-gradient(150deg, #f4e9d3, #e9dabc);
   --brand-color: #6d5322;
   --eq-dot-fill: #8a6a33;
 
@@ -215,11 +232,11 @@
   --emo-mid: #7d6026;
   --emo-pos: #2e7d5e;
 
-  /* ── 晨光光场：暖金 / 晨空蓝 / 一点桃色 ── */
-  --ambient-a: rgba(228, 178, 100, 0.34);
-  --ambient-b: rgba(150, 178, 210, 0.3);
-  --ambient-c: rgba(222, 160, 142, 0.22);
-  --ambient-glow: rgba(255, 244, 218, 0.55);
-  --ambient-vignette: rgba(120, 96, 66, 0.12);
-  --grain-opacity: 0.035;
+  /* ── 晨光光场：暖金 / 晨空蓝 / 一点桃色。收敛强度，让底色保持瓷白 ── */
+  --ambient-a: rgba(224, 175, 100, 0.26);
+  --ambient-b: rgba(146, 176, 210, 0.26);
+  --ambient-c: rgba(222, 160, 142, 0.18);
+  --ambient-glow: rgba(255, 243, 215, 0.38);
+  --ambient-vignette: rgba(112, 92, 66, 0.1);
+  --grain-opacity: 0.03;
 }

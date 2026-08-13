@@ -17,7 +17,7 @@ import {
   XCircle
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ApiError, isAbortError, type MemoryApi } from "../../api";
+import { isAbortError, type MemoryApi } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
@@ -35,6 +35,8 @@ import type {
   RouteInfo
 } from "../../types";
 import { errorMessage } from "../../utils/format";
+import { isProviderSetupReady } from "../../utils/providerSetup";
+import { AddChannelModelPanel } from "./AddChannelModelPanel";
 import { NewChannelWizard, ROUTE_LABELS } from "./NewChannelWizard";
 
 type Feedback = { tone: "success" | "warning" | "error"; message: string };
@@ -94,11 +96,13 @@ function useUnsavedChangesGuard(dirty: boolean, message: string, confirm: Confir
 export function ProvidersPage({
   api,
   initialSetup = false,
-  expertMode = false
+  expertMode = false,
+  onSetupChanged
 }: {
   api: MemoryApi;
   initialSetup?: boolean;
   expertMode?: boolean;
+  onSetupChanged?: () => Promise<void> | void;
 }) {
   const [status, setStatus] = useState<ProvidersStatus | null>(null);
   const [drafts, setDrafts] = useState<ModelGatewayRouteDraft[]>([]);
@@ -114,6 +118,9 @@ export function ProvidersPage({
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [validatedSignature, setValidatedSignature] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [addModelConnectionId, setAddModelConnectionId] = useState("");
+  const addModelConnection =
+    status?.control?.connections.find((item) => item.id === addModelConnectionId) || null;
   const { confirm, confirmState, resolveConfirm } = useConfirm();
 
   const load = useCallback(
@@ -223,7 +230,7 @@ export function ProvidersPage({
       });
     } catch (cause) {
       setValidatedSignature("");
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     } finally {
       setBusyAction("");
     }
@@ -247,7 +254,7 @@ export function ProvidersPage({
       });
     } catch (cause) {
       setValidatedSignature("");
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     } finally {
       setBusyAction("");
     }
@@ -274,7 +281,7 @@ export function ProvidersPage({
         message: `${connection.channel_operator} 的密钥已替换。密钥值未被页面读取或保存。`
       });
     } catch (cause) {
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     } finally {
       setBusyAction("");
     }
@@ -292,7 +299,7 @@ export function ProvidersPage({
         delete next[connection.id];
         return next;
       });
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     }
   };
 
@@ -341,11 +348,10 @@ export function ProvidersPage({
       }
     } catch (cause) {
       setAdminCheck("invalid");
-      const message =
-        cause instanceof ApiError && cause.status === 401
-          ? "验证失败：这不是 Model Gateway 的 admin 密钥。注意 admin 密钥（admin.key）与登录网页用的 Console token（gateway.key）是两把不同的钥匙。"
-          : errorMessage(cause);
-      setFeedback({ tone: "error", message });
+      setFeedback({
+        tone: "error",
+        message: errorMessage(cause, { credential: "admin" })
+      });
     }
   };
 
@@ -388,7 +394,7 @@ export function ProvidersPage({
         message: `${id} 已${enabled ? "启用" : "禁用"}，配置已热加载。`
       });
     } catch (cause) {
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     } finally {
       setBusyAction("");
     }
@@ -419,23 +425,30 @@ export function ProvidersPage({
       await refreshAll(false);
       setFeedback({ tone: "success", message: `${id} 已删除。` });
     } catch (cause) {
-      setFeedback({ tone: "error", message: errorMessage(cause) });
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
     } finally {
       setBusyAction("");
     }
   };
 
-  const setupMode = initialSetup && !status?.setup.chat_ready;
+  const setupMode = initialSetup && !isProviderSetupReady(status?.setup);
+  const repairMode = Boolean(
+    status &&
+      (status.setup.state === "configuration_error" || !status.setup.service_ready)
+  );
 
   return (
     <div className="page-stack providers-page">
       <PageHeader
-        eyebrow={setupMode ? "首次设置 · 第 2 步" : undefined}
-        title={setupMode ? "连接一个模型渠道" : "模型与路由"}
+        eyebrow={setupMode ? (repairMode ? "运行配置需处理" : "首次设置 · 第 2 步") : undefined}
+        title={setupMode ? (repairMode ? "修复模型与向量配置" : "连接一个模型渠道") : "模型与路由"}
+        showTitle={setupMode}
         subtitle={
           setupMode
-            ? "选择渠道、粘贴供应商 API Key，再选择一个聊天模型即可。"
-            : "管理模型渠道、密钥和故障切换顺序。"
+            ? repairMode
+              ? "聊天路由可能仍可用，但整体配置尚未就绪；请按状态提示修复后再继续。"
+              : "选择渠道、粘贴供应商 API Key，再选择一个聊天模型即可。"
+            : undefined
         }
         action={
           <div className="provider-page-actions">
@@ -444,26 +457,28 @@ export function ProvidersPage({
                 放弃草稿
               </button>
             )}
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => {
-                void refreshAll(false).catch((cause) => {
-                  setFeedback({ tone: "error", message: errorMessage(cause) });
-                });
-              }}
-              disabled={loading || Boolean(busyAction)}
-            >
-              <RefreshCcw size={16} aria-hidden />
-              {dirty ? "放弃并刷新" : "刷新"}
-            </button>
-            {status?.control && (
+            {dirty && (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  void refreshAll(false).catch((cause) => {
+                    setFeedback({ tone: "error", message: errorMessage(cause) });
+                  });
+                }}
+                disabled={loading || Boolean(busyAction)}
+              >
+                <RefreshCcw size={16} aria-hidden />
+                放弃并刷新
+              </button>
+            )}
+            {dirty && status?.control && (
               <>
                 <button
                   type="button"
                   className="secondary-button"
                   onClick={() => void validateRoutes()}
-                  disabled={!dirty || !hasAdminKey || Boolean(busyAction)}
+                  disabled={!hasAdminKey || Boolean(busyAction)}
                 >
                   <ShieldCheck size={16} aria-hidden />
                   {busyAction === "validate" ? "正在校验" : "校验草稿"}
@@ -488,13 +503,14 @@ export function ProvidersPage({
 
       {status && (
         <>
-          {setupMode && <FirstRunProgress status={status} adminCheck={adminCheck} />}
+          {setupMode && !repairMode && <FirstRunProgress status={status} adminCheck={adminCheck} />}
           {status.config_error && <ErrorBlock message={`配置不可用：${status.config_error}`} />}
-          {!setupMode && (
+          {(!setupMode || repairMode) && (
             <RuntimeBanner
               status={status}
               dirty={dirty}
               validated={validated}
+              compact={!expertMode}
               onLiveProbe={() => void runLiveProbe()}
               liveProbeBusy={busyAction === "live-probe"}
             />
@@ -540,7 +556,14 @@ export function ProvidersPage({
                 }
                 onSaveSecret={(connection) => void saveSecret(connection)}
                 onCheck={(connection) => void checkConnection(connection)}
-                onCreateChannel={() => setWizardOpen(true)}
+                onCreateChannel={() => {
+                  setAddModelConnectionId("");
+                  setWizardOpen(true);
+                }}
+                onAddModel={(connection) => {
+                  setWizardOpen(false);
+                  setAddModelConnectionId(connection.id);
+                }}
               />
               {wizardOpen && (
                 <NewChannelWizard
@@ -549,8 +572,24 @@ export function ProvidersPage({
                   control={status.control}
                   confirm={confirm}
                   onClose={() => setWizardOpen(false)}
-                onCompleted={() => refreshAll(false)}
+                onCompleted={async () => {
+                  await refreshAll(false);
+                  await onSetupChanged?.();
+                }}
               />
+              )}
+              {addModelConnection && (
+                <AddChannelModelPanel
+                  api={api}
+                  adminKey={adminKey}
+                  control={status.control}
+                  connection={addModelConnection}
+                  onClose={() => setAddModelConnectionId("")}
+                  onCompleted={async () => {
+                    await refreshAll(false);
+                    await onSetupChanged?.();
+                  }}
+                />
               )}
               {expertMode ? (
                 <>
@@ -578,7 +617,7 @@ export function ProvidersPage({
               ) : (
                 <div className="provider-feedback" role="note">
                   <ShieldCheck size={18} aria-hidden />
-                  <span>故障切换顺序、底层 deployment 和未引用对象管理已收进本机专家模式；日常添加渠道无需开启。</span>
+                  <span>故障切换顺序、底层部署对象（deployment）和未引用对象管理已收进本机专家模式；日常添加渠道无需开启。</span>
                 </div>
               )}
             </>
@@ -656,7 +695,7 @@ function AdminAccess({
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>
         <p>
-          Docker 首次安装只把它写入安装目录的 <code>credentials/admin.key</code> 私有文件；不会写入容器日志或环境变量。
+          Docker 首次安装只把它写入安装目录的 <code>credentials/admin.txt</code> 私有文件（旧版为 <code>admin.key</code>）；不会写入容器日志或环境变量。
         </p>
         <p>丢失后只能换一枚新的；旧密钥会立即失效：</p>
         <p>Docker：在安装目录（默认 memory-platform）打开终端后运行：</p>
@@ -710,7 +749,8 @@ function ConnectionsEditor({
   onToggleSecret,
   onSaveSecret,
   onCheck,
-  onCreateChannel
+  onCreateChannel,
+  onAddModel
 }: {
   control: ModelGatewayControlSnapshot;
   adminReady: boolean;
@@ -723,6 +763,7 @@ function ConnectionsEditor({
   onSaveSecret: (connection: ModelGatewayConnectionInfo) => void;
   onCheck: (connection: ModelGatewayConnectionInfo) => void;
   onCreateChannel: () => void;
+  onAddModel: (connection: ModelGatewayConnectionInfo) => void;
 }) {
   const deploymentsByConnection = useMemo(() => {
     const grouped: Record<string, ModelGatewayDeploymentInfo[]> = {};
@@ -737,7 +778,7 @@ function ConnectionsEditor({
       <div className="panel-header provider-section-header">
         <div>
           <h2 id="provider-connections-title">模型渠道</h2>
-          <p>替换已有渠道密钥并执行免费的模型列表检查；不会发起推理。</p>
+          <p>添加模型或检查连接。密钥替换放在各渠道展开项里。</p>
         </div>
         <div className="provider-section-actions">
           <span className="provider-count">{control.connections.length} 个渠道</span>
@@ -750,8 +791,7 @@ function ConnectionsEditor({
       {control.connections.length === 0 && (
         <div className="provider-empty-cta">
           <p>
-            还没有任何模型渠道。新建第一个渠道后，即可选择聊天模型并把
-            memory.* / knowledge.* 用途路由指向它，无需回到终端。
+            还没有任何模型渠道。新建第一个渠道后，选择一个聊天模型即可开始用。
           </p>
           <button type="button" className="primary-button" onClick={onCreateChannel}>
             <Plus size={16} aria-hidden />
@@ -775,15 +815,17 @@ function ConnectionsEditor({
                   />
                 </div>
                 <p>{connection.base_url}</p>
-                <div className="provider-deployment-chips" aria-label="关联 deployment">
+                <div className="provider-deployment-chips" aria-label="关联部署">
                   {(deploymentsByConnection[connection.id] || []).map((deployment) => (
                     <span key={deployment.id}>{deployment.id}</span>
                   ))}
                 </div>
               </div>
               <div className="provider-secret-actions">
+                <details className="provider-secret-replace">
+                  <summary>替换渠道密钥</summary>
                 <label className="field-block">
-                  <span>替换渠道密钥</span>
+                  <span className="sr-only">新的渠道密钥</span>
                   <div className="secret-field">
                     <input
                       type={showSecrets[connection.id] ? "text" : "password"}
@@ -809,7 +851,6 @@ function ConnectionsEditor({
                     </button>
                   </div>
                 </label>
-                <div className="provider-connection-buttons">
                   <button
                     type="button"
                     className="secondary-button"
@@ -819,6 +860,8 @@ function ConnectionsEditor({
                     <KeyRound size={16} aria-hidden />
                     {busyAction === `secret:${connection.id}` ? "正在保存" : "替换密钥"}
                   </button>
+                </details>
+                <div className="provider-connection-buttons">
                   <button
                     type="button"
                     className="secondary-button"
@@ -827,6 +870,15 @@ function ConnectionsEditor({
                   >
                     <PlugZap size={16} aria-hidden />
                     {check === "checking" ? "正在检查" : "检查连接"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => onAddModel(connection)}
+                    disabled={!adminReady || !connection.configured || Boolean(busyAction)}
+                  >
+                    <Plus size={16} aria-hidden />
+                    添加模型
                   </button>
                 </div>
                 {check && check !== "checking" && <ConnectionCheckResult result={check} />}
@@ -904,7 +956,7 @@ function ObjectManager({
     <details className="panel provider-advanced-panel provider-object-manager">
       <summary>专家模式：底层对象管理</summary>
       <p className="muted">
-        这里展示 admin 视图中的全部对象，包括未被 route 引用的候选项。只能删除未引用对象；服务端会用 revision CAS 再次核验。
+        这里展示管理视图中的全部对象，包括未被任何路由引用的候选项。只能删除未引用对象；服务端会在删除前再次核验版本。
       </p>
       <div className="provider-object-groups">
         <ObjectGroup title="Connections" count={control.connections.length}>
@@ -1062,7 +1114,7 @@ function RoutesEditor({
       <div className="provider-routes-heading">
         <div>
           <h2 id="provider-routes-title">用途与优先顺序</h2>
-          <p>上方模型不可用时，Model Gateway 按顺序尝试下一个 deployment。</p>
+          <p>上方模型不可用时，Model Gateway 按顺序尝试下一个部署（deployment）。</p>
         </div>
         <span>拖动替代为明确的上移/下移按钮，键盘和触控都可操作</span>
       </div>
@@ -1184,17 +1236,47 @@ function RuntimeBanner({
   status,
   dirty,
   validated,
+  compact = false,
   onLiveProbe,
   liveProbeBusy
 }: {
   status: ProvidersStatus;
   dirty: boolean;
   validated: boolean;
+  compact?: boolean;
   onLiveProbe?: () => void;
   liveProbeBusy?: boolean;
 }) {
   const { runtime, embedding, setup } = status;
   const probe = setup.live_probe;
+  const embeddingMode = embedding.mode === "pinned" ? "固定契约" : "自动契约";
+  const embeddingState = {
+    ready: "可用",
+    off: "已关闭（关键词检索）",
+    invalid: "契约无效",
+    unavailable: "暂不可用"
+  }[embedding.state];
+  if (compact) {
+    return (
+      <div className="runtime-banner runtime-banner-compact" role="status">
+        <span>
+          向量{embeddingState}
+          {embedding.configured ? ` · ${embedding.dimensions} 维` : ""}
+          {validated ? " · 草稿已校验" : dirty ? " · 有未应用草稿" : ""}
+        </span>
+        {onLiveProbe && setup.chat_ready && (
+          <button
+            type="button"
+            className="ghost-button compact"
+            onClick={onLiveProbe}
+            disabled={liveProbeBusy}
+          >
+            {liveProbeBusy ? "探测中…" : "探测上游"}
+          </button>
+        )}
+      </div>
+    );
+  }
   return (
     <div className="runtime-banner">
       <div>
@@ -1216,7 +1298,9 @@ function RuntimeBanner({
       <div>
         <strong>向量模型</strong>
         <span>
-          {embedding.model} · {embedding.dimensions} 维 · {embedding.configured ? "可用" : "未配置"}
+          {embedding.model} · {embeddingMode} · {embeddingState}
+          {embedding.configured ? ` · ${embedding.dimensions} 维` : ""}
+          {embedding.code ? ` · ${embedding.code}` : ""}
         </span>
       </div>
       <div>

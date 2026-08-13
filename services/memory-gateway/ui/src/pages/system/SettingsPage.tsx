@@ -25,6 +25,12 @@ export function SettingsPage({
   const [testMessage, setTestMessage] = useState("保存前可先确认服务和访问密钥都有效。");
   const testRequestRef = useRef<AbortController | null>(null);
   const onboarding = !settings.apiKey;
+  const reauth = Boolean(settings.apiKey) && Boolean(
+    // Parent forces this page when the stored key fails auth; surface that context.
+    (typeof document !== "undefined" &&
+      document.documentElement.dataset.credentialsGate === "reauth")
+  );
+  const gateMode = onboarding || reauth;
 
   useEffect(() => {
     setForm(settings);
@@ -64,7 +70,7 @@ export function SettingsPage({
       } else {
         setAuthCheck("error");
       }
-      const message = errorMessage(error);
+      const message = errorMessage(error, { credential: "console" });
       setTestMessage(message);
       notify(message, "error");
     } finally {
@@ -73,11 +79,24 @@ export function SettingsPage({
   };
 
   return (
-    <div className={`page-stack settings-page ${!settings.apiKey ? "onboarding-page" : ""}`}>
+    <div className={`page-stack settings-page ${gateMode ? "onboarding-page" : ""}`}>
       <PageHeader
-        eyebrow={onboarding ? "首次设置 · 第 1 步" : undefined}
-        title={onboarding ? "输入客户端访问密钥" : "设置"}
-        subtitle={onboarding ? "粘贴安装器写入 credentials/gateway.key 的初始 Console token；它只保存在当前浏览器。" : "连接信息与本机偏好。"}
+        eyebrow={onboarding ? "首次设置 · 第 1 步" : reauth ? "需要重新登录" : undefined}
+        showTitle={onboarding || reauth}
+        title={
+          onboarding
+            ? "输入访问密钥"
+            : reauth
+              ? "更新访问密钥"
+              : "连接设置"
+        }
+        subtitle={
+          onboarding
+            ? "这是登录本网页控制台的 Console token，不是聊天用的 chat token，也不是 admin.txt。"
+            : reauth
+              ? "当前浏览器保存的密钥已失效（常见于重装或轮换 token）。请粘贴新的 gateway.txt（或旧版 gateway.key）。"
+              : "更换登录本网页的 Console token；日常聊天密钥请到「接入信息」管理。"
+        }
       />
       <section className="panel settings-panel">
         <div className="panel-header">
@@ -86,8 +105,24 @@ export function SettingsPage({
             <h2>连接设置</h2>
           </div>
         </div>
-        {onboarding && (
-          <div className="notice">已检测到本地服务：<code>{window.location.origin}</code></div>
+        {gateMode && (
+          <div className="notice">
+            {/* 整句包成单个 .notice-text：flex 容器里散落的文本节点会被压成竖条 */}
+            <span className="notice-text">
+              {onboarding ? (
+                <>
+                  已检测到本地服务：<code>{window.location.origin}</code>
+                  。请打开安装目录里的 <code>credentials/gateway.txt</code>
+                  （旧安装可能是 <code>gateway.key</code>），用文本编辑器打开后把整行粘贴到下方。
+                </>
+              ) : (
+                <>
+                  密钥只保存在当前浏览器的本地存储。Docker 重装或撤销 token 后，需要重新粘贴{" "}
+                  <code>credentials/gateway.txt</code>（或旧版 <code>gateway.key</code>）。
+                </>
+              )}
+            </span>
+          </div>
         )}
         <label className="field-block">
           <span>访问密钥</span>
@@ -96,7 +131,10 @@ export function SettingsPage({
               type={showKey ? "text" : "password"}
               value={form.apiKey}
               onChange={(event) => setForm({ ...form, apiKey: event.target.value })}
-              placeholder="mgw_…（迁移旧安装时也可暂用 legacy key）"
+              placeholder="mgw_…（credentials/gateway.txt 全文）"
+              aria-label="访问密钥"
+              autoComplete="off"
+              spellCheck={false}
             />
             <button
               className="icon-button"
@@ -107,6 +145,11 @@ export function SettingsPage({
               {showKey ? <EyeOff size={16} /> : <Eye size={16} />}
             </button>
           </div>
+          <small className="field-hint">
+            即 Console token：安装时写入 <code>credentials/gateway.txt</code> 的那一串（旧版
+            <code>gateway.key</code> 仍可用）。不要填 <code>admin.txt</code>
+            （模型配置用），也不要填 chat token（聊天客户端用）。
+          </small>
         </label>
         {!onboarding && (
           <details className="settings-advanced-connection">
@@ -142,7 +185,13 @@ export function SettingsPage({
             disabled={testing || !form.apiKey.trim()}
             onClick={testConnection}
           >
-            {testing ? "正在验证" : onboarding ? "验证并继续" : "测试并保存"}
+            {testing
+              ? "正在验证"
+              : onboarding
+                ? "验证并继续"
+                : reauth
+                  ? "验证并重新进入"
+                  : "测试并保存"}
           </button>
         </div>
         <div className="connection-checks" aria-live="polite">
@@ -152,7 +201,7 @@ export function SettingsPage({
         </div>
       </section>
 
-      {!onboarding && (
+      {!gateMode && (
         <details className="panel panel--quiet settings-reference settings-reference-details">
           <summary>高级：运维与旧版直连配置参考</summary>
           <div className="notice">

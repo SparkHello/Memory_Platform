@@ -183,9 +183,9 @@ modelgw check --connection interactive-plan --as-interactive --live
 - 默认 discovery 检查最多对每个 connection 请求一次 `GET /models`，不发送推理；
 - 模型没出现在列表中只记为 `connected_unlisted`，不等于模型已废弃；
 - `--live` 才会对每个启用的 deployment 发送最小真实请求，可能产生费用；
-- `--as-interactive` 只改变本次健康检查的用途身份，不会把受限连接开放给 backend。
+- `--as-interactive` 只改变本次健康检查的用途身份，不会修改连接上的 `usage_scope`。
 
-`token_plan` 和 `coding_plan` 必须是 `interactive_only`，My_Memory 这类 `backend` client 永远不能路由到它们。配置校验和运行时路由都会执行这条边界。
+套餐类型（含 `token_plan` / `coding_plan`）默认允许 `backend_allowed`：提供商条款由使用者自行遵守。若你**显式**把连接设为 `interactive_only`，backend 客户端仍不会路由到它。
 
 ## 推荐给 My_Memory 的八条 route
 

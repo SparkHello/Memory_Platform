@@ -37,14 +37,17 @@ from conftest import config_payload
 
 
 @pytest.mark.parametrize("plan_type", ["token_plan", "coding_plan", "direct_tool_only"])
-def test_restricted_plan_cannot_be_used_by_backend(plan_type: str) -> None:
+def test_plan_types_may_use_backend_allowed(plan_type: str) -> None:
+    """Plan labels are informational; operators own provider ToS risk."""
     payload = config_payload()
     payload["connections"]["official"]["billing_plan"] = {
         "type": plan_type,
-        "name": "coding-only",
+        "name": "operator-managed",
     }
-    with pytest.raises(ValidationError, match="不能配置为 backend_allowed"):
-        GatewayConfig.model_validate(payload)
+    payload["connections"]["official"]["usage_scope"] = "backend_allowed"
+    config = GatewayConfig.model_validate(payload)
+    assert config.connections["official"].billing_plan.type == plan_type
+    assert config.connections["official"].usage_scope == "backend_allowed"
 
 
 def test_embedding_route_cannot_mix_vector_spaces() -> None:

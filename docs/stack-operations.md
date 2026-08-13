@@ -9,7 +9,8 @@
 | 用途 | URL |
 | --- | --- |
 | Web Console | `http://127.0.0.1:2026/ui/` |
-| Memory Gateway 健康检查 | `http://127.0.0.1:2026/health` |
+| Memory Gateway 存活检查 | `http://127.0.0.1:2026/health` |
+| Memory Gateway 运行就绪检查 | `http://127.0.0.1:2026/readyz` |
 | MCP | `http://127.0.0.1:2026/mcp` |
 | OpenAI 兼容 Memory base URL | `http://127.0.0.1:2026/v1` |
 | Model Gateway base URL（Docker 内部） | `http://model-gateway:2030/v1`；不发布宿主端口 |
@@ -36,12 +37,32 @@ scripts/memgw stack stop
 
 ```bash
 docker compose -f docker-compose.user.yml ps
-docker compose -f docker-compose.user.yml exec memory-gateway memgw stack doctor
+curl -fsS http://127.0.0.1:2026/health
+curl -fsS http://127.0.0.1:2026/readyz
 
 docker compose -f docker-compose.user.yml restart
 docker compose -f docker-compose.user.yml stop
 docker compose -f docker-compose.user.yml start
 ```
+
+`/health` 只表示 Memory 进程和首次配置页面可访问，也是 Compose 的容器 healthcheck；因此全新安装尚未配置模型时，容器显示 `healthy` 是正确行为。`/readyz` 才检查磁盘、Model Gateway 接线、必需聊天 route 与已明确启用的 embedding 契约，返回不含密钥的稳定原因码。首次配置完成前它可以返回 503；配置完成后应返回 200。
+
+## 卸载 Docker 安装
+
+在安装目录（默认 `~/memory-platform`，本地源码自建则为仓库 `deploy/`）执行，只拆当前 Compose project 的容器、网络和四个数据卷，**不要**跑 `docker system prune` 或 `docker volume prune`：
+
+```bash
+# 发布版一键安装目录
+cd ~/memory-platform
+docker compose -f docker-compose.user.yml down --volumes --remove-orphans
+
+# 或使用仓库脚本（可用 MEMORY_PLATFORM_DIR 指定目录）
+sh /path/to/Memory_Platform/deploy/uninstall.sh
+```
+
+四个卷名通常是 `<project>_memory-data`、`<project>_memory-secrets`、`<project>_model-data`、`<project>_model-secrets`。`credentials/` 和 `backups/` 不会随卷删除；确认不再需要后再手工删。源码安装用 `scripts/memgw stack stop`，不要对 Docker 卷执行这条命令。
+
+不要在 split 容器中运行 `docker compose exec memory-gateway memgw stack doctor`：长期 Memory 容器按隔离设计看不到 Model 的数据卷和 secret，源码栈的本地路径检查会产生误报。Docker 排查使用上面的两个 HTTP 端点、`docker compose ps` 和日志；`scripts/memgw stack doctor` 只用于源码安装。
 
 查看后续日志（生成的密钥永远不会写入这里）：
 
@@ -100,13 +121,13 @@ irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deplo
 | --- | --- | --- |
 | per-device chat token | 单台聊天客户端访问 `/v1` | Auth SQLite 仅保存 SHA-256；明文只在创建时显示一次 |
 | per-device MCP token | 单台 MCP 客户端访问 `/mcp` | 同上，可单独撤销 |
-| Console token | 管理 REST 与 Web Console | 新装时初始 token 交付到 `credentials/gateway.key`；后续只能由本机 CLI 创建 |
-| Legacy Gateway key | 仅旧卷迁移的一个版本全 scope 兼容 | `credentials/gateway.key` 与 Memory 私有 settings；迁移完即禁用 |
+| Console token | 管理 REST 与 Web Console | 新装时初始 token 交付到 `credentials/gateway.txt`（兼容旧版 `gateway.key`）；后续只能由本机 CLI 创建 |
+| Legacy Gateway key | 仅旧卷迁移的一个版本全 scope 兼容 | `credentials/gateway.txt` / `gateway.key` 与 Memory 私有 settings；迁移完即禁用 |
 | Model Gateway backend key | Memory Gateway 调用配置解析出的 8 条精确 chat/memory/knowledge/embedding route | 两端各自的隔离密钥文件 |
 | Model Gateway admin key | 修改渠道密钥和 route 配置 | 仅管理端临时使用，不由 Memory Gateway 持久化 |
 | Provider API key | 调用真实上游渠道 | Model Gateway 仓库外 `secrets.env` |
 
-Docker 全新安装在 Auth DB 中创建唯一的 `first-console` token，关闭 legacy key，并把 Console token 与 Model admin key 分别写入宿主机 `credentials/gateway.key`、`credentials/admin.key`（`0600`），只报告路径；它们不进入 daemon logs 或长期进程环境。旧卷迁移仍临时交付 legacy key。日常客户端应在 Console「接入信息」创建 chat/MCP token。源码 CLI 可创建、查看元数据或撤销 token：
+Docker 全新安装在 Auth DB 中创建唯一的 `first-console` token，关闭 legacy key，并把 Console token 与 Model admin key 分别写入宿主机 `credentials/gateway.txt`、`credentials/admin.txt`（`0600` 纯文本；旧安装可能仍是 `.key`），只报告路径；它们不进入 daemon logs 或长期进程环境。旧卷迁移仍临时交付 legacy key。日常客户端应在 Console「接入信息」创建 chat/MCP token。源码 CLI 可创建、查看元数据或撤销 token：
 
 ```bash
 scripts/memgw token create --role chat --name <设备名> --user <用户>
@@ -173,7 +194,8 @@ modelgw discover --preset <id> --non-interactive --json
 - `ALLOW_SENSITIVE_EGRESS=false` 默认阻止本地识别为 private/sensitive 的内容进入远程记忆提取、embedding、AI 体检和知识代理。
 - 该开关不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。
 - `redact_sensitive=true` 只遮罩本次响应，不会改写 SQLite 原文，也不会让备份自动脱敏。
-- 记忆与知识 embedding 必须携带可信且一致的空间 ID；缺失或不匹配时回退关键词/FTS，不猜测旧向量属于当前空间。
+- `MODEL_GATEWAY_EMBEDDING_SPACE_ID` 留空表示自动采用 `memory.embedding` route 声明的 immutable space 与维度；非空表示严格固定该契约。
+- 创建并启用 `memory.embedding` route 表示明确开启语义向量能力；route 缺失或关闭则是 `off`，继续使用关键词/FTS，且不阻断 `/readyz`。已启用 route 若目标不可用、空间/维度声明畸形，或与固定值不匹配，则 `/readyz` 返回 503，绝不猜测旧向量属于当前空间。敏感文本出站仍另外受 `ALLOW_SENSITIVE_EGRESS` 控制。
 - 知识代理只编排本地索引并选择引用，不执行文档中的指令。
 
 当前默认部署目标是个人电脑或可信家庭网络：
@@ -214,6 +236,8 @@ scripts/memgw stack backup --output memory-stack.zip
 整栈备份（含 Console「报告与备份」页的下载按钮和 `POST /memories/stack-backup`）是**整实例**导出：会包含本部署所有用户的完整数据，不按发起请求的身份过滤。
 
 备份虽然不含密钥，仍包含完整私人记忆和知识正文，必须按敏感文件保管。
+
+Console「报告与备份」可上传 zip 做 **dry-run 校验**（`POST /memories/stack-backup/validate`）：核对清单哈希、schema 与 SQLite 完整性，**不写生产库、不在线恢复**。页面会给出可复制的停服恢复命令；真正替换数据库仍须 CLI / 维护容器，且服务必须已停止。
 
 恢复到已安装依赖的新设备：
 
@@ -257,7 +281,7 @@ docker compose -f docker-compose.user.yml up -d
 
 误删安装目录（默认 `~/memory-platform`）不会丢数据：四个 Docker 数据卷独立于安装目录存在。恢复步骤：
 
-1. 重建安装目录，并把原目录中的 `credentials/gateway.key` 与 `credentials/admin.key` 放回新目录的 `credentials/` 下（若曾把这两个文件备份到别处）。
+1. 重建安装目录，并把原目录中的 `credentials/gateway.txt`（或 `gateway.key`）与 `credentials/admin.txt`（或 `admin.key`）放回新目录的 `credentials/` 下（若曾把这两个文件备份到别处）。
 2. 重跑同一条一键安装命令。安装器检测到同名 project 的四个数据卷后会直接接回旧数据。
 
 若两枚密钥文件确实遗失：数据卷本身仍完整，但需要重设凭据——Console token 用维护容器在 Auth 库中新建（`--profile maintenance run --rm stack-maintenance token create --role console ...`），admin key 用 `modelgw secret set memory-console-admin --stdin` 重设。安装器在检测到"四卷存在但 credentials 缺失"时会拒绝按全新安装继续，避免误初始化。

@@ -26,6 +26,7 @@ from app.schema_versions import (
 from app.stack_backup import (
     create_stack_backup as _create_stack_backup,
     restore_stack_backup as _restore_stack_backup,
+    validate_stack_backup as _validate_stack_backup,
 )
 
 
@@ -46,6 +47,10 @@ def restore_stack_backup(**kwargs):
         Path(kwargs["memory_database"]).with_name("auth.db"),
     )
     return _restore_stack_backup(**kwargs)
+
+
+def validate_stack_backup(**kwargs):
+    return _validate_stack_backup(**kwargs)
 
 
 def _database(path: Path, value: str) -> None:
@@ -184,6 +189,81 @@ def test_stack_backup_endpoint_streams_zip_and_declares_scope(
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["version"] == 2
         assert manifest["components"]["auth_database"]["status"] == "present"
+
+
+def test_validate_stack_backup_accepts_portable_archive(tmp_path: Path) -> None:
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "portable.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+
+    result = validate_stack_backup(archive_path=archive_path)
+
+    assert result["ok"] is True
+    assert result["restorable"] is True
+    assert result["secrets_included"] is False
+    assert result["version"] == 2
+    assert result["restore_requires_stopped_services"] is True
+    assert result["components"]["memory_database"]["status"] == "present"
+    assert "active_memories" in result["stats"]
+
+
+def test_validate_stack_backup_rejects_non_zip(tmp_path: Path) -> None:
+    junk = tmp_path / "not-a-backup.txt"
+    junk.write_text("hello", encoding="utf-8")
+    with pytest.raises((ValueError, zipfile.BadZipFile)):
+        validate_stack_backup(archive_path=junk)
+
+
+def test_stack_backup_validate_endpoint_accepts_upload(
+    client, auth_headers, tmp_path: Path
+) -> None:
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "portable.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+
+    response = client.post(
+        "/memories/stack-backup/validate",
+        headers=auth_headers,
+        files={
+            "file": (
+                "memory-stack.zip",
+                archive_path.read_bytes(),
+                "application/zip",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["restorable"] is True
+    assert payload["version"] == 2
+
+
+def test_stack_backup_validate_endpoint_rejects_garbage(
+    client, auth_headers
+) -> None:
+    response = client.post(
+        "/memories/stack-backup/validate",
+        headers=auth_headers,
+        files={"file": ("bad.zip", b"not-a-zip", "application/zip")},
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["ok"] is False
+    assert detail["code"] == "stack_backup_invalid"
 
 
 def test_stack_backup_is_portable_and_excludes_all_secrets(tmp_path: Path) -> None:

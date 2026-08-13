@@ -39,6 +39,10 @@ function connectionCheck(
   };
 }
 
+async function pickDeepseek(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("radio", { name: /DeepSeek 官方/ }));
+}
+
 function discovery(models: string[]): ModelGatewayChannelDiscoverResult {
   return {
     valid: true,
@@ -69,7 +73,9 @@ describe("first-run setup", () => {
       />
     );
 
+    expect(screen.getByRole("heading", { name: "输入访问密钥" })).toBeInTheDocument();
     expect(screen.getByText(/已检测到本地服务/)).toBeInTheDocument();
+    expect(screen.getAllByText(/credentials\/gateway\.txt/).length).toBeGreaterThan(0);
     expect(screen.queryByLabelText("服务地址")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("用户 ID")).not.toBeInTheDocument();
 
@@ -103,10 +109,13 @@ describe("first-run setup", () => {
       />
     );
 
+    await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "rejected-key");
     await user.click(screen.getByRole("button", { name: "只读发现模型" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("均未保存");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "密钥和渠道都还没保存"
+    );
     expect(screen.queryByLabelText("聊天模型")).not.toBeInTheDocument();
     expect(validateProviderChannelBundle).not.toHaveBeenCalled();
     expect(applyProviderChannelBundle).not.toHaveBeenCalled();
@@ -179,13 +188,14 @@ describe("first-run setup", () => {
       />
     );
 
+    await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
     await user.click(screen.getByRole("button", { name: "只读发现模型" }));
     await screen.findByLabelText("聊天模型");
     expect(screen.getByLabelText("现有文本路由")).toHaveValue("keep");
 
     await user.click(screen.getByRole("button", { name: "校验完整配置" }));
-    expect(await screen.findByText(/完整配置校验通过/)).toBeInTheDocument();
+    expect(await screen.findByText(/配置检查通过/)).toBeInTheDocument();
     const bundle = validateProviderChannelBundle.mock.calls[0][0];
     expect(bundle.connection.secret).toBe("candidate-key");
     expect(bundle.deployments[0].model_author).toBe("unknown");
@@ -202,7 +212,7 @@ describe("first-run setup", () => {
       max_attempts: 1
     });
 
-    await user.click(screen.getByRole("button", { name: "确认并原子应用" }));
+    await user.click(screen.getByRole("button", { name: "确认并保存" }));
     expect(await screen.findByText("模型配置完成")).toBeInTheDocument();
     expect(applyProviderChannelBundle).toHaveBeenCalledTimes(1);
   });
@@ -247,6 +257,7 @@ describe("first-run setup", () => {
     render(
       <NewChannelWizard api={api} adminKey="admin" control={control} onClose={vi.fn()} onCompleted={vi.fn()} />
     );
+    await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
     await user.click(screen.getByRole("button", { name: "只读发现模型" }));
     await user.selectOptions(await screen.findByLabelText("聊天模型"), "chat-v1");
@@ -278,15 +289,174 @@ describe("first-run setup", () => {
     render(
       <NewChannelWizard api={api} adminKey="admin" control={emptyControl} onClose={vi.fn()} onCompleted={vi.fn()} />
     );
+    await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
     await user.click(screen.getByRole("button", { name: "只读发现模型" }));
     await screen.findByLabelText("聊天模型");
     await user.click(screen.getByRole("button", { name: "校验完整配置" }));
-    await screen.findByText(/完整配置校验通过/);
-    await user.click(screen.getByRole("button", { name: "确认并原子应用" }));
+    await screen.findByText(/配置检查通过/);
+    await user.click(screen.getByRole("button", { name: "确认并保存" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("整套提交可能已经生效");
     expect(screen.getByRole("alert")).toHaveTextContent("请先刷新配置确认，勿直接重试");
     expect(screen.queryByText("模型配置完成")).not.toBeInTheDocument();
+  });
+
+  it("surfaces the TUN fake-ip opt-in beside the discovery error", async () => {
+    const user = userEvent.setup();
+    const api = {
+      discoverProviderChannel: vi.fn().mockRejectedValue(
+        new Error("base_url hostname 解析到未显式允许的本地或私有地址（dashscope.aliyuncs.com → 198.18.4.17）")
+      )
+    } as unknown as MemoryApi;
+
+    render(
+      <NewChannelWizard api={api} adminKey="admin" control={emptyControl} onClose={vi.fn()} onCompleted={vi.fn()} />
+    );
+    await pickDeepseek(user);
+    await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
+    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("使用 Clash/Surge 等 TUN fake-ip");
+    const boxes = screen.getAllByRole("checkbox", { name: /使用 Clash\/Surge 等 TUN fake-ip/ });
+    expect(boxes.length).toBeGreaterThanOrEqual(1);
+    expect(boxes[0]).toBeVisible();
+  });
+
+  it("hides embedding model IDs from the chat dropdown", async () => {
+    const user = userEvent.setup();
+    const api = {
+      discoverProviderChannel: vi.fn().mockResolvedValue(
+        discovery(["deepseek-chat", "qwen3.7-text-embedding", "qwen-tts-flash"])
+      )
+    } as unknown as MemoryApi;
+
+    render(
+      <NewChannelWizard api={api} adminKey="admin" control={emptyControl} onClose={vi.fn()} onCompleted={vi.fn()} />
+    );
+    await pickDeepseek(user);
+    await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
+    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+
+    const chatSelect = await screen.findByLabelText("聊天模型");
+    expect(chatSelect).toHaveTextContent("deepseek-chat");
+    expect(chatSelect).not.toHaveTextContent("qwen3.7-text-embedding");
+    expect(chatSelect).not.toHaveTextContent("qwen-tts-flash");
+    expect(screen.getByText(/已隐藏 2 个嵌入\/语音\/图像模型/)).toBeInTheDocument();
+  });
+
+  it("reuses an existing chat token and re-embeds after enabling vectors", async () => {
+    const user = userEvent.setup();
+    const createAuthToken = vi.fn();
+    const reEmbedMemories = vi.fn().mockResolvedValue({
+      re_embedded: 2,
+      memory_ids: ["a", "b"],
+      failed_ids: []
+    });
+    const api = {
+      discoverProviderChannel: vi.fn().mockResolvedValue(discovery(["deepseek-chat", "text-embedding-v3"])),
+      validateProviderChannelBundle: vi.fn().mockResolvedValue({
+        valid: true,
+        applied: false,
+        connection_id: "deepseek-account",
+        deployment_ids: ["deepseek-chat"],
+        changed_routes: ["memory.chat", "memory.embedding"],
+        revision: "revision-1",
+        discovery: connectionCheck("ok", "连接正常", ["deepseek-chat"])
+      }),
+      applyProviderChannelBundle: vi.fn().mockResolvedValue({
+        valid: true,
+        applied: true,
+        connection_id: "deepseek-account",
+        deployment_ids: ["deepseek-chat"],
+        changed_routes: ["memory.chat", "memory.embedding"],
+        revision: "revision-2",
+        discovery: connectionCheck("ok", "连接正常", ["deepseek-chat"])
+      }),
+      authTokens: vi.fn().mockResolvedValue({
+        data: [
+          {
+            token_id: "existing",
+            name: "laptop",
+            user_id: "default",
+            role: "chat",
+            created_at: "2026-01-01T00:00:00Z",
+            revoked_at: null,
+            is_current: false,
+            can_revoke: true
+          }
+        ],
+        current_user_id: "default",
+        legacy_key_enabled: false
+      }),
+      createAuthToken,
+      reEmbedMemories
+    } as unknown as MemoryApi;
+
+    render(
+      <NewChannelWizard api={api} adminKey="admin" control={emptyControl} onClose={vi.fn()} onCompleted={vi.fn()} />
+    );
+    await pickDeepseek(user);
+    await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
+    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByLabelText("同时保存一个向量模型（可选）"));
+    await user.type(screen.getByPlaceholderText("精确 embedding 模型 ID"), "text-embedding-v3");
+    await user.type(screen.getByPlaceholderText("例如 1024"), "1024");
+    await user.click(screen.getByRole("button", { name: "校验完整配置" }));
+    await screen.findByText(/配置检查通过/);
+    await user.click(screen.getByRole("button", { name: "确认并保存" }));
+
+    expect(await screen.findByText("模型配置完成")).toBeInTheDocument();
+    expect(createAuthToken).not.toHaveBeenCalled();
+    expect(reEmbedMemories).toHaveBeenCalledWith({ scan: true });
+    expect(screen.getByText(/已为 2 条缺少当前空间向量的记忆补齐向量/)).toBeInTheDocument();
+    expect(screen.getByText(/请到「接入信息」使用已有 chat token/)).toBeInTheDocument();
+  });
+
+  it("defaults the embedding access point to the chat URL and only sends it when different", async () => {
+    const user = userEvent.setup();
+    const validateProviderChannelBundle = vi.fn().mockResolvedValue({
+      valid: true,
+      applied: false,
+      connection_id: "deepseek-account",
+      embedding_connection_id: "deepseek-embedding-account",
+      deployment_ids: ["deepseek-chat", "deepseek-embed"],
+      changed_routes: ["memory.chat", "memory.embedding"],
+      revision: "revision-1",
+      discovery: connectionCheck("ok", "连接正常", ["deepseek-chat"])
+    });
+    const api = {
+      discoverProviderChannel: vi.fn().mockResolvedValue(discovery(["deepseek-chat"])),
+      validateProviderChannelBundle,
+      applyProviderChannelBundle: vi.fn()
+    } as unknown as MemoryApi;
+
+    render(
+      <NewChannelWizard api={api} adminKey="admin" control={emptyControl} onClose={vi.fn()} onCompleted={vi.fn()} />
+    );
+    await pickDeepseek(user);
+    await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
+    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByLabelText("同时保存一个向量模型（可选）"));
+    await user.type(screen.getByPlaceholderText("精确 embedding 模型 ID"), "text-embedding-v3");
+    await user.type(screen.getByPlaceholderText("例如 1024"), "1024");
+
+    const embedUrl = screen.getByLabelText("向量接入点");
+    expect(embedUrl).toHaveValue("https://api.deepseek.com");
+
+    await user.click(screen.getByRole("button", { name: "校验完整配置" }));
+    expect(await screen.findByText(/配置检查通过/)).toBeInTheDocument();
+    expect(validateProviderChannelBundle.mock.calls[0][0].embedding_base_url).toBeUndefined();
+
+    await user.clear(embedUrl);
+    await user.type(embedUrl, "https://embed.deepseek.com/v1");
+    await user.click(screen.getByRole("button", { name: "校验完整配置" }));
+    expect(await screen.findByText(/向量模型会走单独接入点/)).toBeInTheDocument();
+    expect(validateProviderChannelBundle.mock.calls[1][0].embedding_base_url).toBe(
+      "https://embed.deepseek.com/v1"
+    );
+    expect(validateProviderChannelBundle.mock.calls[1][0].deployments[1].embedding_space).toContain(
+      "embed.deepseek.com"
+    );
   });
 });

@@ -57,6 +57,9 @@ def create_tables(connection: sqlite3.Connection) -> None:
             created_at TEXT,
             updated_at TEXT,
             archived INTEGER DEFAULT 0,
+            color TEXT,
+            description TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
             UNIQUE(user_id, normalized_name)
         )
         """

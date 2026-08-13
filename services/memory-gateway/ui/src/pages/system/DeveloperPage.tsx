@@ -182,7 +182,8 @@ export function DeveloperPage({
     <div className="page-stack developer-page">
       <PageHeader
         title="客户端接入"
-        subtitle="为每台设备创建最小权限 token，再连接 OpenAI 兼容聊天或 MCP。"
+        subtitle="为每台设备创建最小权限 token，再连接聊天应用或 MCP。"
+        showTitle={false}
       />
 
       {tokens?.legacy_key_enabled && (

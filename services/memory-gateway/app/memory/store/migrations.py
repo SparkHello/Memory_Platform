@@ -97,12 +97,44 @@ def _memory_migration_v5(connection: sqlite3.Connection) -> None:
     )
 
 
+def _memory_migration_v6(connection: sqlite3.Connection) -> None:
+    """Space workbench metadata: color, description, sort_order."""
+    table_exists = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'memory_spaces'
+        """
+    ).fetchone()
+    if table_exists is None:
+        # Partial fixture databases used by migration unit tests may only
+        # include the memories table; skip metadata columns until full schema.
+        return
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(memory_spaces)")
+    }
+    if "color" not in columns:
+        connection.execute("ALTER TABLE memory_spaces ADD COLUMN color TEXT")
+    if "description" not in columns:
+        connection.execute("ALTER TABLE memory_spaces ADD COLUMN description TEXT")
+    if "sort_order" not in columns:
+        connection.execute(
+            "ALTER TABLE memory_spaces ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+        )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_spaces_user_sort
+        ON memory_spaces(user_id, archived, sort_order ASC, name ASC)
+        """
+    )
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
     (2, _memory_migration_v2),
     (3, _memory_migration_v3),
     (4, _memory_migration_v4),
     (5, _memory_migration_v5),
+    (6, _memory_migration_v6),
 ]
 
 if _MEMORY_SCHEMA_MIGRATIONS[-1][0] != MEMORY_SCHEMA_VERSION:

@@ -7,6 +7,7 @@ from pydantic import Field, field_validator, model_validator
 
 from model_gateway.auth import AuthenticatedClient, provider_secret_header_value
 from model_gateway.config_store import configuration_revision
+from model_gateway.http_safety import normalize_base_url
 from model_gateway.models import (
     AuthConfig,
     BillingPlan,
@@ -224,6 +225,62 @@ class CandidateDiscoverRequest(StrictModel):
         return self.dialect or self.adapter
 
 
+class CapabilityProbeRequest(StrictModel):
+    """Live, non-persisting probes for chat capability checkboxes."""
+
+    revision: str
+    candidate_key: str = Field(min_length=1, max_length=65536)
+    channel_operator: str
+    base_url: str
+    adapter: Literal[
+        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
+    ] = "generic"
+    auth_type: Literal["bearer", "x-api-key"] = "bearer"
+    allowed_private_networks: list[str] = Field(default_factory=list)
+    upstream_model: str = Field(min_length=1, max_length=300)
+    probes: list[
+        Literal["chat", "streaming", "tools", "reasoning", "json_object"]
+    ] = Field(
+        default_factory=lambda: [
+            "chat",
+            "streaming",
+            "tools",
+            "reasoning",
+            "json_object",
+        ]
+    )
+
+    @field_validator("revision")
+    @classmethod
+    def valid_revision(cls, value: str) -> str:
+        return _valid_revision(value)
+
+    @field_validator("candidate_key")
+    @classmethod
+    def safe_secret(cls, value: str) -> str:
+        return provider_secret_header_value(value)
+
+    @field_validator("channel_operator", "upstream_model")
+    @classmethod
+    def required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("字段不能为空")
+        return normalized
+
+    @field_validator("probes")
+    @classmethod
+    def unique_probes(
+        cls,
+        values: list[Literal["chat", "streaming", "tools", "reasoning", "json_object"]],
+    ) -> list[Literal["chat", "streaming", "tools", "reasoning", "json_object"]]:
+        if not values:
+            raise ValueError("至少选择一项探测")
+        if len(set(values)) != len(values):
+            raise ValueError("probes 不得重复")
+        return values
+
+
 class RevisionRequest(StrictModel):
     revision: str
 
@@ -326,6 +383,7 @@ class BundleRouteOperation(StrictModel):
 class BundleApplyRequest(StrictModel):
     revision: str
     connection: BundleConnectionDraft
+    embedding_base_url: str = Field(default="", max_length=2048)
     deployments: list[BundleDeploymentDraft] = Field(default_factory=list)
     pricing: list[BundlePricingDraft] = Field(default_factory=list)
     routes: list[BundleRouteOperation] = Field(default_factory=list)
@@ -334,6 +392,11 @@ class BundleApplyRequest(StrictModel):
     @classmethod
     def valid_revision(cls, value: str) -> str:
         return _valid_revision(value)
+
+    @field_validator("embedding_base_url")
+    @classmethod
+    def stripped_embedding_base_url(cls, value: str) -> str:
+        return value.strip()
 
     @model_validator(mode="after")
     def unique_ids(self) -> "BundleApplyRequest":
@@ -625,8 +688,14 @@ def deployment_candidate(
 def bundle_candidate(
     config: GatewayConfig,
     request: BundleApplyRequest,
-) -> tuple[GatewayConfig, str, str, list[str], list[str]]:
-    """Build one fully validated v2 graph without persisting its candidate key."""
+) -> tuple[GatewayConfig, str, str, list[str], list[str], str]:
+    """Build one fully validated v2 graph without persisting its candidate key.
+
+    When ``embedding_base_url`` normalizes to a different HTTPS origin/path
+    than the chat connection, embedding deployments land on a sibling
+    ``{operator}-embedding-account`` that reuses the same ``secret_ref``.
+    Discovery stays on the chat connection.
+    """
 
     payload = config.model_dump(mode="python", exclude_none=False)
     operator = request.connection.channel_operator.strip().lower()
@@ -767,6 +836,18 @@ def bundle_candidate(
         connection_id: connection_payload,
     }
 
+    embedding_connection_id, embedding_connection = _embedding_target_connection(
+        request,
+        operator=operator,
+        chat_connection_id=connection_id,
+        chat_connection=candidate_connection,
+        connections_payload=payload["connections"],
+    )
+    if embedding_connection_id != connection_id:
+        payload["connections"][embedding_connection_id] = (
+            embedding_connection.model_dump(mode="python", exclude_none=False)
+        )
+
     pricing_records = dict(payload["pricing"])
     for draft in request.pricing:
         pricing_records[draft.id] = draft.value.model_dump(
@@ -777,17 +858,23 @@ def bundle_candidate(
     deployments = dict(payload["deployments"])
     deployment_ids: list[str] = []
     for draft in request.deployments:
+        target_connection_id = (
+            embedding_connection_id if draft.kind == "embedding" else connection_id
+        )
+        target_connection = (
+            embedding_connection if draft.kind == "embedding" else candidate_connection
+        )
         deployment_id = draft.id or _unique_id(
-            _slug(f"{connection_id}-{draft.upstream_model}"), deployments
+            _slug(f"{target_connection_id}-{draft.upstream_model}"), deployments
         )
         current = config.deployments.get(deployment_id)
-        if current is not None and current.connection != connection_id:
+        if current is not None and current.connection != target_connection_id:
             raise ValueError(
                 f"deployment {deployment_id} 属于其他 connection，不能在 bundle 中接管"
             )
         derived_space = (
             derive_embedding_space(
-                candidate_connection,
+                target_connection,
                 draft.upstream_model,
                 int(draft.dimensions),
             )
@@ -801,12 +888,12 @@ def bundle_candidate(
             and current.upstream_model == draft.upstream_model
             and current.dimensions == draft.dimensions
             and config.connections[current.connection].channel_operator
-            == candidate_connection.channel_operator
+            == target_connection.channel_operator
             and config.connections[current.connection].base_url
-            == candidate_connection.base_url
+            == target_connection.base_url
         )
         deployment = DeploymentConfig(
-            connection=connection_id,
+            connection=target_connection_id,
             upstream_model=draft.upstream_model,
             model_author=(draft.model_author.strip() or "unknown"),
             model_family=current.model_family if current is not None else "",
@@ -877,7 +964,54 @@ def bundle_candidate(
         changed_routes.append(operation.id)
     payload["routes"] = routes
     candidate = GatewayConfig.model_validate(payload)
-    return candidate, connection_id, secret_ref, deployment_ids, changed_routes
+    return (
+        candidate,
+        connection_id,
+        secret_ref,
+        deployment_ids,
+        changed_routes,
+        embedding_connection_id,
+    )
+
+
+def _embedding_target_connection(
+    request: BundleApplyRequest,
+    *,
+    operator: str,
+    chat_connection_id: str,
+    chat_connection: ConnectionConfig,
+    connections_payload: dict[str, Any],
+) -> tuple[str, ConnectionConfig]:
+    """Pick the connection that should own embedding deployments.
+
+    Empty or equivalent ``embedding_base_url`` keeps vectors on the chat
+    connection. A distinct HTTPS URL creates ``{operator}-embedding-account``
+    that shares the chat ``secret_ref``.
+    """
+
+    raw = request.embedding_base_url.strip()
+    has_embedding = any(item.kind == "embedding" for item in request.deployments)
+    if raw and not has_embedding:
+        raise ValueError("embedding_base_url 仅在同时配置向量模型时有效")
+    if not raw or not has_embedding:
+        return chat_connection_id, chat_connection
+    try:
+        embedding_url = normalize_base_url(
+            raw,
+            allowed_private_networks=chat_connection.allowed_private_networks,
+        )
+    except ValueError as exc:
+        raise ValueError(f"embedding_base_url 无效：{exc}") from exc
+    if embedding_url == chat_connection.base_url:
+        return chat_connection_id, chat_connection
+    embedding_connection_id = _unique_id(
+        _slug(f"{operator}-embedding-account"),
+        connections_payload,
+    )
+    return (
+        embedding_connection_id,
+        chat_connection.model_copy(update={"base_url": embedding_url}),
+    )
 
 
 def _ordered_unique(values: list[str]) -> list[str]:

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MemoryApi } from "./api";
+import { ApiError, MemoryApi } from "./api";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { MemoryDetailDrawer } from "./components/MemoryDetailDrawer";
 import { ToastView } from "./components/Toast";
@@ -34,12 +34,17 @@ import {
 } from "./storage";
 import type { ConnectionSettings, KnowledgeStatus, PageKey, ProvidersStatus } from "./types";
 import { errorMessage } from "./utils/format";
+import { isProviderSetupReady } from "./utils/providerSetup";
 import { scrollWorkspaceToTop } from "./utils/scroll";
 
 export function App() {
   const [settings, setSettings] = useState<ConnectionSettings>(() => loadSettings());
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
   const [uiMode, setUiMode] = useState<UiMode>(() => loadUiMode());
+  // 无密钥或密钥失效时挡住主站，必须先完成连接设置（简洁模式也不例外）。
+  const [credentialsBlocked, setCredentialsBlocked] = useState(
+    () => !loadSettings().apiKey
+  );
   const [page, setPage] = useState<PageKey>(() => {
     const saved = loadSettings();
     return parseHash(window.location.hash)?.page ?? (saved.apiKey ? "dashboard" : "settings");
@@ -65,21 +70,29 @@ export function App() {
   const { toast, notify, clearToast } = useToast();
   const { confirm, confirmState, resolveConfirm } = useConfirm();
 
-  const activePage: PageKey = !settings.apiKey ? "settings" : page;
+  const needsCredentialSetup = !settings.apiKey || credentialsBlocked;
+  const activePage: PageKey = needsCredentialSetup ? "settings" : page;
 
-  // 侧栏待办角标：体检建议、回收站、评测待标注。失败时静默，不影响主流程。
+  useEffect(() => {
+    document.documentElement.dataset.credentialsGate = !settings.apiKey
+      ? "missing"
+      : credentialsBlocked
+        ? "reauth"
+        : "ok";
+  }, [settings.apiKey, credentialsBlocked]);
+
+  // 侧栏待办角标：体检建议、回收站。失败时静默，不影响主流程。
   const refreshSignals = useCallback(async () => {
-    if (!settings.apiKey) {
+    if (!settings.apiKey || credentialsBlocked) {
       setNavSignals({});
       setKnowledgeStatus(null);
       return;
     }
     const next: NavSignals = {};
     try {
-      const [report, review, workbench, knowledge, providers, tokens] = await Promise.all([
+      const [report, review, knowledge, providers, tokens] = await Promise.all([
         api.memoryReport(),
         api.reviewMemories(),
-        api.recallEvaluationWorkbench().catch(() => null),
         api.knowledgeStatus().catch(() => null),
         api.providersStatus().catch(() => null),
         api.authTokens().catch(() => null)
@@ -89,15 +102,6 @@ export function App() {
       }
       if (report.counts.deleted_memories > 0) {
         next.memories = { text: String(report.counts.deleted_memories), tone: "muted" };
-      }
-      if (workbench?.labels?.length) {
-        const unlabeled = workbench.labels.filter((label) => {
-          const judgment = label.judgment || (label.relevant_ids.length > 0 ? "relevant" : "unlabeled");
-          return !(judgment === "no_answer" || (judgment === "relevant" && label.relevant_ids.length > 0));
-        }).length;
-        if (unlabeled > 0) {
-          next.evaluation = { text: String(unlabeled), tone: "info" };
-        }
       }
       const failedIndexes =
         knowledge?.failed_indexes ??
@@ -111,7 +115,7 @@ export function App() {
       if (failedIndexes > 0) {
         next.knowledge = { text: String(failedIndexes), tone: "warning" };
       }
-      if (providers && !providers.setup.chat_ready) {
+      if (providers && !isProviderSetupReady(providers.setup)) {
         next.providers = { text: "配置", tone: "warning" };
         setSetupStatus(providers.setup);
       } else if (providers) {
@@ -124,11 +128,17 @@ export function App() {
         };
       }
       setKnowledgeStatus(knowledge);
-    } catch {
-      // 角标只是辅助信号，拉取失败时保持无角标状态
+      setCredentialsBlocked(false);
+    } catch (error) {
+      // 角标只是辅助信号；若鉴权失败则强制回到连接设置。
+      if (error instanceof ApiError && error.status === 401) {
+        setCredentialsBlocked(true);
+        setNavSignals({});
+        return;
+      }
     }
     setNavSignals(next);
-  }, [api, settings.apiKey]);
+  }, [api, settings.apiKey, credentialsBlocked]);
 
   const lastSignalsRefreshRef = useRef(0);
   const seenRefreshKeyRef = useRef(memoryRefreshKey);
@@ -231,12 +241,14 @@ export function App() {
         return;
       }
       if (!settings.apiKey) {
-        setServiceStatus({ loading: false, tone: "warning", message: "服务在线 · 待配置" });
+        setCredentialsBlocked(true);
+        setServiceStatus({ loading: false, tone: "warning", message: "服务在线 · 请填写访问密钥" });
         return;
       }
       const [, providers] = await Promise.all([api.memoryReport(), api.providersStatus()]);
+      setCredentialsBlocked(false);
       setSetupStatus(providers.setup);
-      if (!providers.setup.chat_ready) {
+      if (!isProviderSetupReady(providers.setup)) {
         setServiceStatus({
           loading: false,
           tone: "warning",
@@ -253,6 +265,15 @@ export function App() {
         message: "聊天配置已就绪"
       });
     } catch (error) {
+      if (error instanceof ApiError && error.status === 401 && settings.apiKey) {
+        setCredentialsBlocked(true);
+        setServiceStatus({
+          loading: false,
+          tone: "warning",
+          message: "访问密钥无效 · 请重新配置"
+        });
+        return;
+      }
       setServiceStatus({
         loading: false,
         tone: "bad",
@@ -266,21 +287,26 @@ export function App() {
   }, [pingService]);
 
   const applySettings = (next: ConnectionSettings, message = "设置已保存") => {
-    const isFirstConnection = !settings.apiKey;
+    const wasBlocked = !settings.apiKey || credentialsBlocked;
     const saved = saveSettings(next);
     setSettings(saved);
     notify(message, "success");
-    if (isFirstConnection && saved.apiKey) {
-      // 首次连接先进入模型配置。若这其实是已配置环境中的新浏览器，
-      // 状态检查成功后再自动回到工作室。
+    if (wasBlocked && saved.apiKey) {
+      // 验证通过后先放开主站；首次/重登优先模型配置，已就绪则回工作室。
+      setCredentialsBlocked(false);
       navigateToPage("providers");
       const savedApi = new MemoryApi(saved);
       void savedApi.providersStatus()
         .then((providers) => {
           setSetupStatus(providers.setup);
-          if (providers.setup.chat_ready) navigateToPage("dashboard");
+          setCredentialsBlocked(false);
+          if (isProviderSetupReady(providers.setup)) navigateToPage("dashboard");
         })
-        .catch(() => undefined);
+        .catch((error) => {
+          if (error instanceof ApiError && error.status === 401) {
+            setCredentialsBlocked(true);
+          }
+        });
     }
   };
 
@@ -292,6 +318,7 @@ export function App() {
         serviceStatus={serviceStatus}
         theme={theme}
         uiMode={uiMode}
+        needsCredentialSetup={needsCredentialSetup}
         signals={navSignals}
         onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
         onToggleUiMode={() => setUiMode((current) => (current === "simple" ? "expert" : "simple"))}
@@ -346,8 +373,9 @@ export function App() {
         {activePage === "providers" && (
           <ProvidersPage
             api={api}
-            initialSetup={!setupStatus?.chat_ready}
+            initialSetup={!isProviderSetupReady(setupStatus)}
             expertMode={uiMode === "expert"}
+            onSetupChanged={() => pingService()}
           />
         )}
         {activePage === "settings" && (

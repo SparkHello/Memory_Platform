@@ -282,7 +282,12 @@ def _route_class(scope: Scope) -> str | None:
         return "chat"
     if _KNOWLEDGE_PART_RE.fullmatch(path):
         return "knowledge_part"
-    if path == "/memories/restore":
+    if path in {
+        "/memories/restore",
+        "/memories/stack-backup/validate",
+        "/memories/import/conversations/preview",
+        "/memories/import/conversations/commit",
+    }:
         return "memory_restore"
     if path == "/knowledge/restore":
         return "knowledge_restore"

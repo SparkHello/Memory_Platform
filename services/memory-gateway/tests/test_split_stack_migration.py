@@ -115,8 +115,10 @@ def test_legacy_volume_migrates_only_allowlisted_state(tmp_path, monkeypatch, ca
     assert "MEMORY_CONSOLE_ADMIN_KEY" not in migrated_settings
     assert "LEGACY_GATEWAY_KEY_ENABLED" not in migrated_settings
     assert (roots["MODEL_SECRETS"] / "secrets.env").stat().st_mode & 0o777 == 0o600
-    assert (roots["CREDENTIALS"] / "gateway.key").read_text().strip() == "legacy-gateway-test-value"
-    assert (roots["CREDENTIALS"] / "admin.key").read_text().strip() == "legacy-admin-test-value"
+    assert (roots["CREDENTIALS"] / "gateway.txt").read_text().strip() == "legacy-gateway-test-value"
+    assert (roots["CREDENTIALS"] / "admin.txt").read_text().strip() == "legacy-admin-test-value"
+    assert not (roots["CREDENTIALS"] / "gateway.key").exists()
+    assert not (roots["CREDENTIALS"] / "admin.key").exists()
     with sqlite3.connect(roots["MEMORY_DATA"] / "memory.db") as connection:
         assert connection.execute("SELECT value FROM canary").fetchone()[0] == "memory-canary"
     with sqlite3.connect(roots["MODEL_DATA"] / "usage.db") as connection:

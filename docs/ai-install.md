@@ -125,7 +125,7 @@ printf '%s\n' "$USER_PROVIDED_API_KEY" | \
 - **Web Console**：`http://127.0.0.1:2026/ui/`
 - **OpenAI 兼容 base URL**：`http://127.0.0.1:2026/v1`
 - **MCP**：`http://127.0.0.1:2026/mcp`
-- **Web Console token**：安装输出列出的 `gateway.key` 私有文件（仅 Console 管理用途）
+- **Web Console token**：安装输出列出的 `gateway.txt` 私有文件（旧安装可能仍为 `gateway.key`；仅 Console 管理用途）
 - **客户端 token**：运行 `scripts/memgw token create --name DEVICE --role chat`；MCP 改用 `--role mcp`
 - **模型名**：客户端填 `memory-auto`
 

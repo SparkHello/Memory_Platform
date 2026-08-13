@@ -1099,6 +1099,35 @@ async def test_relation_gates_keep_metadata_from_answering_a_different_question(
 
 
 @pytest.mark.asyncio
+async def test_food_preference_query_matches_only_drink_statement(
+    memory_store: MemoryStore,
+) -> None:
+    coffee = memory_store.create_memory(
+        user_id="default",
+        content="用户只喝美式咖啡，不加糖不加奶。",
+        topics=["偏好", "饮食"],
+    )
+    memory_store.create_memory(
+        user_id="default",
+        content="用户喂西瓜很有分寸，吃完后会控制糖分。",
+        topics=["宠物", "饮食"],
+    )
+    service = MemorySearchService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        enable_cache=False,
+    )
+
+    results = await service.search(
+        query="我喜欢喝什么咖啡",
+        user_id="default",
+        record_usage=False,
+    )
+
+    assert [memory.id for memory in results] == [coffee.id]
+
+
+@pytest.mark.asyncio
 async def test_keyword_search_supports_meaningful_single_cjk_character(
     memory_store: MemoryStore,
 ) -> None:
