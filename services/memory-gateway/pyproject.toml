@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memory-gateway"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local long-term memory and isolated long-text knowledge service with MCP and a Web console."
 readme = "README.md"
 requires-python = ">=3.12"

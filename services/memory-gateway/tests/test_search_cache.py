@@ -209,7 +209,8 @@ class TestSearchCache:
 
     async def test_cache_expires_at_scheduled_temporal_boundary(self, memory_store):
         now = datetime.now(UTC)
-        future_start = now + timedelta(seconds=0.2)
+        # Leave enough setup time for loaded CI runners before the boundary.
+        future_start = now + timedelta(seconds=2)
         old = memory_store.create_memory(
             user_id="default",
             content="User city is Alpha.",
@@ -244,7 +245,7 @@ class TestSearchCache:
         key = ("default", _normalize_query("user city coffee"), 8, False, "")
         assert SEARCH_CACHE[key][0] <= future_start.timestamp()
 
-        time.sleep(0.25)
+        time.sleep(max(0.0, future_start.timestamp() - time.time()) + 0.05)
         after = await service.search_hits(
             query="user city coffee",
             user_id="default",

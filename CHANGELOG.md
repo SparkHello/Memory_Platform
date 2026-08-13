@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-08-13
+
+### Fixed
+
+- Console Chromium 验收的 fake API 补齐 `/memories/health`，新增健康检查不再被误报为未知请求。
+- 时间边界缓存测试改为等待实际生效时刻，避免较慢 CI runner 在首次断言前越过 0.2 秒边界。
+
 ## 0.5.0 - 2026-08-13
 
 ### Changed

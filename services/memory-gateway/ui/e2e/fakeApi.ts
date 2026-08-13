@@ -184,6 +184,14 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     state.calls.push(call);
 
     if (url.pathname === "/health") return json(route, { status: "ok" });
+    if (url.pathname === "/memories/health") {
+      return json(route, {
+        status: "ok",
+        checked_at: "2026-08-09T10:00:00+00:00",
+        summary: { errors: 0, warnings: 0, info: 0 },
+        issues: []
+      });
+    }
     if (url.pathname === "/memories/report") {
       return json(route, {
         user_id: "e2e-user",
