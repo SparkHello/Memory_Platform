@@ -2,12 +2,9 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.schema_migrations import apply_schema_migrations
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
 
 def _ensure_columns(
     connection: sqlite3.Connection,
@@ -24,7 +21,6 @@ def _ensure_columns(
             connection.execute(
                 f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
             )
-
 
 def _ensure_memories_usage_columns(connection: sqlite3.Connection) -> None:
     _ensure_columns(
@@ -96,7 +92,6 @@ def _ensure_memories_usage_columns(connection: sqlite3.Connection) -> None:
         """
     )
 
-
 def _ensure_memories_embedding_space_column(connection: sqlite3.Connection) -> None:
     columns = {
         row["name"]
@@ -109,7 +104,6 @@ def _ensure_memories_embedding_space_column(connection: sqlite3.Connection) -> N
         connection.execute(
             "ALTER TABLE memories ADD COLUMN embedding_space_id TEXT"
         )
-
 
 def _ensure_revision_columns(connection: sqlite3.Connection) -> None:
     for table_name in (
@@ -135,7 +129,6 @@ def _ensure_revision_columns(connection: sqlite3.Connection) -> None:
             "WHERE revision IS NULL OR revision < 1"
         )
 
-
 def _run_migrations(connection: sqlite3.Connection) -> None:
     """按 PRAGMA user_version 顺序执行一次性的 schema/数据迁移。
 
@@ -150,5 +143,4 @@ def _run_migrations(connection: sqlite3.Connection) -> None:
         migrations_mod._MEMORY_SCHEMA_MIGRATIONS,
         schema_name="memory database",
     )
-
 

@@ -4,20 +4,23 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import re
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.classification import normalize_classification_name
 from app.memory.models import MemoryRecord, MemorySpace, new_memory_id, utc_now_iso
 from app.memory.store.errors import RevisionConflictError
-from app.memory.store.helpers import _ordered_unique
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
+from app.memory.store.helpers import (
+    _ConnectableStore,
+    _ordered_unique,
+    _row_to_memory,
+    _row_to_memory_space,
+    _rows_to_memories,
+    _space_ids_for_memory_ids_on_connection,
+)
 
 _SPACE_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _SPACE_DESCRIPTION_MAX = 500
 _SPACE_SORT_ORDER_MAX = 9999
-
 
 def normalize_space_color(value: str | None) -> str | None:
     if value is None:
@@ -29,7 +32,6 @@ def normalize_space_color(value: str | None) -> str | None:
         raise ValueError("color 须为 #RRGGBB 十六进制颜色，或留空")
     return text.upper()
 
-
 def normalize_space_description(value: str | None) -> str | None:
     if value is None:
         return None
@@ -40,7 +42,6 @@ def normalize_space_description(value: str | None) -> str | None:
         raise ValueError(f"description 最多 {_SPACE_DESCRIPTION_MAX} 个字符")
     return text
 
-
 def normalize_space_sort_order(value: int | None) -> int:
     if value is None:
         return 0
@@ -49,19 +50,16 @@ def normalize_space_sort_order(value: int | None) -> int:
         raise ValueError(f"sort_order 须在 0..{_SPACE_SORT_ORDER_MAX}")
     return order
 
-
-def upsert_memory_space(store: MemoryStore, *, user_id: str, name: str) -> MemorySpace:
+def upsert_memory_space(store: _ConnectableStore, *, user_id: str, name: str) -> MemorySpace:
     display_name = normalize_classification_name(name, field_name="space")
     with store._connect() as connection:
-        return store._upsert_memory_space_on_connection(
+        return _upsert_memory_space_on_connection(
             connection=connection,
             user_id=user_id,
             display_name=display_name,
         )
 
-
 def _upsert_memory_space_on_connection(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -89,7 +87,7 @@ def _upsert_memory_space_on_connection(
             "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
             (row["id"], user_id),
         ).fetchone()
-        return store._row_to_memory_space(updated)
+        return _row_to_memory_space(updated)
 
     space = MemorySpace(
         id=new_memory_id(),
@@ -126,9 +124,8 @@ def _upsert_memory_space_on_connection(
     )
     return space
 
-
 def create_memory_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     name: str,
@@ -186,9 +183,8 @@ def create_memory_space(
         )
         return space
 
-
 def update_memory_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     space_id: str,
@@ -212,7 +208,7 @@ def update_memory_space(
         ).fetchone()
         if row is None:
             return None
-        current = store._row_to_memory_space(row)
+        current = _row_to_memory_space(row)
         display_name = current.name
         normalized_name = current.normalized_name
         if update_name:
@@ -265,11 +261,10 @@ def update_memory_space(
             "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
             (space_id, user_id),
         ).fetchone()
-        return store._row_to_memory_space(updated) if updated else None
-
+        return _row_to_memory_space(updated) if updated else None
 
 def set_memory_space_archived(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     space_id: str,
@@ -298,11 +293,10 @@ def set_memory_space_archived(
             "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
             (space_id, user_id),
         ).fetchone()
-        return store._row_to_memory_space(updated) if updated else None
-
+        return _row_to_memory_space(updated) if updated else None
 
 def delete_memory_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     space_id: str,
@@ -333,9 +327,8 @@ def delete_memory_space(
         )
         return "deleted"
 
-
 def list_memory_spaces(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     include_archived: bool = False,
@@ -347,11 +340,10 @@ def list_memory_spaces(
     query += " ORDER BY sort_order ASC, name ASC, updated_at DESC"
     with store._connect() as connection:
         rows = connection.execute(query, params).fetchall()
-    return [store._row_to_memory_space(row) for row in rows]
-
+    return [_row_to_memory_space(row) for row in rows]
 
 def list_memory_space_summaries(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     include_archived: bool = False,
@@ -379,16 +371,15 @@ def list_memory_space_summaries(
         ).fetchall()
     summaries: list[dict] = []
     for row in rows:
-        space = store._row_to_memory_space(row)
+        space = _row_to_memory_space(row)
         payload = space.model_dump()
         payload["active_memory_count"] = int(row["active_memory_count"] or 0)
         payload["last_memory_updated_at"] = row["last_memory_updated_at"]
         summaries.append(payload)
     return summaries
 
-
 def get_memory_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     space_id: str,
@@ -411,11 +402,10 @@ def get_memory_space(
                 """,
                 (user_id, space_id),
             ).fetchone()
-    return store._row_to_memory_space(row) if row else None
-
+    return _row_to_memory_space(row) if row else None
 
 def list_memories_for_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     space_id: str,
@@ -436,11 +426,10 @@ def list_memories_for_space(
             """,
             (user_id, space_id, limit),
         ).fetchall()
-    return store._rows_to_memories(rows)
-
+    return _rows_to_memories(store, rows)
 
 def replace_memory_spaces(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_id: str,
     user_id: str,
@@ -478,7 +467,7 @@ def replace_memory_spaces(
                 current_revision=current_revision,
             )
         created_spaces = [
-            store._upsert_memory_space_on_connection(
+            _upsert_memory_space_on_connection(
                 connection=connection,
                 user_id=user_id,
                 display_name=normalize_classification_name(name, field_name="space"),
@@ -490,12 +479,12 @@ def replace_memory_spaces(
         )
         if len(normalized_space_ids) > 10:
             raise ValueError("space_ids 最多 10 个")
-        store._validate_space_ids(
+        _validate_space_ids(
             connection=connection,
             user_id=user_id,
             space_ids=normalized_space_ids,
         )
-        store._replace_memory_space_links(
+        _replace_memory_space_links(
             connection=connection,
             user_id=user_id,
             memory_id=memory_id,
@@ -519,54 +508,10 @@ def replace_memory_spaces(
         ).fetchone()
         if updated_row is None:
             raise RuntimeError("Memory space update did not persist.")
-        return store._row_to_memory(
+        return _row_to_memory(
             updated_row,
             space_ids=normalized_space_ids,
         )
-
-
-def _space_ids_for_memory_ids(
-    store: MemoryStore,
-    *,
-    user_id: str,
-    memory_ids: list[str],
-) -> dict[str, list[str]]:
-    with store._connect() as connection:
-        return store._space_ids_for_memory_ids_on_connection(
-            connection=connection,
-            user_id=user_id,
-            memory_ids=memory_ids,
-        )
-
-
-def _space_ids_for_memory_ids_on_connection(
-    *,
-    connection: sqlite3.Connection,
-    user_id: str,
-    memory_ids: list[str],
-) -> dict[str, list[str]]:
-    unique_ids = _ordered_unique(memory_ids)
-    if not unique_ids:
-        return {}
-    result = {memory_id: [] for memory_id in unique_ids}
-    for offset in range(0, len(unique_ids), 500):
-        batch = unique_ids[offset : offset + 500]
-        placeholders = ", ".join("?" for _ in batch)
-        rows = connection.execute(
-            f"""
-            SELECT memory_id, space_id
-            FROM memory_space_links
-            WHERE user_id = ? AND memory_id IN ({placeholders})
-            ORDER BY created_at ASC, rowid ASC
-            """,
-            (user_id, *batch),
-        ).fetchall()
-        for row in rows:
-            result.setdefault(str(row["memory_id"]), []).append(
-                str(row["space_id"])
-            )
-    return result
-
 
 def _replace_memory_space_links(
     *,
@@ -594,7 +539,6 @@ def _replace_memory_space_links(
             (user_id, memory_id, space_id, created_at),
         )
 
-
 def _filter_existing_space_ids(
     *,
     connection: sqlite3.Connection,
@@ -615,7 +559,6 @@ def _filter_existing_space_ids(
     existing = {str(row["id"]) for row in rows}
     return [space_id for space_id in unique_ids if space_id in existing]
 
-
 def _validate_space_ids(
     *,
     connection: sqlite3.Connection,
@@ -635,20 +578,3 @@ def _validate_space_ids(
     missing = [space_id for space_id in unique_ids if space_id not in existing]
     if missing:
         raise ValueError(f"空间不存在或不属于当前用户：{', '.join(missing)}")
-
-
-def _row_to_memory_space(row: sqlite3.Row) -> MemorySpace:
-    payload = dict(row)
-    # Tolerate pre-migration rows and NULL metadata.
-    if payload.get("color") is not None:
-        payload["color"] = str(payload["color"]) or None
-    if payload.get("description") is not None:
-        text = str(payload["description"]).strip()
-        payload["description"] = text or None
-    try:
-        payload["sort_order"] = int(payload.get("sort_order") or 0)
-    except (TypeError, ValueError):
-        payload["sort_order"] = 0
-    return MemorySpace(**payload)
-
-

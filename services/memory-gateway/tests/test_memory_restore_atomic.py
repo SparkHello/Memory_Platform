@@ -2,6 +2,7 @@ import pytest
 
 from app.memory.report import restore_memory_export
 from app.memory.store import MemoryStore
+from app.memory.store import export_import as store_export_import
 
 
 def _restore_payload() -> dict:
@@ -42,7 +43,7 @@ def test_restore_rolls_back_every_partition_on_unexpected_write_failure(
     memory_store: MemoryStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = memory_store._import_prepared_memory_record_on_connection
+    original = store_export_import._import_prepared_memory_record_on_connection
     calls = 0
 
     def fail_on_second_memory(*args, **kwargs):
@@ -53,7 +54,7 @@ def test_restore_rolls_back_every_partition_on_unexpected_write_failure(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        memory_store,
+        store_export_import,
         "_import_prepared_memory_record_on_connection",
         fail_on_second_memory,
     )

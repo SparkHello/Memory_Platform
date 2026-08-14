@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import hashlib
 
@@ -28,23 +28,34 @@ from app.memory.classification import (
 )
 from app.memory.store.constants import _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT
 from app.memory.store.helpers import (
-    _sensitivity_with_floor,
+    _ConnectableStore,
     _bounded_float,
     _coerce_float,
     _coerce_float_or_none,
     _coerce_int,
     _coerce_string_list,
+    _insert_memory_row,
     _json_string_list,
     _ordered_unique,
+    _row_to_conversation_branch_node,
+    _row_to_core_memory_section,
+    _row_to_core_memory_section_history,
+    _row_to_memory,
+    _row_to_memory_space,
+    _row_to_recent_context_summary,
+    _rows_to_memories_on_connection,
+    _sensitivity_with_floor,
+    _space_ids_for_memory_ids_on_connection,
 )
+from app.memory.store.spaces import (
+    _filter_existing_space_ids,
+    _replace_memory_space_links,
+)
+from app.memory.store.temporal import _rebuild_temporal_key
 from app.memory.utils import _parse_iso_datetime
 
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
-
 def list_all_memories_for_export(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     archived: bool,
@@ -71,14 +82,13 @@ def list_all_memories_for_export(
                 break
             rows.extend(page)
             last_rowid = int(page[-1]["export_rowid"])
-        return store._rows_to_memories_on_connection(
+        return _rows_to_memories_on_connection(
             connection=connection,
             rows=rows,
         )
 
-
 def read_memory_export_snapshot(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     include_deleted: bool = True,
@@ -107,7 +117,7 @@ def read_memory_export_snapshot(
             memory_rows.extend(rows)
             last_rowid = int(rows[-1]["export_rowid"])
 
-        memories = store._rows_to_memories_on_connection(
+        memories = _rows_to_memories_on_connection(
             connection=connection,
             rows=memory_rows,
         )
@@ -172,29 +182,28 @@ def read_memory_export_snapshot(
         ).fetchall()
 
         return {
-            "memory_spaces": [store._row_to_memory_space(row) for row in space_rows],
+            "memory_spaces": [_row_to_memory_space(row) for row in space_rows],
             "memories": [memory for memory in memories if not memory.archived],
             "deleted_memories": [memory for memory in memories if memory.archived],
             "core_memory_sections": [
-                store._row_to_core_memory_section(row) for row in core_rows
+                _row_to_core_memory_section(row) for row in core_rows
             ],
             "core_memory_section_history": [
-                store._row_to_core_memory_section_history(row)
+                _row_to_core_memory_section_history(row)
                 for row in core_history_rows
             ],
             "recent_context_summaries": [
-                store._row_to_recent_context_summary(row)
+                _row_to_recent_context_summary(row)
                 for row in recent_context_rows
             ],
             "conversation_branch_nodes": [
-                store._row_to_conversation_branch_node(row) for row in branch_rows
+                _row_to_conversation_branch_node(row) for row in branch_rows
             ],
             "decision_logs": [DecisionLog(**dict(row)) for row in decision_rows],
         }
 
-
 def read_memory_selection_export_snapshot(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -229,7 +238,7 @@ def read_memory_selection_export_snapshot(
             for memory_id in requested_ids
             if memory_id in rows_by_id
         ]
-        memories = store._rows_to_memories_on_connection(
+        memories = _rows_to_memories_on_connection(
             connection=connection,
             rows=ordered_rows,
         )
@@ -249,7 +258,7 @@ def read_memory_selection_export_snapshot(
             ).fetchall()
             spaces_by_id.update(
                 {
-                    str(row["id"]): store._row_to_memory_space(row)
+                    str(row["id"]): _row_to_memory_space(row)
                     for row in rows
                 }
             )
@@ -264,9 +273,8 @@ def read_memory_selection_export_snapshot(
             "missing_memory_ids": missing_ids,
         }
 
-
 def prepare_memory_space_import(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     data: dict,
 ) -> dict[str, object] | None:
@@ -298,9 +306,8 @@ def prepare_memory_space_import(
         "sort_order": max(0, min(9999, sort_order)),
     }
 
-
 def import_memory_space(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     data: dict,
@@ -347,7 +354,7 @@ def import_memory_space(
                 "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
                 (existing_name["id"], user_id),
             ).fetchone()
-            return "updated", store._row_to_memory_space(updated), old_id or existing_name["id"]
+            return "updated", _row_to_memory_space(updated), old_id or existing_name["id"]
 
         existing_same_id = connection.execute(
             "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
@@ -355,7 +362,7 @@ def import_memory_space(
         ).fetchone()
         if existing_same_id is not None:
             if not overwrite:
-                return "skipped", store._row_to_memory_space(existing_same_id), old_id or space_id
+                return "skipped", _row_to_memory_space(existing_same_id), old_id or space_id
             connection.execute(
                 """
                 UPDATE memory_spaces
@@ -375,7 +382,7 @@ def import_memory_space(
                 "SELECT * FROM memory_spaces WHERE id = ? AND user_id = ?",
                 (space_id, user_id),
             ).fetchone()
-            return "updated", store._row_to_memory_space(updated), old_id or space_id
+            return "updated", _row_to_memory_space(updated), old_id or space_id
 
         try:
             sort_order = int(data.get("sort_order") or 0)
@@ -418,9 +425,8 @@ def import_memory_space(
         )
     return "created", space, old_id or space_id
 
-
 def plan_memory_import_ids(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     source_ids: list[str],
@@ -433,13 +439,12 @@ def plan_memory_import_ids(
     if not ordered_ids:
         return {}
     with store._connect() as connection:
-        return store._plan_memory_import_ids_on_connection(
+        return _plan_memory_import_ids_on_connection(
             connection=connection,
             user_id=user_id,
             source_ids=ordered_ids,
             rebind_all=rebind_all,
         )
-
 
 def _plan_memory_import_ids_on_connection(
     *,
@@ -484,9 +489,8 @@ def _plan_memory_import_ids_on_connection(
         allocated.add(target_id)
     return result
 
-
 def filter_existing_memory_ids(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -496,12 +500,11 @@ def filter_existing_memory_ids(
         [str(memory_id).strip() for memory_id in memory_ids if str(memory_id).strip()]
     )
     with store._connect() as connection:
-        return store._filter_existing_memory_ids_on_connection(
+        return _filter_existing_memory_ids_on_connection(
             connection=connection,
             user_id=user_id,
             memory_ids=ordered_ids,
         )
-
 
 def _filter_existing_memory_ids_on_connection(
     *,
@@ -526,9 +529,8 @@ def _filter_existing_memory_ids_on_connection(
         existing.update(str(row["id"]) for row in rows)
     return existing
 
-
 def prune_dangling_memory_references(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -541,12 +543,11 @@ def prune_dangling_memory_references(
         return 0
     with store._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        return store._prune_dangling_memory_references_on_connection(
+        return _prune_dangling_memory_references_on_connection(
             connection=connection,
             user_id=user_id,
             memory_ids=target_ids,
         )
-
 
 def _prune_dangling_memory_references_on_connection(
     *,
@@ -622,9 +623,8 @@ def _prune_dangling_memory_references_on_connection(
             changed_references += removed
     return changed_references
 
-
 def restore_prepared_export(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     prepared_spaces: list[dict[str, object]],
@@ -642,13 +642,13 @@ def restore_prepared_export(
         connection.execute("BEGIN IMMEDIATE")
 
         # Finish every database-dependent mapping before the first write.
-        space_plans, space_id_map = store._plan_memory_space_imports_on_connection(
+        space_plans, space_id_map = _plan_memory_space_imports_on_connection(
             connection=connection,
             user_id=user_id,
             prepared_spaces=prepared_spaces,
             overwrite=overwrite,
         )
-        memory_id_map = store._plan_memory_import_ids_on_connection(
+        memory_id_map = _plan_memory_import_ids_on_connection(
             connection=connection,
             user_id=user_id,
             source_ids=source_memory_ids,
@@ -658,7 +658,7 @@ def restore_prepared_export(
             not exported_user_id or exported_user_id == user_id
         )
         allowed_existing_ids = (
-            store._filter_existing_memory_ids_on_connection(
+            _filter_existing_memory_ids_on_connection(
                 connection=connection,
                 user_id=user_id,
                 memory_ids=referenced_source_ids,
@@ -698,7 +698,7 @@ def restore_prepared_export(
         # point. Any unexpected exception escapes the context manager and
         # rolls back every already-written partition.
         for plan in space_plans:
-            store._apply_memory_space_import_plan_on_connection(
+            _apply_memory_space_import_plan_on_connection(
                 connection=connection,
                 user_id=user_id,
                 plan=plan,
@@ -707,7 +707,7 @@ def restore_prepared_export(
         memory_results: list[tuple[str, MemoryRecord | None]] = []
         imported_memory_ids: list[str] = []
         for memory in mapped_memories:
-            action, persisted = store._import_prepared_memory_record_on_connection(
+            action, persisted = _import_prepared_memory_record_on_connection(
                 connection=connection,
                 user_id=user_id,
                 memory=memory,
@@ -718,19 +718,19 @@ def restore_prepared_export(
             if persisted is not None and action in {"created", "updated"}:
                 imported_memory_ids.append(persisted.id)
 
-        dangling_removed = store._prune_dangling_memory_references_on_connection(
+        dangling_removed = _prune_dangling_memory_references_on_connection(
             connection=connection,
             user_id=user_id,
             memory_ids=imported_memory_ids,
         )
-        final_existing_ids = store._filter_existing_memory_ids_on_connection(
+        final_existing_ids = _filter_existing_memory_ids_on_connection(
             connection=connection,
             user_id=user_id,
             memory_ids=[*memory_id_map.values(), *referenced_source_ids],
         )
 
         recent_context_actions = [
-            store._restore_recent_context_on_connection(
+            _restore_recent_context_on_connection(
                 connection=connection,
                 user_id=user_id,
                 prepared=prepared,
@@ -739,7 +739,7 @@ def restore_prepared_export(
             for prepared in recent_contexts
         ]
         branch_node_actions = [
-            store._restore_branch_node_on_connection(
+            _restore_branch_node_on_connection(
                 connection=connection,
                 user_id=user_id,
                 prepared=prepared,
@@ -762,9 +762,7 @@ def restore_prepared_export(
             connection.rollback()
         return result
 
-
 def _plan_memory_space_imports_on_connection(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -776,7 +774,7 @@ def _plan_memory_space_imports_on_connection(
         (user_id,),
     ).fetchall()
     by_id = {
-        str(row["id"]): store._row_to_memory_space(row)
+        str(row["id"]): _row_to_memory_space(row)
         for row in target_rows
     }
     by_name = {space.normalized_name: space for space in by_id.values()}
@@ -877,7 +875,6 @@ def _plan_memory_space_imports_on_connection(
         space_id_map[source_id or space.id] = space.id
     return plans, space_id_map
 
-
 def _apply_memory_space_import_plan_on_connection(
     *,
     connection: sqlite3.Connection,
@@ -939,7 +936,6 @@ def _apply_memory_space_import_plan_on_connection(
                 user_id,
             ),
         )
-
 
 def _restore_recent_context_on_connection(
     *,
@@ -1017,7 +1013,6 @@ def _restore_recent_context_on_connection(
         ),
     )
     return "created"
-
 
 def _restore_branch_node_on_connection(
     *,
@@ -1102,9 +1097,8 @@ def _restore_branch_node_on_connection(
     )
     return "created" if existing is None else "updated"
 
-
 def prepare_memory_import_record(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     data: dict,
@@ -1195,9 +1189,8 @@ def prepare_memory_import_record(
 
     return memory
 
-
 def import_memory_record(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     data: dict,
@@ -1206,7 +1199,8 @@ def import_memory_record(
     space_id_map: dict[str, str] | None = None,
     rebind_on_conflict: bool = True,
 ) -> tuple[str, MemoryRecord | None]:
-    memory = store.prepare_memory_import_record(
+    memory = prepare_memory_import_record(
+        store,
         user_id=user_id,
         data=data,
         archived=archived,
@@ -1217,7 +1211,7 @@ def import_memory_record(
 
     with store._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        return store._import_prepared_memory_record_on_connection(
+        return _import_prepared_memory_record_on_connection(
             connection=connection,
             user_id=user_id,
             memory=memory,
@@ -1225,9 +1219,7 @@ def import_memory_record(
             rebind_on_conflict=rebind_on_conflict,
         )
 
-
 def _import_prepared_memory_record_on_connection(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -1238,7 +1230,7 @@ def _import_prepared_memory_record_on_connection(
     """Write a fully validated import row using the caller's transaction."""
     memory = memory.model_copy(deep=True)
     now = utc_now_iso()
-    memory.space_ids = store._filter_existing_space_ids(
+    memory.space_ids = _filter_existing_space_ids(
         connection=connection,
         user_id=user_id,
         space_ids=memory.space_ids,
@@ -1264,7 +1256,7 @@ def _import_prepared_memory_record_on_connection(
         return "skipped", None
 
     existing_memory = (
-        store._row_to_memory(row, space_ids=[])
+        _row_to_memory(row, space_ids=[])
         if row is not None
         else None
     )
@@ -1375,7 +1367,7 @@ def _import_prepared_memory_record_on_connection(
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Memory import update lost its user-scoped target.")
-        store._replace_memory_space_links(
+        _replace_memory_space_links(
             connection=connection,
             user_id=user_id,
             memory_id=memory.id,
@@ -1384,8 +1376,8 @@ def _import_prepared_memory_record_on_connection(
         )
         action = "updated"
     else:
-        store._insert_memory_row(connection=connection, memory=memory)
-        store._replace_memory_space_links(
+        _insert_memory_row(connection=connection, memory=memory)
+        _replace_memory_space_links(
             connection=connection,
             user_id=user_id,
             memory_id=memory.id,
@@ -1400,7 +1392,7 @@ def _import_prepared_memory_record_on_connection(
         if key is not None
     }
     for subject, predicate in temporal_keys:
-        store._rebuild_temporal_key(
+        _rebuild_temporal_key(
             connection=connection,
             user_id=user_id,
             temporal_subject=subject,
@@ -1413,15 +1405,14 @@ def _import_prepared_memory_record_on_connection(
     ).fetchone()
     if persisted_row is None:
         raise RuntimeError("Memory import did not persist.")
-    persisted_space_ids = store._space_ids_for_memory_ids_on_connection(
+    persisted_space_ids = _space_ids_for_memory_ids_on_connection(
         connection=connection,
         user_id=user_id,
         memory_ids=[memory.id],
     ).get(memory.id, [])
-    persisted = store._row_to_memory(
+    persisted = _row_to_memory(
         persisted_row,
         space_ids=persisted_space_ids,
     )
     return action, persisted
-
 

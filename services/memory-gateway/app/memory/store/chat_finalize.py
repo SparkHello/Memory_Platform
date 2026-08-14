@@ -9,14 +9,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
+from app.memory.store.helpers import _ConnectableStore
 
 def claim_chat_side_effect(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     kind: str,
     key: str,
@@ -62,9 +58,8 @@ def claim_chat_side_effect(
         )
         return cursor.rowcount == 1
 
-
 def release_chat_side_effect_claim(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     kind: str,
     key: str,
@@ -82,9 +77,8 @@ def release_chat_side_effect_claim(
             (normalized_kind, key_hash, normalized_user[:200]),
         )
 
-
 def enqueue_chat_finalize_job(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     job_id: str,
     user_id: str,
@@ -119,9 +113,8 @@ def enqueue_chat_finalize_job(
         )
         return cursor.rowcount == 1
 
-
 def mark_chat_finalize_job(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     job_id: str,
     status: str,
@@ -149,8 +142,7 @@ def mark_chat_finalize_job(
         )
         return cursor.rowcount == 1
 
-
-def prune_chat_finalize_jobs(store: "MemoryStore", *, keep_per_user: int = 5000) -> int:
+def prune_chat_finalize_jobs(store: _ConnectableStore, *, keep_per_user: int = 5000) -> int:
     """Cap terminal (done/failed) outbox rows per user, newest first."""
     bounded = max(1, int(keep_per_user))
     with store._connect() as connection:
@@ -170,9 +162,8 @@ def prune_chat_finalize_jobs(store: "MemoryStore", *, keep_per_user: int = 5000)
         )
         return int(cursor.rowcount or 0)
 
-
 def list_recoverable_chat_finalize_jobs(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     limit: int = 20,
     stale_running_seconds: float = 120.0,

@@ -5,12 +5,37 @@ from datetime import datetime
 import json
 import math
 import sqlite3
-from typing import Any
+from typing import Any, Protocol
 
-from app.memory.models import MemorySensitivity, MemoryStability, MemoryType
+from app.memory.models import (
+    ConversationBranchNode,
+    CoreMemorySection,
+    CoreMemorySectionHistory,
+    MemoryRecord,
+    MemorySensitivity,
+    MemorySpace,
+    MemoryStability,
+    MemoryType,
+    RecentContextSummary,
+    normalize_iso_text,
+    normalize_memory_type,
+    normalize_optional_text,
+)
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.store.constants import _SENSITIVITY_RANK
 from app.memory.utils import _parse_iso_datetime
+
+
+class _ConnectableStore(Protocol):
+    """store 领域子模块对 MemoryStore 的最小能力要求。
+
+    打破子模块与 MemoryStore 之间的类型层环形依赖：运行时仍传入
+    MemoryStore 实例，类型上只要求能打开 SQLite 连接（外加个别公共读方法）。
+    """
+
+    def _connect(self) -> sqlite3.Connection: ...
+
+    def get_memory(self, *, memory_id: str, user_id: str) -> MemoryRecord | None: ...
 
 
 def _json_string_list(raw_value: str | None) -> list[str]:
@@ -199,3 +224,246 @@ def _sensitivity_with_floor(
     )
     return max((declared, detected), key=_SENSITIVITY_RANK.__getitem__)
 
+
+def _insert_memory_row(
+    *,
+    connection: sqlite3.Connection,
+    memory: MemoryRecord,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO memories (
+            id, user_id, content, type, importance, confidence,
+            valence, arousal,
+            source_message, source_conversation_id, origin, embedding_json,
+            embedding_space_id,
+            last_used_at, usage_count, stability, valid_from, valid_until, review_after,
+            sensitivity, evidence_memory_ids_json, topics_json, entities_json,
+            temporal_subject, temporal_predicate,
+            status, digested, decay_lambda, supersedes, superseded_by,
+            created_at, updated_at, archived_at, archived, revision
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            memory.id,
+            memory.user_id,
+            memory.content,
+            memory.type,
+            memory.importance,
+            memory.confidence,
+            memory.valence,
+            memory.arousal,
+            memory.source_message,
+            memory.source_conversation_id,
+            memory.origin,
+            memory.embedding_json,
+            memory.embedding_space_id,
+            memory.last_used_at,
+            memory.usage_count,
+            memory.stability,
+            memory.valid_from,
+            memory.valid_until,
+            memory.review_after,
+            memory.sensitivity,
+            json.dumps(memory.evidence_memory_ids, ensure_ascii=False),
+            json.dumps(memory.topics, ensure_ascii=False),
+            json.dumps(memory.entities, ensure_ascii=False),
+            memory.temporal_subject,
+            memory.temporal_predicate,
+            memory.status,
+            int(memory.digested),
+            memory.decay_lambda,
+            memory.supersedes,
+            memory.superseded_by,
+            memory.created_at,
+            memory.updated_at,
+            memory.archived_at,
+            memory.archived,
+            memory.revision,
+        ),
+    )
+
+
+def _space_ids_for_memory_ids_on_connection(
+    *,
+    connection: sqlite3.Connection,
+    user_id: str,
+    memory_ids: list[str],
+) -> dict[str, list[str]]:
+    unique_ids = _ordered_unique(memory_ids)
+    if not unique_ids:
+        return {}
+    result = {memory_id: [] for memory_id in unique_ids}
+    for offset in range(0, len(unique_ids), 500):
+        batch = unique_ids[offset : offset + 500]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = connection.execute(
+            f"""
+            SELECT memory_id, space_id
+            FROM memory_space_links
+            WHERE user_id = ? AND memory_id IN ({placeholders})
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (user_id, *batch),
+        ).fetchall()
+        for row in rows:
+            result.setdefault(str(row["memory_id"]), []).append(
+                str(row["space_id"])
+            )
+    return result
+
+
+def _rows_to_memories(
+    store: _ConnectableStore, rows: list[sqlite3.Row]
+) -> list[MemoryRecord]:
+    if not rows:
+        return []
+    with store._connect() as connection:
+        return _rows_to_memories_on_connection(
+            connection=connection,
+            rows=rows,
+        )
+
+
+def _rows_to_memories_on_connection(
+    *,
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> list[MemoryRecord]:
+    if not rows:
+        return []
+    space_ids_by_memory = _space_ids_for_memory_ids_on_connection(
+        connection=connection,
+        user_id=str(rows[0]["user_id"]),
+        memory_ids=[str(row["id"]) for row in rows],
+    )
+    return [
+        _row_to_memory(row, space_ids=space_ids_by_memory.get(str(row["id"]), []))
+        for row in rows
+    ]
+
+
+def _row_to_memory(
+    row: sqlite3.Row,
+    *,
+    space_ids: list[str],
+) -> MemoryRecord:
+    data = dict(row)
+    raw_evidence = data.pop("evidence_memory_ids_json", None)
+    raw_topics = data.pop("topics_json", None)
+    raw_entities = data.pop("entities_json", None)
+    data["evidence_memory_ids"] = _json_string_list(raw_evidence)
+    data["topics"] = _json_string_list(raw_topics)
+    data["entities"] = _json_string_list(raw_entities)
+    data["type"] = normalize_memory_type(data.get("type") or "semantic")
+    data["origin"] = data.get("origin") or "user_asserted"
+    data.setdefault("embedding_space_id", None)
+    if not data.get("embedding_json"):
+        data["embedding_space_id"] = None
+    data["usage_count"] = float(data.get("usage_count") or 0)
+    data["digested"] = bool(data.get("digested"))
+    data["temporal_subject"] = normalize_optional_text(data.get("temporal_subject"))
+    data["temporal_predicate"] = normalize_optional_text(data.get("temporal_predicate"))
+    if bool(data["temporal_subject"]) != bool(data["temporal_predicate"]):
+        # Pre-validation databases could contain a half-key. Treat it as
+        # unkeyed instead of letting one corrupt row break all recall.
+        data["temporal_subject"] = None
+        data["temporal_predicate"] = None
+    data.setdefault("valid_from", None)
+    data.setdefault("status", "dynamic")
+    data.setdefault("decay_lambda", None)
+    for field_name in ("valid_from", "valid_until"):
+        try:
+            data[field_name] = normalize_iso_text(data.get(field_name))
+        except ValueError:
+            data[field_name] = None
+    starts_at = _parse_iso_datetime(data.get("valid_from"))
+    ends_at = _parse_iso_datetime(data.get("valid_until"))
+    if starts_at is not None and ends_at is not None and starts_at > ends_at:
+        # Preserve the expiry (the conservative current-view boundary) and
+        # discard the impossible start on legacy corrupt data.
+        data["valid_from"] = None
+    try:
+        decay_lambda = float(data["decay_lambda"])
+    except (TypeError, ValueError):
+        decay_lambda = None
+    if (
+        decay_lambda is None
+        or not math.isfinite(decay_lambda)
+        or not 0.0 <= decay_lambda <= 10.0
+    ):
+        decay_lambda = None
+    data["decay_lambda"] = decay_lambda
+    data.setdefault("supersedes", None)
+    data.setdefault("superseded_by", None)
+    data["space_ids"] = space_ids
+    return MemoryRecord(**data)
+
+
+def _row_to_memory_space(row: sqlite3.Row) -> MemorySpace:
+    payload = dict(row)
+    # Tolerate pre-migration rows and NULL metadata.
+    if payload.get("color") is not None:
+        payload["color"] = str(payload["color"]) or None
+    if payload.get("description") is not None:
+        text = str(payload["description"]).strip()
+        payload["description"] = text or None
+    try:
+        payload["sort_order"] = int(payload.get("sort_order") or 0)
+    except (TypeError, ValueError):
+        payload["sort_order"] = 0
+    return MemorySpace(**payload)
+
+
+def _row_to_core_memory_section(row: sqlite3.Row) -> CoreMemorySection:
+    data = dict(row)
+    raw_evidence = data.pop("evidence_memory_ids_json", None)
+    data["evidence_memory_ids"] = _json_string_list(raw_evidence)
+    return CoreMemorySection(**data)
+
+
+def _row_to_core_memory_section_history(row: sqlite3.Row) -> CoreMemorySectionHistory:
+    data = dict(row)
+    raw_evidence = data.pop("evidence_memory_ids_json", None)
+    data["evidence_memory_ids"] = _json_string_list(raw_evidence)
+    return CoreMemorySectionHistory(**data)
+
+
+def _row_to_recent_context_summary(row: sqlite3.Row) -> RecentContextSummary:
+    data = dict(row)
+    raw_turns = data.pop("recent_turns_json", None)
+    try:
+        parsed_turns = json.loads(raw_turns) if raw_turns else []
+    except json.JSONDecodeError:
+        parsed_turns = []
+    data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
+    return RecentContextSummary(**data)
+
+
+def _row_to_conversation_branch_node(
+    row: sqlite3.Row,
+) -> ConversationBranchNode:
+    data = dict(row)
+    raw_turns = data.pop("recent_turns_json", None)
+    try:
+        parsed_turns = json.loads(raw_turns) if raw_turns else []
+    except json.JSONDecodeError:
+        parsed_turns = []
+    data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
+    return ConversationBranchNode(**data)
+
+
+def _temporal_snapshot(row: sqlite3.Row) -> dict:
+    columns = set(row.keys())
+    return {
+        "id": row["id"],
+        "valid_from": row["valid_from"] if "valid_from" in columns else None,
+        "valid_until": row["valid_until"] if "valid_until" in columns else None,
+        "temporal_subject": row["temporal_subject"] if "temporal_subject" in columns else None,
+        "temporal_predicate": row["temporal_predicate"] if "temporal_predicate" in columns else None,
+        "status": row["status"] if "status" in columns else None,
+        "supersedes": row["supersedes"] if "supersedes" in columns else None,
+        "superseded_by": row["superseded_by"] if "superseded_by" in columns else None,
+        "updated_at": row["updated_at"],
+    }

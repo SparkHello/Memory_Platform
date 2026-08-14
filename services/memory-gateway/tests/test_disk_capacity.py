@@ -14,6 +14,7 @@ from app.config import Settings, get_settings
 from app.disk_capacity import DiskCapacityError
 from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
 from app.memory.search import EmbeddingClient
+from app.memory.store import export_import as store_export_import
 
 
 MIB = 1024 * 1024
@@ -250,7 +251,7 @@ def test_memory_restore_sqlite_full_returns_507_and_rolls_back_all_partitions(
         "recent_context_summaries": [],
         "conversation_branch_nodes": [],
     }
-    original = memory_store._import_prepared_memory_record_on_connection
+    original = store_export_import._import_prepared_memory_record_on_connection
     calls = 0
 
     def fail_on_second(*args, **kwargs):
@@ -261,7 +262,7 @@ def test_memory_restore_sqlite_full_returns_507_and_rolls_back_all_partitions(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        memory_store,
+        store_export_import,
         "_import_prepared_memory_record_on_connection",
         fail_on_second,
     )

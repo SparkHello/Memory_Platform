@@ -7,6 +7,7 @@ import pytest
 
 from app.memory.models import RecentContextTurn
 from app.memory.store import MemoryStore
+from app.memory.store import digest as store_digest
 from app.memory.temporal import is_current_temporal_memory
 
 
@@ -300,7 +301,7 @@ def test_apply_memory_digest_rolls_back_every_write_on_failure(
         user_id="default",
         content="用户此前尚未完成原子化消化。",
     )
-    original_insert = memory_store._insert_memory_row
+    original_insert = store_digest._insert_memory_row
     insert_count = 0
 
     def fail_second_insert(*, connection, memory) -> None:
@@ -310,7 +311,7 @@ def test_apply_memory_digest_rolls_back_every_write_on_failure(
             raise RuntimeError("forced second insert failure")
         original_insert(connection=connection, memory=memory)
 
-    monkeypatch.setattr(memory_store, "_insert_memory_row", fail_second_insert)
+    monkeypatch.setattr(store_digest, "_insert_memory_row", fail_second_insert)
 
     with pytest.raises(RuntimeError, match="forced second insert failure"):
         memory_store.apply_memory_digest(

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import (
     CoreMemorySection,
@@ -16,9 +16,12 @@ from app.memory.models import (
 )
 from app.memory.purge_preview import purge_memory_ids_digest
 from app.memory.store.helpers import (
+    _ConnectableStore,
     _json_string_list,
     _merge_core_section_audit_summaries,
     _ordered_unique,
+    _row_to_core_memory_section,
+    _row_to_memory,
 )
 from app.memory.store.purge_ops import (
     PurgePreviewConflictError,
@@ -29,11 +32,8 @@ from app.memory.store.purge_ops import (
     _scrub_purged_memory_artifacts,
 )
 
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
 def preview_archived_memory_purge(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -57,9 +57,8 @@ def preview_archived_memory_purge(
         "effects": snapshot.effects,
     }
 
-
 def commit_archived_memory_purge(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -116,9 +115,8 @@ def commit_archived_memory_purge(
         log,
     )
 
-
 def purge_archived_memory(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_id: str,
     user_id: str,
@@ -147,7 +145,7 @@ def purge_archived_memory(
             """,
             (user_id, memory_id),
         ).fetchall()
-        memory = store._row_to_memory(
+        memory = _row_to_memory(
             row,
             space_ids=[str(space_row["space_id"]) for space_row in space_rows],
         )
@@ -225,9 +223,8 @@ def purge_archived_memory(
             raise RuntimeError("Purge target disappeared during transaction.")
     return memory, log
 
-
 def list_purge_affected_core_sections(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_id: str,
     user_id: str,
@@ -256,11 +253,10 @@ def list_purge_affected_core_sections(
             (user_id,),
         ).fetchall()
     return [
-        store._row_to_core_memory_section(row)
+        _row_to_core_memory_section(row)
         for row in rows
         if affected_ids.intersection(
             _json_string_list(row["evidence_memory_ids_json"])
         )
     ]
-
 

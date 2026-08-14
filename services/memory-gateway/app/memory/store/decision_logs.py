@@ -4,17 +4,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import DecisionLog, DecisionLogAction, new_memory_id, utc_now_iso
 from app.memory.store.constants import _DECISION_LOG_RETENTION_LIMIT
 from app.memory.store.purge_ops import _decision_log_references_memory_ids
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
+from app.memory.store.helpers import _ConnectableStore
 
 def _insert_decision_log(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str = "default",
@@ -65,9 +62,8 @@ def _insert_decision_log(
     )
     return log
 
-
 def create_decision_log(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str = "default",
     conversation_id: str | None,
@@ -76,7 +72,7 @@ def create_decision_log(
     reason: str,
 ) -> DecisionLog:
     with store._connect() as connection:
-        return store._insert_decision_log(
+        return _insert_decision_log(
             connection=connection,
             user_id=user_id,
             conversation_id=conversation_id,
@@ -85,9 +81,8 @@ def create_decision_log(
             reason=reason,
         )
 
-
 def list_decision_logs(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str | None = None,
     conversation_id: str | None = None,
@@ -125,7 +120,6 @@ def list_decision_logs(
         rows = connection.execute(query, params).fetchall()
     return [DecisionLog(**dict(row)) for row in rows]
 
-
 def _ensure_decision_logs_user_id(connection: sqlite3.Connection) -> None:
     columns = {
         row["name"]
@@ -135,5 +129,4 @@ def _ensure_decision_logs_user_id(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE memory_decision_logs ADD COLUMN user_id TEXT DEFAULT 'default'"
         )
-
 

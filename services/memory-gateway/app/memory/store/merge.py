@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.classification import normalize_classification_names
 from app.memory.models import (
@@ -17,6 +17,7 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.store.helpers import (
+    _ConnectableStore,
     _average_float,
     _casefold_set,
     _earliest_datetime_text,
@@ -25,17 +26,18 @@ from app.memory.store.helpers import (
     _merged_stability,
     _merged_type,
     _ordered_unique,
+    _row_to_memory,
     _sensitivity_with_floor,
     _shared_value,
 )
+from app.memory.store.spaces import (
+    _replace_memory_space_links,
+    _validate_space_ids,
+)
 from app.memory.utils import _parse_iso_datetime
 
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
-
 def merge_memories(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -94,7 +96,7 @@ def merge_memories(
                 str(link_row["space_id"])
             )
         active_memories = [
-            store._row_to_memory(
+            _row_to_memory(
                 rows_by_id[memory_id],
                 space_ids=spaces_by_memory_id.get(memory_id, []),
             )
@@ -157,7 +159,7 @@ def merge_memories(
         )
         if len(space_ids) > 10:
             raise ValueError("space_ids 最多 10 个")
-        store._validate_space_ids(
+        _validate_space_ids(
             connection=connection,
             user_id=user_id,
             space_ids=space_ids,
@@ -236,7 +238,7 @@ def merge_memories(
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Merge target disappeared during transaction.")
-        store._replace_memory_space_links(
+        _replace_memory_space_links(
             connection=connection,
             user_id=user_id,
             memory_id=target.id,
@@ -271,7 +273,7 @@ def merge_memories(
         ).fetchone()
         if updated_row is None:
             raise RuntimeError("Merge target was not persisted.")
-        updated = store._row_to_memory(updated_row, space_ids=space_ids)
+        updated = _row_to_memory(updated_row, space_ids=space_ids)
 
     return MemoryMergeResult(
         action="update",
@@ -280,5 +282,4 @@ def merge_memories(
         archived_memory_ids=archived_ids,
         reason="已合并记忆并保留 evidence ids",
     )
-
 

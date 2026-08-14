@@ -4,23 +4,23 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import MemoryRecord, MemoryType, new_memory_id, utc_now_iso
 from app.memory.store.constants import _SENSITIVITY_RANK
 from app.memory.store.helpers import (
+    _ConnectableStore,
     _average_float,
+    _insert_memory_row,
     _json_string_list,
     _ordered_unique,
+    _rows_to_memories,
     _sensitivity_with_floor,
 )
 from app.memory.utils import _parse_iso_datetime
 
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
 def list_undigested_memories(
-    store: MemoryStore, *, user_id: str, limit: int = 10, include_sensitive: bool = False
+    store: _ConnectableStore, *, user_id: str, limit: int = 10, include_sensitive: bool = False
 ) -> list[MemoryRecord]:
     """返回近期未消化的记忆，供 digest_memories 使用。"""
     with store._connect() as connection:
@@ -35,7 +35,7 @@ def list_undigested_memories(
             """,
             (user_id,),
         ).fetchall()
-    memories = store._rows_to_memories(rows)
+    memories = _rows_to_memories(store, rows)
     if not include_sensitive:
         memories = [
             memory
@@ -50,9 +50,8 @@ def list_undigested_memories(
         ]
     return memories[: max(0, limit)]
 
-
 def get_digest_source_memories(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -65,17 +64,16 @@ def get_digest_source_memories(
     if not source_ids:
         raise ValueError("source_ids must contain at least one memory ID")
     with store._connect() as connection:
-        rows = store._validated_digest_source_rows(
+        rows = _validated_digest_source_rows(
             connection=connection,
             user_id=user_id,
             source_ids=source_ids,
             include_sensitive=include_sensitive,
         )
-    return store._rows_to_memories(rows)
-
+    return _rows_to_memories(store, rows)
 
 def apply_memory_digest(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     source_ids: list[str],
@@ -110,7 +108,7 @@ def apply_memory_digest(
     created: list[MemoryRecord] = []
     with store._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        source_rows = store._validated_digest_source_rows(
+        source_rows = _validated_digest_source_rows(
             connection=connection,
             user_id=user_id,
             source_ids=source_ids,
@@ -180,7 +178,7 @@ def apply_memory_digest(
                 updated_at=now,
                 archived=0,
             )
-            store._insert_memory_row(connection=connection, memory=memory)
+            _insert_memory_row(connection=connection, memory=memory)
             created.append(memory)
 
         source_placeholders = ", ".join("?" for _ in source_ids)
@@ -211,7 +209,6 @@ def apply_memory_digest(
             if resolved_count != len(resolved_ids):
                 raise RuntimeError("resolved source set changed during submission")
     return created, resolved_count
-
 
 def _validated_digest_source_rows(
     *,
@@ -249,8 +246,7 @@ def _validated_digest_source_rows(
         raise ValueError("source_ids contain missing or inaccessible memories")
     return [rows_by_id[memory_id] for memory_id in source_ids]
 
-
-def mark_digested(store: MemoryStore, *, memory_ids: list[str], user_id: str) -> None:
+def mark_digested(store: _ConnectableStore, *, memory_ids: list[str], user_id: str) -> None:
     """标记记忆为已消化。"""
     if not memory_ids:
         return
@@ -265,5 +261,4 @@ def mark_digested(store: MemoryStore, *, memory_ids: list[str], user_id: str) ->
             """,
             (now, *memory_ids, user_id),
         )
-
 

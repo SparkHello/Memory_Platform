@@ -4,26 +4,29 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import MemoryRecord, new_memory_id, normalize_optional_text, utc_now_iso
 from app.memory.store.constants import _TIME_RIPPLE_MAX_CANDIDATES
+from app.memory.store.decision_logs import _insert_decision_log
 from app.memory.store.helpers import (
+    _ConnectableStore,
     _bounded_float,
     _casefold_set,
     _coerce_int,
+    _insert_memory_row,
     _json_string_list,
+    _row_to_memory,
+    _space_ids_for_memory_ids_on_connection,
+    _temporal_snapshot,
     _time_ripple_anchor,
     _time_ripple_profiles,
 )
+from app.memory.store.spaces import _replace_memory_space_links
 from app.memory.utils import _parse_iso_datetime
 
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
-
-
 def restore_temporal_memory(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     memory_id: str,
     user_id: str,
@@ -41,12 +44,12 @@ def restore_temporal_memory(
         if row is None:
             return None
 
-        space_ids = store._space_ids_for_memory_ids_on_connection(
+        space_ids = _space_ids_for_memory_ids_on_connection(
             connection=connection,
             user_id=user_id,
             memory_ids=[memory_id],
         ).get(memory_id, [])
-        source = store._row_to_memory(row, space_ids=space_ids)
+        source = _row_to_memory(row, space_ids=space_ids)
         current_instant = _parse_iso_datetime(now)
         starts_at = _parse_iso_datetime(source.valid_from or source.created_at)
         ends_at = _parse_iso_datetime(source.valid_until)
@@ -75,21 +78,21 @@ def restore_temporal_memory(
                 "archived": 0,
             }
         )
-        store._insert_memory_row(connection=connection, memory=restored)
-        store._replace_memory_space_links(
+        _insert_memory_row(connection=connection, memory=restored)
+        _replace_memory_space_links(
             connection=connection,
             user_id=user_id,
             memory_id=restored.id,
             space_ids=space_ids,
             created_at=now,
         )
-        store._apply_temporal_invalidation(
+        _apply_temporal_invalidation(
             connection=connection,
             user_id=user_id,
             new_memory=restored,
         )
 
-        store._insert_decision_log(
+        _insert_decision_log(
             connection=connection,
             user_id=user_id,
             conversation_id=None,
@@ -98,7 +101,7 @@ def restore_temporal_memory(
                     "source": "temporal_restore",
                     "source_memory_id": memory_id,
                     "restored_memory_id": restored.id,
-                    "before": store._temporal_snapshot(row),
+                    "before": _temporal_snapshot(row),
                     "after": {
                         "valid_from": restored.valid_from,
                         "valid_until": restored.valid_until,
@@ -114,9 +117,8 @@ def restore_temporal_memory(
         )
     return store.get_memory(memory_id=restored.id, user_id=user_id)
 
-
 def get_next_temporal_boundary(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     after: datetime,
@@ -143,9 +145,7 @@ def get_next_temporal_boundary(
     ]
     return min(boundaries) if boundaries else None
 
-
 def _apply_time_ripple(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -245,9 +245,7 @@ def _apply_time_ripple(
         (ripple_delta, used_at, user_id, *ripple_ids),
     )
 
-
 def _rebuild_temporal_key(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -276,7 +274,7 @@ def _rebuild_temporal_key(
         """,
         (user_id, subject, predicate),
     ).fetchall()
-    memories = [store._row_to_memory(row, space_ids=[]) for row in rows]
+    memories = [_row_to_memory(row, space_ids=[]) for row in rows]
     memories.sort(
         key=lambda memory: (
             _parse_iso_datetime(memory.valid_from or memory.created_at)
@@ -364,9 +362,7 @@ def _rebuild_temporal_key(
         changed += max(0, int(cursor.rowcount))
     return changed
 
-
 def _rebuild_all_active_temporal_chains(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
 ) -> int:
@@ -383,7 +379,7 @@ def _rebuild_all_active_temporal_chains(
     changed = 0
     for row in keys:
         user_id = str(row["user_id"] or "default")
-        changed += store._rebuild_temporal_key(
+        changed += _rebuild_temporal_key(
             connection=connection,
             user_id=user_id,
             temporal_subject=row["temporal_subject"],
@@ -391,9 +387,7 @@ def _rebuild_all_active_temporal_chains(
         )
     return changed
 
-
 def _detach_temporal_position(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -507,9 +501,7 @@ def _detach_temporal_position(
             (predecessor_id, now, successor_id, user_id),
         )
 
-
 def _apply_temporal_invalidation(
-    store: MemoryStore,
     *,
     connection: sqlite3.Connection,
     user_id: str,
@@ -646,7 +638,7 @@ def _apply_temporal_invalidation(
             (new_memory.id, now, successor_id, user_id),
         )
 
-    store._insert_decision_log(
+    _insert_decision_log(
         connection=connection,
         user_id=user_id,
         conversation_id=None,
@@ -660,7 +652,7 @@ def _apply_temporal_invalidation(
                 "superseded_memory_ids": superseded_ids,
                 "primary_superseded_id": primary_superseded_id,
                 "successor_memory_id": successor_id,
-                "before": [store._temporal_snapshot(row) for row in rows],
+                "before": [_temporal_snapshot(row) for row in rows],
                 "after": [
                     {
                         "id": str(row["id"]),
@@ -692,20 +684,3 @@ def _apply_temporal_invalidation(
         reason="Closed older temporal facts with the same subject and predicate",
     )
     return superseded_ids
-
-
-def _temporal_snapshot(row: sqlite3.Row) -> dict:
-    columns = set(row.keys())
-    return {
-        "id": row["id"],
-        "valid_from": row["valid_from"] if "valid_from" in columns else None,
-        "valid_until": row["valid_until"] if "valid_until" in columns else None,
-        "temporal_subject": row["temporal_subject"] if "temporal_subject" in columns else None,
-        "temporal_predicate": row["temporal_predicate"] if "temporal_predicate" in columns else None,
-        "status": row["status"] if "status" in columns else None,
-        "supersedes": row["supersedes"] if "supersedes" in columns else None,
-        "superseded_by": row["superseded_by"] if "superseded_by" in columns else None,
-        "updated_at": row["updated_at"],
-    }
-
-

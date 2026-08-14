@@ -4,8 +4,6 @@ from functools import wraps
 from pathlib import Path
 import sqlite3
 
-from pydantic import ValidationError
-
 from app.memory.models import (
     ConversationBranchNode,
     CoreMemorySection,
@@ -24,21 +22,8 @@ from app.memory.models import (
     MemoryType,
     RecentContextSummary,
     RecentContextTurn,
-    normalize_iso_text,
-    normalize_memory_type,
-    normalize_optional_text,
-    new_memory_id,
-    utc_now_iso,
 )
-from app.memory.classification import (
-    normalize_classification_name,
-    normalize_classification_names,
-)
-from app.memory.redaction import detect_text_sensitivity
-from app.memory.purge_preview import purge_memory_ids_digest
-from app.memory.utils import _parse_iso_datetime
 from app.schema_migrations import (
-    apply_schema_migrations,
     enable_wal_with_retry,
     validated_schema_version,
 )
@@ -57,60 +42,11 @@ from app.memory.store import chat_finalize as _chat_finalize
 from app.memory.store import lifecycle_purge as _lifecycle_purge
 from app.memory.store import schema_ensure as _schema_ensure
 from app.memory.store import migrations as _migrations
-from app.memory.store.helpers import (
-    _sensitivity_with_floor,
-    _average_float,
-    _bounded_float,
-    _casefold_set,
-    _coerce_float,
-    _coerce_float_or_none,
-    _coerce_int,
-    _coerce_string_list,
-    _core_section_audit_summaries,
-    _earliest_datetime_text,
-    _join_memory_contents,
-    _json_like_safe,
-    _json_string_list,
-    _like_escape,
-    _merge_core_section_audit_summaries,
-    _merged_sensitivity,
-    _merged_stability,
-    _merged_type,
-    _ordered_unique,
-    _shared_value,
-    _time_ripple_anchor,
-    _time_ripple_profiles,
-)
-from app.memory.store.purge_ops import (
-    PurgePreviewConflictError,
-    _BatchPurgeSnapshot,
-    _apply_batch_purge_snapshot,
-    _build_batch_purge_snapshot,
-    _decision_log_references_memory_ids,
-    _derived_memory_dependency_closure,
-    _insert_batch_purge_audit,
-    _repair_purged_temporal_references,
-    _scrub_purged_memory_artifacts,
-)
-
-
-
 from app.memory.store.constants import (
-    _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT,
-    _DECISION_LOG_RETENTION_LIMIT,
     _MEMORY_DB_INIT_LOCK,
-    _SENSITIVITY_RANK,
-    _TIME_RIPPLE_MAX_CANDIDATES,
     _UNSET,
 )
-
-
-from app.memory.store.errors import RevisionConflictError
-from app.memory.store.purge_ops import PurgePreviewConflictError  # re-export
-
-
-
-
+from app.sqlite_util import ClosingSQLiteConnection
 
 
 def _serialize_memory_init(method):
@@ -120,11 +56,6 @@ def _serialize_memory_init(method):
             return method(*args, **kwargs)
 
     return wrapped
-
-
-from app.sqlite_util import ClosingSQLiteConnection
-
-
 
 
 class MemoryStore:
@@ -150,7 +81,7 @@ class MemoryStore:
             self._create_tables(connection)
             self._run_migrations(connection)
             self._create_indexes(connection)
-            self._rebuild_all_active_temporal_chains(connection=connection)
+            _temporal._rebuild_all_active_temporal_chains(connection=connection)
 
     def claim_chat_side_effect(
         self,
@@ -676,16 +607,6 @@ class MemoryStore:
         return _spaces.upsert_memory_space(self, user_id=user_id, name=name)
 
 
-    def _upsert_memory_space_on_connection(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        display_name: str,
-    ) -> MemorySpace:
-        return _spaces._upsert_memory_space_on_connection(self, connection=connection, user_id=user_id, display_name=display_name)
-
-
     def prepare_memory_space_import(
         self,
         *,
@@ -831,17 +752,6 @@ class MemoryStore:
         return _export_import.plan_memory_import_ids(self, user_id=user_id, source_ids=source_ids, rebind_all=rebind_all)
 
 
-    @staticmethod
-    def _plan_memory_import_ids_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        source_ids: list[str],
-        rebind_all: bool,
-    ) -> dict[str, str]:
-        return _export_import._plan_memory_import_ids_on_connection(connection=connection, user_id=user_id, source_ids=source_ids, rebind_all=rebind_all)
-
-
     def filter_existing_memory_ids(
         self,
         *,
@@ -851,16 +761,6 @@ class MemoryStore:
         return _export_import.filter_existing_memory_ids(self, user_id=user_id, memory_ids=memory_ids)
 
 
-    @staticmethod
-    def _filter_existing_memory_ids_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory_ids: list[str],
-    ) -> set[str]:
-        return _export_import._filter_existing_memory_ids_on_connection(connection=connection, user_id=user_id, memory_ids=memory_ids)
-
-
     def prune_dangling_memory_references(
         self,
         *,
@@ -868,16 +768,6 @@ class MemoryStore:
         memory_ids: list[str],
     ) -> int:
         return _export_import.prune_dangling_memory_references(self, user_id=user_id, memory_ids=memory_ids)
-
-
-    @staticmethod
-    def _prune_dangling_memory_references_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory_ids: list[str],
-    ) -> int:
-        return _export_import._prune_dangling_memory_references_on_connection(connection=connection, user_id=user_id, memory_ids=memory_ids)
 
 
     def restore_prepared_export(
@@ -895,49 +785,6 @@ class MemoryStore:
         dry_run: bool = False,
     ) -> dict[str, object]:
         return _export_import.restore_prepared_export(self, user_id=user_id, prepared_spaces=prepared_spaces, prepared_memories=prepared_memories, source_memory_ids=source_memory_ids, referenced_source_ids=referenced_source_ids, recent_contexts=recent_contexts, branch_nodes=branch_nodes, exported_user_id=exported_user_id, overwrite=overwrite, dry_run=dry_run)
-
-
-    def _plan_memory_space_imports_on_connection(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        prepared_spaces: list[dict[str, object]],
-        overwrite: bool,
-    ) -> tuple[list[dict[str, object]], dict[str, str]]:
-        return _export_import._plan_memory_space_imports_on_connection(self, connection=connection, user_id=user_id, prepared_spaces=prepared_spaces, overwrite=overwrite)
-
-
-    @staticmethod
-    def _apply_memory_space_import_plan_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        plan: dict[str, object],
-    ) -> None:
-        return _export_import._apply_memory_space_import_plan_on_connection(connection=connection, user_id=user_id, plan=plan)
-
-
-    @staticmethod
-    def _restore_recent_context_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        prepared: dict[str, object],
-        overwrite: bool,
-    ) -> str:
-        return _export_import._restore_recent_context_on_connection(connection=connection, user_id=user_id, prepared=prepared, overwrite=overwrite)
-
-
-    @staticmethod
-    def _restore_branch_node_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        prepared: dict[str, object],
-        overwrite: bool,
-    ) -> str:
-        return _export_import._restore_branch_node_on_connection(connection=connection, user_id=user_id, prepared=prepared, overwrite=overwrite)
 
 
     def prepare_memory_import_record(
@@ -964,18 +811,6 @@ class MemoryStore:
         return _export_import.import_memory_record(self, user_id=user_id, data=data, overwrite=overwrite, archived=archived, space_id_map=space_id_map, rebind_on_conflict=rebind_on_conflict)
 
 
-    def _import_prepared_memory_record_on_connection(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory: MemoryRecord,
-        overwrite: bool,
-        rebind_on_conflict: bool,
-    ) -> tuple[str, MemoryRecord | None]:
-        return _export_import._import_prepared_memory_record_on_connection(self, connection=connection, user_id=user_id, memory=memory, overwrite=overwrite, rebind_on_conflict=rebind_on_conflict)
-
-
     def mark_memories_used(
         self,
         *,
@@ -996,19 +831,6 @@ class MemoryStore:
         time_ripple_window_hours: int = 48,
     ) -> None:
         return _crud.touch_memory(self, memory_id=memory_id, user_id=user_id, time_ripple_delta=time_ripple_delta, time_ripple_window_hours=time_ripple_window_hours)
-
-
-    def _apply_time_ripple(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        seed_ids: list[str],
-        used_at: str,
-        delta: float,
-        window_hours: int,
-    ) -> None:
-        return _temporal._apply_time_ripple(self, connection=connection, user_id=user_id, seed_ids=seed_ids, used_at=used_at, delta=delta, window_hours=window_hours)
 
 
     def list_undigested_memories(
@@ -1044,17 +866,6 @@ class MemoryStore:
         return _digest.apply_memory_digest(self, user_id=user_id, source_ids=source_ids, resolved_ids=resolved_ids, reflection=reflection, reflection_valence=reflection_valence, reflection_arousal=reflection_arousal, feel=feel, feel_valence=feel_valence, feel_arousal=feel_arousal, include_sensitive=include_sensitive)
 
 
-    @staticmethod
-    def _validated_digest_source_rows(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        source_ids: list[str],
-        include_sensitive: bool = False,
-    ) -> list[sqlite3.Row]:
-        return _digest._validated_digest_source_rows(connection=connection, user_id=user_id, source_ids=source_ids, include_sensitive=include_sensitive)
-
-
     def mark_digested(self, *, memory_ids: list[str], user_id: str) -> None:
         return _digest.mark_digested(self, memory_ids=memory_ids, user_id=user_id)
 
@@ -1067,63 +878,6 @@ class MemoryStore:
         status: str,
     ) -> int:
         return _crud.update_memory_statuses(self, memory_ids=memory_ids, user_id=user_id, status=status)
-
-
-    def _rebuild_temporal_key(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        temporal_subject: str | None,
-        temporal_predicate: str | None,
-    ) -> int:
-        return _temporal._rebuild_temporal_key(self, connection=connection, user_id=user_id, temporal_subject=temporal_subject, temporal_predicate=temporal_predicate)
-
-
-    def _rebuild_all_active_temporal_chains(
-        self,
-        *,
-        connection: sqlite3.Connection,
-    ) -> int:
-        return _temporal._rebuild_all_active_temporal_chains(self, connection=connection)
-
-
-    def _detach_temporal_position(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory: MemoryRecord,
-    ) -> None:
-        return _temporal._detach_temporal_position(self, connection=connection, user_id=user_id, memory=memory)
-
-
-    def _apply_temporal_invalidation(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        new_memory: MemoryRecord,
-    ) -> list[str]:
-        return _temporal._apply_temporal_invalidation(self, connection=connection, user_id=user_id, new_memory=new_memory)
-
-
-    @staticmethod
-    def _temporal_snapshot(row: sqlite3.Row) -> dict:
-        return _temporal._temporal_snapshot(row)
-
-
-    def _insert_decision_log(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        user_id: str = "default",
-        conversation_id: str | None,
-        candidate_json: str,
-        decision: DecisionLogAction,
-        reason: str,
-    ) -> DecisionLog:
-        return _decision_logs._insert_decision_log(self, connection=connection, user_id=user_id, conversation_id=conversation_id, candidate_json=candidate_json, decision=decision, reason=reason)
 
 
     def create_decision_log(
@@ -1149,25 +903,6 @@ class MemoryStore:
         return _decision_logs.list_decision_logs(self, user_id=user_id, conversation_id=conversation_id, memory_id=memory_id, limit=limit)
 
 
-    def _create_core_memory_section_history(
-        self,
-        *,
-        connection: sqlite3.Connection | None,
-        section: CoreMemorySection,
-        replaced_at: str,
-    ) -> None:
-        return _core_memory._create_core_memory_section_history(self, connection=connection, section=section, replaced_at=replaced_at)
-
-
-    def _insert_memory_row(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        memory: MemoryRecord,
-    ) -> None:
-        return _crud._insert_memory_row(self, connection=connection, memory=memory)
-
-
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
@@ -1177,146 +912,3 @@ class MemoryStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=5000")
         return connection
-
-    @staticmethod
-    def _archive_duplicate_recent_context_summaries(connection: sqlite3.Connection) -> None:
-        return _conversation._archive_duplicate_recent_context_summaries(connection)
-
-
-    @staticmethod
-    def _ensure_memories_usage_columns(connection: sqlite3.Connection) -> None:
-        return _schema_ensure._ensure_memories_usage_columns(connection)
-
-
-    @staticmethod
-    def _ensure_memories_embedding_space_column(connection: sqlite3.Connection) -> None:
-        return _schema_ensure._ensure_memories_embedding_space_column(connection)
-
-
-    @staticmethod
-    def _ensure_core_memory_sections_columns(connection: sqlite3.Connection) -> None:
-        return _core_memory._ensure_core_memory_sections_columns(connection)
-
-
-    @staticmethod
-    def _ensure_revision_columns(connection: sqlite3.Connection) -> None:
-        return _schema_ensure._ensure_revision_columns(connection)
-
-
-    @staticmethod
-    def _merge_duplicate_active_core_sections(connection: sqlite3.Connection) -> None:
-        return _core_memory._merge_duplicate_active_core_sections(connection)
-
-
-    @staticmethod
-    def _ensure_recent_context_summary_columns(connection: sqlite3.Connection) -> None:
-        return _conversation._ensure_recent_context_summary_columns(connection)
-
-
-    @staticmethod
-    def _ensure_decision_logs_user_id(connection: sqlite3.Connection) -> None:
-        return _decision_logs._ensure_decision_logs_user_id(connection)
-
-
-    def _space_ids_for_memory_ids(
-        self,
-        *,
-        user_id: str,
-        memory_ids: list[str],
-    ) -> dict[str, list[str]]:
-        return _spaces._space_ids_for_memory_ids(self, user_id=user_id, memory_ids=memory_ids)
-
-
-    @staticmethod
-    def _space_ids_for_memory_ids_on_connection(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory_ids: list[str],
-    ) -> dict[str, list[str]]:
-        return _spaces._space_ids_for_memory_ids_on_connection(connection=connection, user_id=user_id, memory_ids=memory_ids)
-
-
-    @staticmethod
-    def _replace_memory_space_links(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        memory_id: str,
-        space_ids: list[str],
-        created_at: str,
-    ) -> None:
-        return _spaces._replace_memory_space_links(connection=connection, user_id=user_id, memory_id=memory_id, space_ids=space_ids, created_at=created_at)
-
-
-    @staticmethod
-    def _filter_existing_space_ids(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        space_ids: list[str],
-    ) -> list[str]:
-        return _spaces._filter_existing_space_ids(connection=connection, user_id=user_id, space_ids=space_ids)
-
-
-    @staticmethod
-    def _validate_space_ids(
-        *,
-        connection: sqlite3.Connection,
-        user_id: str,
-        space_ids: list[str],
-    ) -> None:
-        return _spaces._validate_space_ids(connection=connection, user_id=user_id, space_ids=space_ids)
-
-
-    def _rows_to_memories(self, rows: list[sqlite3.Row]) -> list[MemoryRecord]:
-        return _crud._rows_to_memories(self, rows)
-
-
-    def _rows_to_memories_on_connection(
-        self,
-        *,
-        connection: sqlite3.Connection,
-        rows: list[sqlite3.Row],
-    ) -> list[MemoryRecord]:
-        return _crud._rows_to_memories_on_connection(self, connection=connection, rows=rows)
-
-
-    def _row_to_memory(
-        self,
-        row: sqlite3.Row,
-        *,
-        space_ids: list[str] | None = None,
-    ) -> MemoryRecord:
-        return _crud._row_to_memory(self, row, space_ids=space_ids)
-
-
-    @staticmethod
-    def _row_to_memory_space(row: sqlite3.Row) -> MemorySpace:
-        return _spaces._row_to_memory_space(row)
-
-
-    @staticmethod
-    def _row_to_core_memory_section(row: sqlite3.Row) -> CoreMemorySection:
-        return _core_memory._row_to_core_memory_section(row)
-
-
-    @staticmethod
-    def _row_to_core_memory_section_history(row: sqlite3.Row) -> CoreMemorySectionHistory:
-        return _core_memory._row_to_core_memory_section_history(row)
-
-
-    @staticmethod
-    def _row_to_recent_context_summary(row: sqlite3.Row) -> RecentContextSummary:
-        return _conversation._row_to_recent_context_summary(row)
-
-
-    @staticmethod
-    def _row_to_conversation_branch_node(
-        row: sqlite3.Row,
-    ) -> ConversationBranchNode:
-        return _conversation._row_to_conversation_branch_node(row)
-
-
-
-

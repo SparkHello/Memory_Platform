@@ -208,7 +208,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/mcp_server/server.py`：FastMCP server、instructions 和全部 MCP 工具。
 - `app/memory/models.py`：记忆、核心记忆、候选记忆、体检建议、决策日志等 Pydantic 模型。
 - `app/schema_migrations.py`：记忆库与知识库共用的 `PRAGMA user_version` 校验与迁移执行器；拒绝非正整数、重复、乱序迁移版本和高于当前程序支持范围的未来数据库。
-- `app/memory/store/`：SQLite 记忆存储 package（`__init__` 再导出 `MemoryStore` 与历史符号）；实现按 schema/crud/merge/temporal/export_import/purge/core/conversation 等模块拆分，`_monolith.py` 为编排壳。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`ClosingSQLiteConnection`）。
+- `app/memory/store/`：SQLite 记忆存储 package（`__init__` 再导出 `MemoryStore` 与历史符号）；实现按 schema/crud/merge/temporal/export_import/purge/core/conversation 等模块拆分，`_monolith.py` 为编排壳。子模块首参只依赖 `helpers._ConnectableStore` Protocol（`_connect` 等最小能力），不再类型引用 `MemoryStore`；跨模块共享的 row→model 映射与 connection 级原语（`_row_to_*`、`_insert_memory_row`、`_rows_to_memories*`、`_space_ids_for_memory_ids_on_connection`、`_temporal_snapshot`）是 `helpers.py` 里的自由函数。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`ClosingSQLiteConnection`）。
 - `app/memory/conversation_context.py`：会话/分支级滚动上下文。以无存储副作用的状态演进生成压缩摘要和最近原始轮次，为记忆提取构造敏感过滤后的消歧上下文，并在阈值到达时通过共享 LLM provider 后台压缩较早普通轮次。
 - `app/memory/search.py`：embedding/中文关键词召回、拒绝阈值、多模式自然浮现、敏感硬过滤、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import (
     CoreMemorySection,
@@ -15,13 +15,16 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.store.errors import RevisionConflictError
-from app.memory.store.helpers import _json_string_list, _ordered_unique
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
+from app.memory.store.helpers import (
+    _ConnectableStore,
+    _json_string_list,
+    _ordered_unique,
+    _row_to_core_memory_section,
+    _row_to_core_memory_section_history,
+)
 
 def list_core_memory_sections(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
 ) -> list[CoreMemorySection]:
@@ -44,11 +47,10 @@ def list_core_memory_sections(
             """,
             (user_id,),
         ).fetchall()
-    return [store._row_to_core_memory_section(row) for row in rows]
-
+    return [_row_to_core_memory_section(row) for row in rows]
 
 def get_core_memory_section(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -63,11 +65,10 @@ def get_core_memory_section(
             """,
             (user_id, section),
         ).fetchone()
-    return store._row_to_core_memory_section(row) if row else None
-
+    return _row_to_core_memory_section(row) if row else None
 
 def upsert_core_memory_section(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -88,7 +89,7 @@ def upsert_core_memory_section(
             """,
             (user_id, section),
         ).fetchone()
-        existing = store._row_to_core_memory_section(row) if row else None
+        existing = _row_to_core_memory_section(row) if row else None
         if expected_revision is not None:
             current_revision = existing.revision if existing is not None else 0
             if int(expected_revision) != current_revision:
@@ -144,7 +145,8 @@ def upsert_core_memory_section(
             and abs(existing.confidence - confidence) < 0.001
         ):
             return "ignore", existing
-        store._create_core_memory_section_history(
+        _create_core_memory_section_history(
+            store,
             connection=connection,
             section=existing,
             replaced_at=now,
@@ -178,11 +180,10 @@ def upsert_core_memory_section(
         ).fetchone()
         if updated_row is None:
             raise RuntimeError("Core memory update did not persist.")
-        return "update", store._row_to_core_memory_section(updated_row)
-
+        return "update", _row_to_core_memory_section(updated_row)
 
 def archive_core_memory_section(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -222,9 +223,8 @@ def archive_core_memory_section(
         )
     return cursor.rowcount > 0
 
-
 def list_core_memory_section_history(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     section: CoreMemorySectionName | None = None,
@@ -244,11 +244,10 @@ def list_core_memory_section_history(
         params.append(max(1, int(limit)))
     with store._connect() as connection:
         rows = connection.execute(query, params).fetchall()
-    return [store._row_to_core_memory_section_history(row) for row in rows]
-
+    return [_row_to_core_memory_section_history(row) for row in rows]
 
 def _create_core_memory_section_history(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     connection: sqlite3.Connection | None,
     section: CoreMemorySection,
@@ -283,7 +282,6 @@ def _create_core_memory_section_history(
     with store._connect() as owned_connection:
         owned_connection.execute(query, params)
 
-
 def _ensure_core_memory_sections_columns(connection: sqlite3.Connection) -> None:
     columns = {
         row["name"]
@@ -293,7 +291,6 @@ def _ensure_core_memory_sections_columns(connection: sqlite3.Connection) -> None
         connection.execute(
             "ALTER TABLE core_memory_sections ADD COLUMN version INTEGER DEFAULT 1"
         )
-
 
 def _merge_duplicate_active_core_sections(connection: sqlite3.Connection) -> None:
     columns = {
@@ -435,19 +432,3 @@ def _merge_duplicate_active_core_sections(connection: sqlite3.Connection) -> Non
                     winner["id"],
                 ),
             )
-
-
-def _row_to_core_memory_section(row: sqlite3.Row) -> CoreMemorySection:
-    data = dict(row)
-    raw_evidence = data.pop("evidence_memory_ids_json", None)
-    data["evidence_memory_ids"] = _json_string_list(raw_evidence)
-    return CoreMemorySection(**data)
-
-
-def _row_to_core_memory_section_history(row: sqlite3.Row) -> CoreMemorySectionHistory:
-    data = dict(row)
-    raw_evidence = data.pop("evidence_memory_ids_json", None)
-    data["evidence_memory_ids"] = _json_string_list(raw_evidence)
-    return CoreMemorySectionHistory(**data)
-
-

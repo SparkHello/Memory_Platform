@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.memory.classification import classify_memory, normalize_classification_values
 from app.memory.models import CandidateMemory, MemoryRecord, new_memory_id, utc_now_iso
 from app.memory.store import MemoryStore, normalize_classification_name
+from app.memory.store.helpers import _row_to_memory
 
 
 SOURCE = "classification_backfill"
@@ -157,7 +158,7 @@ def _load_memories(
             memory_ids=memory_ids,
         )
     return [
-        store._row_to_memory(row, space_ids=space_ids_by_memory.get(str(row["id"]), []))
+        _row_to_memory(row, space_ids=space_ids_by_memory.get(str(row["id"]), []))
         for row in rows
     ]
 

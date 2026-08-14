@@ -18,20 +18,19 @@ FTS5 索引把候选缩小到"至少共享一个查询词"的记忆，再交给�
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING
 
 from app.memory.models import MemoryRecord
+from app.memory.store.helpers import (
+    _ConnectableStore,
+    _rows_to_memories_on_connection,
+)
 from app.memory.utils import _terms
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
 
 # 低于此规模，全表扫描 + 全库 IDF 更简单也更准；索引只在大库时启用。
 FTS_MIN_CORPUS_ROWS = 2000
 # 单次 MATCH 返回的候选上限；bm25 排序保证截断时保留共享词最多的记忆。
 FTS_CANDIDATE_LIMIT = 512
 _ACTIVE_WHERE = "archived = 0 AND (status IS NULL OR status != 'archived')"
-
 
 def _row_terms(row: sqlite3.Row) -> str:
     import json
@@ -54,7 +53,6 @@ def _row_terms(row: sqlite3.Row) -> str:
     )
     return " ".join(sorted(terms))
 
-
 def _ensure_fts_table(connection: sqlite3.Connection) -> bool:
     try:
         connection.execute(
@@ -71,7 +69,6 @@ def _ensure_fts_table(connection: sqlite3.Connection) -> bool:
     except sqlite3.OperationalError:
         # SQLite 编译时未启用 FTS5；调用方回退全表扫描。
         return False
-
 
 def _upsert_rows(connection: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
     for row in rows:
@@ -96,7 +93,6 @@ def _upsert_rows(connection: sqlite3.Connection, rows: list[sqlite3.Row]) -> Non
             ),
         )
 
-
 def _rebuild_user_index(connection: sqlite3.Connection, user_id: str) -> None:
     connection.execute("DELETE FROM memories_fts WHERE user_id = ?", (user_id,))
     rows = connection.execute(
@@ -109,7 +105,6 @@ def _rebuild_user_index(connection: sqlite3.Connection, user_id: str) -> None:
         (user_id,),
     ).fetchall()
     _upsert_rows(connection, rows)
-
 
 def _refresh_user_index(connection: sqlite3.Connection, user_id: str) -> None:
     active_row = connection.execute(
@@ -153,9 +148,8 @@ def _refresh_user_index(connection: sqlite3.Connection, user_id: str) -> None:
         # 物理删除或绕过 updated_at 的写路径造成漂移：整用户重建自愈。
         _rebuild_user_index(connection, user_id)
 
-
 def keyword_candidate_memories(
-    store: "MemoryStore",
+    store: _ConnectableStore,
     *,
     user_id: str,
     terms: list[str],
@@ -202,6 +196,6 @@ def keyword_candidate_memories(
                 (user_id, *batch),
             ).fetchall()
             memories.extend(
-                store._rows_to_memories_on_connection(connection=connection, rows=rows)
+                _rows_to_memories_on_connection(connection=connection, rows=rows)
             )
         return memories

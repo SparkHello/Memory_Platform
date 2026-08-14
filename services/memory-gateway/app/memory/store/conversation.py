@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.memory.models import (
     ConversationBranchNode,
@@ -15,19 +15,22 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.store.constants import _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT
-from app.memory.store.helpers import _json_string_list
-
-if TYPE_CHECKING:
-    from app.memory.store._monolith import MemoryStore
+from app.memory.store.helpers import (
+    _ConnectableStore,
+    _json_string_list,
+    _row_to_conversation_branch_node,
+    _row_to_recent_context_summary,
+)
 
 def get_recent_context_summary(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     conversation_id: str | None = None,
 ) -> RecentContextSummary | None:
     if conversation_id is not None:
-        return store.get_recent_context_summary_for_conversation(
+        return get_recent_context_summary_for_conversation(
+            store,
             user_id=user_id,
             conversation_id=conversation_id,
         )
@@ -41,11 +44,10 @@ def get_recent_context_summary(
             """,
             (user_id,),
         ).fetchone()
-    return store._row_to_recent_context_summary(row) if row else None
-
+    return _row_to_recent_context_summary(row) if row else None
 
 def get_recent_context_summary_for_conversation(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -68,11 +70,10 @@ def get_recent_context_summary_for_conversation(
         params = (user_id, conversation_id)
     with store._connect() as connection:
         row = connection.execute(query, params).fetchone()
-    return store._row_to_recent_context_summary(row) if row else None
-
+    return _row_to_recent_context_summary(row) if row else None
 
 def list_recent_context_summaries(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     limit: int | None = 20,
@@ -89,17 +90,17 @@ def list_recent_context_summaries(
             query += " LIMIT ?"
             params.append(bounded_limit)
         rows = connection.execute(query, params).fetchall()
-    return [store._row_to_recent_context_summary(row) for row in rows]
-
+    return [_row_to_recent_context_summary(row) for row in rows]
 
 def upsert_recent_context_summary(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     conversation_id: str | None,
     summary: str,
 ) -> RecentContextSummary:
-    return store.upsert_recent_context_state(
+    return upsert_recent_context_state(
+        store,
         user_id=user_id,
         conversation_id=conversation_id,
         summary=summary,
@@ -108,9 +109,8 @@ def upsert_recent_context_summary(
         turn_count=0,
     )
 
-
 def upsert_recent_context_state(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -125,7 +125,8 @@ def upsert_recent_context_state(
         [turn.model_dump() for turn in recent_turns],
         ensure_ascii=False,
     )
-    existing = store.get_recent_context_summary_for_conversation(
+    existing = get_recent_context_summary_for_conversation(
+        store,
         user_id=user_id,
         conversation_id=conversation_id,
     )
@@ -149,7 +150,8 @@ def upsert_recent_context_state(
                     user_id,
                 ),
             )
-        updated = store.get_recent_context_summary_for_conversation(
+        updated = get_recent_context_summary_for_conversation(
+            store,
             user_id=user_id,
             conversation_id=conversation_id,
         )
@@ -193,7 +195,8 @@ def upsert_recent_context_state(
             )
         return recent_summary
     except sqlite3.IntegrityError:
-        return store.upsert_recent_context_state(
+        return upsert_recent_context_state(
+        store,
             user_id=user_id,
             conversation_id=conversation_id,
             summary=normalized_summary,
@@ -202,9 +205,8 @@ def upsert_recent_context_state(
             turn_count=max(0, turn_count),
         )
 
-
 def get_conversation_branch_node(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     history_fingerprint: str,
@@ -221,11 +223,10 @@ def get_conversation_branch_node(
             """,
             (user_id, normalized),
         ).fetchone()
-    return store._row_to_conversation_branch_node(row) if row else None
-
+    return _row_to_conversation_branch_node(row) if row else None
 
 def list_conversation_branch_nodes(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     limit: int = 5000,
@@ -245,11 +246,10 @@ def list_conversation_branch_nodes(
                 max(1, min(limit, _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT)),
             ),
         ).fetchall()
-    return [store._row_to_conversation_branch_node(row) for row in rows]
-
+    return [_row_to_conversation_branch_node(row) for row in rows]
 
 def count_conversation_branch_nodes(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     archived: bool = False,
@@ -265,9 +265,8 @@ def count_conversation_branch_nodes(
         ).fetchone()
     return int(row["count"]) if row else 0
 
-
 def archive_conversation_branch_subtree(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     node_id: str,
     user_id: str,
@@ -303,9 +302,8 @@ def archive_conversation_branch_subtree(
         )
         return connection.total_changes - before
 
-
 def restore_conversation_branch_subtree(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     node_id: str,
     user_id: str,
@@ -341,9 +339,8 @@ def restore_conversation_branch_subtree(
         )
         return connection.total_changes - before
 
-
 def upsert_conversation_branch_node(
-    store: MemoryStore,
+    store: _ConnectableStore,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -435,8 +432,7 @@ def upsert_conversation_branch_node(
         ).fetchone()
     if row is None:
         raise RuntimeError("conversation branch node write did not persist")
-    return store._row_to_conversation_branch_node(row)
-
+    return _row_to_conversation_branch_node(row)
 
 def _archive_duplicate_recent_context_summaries(connection: sqlite3.Connection) -> None:
     connection.execute(
@@ -469,7 +465,6 @@ def _archive_duplicate_recent_context_summaries(connection: sqlite3.Connection) 
         """
     )
 
-
 def _ensure_recent_context_summary_columns(connection: sqlite3.Connection) -> None:
     columns = {
         row["name"]
@@ -492,29 +487,3 @@ def _ensure_recent_context_summary_columns(connection: sqlite3.Connection) -> No
             "ALTER TABLE recent_context_summaries "
             "ADD COLUMN turn_count INTEGER DEFAULT 0"
         )
-
-
-def _row_to_recent_context_summary(row: sqlite3.Row) -> RecentContextSummary:
-    data = dict(row)
-    raw_turns = data.pop("recent_turns_json", None)
-    try:
-        parsed_turns = json.loads(raw_turns) if raw_turns else []
-    except json.JSONDecodeError:
-        parsed_turns = []
-    data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
-    return RecentContextSummary(**data)
-
-
-def _row_to_conversation_branch_node(
-    row: sqlite3.Row,
-) -> ConversationBranchNode:
-    data = dict(row)
-    raw_turns = data.pop("recent_turns_json", None)
-    try:
-        parsed_turns = json.loads(raw_turns) if raw_turns else []
-    except json.JSONDecodeError:
-        parsed_turns = []
-    data["recent_turns"] = parsed_turns if isinstance(parsed_turns, list) else []
-    return ConversationBranchNode(**data)
-
-
