@@ -7,7 +7,8 @@ import anyio
 from app.memory.classification import classify_memory, normalize_classification_values
 from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
-from app.memory.search import EmbeddingClient, cosine_similarity, embedding_space_id_for
+from app.memory.search import EmbeddingClient, embedding_space_id_for
+from app.vector_util import cosine_similarity
 from app.memory.store import MemoryStore
 from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (

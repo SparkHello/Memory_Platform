@@ -26,6 +26,9 @@ _TOKEN_RE = re.compile(r"^mgw_([a-f0-9]{16})_([A-Za-z0-9_-]{32,128})$")
 _TOKEN_ID_RE = re.compile(r"^[a-f0-9]{16}$")
 
 
+from app.sqlite_util import ClosingSQLiteConnection as _ClosingSQLiteConnection
+
+
 @dataclass(frozen=True, slots=True)
 class AuthTokenRecord:
     token_id: str
@@ -323,7 +326,11 @@ class AuthTokenStore:
         return row is not None
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5.0)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=5.0,
+            factory=_ClosingSQLiteConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")

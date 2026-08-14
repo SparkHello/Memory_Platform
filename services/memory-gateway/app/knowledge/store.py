@@ -15,7 +15,7 @@ import threading
 from typing import Any, Final
 from uuid import uuid4
 
-from app.knowledge.chunking import chunk_knowledge_text
+from app.knowledge.chunking import _last_touched_line, _line_at, chunk_knowledge_text
 from app.knowledge.models import (
     KnowledgeChunk,
     KnowledgeCommitResult,
@@ -33,6 +33,8 @@ from app.schema_migrations import (
 )
 from app.schema_versions import KNOWLEDGE_SCHEMA_VERSION
 from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK, detect_text_sensitivity
+from app.sqlite_util import ClosingSQLiteConnection as _ClosingSQLiteConnection
+from app.vector_util import cosine_similarity
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -91,14 +93,6 @@ class KnowledgeSensitivityConfirmationRequired(KnowledgeConflictError):
             "local detection classified this document above the selected "
             "sensitivity; explicit user confirmation is required"
         )
-
-
-class _ClosingSQLiteConnection(sqlite3.Connection):
-    def __exit__(self, exc_type, exc_value, traceback):
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
 
 
 class KnowledgeStore:
@@ -1816,7 +1810,7 @@ class KnowledgeStore:
                 candidate = _validated_vector(json.loads(row["vector_json"]))
             except (TypeError, json.JSONDecodeError, KnowledgeValidationError):
                 continue
-            cosine = _cosine_similarity(vector, candidate)
+            cosine = cosine_similarity(vector, candidate)
             if cosine < min_cosine:
                 continue
             payload = dict(row)
@@ -3238,17 +3232,6 @@ def _validated_vector(values: Sequence[float] | Any) -> list[float]:
     return result
 
 
-def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right) or not left:
-        return -1.0
-    dot = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm <= 0.0 or right_norm <= 0.0:
-        return -1.0
-    return max(-1.0, min(1.0, dot / (left_norm * right_norm)))
-
-
 def _detect_sensitivity(text: str) -> KnowledgeSensitivity:
     return detect_text_sensitivity(text)  # type: ignore[return-value]
 
@@ -3368,16 +3351,6 @@ def _decode_cursor(cursor: str, signing_key: str | bytes) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise KnowledgeValidationError("cursor is invalid")
     return payload
-
-
-def _line_at(text: str, offset: int) -> int:
-    return text.count("\n", 0, max(0, offset)) + 1
-
-
-def _last_touched_line(text: str, start: int, end: int) -> int:
-    if end <= start:
-        return _line_at(text, start)
-    return text.count("\n", 0, end - 1) + 1
 
 
 # ---------------------------------------------------------------------------

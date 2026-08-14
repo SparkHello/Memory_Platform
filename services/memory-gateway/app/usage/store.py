@@ -27,12 +27,7 @@ _USAGE_DB_INIT_LOCK = threading.Lock()
 EVENT_RETENTION_DAYS = 365
 
 
-class _ClosingSQLiteConnection(sqlite3.Connection):
-    def __exit__(self, exc_type, exc_value, traceback):
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
+from app.sqlite_util import ClosingSQLiteConnection as _ClosingSQLiteConnection
 
 
 class UsageStore:

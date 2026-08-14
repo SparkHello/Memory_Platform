@@ -3,7 +3,7 @@ from itertools import combinations
 from app.memory.core import safe_core_memory_sections
 from app.memory.models import MemoryRecord
 from app.memory.redaction import redact_memory_payload
-from app.memory.search import cosine_similarity
+from app.vector_util import cosine_similarity
 from app.memory.store import MemoryStore
 from app.memory.utils import (
     _char_overlap,

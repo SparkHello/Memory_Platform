@@ -128,18 +128,7 @@ def _serialize_memory_init(method):
     return wrapped
 
 
-class ClosingSQLiteConnection(sqlite3.Connection):
-    """sqlite3 的 context manager 只负责 commit/rollback，不关闭连接。
-
-    本项目的所有访问都写成 `with self._connect() as connection:`，
-    因此在退出 with 块时兜底 close，避免连接句柄依赖 GC 回收。
-    """
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
+from app.sqlite_util import ClosingSQLiteConnection
 
 
 

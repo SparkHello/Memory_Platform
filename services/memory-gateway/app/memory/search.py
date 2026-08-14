@@ -39,6 +39,7 @@ from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _ter
 from app.usage.context import current_usage_context, model_usage_scope
 from app.usage.recorder import UsageRecorder
 from app.usage.attribution import model_gateway_usage_headers
+from app.vector_util import cosine_similarity
 
 
 # ---------------------------------------------------------------------------
@@ -1337,17 +1338,6 @@ def _single_cjk_keyword(text: str) -> str | None:
     ):
         return compact
     return None
-
-
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    if len(left) != len(right) or not left:
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return dot / (left_norm * right_norm)
 
 
 def _char_overlap_score(query: str, content: str) -> float:
