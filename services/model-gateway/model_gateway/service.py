@@ -107,6 +107,34 @@ def create_app(
         )
     admin_write_lock = asyncio.Lock()
 
+    async def _admin_context(request: Request):
+        """Snapshot + authenticate + require admin; returns context or error."""
+        try:
+            config, secrets = await manager.snapshot_async()
+            client = _authenticate(request, config=config, secrets=secrets)
+        except ConfigError:
+            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
+        except AuthenticationError as exc:
+            return _error(401, str(exc))
+        forbidden = _require_admin(client)
+        if forbidden is not None:
+            return forbidden
+        return config, secrets, client
+
+    def _commit_admin_change(expected_revision, *, config=None, secret_updates=None):
+        """Commit + reload, mapping ConfigConflict to the stale error."""
+        try:
+            commit = commit_control_plane(
+                paths,
+                expected_revision=expected_revision,
+                config=config,
+                secret_updates=secret_updates,
+            )
+        except ConfigConflict:
+            return _config_stale_error()
+        manager.force_reload()
+        return commit
+
     # OpenAPI is off by default; Model port is internal but still avoid free recon.
     openapi_enabled = os.environ.get(
         "MODEL_GATEWAY_ENABLE_OPENAPI", ""
@@ -245,16 +273,10 @@ def create_app(
 
         Provider/admin secret values stay in secrets.env and are never included.
         """
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         del secrets
         payload = config.model_dump(mode="json", exclude_none=False)
         body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -269,16 +291,10 @@ def create_app(
 
     @app.post("/admin/routes/validate")
     async def validate_admin_routes(request: Request) -> Response:
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         payload = await _validated_admin_body(
             request,
             limit=config.server.body_limit_bytes,
@@ -314,16 +330,10 @@ def create_app(
     @app.put("/admin/routes")
     async def apply_admin_routes(request: Request) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             payload = await _validated_admin_body(
                 request,
                 limit=config.server.body_limit_bytes,
@@ -347,15 +357,9 @@ def create_app(
                     f"路由草稿未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
-            try:
-                commit = commit_control_plane(
-                    paths,
-                    expected_revision=payload.revision,
-                    config=candidate,
-                )
-            except ConfigConflict:
-                return _config_stale_error()
-            manager.force_reload()
+            commit = _commit_admin_change(payload.revision, config=candidate)
+            if isinstance(commit, JSONResponse):
+                return commit
             return JSONResponse(
                 {
                     "applied": True,
@@ -369,16 +373,10 @@ def create_app(
     @app.post("/admin/connections")
     async def create_admin_connection(request: Request) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             payload = await _validated_admin_body(
                 request,
                 limit=config.server.body_limit_bytes,
@@ -403,15 +401,9 @@ def create_app(
                     error_type="model_gateway_config_invalid",
                 )
             if not payload.dry_run:
-                try:
-                    commit = commit_control_plane(
-                        paths,
-                        expected_revision=payload.revision,
-                        config=candidate,
-                    )
-                except ConfigConflict:
-                    return _config_stale_error()
-                manager.force_reload()
+                commit = _commit_admin_change(payload.revision, config=candidate)
+                if isinstance(commit, JSONResponse):
+                    return commit
             return JSONResponse(
                 {
                     "valid": True,
@@ -428,16 +420,10 @@ def create_app(
     @app.post("/admin/deployments")
     async def apply_admin_deployments(request: Request) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             payload = await _validated_admin_body(
                 request,
                 limit=config.server.body_limit_bytes,
@@ -464,15 +450,9 @@ def create_app(
                     error_type="model_gateway_config_invalid",
                 )
             if not payload.dry_run:
-                try:
-                    commit = commit_control_plane(
-                        paths,
-                        expected_revision=payload.revision,
-                        config=candidate,
-                    )
-                except ConfigConflict:
-                    return _config_stale_error()
-                manager.force_reload()
+                commit = _commit_admin_change(payload.revision, config=candidate)
+                if isinstance(commit, JSONResponse):
+                    return commit
             return JSONResponse(
                 {
                     "valid": True,
@@ -503,16 +483,10 @@ def create_app(
         request: Request,
     ) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             connection = config.connections.get(connection_id)
             if connection is None:
                 return _error(404, "找不到指定 connection")
@@ -554,15 +528,12 @@ def create_app(
                     "候选渠道密钥未通过只读 models discovery；原密钥保持不变",
                     error_type="model_gateway_candidate_key_rejected",
                 )
-            try:
-                commit_control_plane(
-                    paths,
-                    expected_revision=revision,
-                    secret_updates={connection.auth.secret_ref: payload.value},
-                )
-            except ConfigConflict:
-                return _config_stale_error()
-            manager.force_reload()
+            result = _commit_admin_change(
+                revision,
+                secret_updates={connection.auth.secret_ref: payload.value},
+            )
+            if isinstance(result, JSONResponse):
+                return result
             router.runtime_health.clear_connection(
                 connection_id,
                 tuple(
@@ -580,16 +551,10 @@ def create_app(
 
     @app.post("/admin/channels/discover")
     async def discover_admin_candidate(request: Request) -> Response:
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         payload = await _validated_admin_body(
             request,
             limit=config.server.body_limit_bytes,
@@ -694,16 +659,10 @@ def create_app(
     @app.post("/admin/channels/probe-capabilities")
     async def probe_admin_candidate_capabilities(request: Request) -> Response:
         """Run cheap live probes; never persists connection or secret."""
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         payload = await _validated_admin_body(
             request,
             limit=config.server.body_limit_bytes,
@@ -771,16 +730,10 @@ def create_app(
             return await _handle_admin_bundle(request, apply=True)
 
     async def _handle_admin_bundle(request: Request, *, apply: bool) -> Response:
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         payload = await _validated_admin_body(
             request,
             limit=config.server.body_limit_bytes,
@@ -827,16 +780,13 @@ def create_app(
             )
         revision = payload.revision
         if apply:
-            try:
-                commit = commit_control_plane(
-                    paths,
-                    expected_revision=revision,
-                    config=candidate,
-                    secret_updates={secret_ref: payload.connection.secret},
-                )
-            except ConfigConflict:
-                return _config_stale_error()
-            manager.force_reload()
+            commit = _commit_admin_change(
+                revision,
+                config=candidate,
+                secret_updates={secret_ref: payload.connection.secret},
+            )
+            if isinstance(commit, JSONResponse):
+                return commit
             revision = commit.revision
             router.runtime_health.clear_connection(connection_id, deployment_ids)
             if embedding_connection_id != connection_id:
@@ -874,16 +824,10 @@ def create_app(
         request: Request, *, collection: str, item_id: str
     ) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             body = await _validated_admin_body(
                 request,
                 limit=config.server.body_limit_bytes,
@@ -901,20 +845,15 @@ def create_app(
             payload[collection][item_id] = record
             try:
                 candidate = type(config).model_validate(payload)
-                commit = commit_control_plane(
-                    paths,
-                    expected_revision=body.revision,
-                    config=candidate,
-                )
-            except ConfigConflict:
-                return _config_stale_error()
             except (ValueError, ValidationError) as exc:
                 return _error(
                     400,
                     f"对象修改未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
-            manager.force_reload()
+            commit = _commit_admin_change(body.revision, config=candidate)
+            if isinstance(commit, JSONResponse):
+                return commit
             return JSONResponse(
                 {
                     "updated": True,
@@ -931,16 +870,10 @@ def create_app(
         request: Request,
     ) -> Response:
         async with admin_write_lock:
-            try:
-                config, secrets = await manager.snapshot_async()
-                client = _authenticate(request, config=config, secrets=secrets)
-            except ConfigError:
-                return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-            except AuthenticationError as exc:
-                return _error(401, str(exc))
-            forbidden = _require_admin(client)
-            if forbidden is not None:
-                return forbidden
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
             body = await _validated_admin_body(
                 request,
                 limit=config.server.body_limit_bytes,
@@ -965,16 +898,13 @@ def create_app(
             secret_updates: dict[str, None] = {}
             if collection == "connections":
                 secret_updates[config.connections[item_id].auth.secret_ref] = None
-            try:
-                commit = commit_control_plane(
-                    paths,
-                    expected_revision=body.revision,
-                    config=candidate,
-                    secret_updates=secret_updates,
-                )
-            except ConfigConflict:
-                return _config_stale_error()
-            manager.force_reload()
+            commit = _commit_admin_change(
+                body.revision,
+                config=candidate,
+                secret_updates=secret_updates,
+            )
+            if isinstance(commit, JSONResponse):
+                return commit
             return JSONResponse(
                 {
                     "deleted": True,
@@ -989,16 +919,10 @@ def create_app(
         connection_id: str,
         request: Request,
     ) -> Response:
-        try:
-            config, secrets = await manager.snapshot_async()
-            client = _authenticate(request, config=config, secrets=secrets)
-        except ConfigError:
-            return _error(503, "本地网关配置无效；请运行 modelgw doctor")
-        except AuthenticationError as exc:
-            return _error(401, str(exc))
-        forbidden = _require_admin(client)
-        if forbidden is not None:
-            return forbidden
+        context = await _admin_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        config, secrets, client = context
         try:
             report = await check_health(
                 config=config,
