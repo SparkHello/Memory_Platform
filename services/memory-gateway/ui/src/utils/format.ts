@@ -78,12 +78,6 @@ export function joinUrl(baseUrl: string, path: string): string {
   return `${normalizeBaseUrl(baseUrl)}${path}`;
 }
 
-export function maskSecret(secret: string): string {
-  if (!secret) return "未设置";
-  if (secret.length <= 6) return "......";
-  return `${secret.slice(0, 3)}....${secret.slice(-3)}`;
-}
-
 export function candidateSummary(raw: string): string {
   try {
     const parsed = JSON.parse(raw) as unknown;

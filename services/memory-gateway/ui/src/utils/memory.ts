@@ -139,6 +139,14 @@ export function contentDivergesFromSource(
   return supported / tokens.length < 0.5;
 }
 
+export function spaceNamesFor(
+  item: { space_ids?: string[] | null },
+  spaces: MemorySpace[]
+): string[] {
+  const namesById = new Map(spaces.map((space) => [space.id, space.name]));
+  return (item.space_ids || []).map((spaceId) => namesById.get(spaceId) || spaceId);
+}
+
 export function normalizeTags(values: string[]): string[] {
   const seen = new Set<string>();
   const tags: string[] = [];

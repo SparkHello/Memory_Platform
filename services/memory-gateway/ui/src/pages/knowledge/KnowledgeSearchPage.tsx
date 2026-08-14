@@ -12,8 +12,8 @@ import {
   Sparkles,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { isAbortError, type MemoryApi } from "../../api";
+import { useMemo, useState } from "react";
+import { type MemoryApi } from "../../api";
 import { PageHeader } from "../../components/PageHeader";
 import { DataTable } from "../../components/DataTable";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
@@ -25,6 +25,7 @@ import type {
   KnowledgeSearchResponse,
   KnowledgeStatus
 } from "../../types";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import { copyText } from "../../utils/files";
 import { errorMessage, numberText } from "../../utils/format";
 import type { Notify } from "../pageTypes";
@@ -41,8 +42,12 @@ export function KnowledgeSearchPage({
   onOpenDocument: (id: string) => void;
   status: KnowledgeStatus | null;
 }) {
-  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
-  const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const { state: documentsState, reload: loadDocuments } = useAsyncData<KnowledgeDocument[]>(
+    (signal) => api.listKnowledgeDocuments({ status: "active", limit: 500 }, signal),
+    [api]
+  );
+  const documents = documentsState.data || [];
+  const documentsError = documentsState.error;
   const [request, setRequest] = useState("");
   const [quality, setQuality] = useState<KnowledgeSearchQuality>("balanced");
   const [limit, setLimit] = useState(5);
@@ -53,22 +58,6 @@ export function KnowledgeSearchPage({
   const [result, setResult] = useState<KnowledgeSearchResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  const loadDocuments = useCallback(async (signal?: AbortSignal) => {
-    setDocumentsError(null);
-    try {
-      setDocuments(await api.listKnowledgeDocuments({ status: "active", limit: 500 }, signal));
-    } catch (loadError) {
-      if (isAbortError(loadError)) return;
-      setDocumentsError(errorMessage(loadError));
-    }
-  }, [api]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void loadDocuments(controller.signal);
-    return () => controller.abort();
-  }, [loadDocuments]);
 
   // 前端超时跟随后端 KNOWLEDGE_AGENT_TIMEOUT_SECONDS（留 10s 余量）；status 未加载时回退 35s。
   const searchTimeoutMs = status?.agent_timeout_seconds ? status.agent_timeout_seconds * 1000 + 10000 : 35000;

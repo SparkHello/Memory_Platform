@@ -24,6 +24,7 @@ import { Modal } from "../../components/Modal";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type { ConfirmFn } from "../../hooks/useConfirm";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import type {
   KnowledgeDocument,
   KnowledgeDocumentDetail,
@@ -107,34 +108,18 @@ function KnowledgeListPage({
   const [tab, setTab] = useState<KnowledgeDocumentStatus>("active");
   const [query, setQuery] = useState("");
   const [submittedQuery, setSubmittedQuery] = useState("");
-  const [documents, setDocuments] = useState<KnowledgeDocument[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { state, reload: load } = useAsyncData<KnowledgeDocument[]>(
+    (signal) => api.listKnowledgeDocuments({ status: tab, query: submittedQuery, limit: 500 }, signal),
+    [api, submittedQuery, tab]
+  );
+  const documents = state.data;
+  const error = state.error;
+  const loading = state.loading;
   const [showUpload, setShowUpload] = useState(false);
   const [purgeTarget, setPurgeTarget] = useState<KnowledgeDocument | null>(null);
   const [restorePreview, setRestorePreview] = useState<KnowledgeExport | null>(null);
   const [restoring, setRestoring] = useState(false);
   const restoreInputRef = useRef<HTMLInputElement>(null);
-
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError(null);
-    try {
-      setDocuments(await api.listKnowledgeDocuments({ status: tab, query: submittedQuery, limit: 500 }, signal));
-    } catch (loadError) {
-      if (isAbortError(loadError)) return;
-      setDocuments(null);
-      setError(errorMessage(loadError));
-    } finally {
-      setLoading(false);
-    }
-  }, [api, submittedQuery, tab]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
 
   // 输入防抖：停顿 300ms 后才真正发搜索请求；Enter 立即触发。
   useEffect(() => {

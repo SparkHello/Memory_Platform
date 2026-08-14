@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useMemo, useState, type CSSProperties } from "react";
 import { RefreshCcw, X } from "lucide-react";
-import { MemoryApi, isAbortError } from "../../api";
+import { MemoryApi } from "../../api";
 import type {
   CoreMemoryHistoryItem,
   CoreMemorySection,
@@ -9,7 +9,7 @@ import type {
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type { ConfirmFn } from "../../hooks/useConfirm";
-import type { LoadState } from "../../hooks/useAsyncData";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import { useDialogA11y } from "../../hooks/useDialogA11y";
 import { CORE_SECTIONS, CORE_SECTION_COLOR_VAR } from "../../utils/constants";
 import { dateText, errorMessage, percent, sectionTitle } from "../../utils/format";
@@ -26,46 +26,23 @@ export function CoreMemoryPage({
 }) {
   const [tab, setTab] = useState<"current" | "history">("current");
   const [sectionFilter, setSectionFilter] = useState<"all" | CoreSectionName>("all");
-  const [sections, setSections] = useState<LoadState<CoreMemorySection[]>>({
-    loading: true,
-    error: null,
-    data: null
-  });
-  const [history, setHistory] = useState<LoadState<CoreMemoryHistoryItem[]>>({
-    loading: true,
-    error: null,
-    data: null
-  });
+  const { state: sections, reload: reloadSections } = useAsyncData<CoreMemorySection[]>(
+    (signal) => api.coreMemory(signal),
+    [api]
+  );
+  const { state: history, reload: reloadHistory } = useAsyncData<CoreMemoryHistoryItem[]>(
+    (signal) => api.coreHistory(signal),
+    [api]
+  );
   const [consolidating, setConsolidating] = useState(false);
   const historyDrawerRef = useDialogA11y<HTMLElement>(
     () => setTab("current"),
     tab === "history"
   );
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setSections({ loading: true, error: null, data: null });
-    setHistory({ loading: true, error: null, data: null });
-    try {
-      const [coreData, historyData] = await Promise.all([
-        api.coreMemory(signal),
-        api.coreHistory(signal)
-      ]);
-      setSections({ loading: false, error: null, data: coreData });
-      setHistory({ loading: false, error: null, data: historyData });
-    } catch (error) {
-      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
-      if (isAbortError(error)) return;
-      const message = errorMessage(error);
-      setSections({ loading: false, error: message, data: null });
-      setHistory({ loading: false, error: message, data: null });
-    }
-  }, [api]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const load = useCallback(async () => {
+    await Promise.all([reloadSections(), reloadHistory()]);
+  }, [reloadSections, reloadHistory]);
 
   const bySection = useMemo(() => {
     return new Map((sections.data || []).map((item) => [item.section, item]));

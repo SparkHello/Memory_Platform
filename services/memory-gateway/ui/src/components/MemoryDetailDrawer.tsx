@@ -45,6 +45,7 @@ import {
   editDraftToSpacesPayload,
   memoryToEditDraft,
   normalizeTags,
+  spaceNamesFor,
   type MemoryEditDraft
 } from "../utils/memory";
 import type { Notify } from "../pages/pageTypes";
@@ -415,7 +416,7 @@ export function MemoryDetailDrawer({
                 {(memory.entities || []).map((entity) => (
                   <span className="profile-chip entity" key={`e-${entity}`}>@{entity}</span>
                 ))}
-                {spaceNames(memory, spaces).map((name) => (
+                {spaceNamesFor(memory, spaces).map((name) => (
                   <span className="profile-chip space" key={`s-${name}`}>{name}</span>
                 ))}
               </div>
@@ -917,7 +918,7 @@ function TemporalFacts({ memory }: { memory: MemoryRecord }) {
   );
 }
 
-export function TagEditor({
+function TagEditor({
   label,
   values,
   placeholder,
@@ -973,9 +974,4 @@ export function TagEditor({
       </div>
     </div>
   );
-}
-
-function spaceNames(memory: MemoryRecord, spaces: MemorySpace[]): string[] {
-  const namesById = new Map(spaces.map((space) => [space.id, space.name]));
-  return (memory.space_ids || []).map((spaceId) => namesById.get(spaceId) || spaceId);
 }

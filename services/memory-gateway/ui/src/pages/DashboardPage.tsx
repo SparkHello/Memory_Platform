@@ -23,6 +23,7 @@ import { MemoryTraverse } from "../components/MemoryTraverse";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../components/StateBlocks";
 import { useCountUp } from "../hooks/useCountUp";
 import type { ConfirmFn } from "../hooks/useConfirm";
+import type { LoadState } from "../hooks/useAsyncData";
 import type {
   ConnectionSettings,
   DecisionLog,
@@ -41,6 +42,7 @@ import type {
 } from "../types";
 import { friendlyIngestSkipReason } from "../utils/decisionReason";
 import { downloadFile } from "../utils/files";
+import { spaceNamesFor } from "../utils/memory";
 import {
   MEMORY_TYPES,
   MEMORY_TYPE_COLOR_VAR,
@@ -138,12 +140,6 @@ function emotionPresetFor(filters: NetworkFilters): EmotionPresetKey | "custom" 
   return match ? match.key : "custom";
 }
 
-type LoadState = {
-  loading: boolean;
-  error: string | null;
-  data: DashboardData | null;
-};
-
 type StudioAction = {
   key: string;
   tone: "warning" | "info" | "muted" | "primary";
@@ -172,7 +168,7 @@ export function DashboardPage({
   confirm: ConfirmFn;
   refreshKey: number;
 }) {
-  const [state, setState] = useState<LoadState>({ loading: true, error: null, data: null });
+  const [state, setState] = useState<LoadState<DashboardData>>({ loading: true, error: null, data: null });
   const [surfaceLoading, setSurfaceLoading] = useState(false);
   const [networkLoading, setNetworkLoading] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -1012,7 +1008,7 @@ function NetworkDetail({
         </div>
         <div>
           <dt>空间</dt>
-          <dd>{spaceNamesForNode(node, spaces).join("、") || "-"}</dd>
+          <dd>{spaceNamesFor(node, spaces).join("、") || "-"}</dd>
         </div>
         <div>
           <dt>最近使用</dt>
@@ -1369,11 +1365,6 @@ function average(values: number[]): number {
 function boundedUnit(value: number): number {
   if (Number.isNaN(value)) return 0;
   return Math.min(1, Math.max(0, value));
-}
-
-function spaceNamesForNode(node: MemoryNetworkNode, spaces: MemorySpace[]): string[] {
-  const namesById = new Map(spaces.map((space) => [space.id, space.name]));
-  return (node.space_ids || []).map((spaceId) => namesById.get(spaceId) || spaceId);
 }
 
 function surfaceReason(reason: string): string {

@@ -29,7 +29,7 @@ import {
   STABILITIES
 } from "../../utils/constants";
 import { dateText, displayText, errorMessage, percent } from "../../utils/format";
-import { normalizeTags } from "../../utils/memory";
+import { normalizeTags, spaceNamesFor } from "../../utils/memory";
 import type { MemoryFilters } from "../../utils/memory";
 import type { Notify } from "../pageTypes";
 
@@ -1042,16 +1042,11 @@ function PurgePreviewSummary({ preview }: { preview: MemoryPurgePreviewResult })
   );
 }
 
-function spaceNamesForMemory(memory: MemoryRecord, spaces: MemorySpace[]): string[] {
-  const namesById = new Map(spaces.map((space) => [space.id, space.name]));
-  return (memory.space_ids || []).map((spaceId) => namesById.get(spaceId) || spaceId);
-}
-
 function classificationSummary(memory: MemoryRecord, spaces: MemorySpace[]): string {
   const parts = [
     ...(memory.topics || []).slice(0, 2),
     ...(memory.entities || []).slice(0, 1),
-    ...spaceNamesForMemory(memory, spaces).slice(0, 2)
+    ...spaceNamesFor(memory, spaces).slice(0, 2)
   ];
   if (!parts.length) return "-";
   const unique = normalizeTags(parts);

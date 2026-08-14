@@ -1,45 +1,28 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { ChevronDown, RefreshCcw } from "lucide-react";
-import { MemoryApi, isAbortError } from "../../api";
+import { MemoryApi } from "../../api";
 import type { DecisionLog, DecisionLogAction } from "../../types";
 import { badge } from "../../components/Badge";
 import { FieldList, FilterSelect } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import { Modal } from "../../components/Modal";
-import type { LoadState } from "../../hooks/useAsyncData";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import { DECISIONS } from "../../utils/constants";
-import { candidateSummary, dateText, errorMessage, prettyJson } from "../../utils/format";
+import { candidateSummary, dateText, prettyJson } from "../../utils/format";
 
 const PAGE_SIZE = 100;
 
 export function DecisionLogsPage({ api }: { api: MemoryApi }) {
-  const [state, setState] = useState<LoadState<DecisionLog[]>>({
-    loading: true,
-    error: null,
-    data: null
-  });
   const [limit, setLimit] = useState(PAGE_SIZE);
   const [decision, setDecision] = useState<"all" | DecisionLogAction>("all");
   const [conversationId, setConversationId] = useState("");
   const [selected, setSelected] = useState<DecisionLog | null>(null);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setState({ loading: true, error: null, data: null });
-    try {
-      setState({ loading: false, error: null, data: await api.decisionLogs(limit, {}, signal) });
-    } catch (error) {
-      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
-      if (isAbortError(error)) return;
-      setState({ loading: false, error: errorMessage(error), data: null });
-    }
-  }, [api, limit]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const { state, reload: load } = useAsyncData<DecisionLog[]>(
+    (signal) => api.decisionLogs(limit, {}, signal),
+    [api, limit]
+  );
 
   const logs = useMemo(() => {
     return (state.data || []).filter((log) => {

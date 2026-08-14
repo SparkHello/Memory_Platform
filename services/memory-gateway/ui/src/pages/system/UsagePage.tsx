@@ -5,11 +5,12 @@ import {
   DatabaseZap,
   RefreshCcw
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { isAbortError, type MemoryApi } from "../../api";
+import { useMemo, useState } from "react";
+import { type MemoryApi } from "../../api";
 import { DataTable } from "../../components/DataTable";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import type {
   CentralModelUsageSummary,
   ModelUsageSummary,
@@ -17,7 +18,7 @@ import type {
   UsageModelBreakdown,
   UsageTotals
 } from "../../types";
-import { dateText, errorMessage, percent } from "../../utils/format";
+import { dateText, percent } from "../../utils/format";
 
 type RangeKey = "7" | "30" | "90" | "all";
 
@@ -46,31 +47,16 @@ const OPERATION_LABELS: Record<string, string> = {
 
 export function UsagePage({ api }: { api: MemoryApi }) {
   const [range, setRange] = useState<RangeKey>("30");
-  const [summary, setSummary] = useState<ModelUsageSummary | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError(null);
-    try {
-      setSummary(await api.modelUsage(range, signal));
-    } catch (loadError) {
-      if (isAbortError(loadError)) return;
-      setError(errorMessage(loadError));
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
-  }, [api, range]);
+  const { state, reload: load } = useAsyncData<ModelUsageSummary>(
+    (signal) => api.modelUsage(range, signal),
+    [api, range]
+  );
+  const summary = state.data;
+  const loading = state.loading;
+  const error = state.error;
 
   const localSummary = summary && "totals" in summary ? summary : null;
   const centralSummary = summary && "attempts" in summary ? summary : null;
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
 
   const visibleDaily = useMemo(
     () => (localSummary?.daily || []).slice(range === "7" ? -7 : -30),

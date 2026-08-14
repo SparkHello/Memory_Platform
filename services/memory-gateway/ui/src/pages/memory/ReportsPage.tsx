@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Clipboard,
   ClipboardCopy,
@@ -7,7 +7,7 @@ import {
   ShieldCheck,
   Upload
 } from "lucide-react";
-import { MemoryApi, isAbortError } from "../../api";
+import { MemoryApi } from "../../api";
 import type {
   ConnectionSettings,
   MemoryExport,
@@ -21,7 +21,7 @@ import { PageHeader } from "../../components/PageHeader";
 import { StatCard } from "../../components/StatCard";
 import { ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import type { ConfirmFn } from "../../hooks/useConfirm";
-import type { LoadState } from "../../hooks/useAsyncData";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import { downloadBlob, downloadFile, copyText } from "../../utils/files";
 import { errorMessage, reportSectionTitle } from "../../utils/format";
 import type { Notify } from "../pageTypes";
@@ -50,11 +50,10 @@ export function ReportsPage({
   notify: Notify;
   confirm: ConfirmFn;
 }) {
-  const [state, setState] = useState<LoadState<MemoryReport>>({
-    loading: true,
-    error: null,
-    data: null
-  });
+  const { state, reload: load } = useAsyncData<MemoryReport>(
+    (signal) => api.memoryReport(signal),
+    [api]
+  );
   const [restorePreview, setRestorePreview] = useState<MemoryExport | null>(null);
   const [overwrite, setOverwrite] = useState(false);
   const [includeDeleted, setIncludeDeleted] = useState(false);
@@ -73,23 +72,6 @@ export function ReportsPage({
   const [importResult, setImportResult] = useState<ConversationImportCommitResult | null>(null);
   const [importBusy, setImportBusy] = useState(false);
   const exportUserId = safeExportUserId(settings.userId || "default");
-
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setState({ loading: true, error: null, data: null });
-    try {
-      setState({ loading: false, error: null, data: await api.memoryReport(signal) });
-    } catch (error) {
-      // 过期请求在 cleanup 里被 abort，直接丢弃，不覆盖新结果。
-      if (isAbortError(error)) return;
-      setState({ loading: false, error: errorMessage(error), data: null });
-    }
-  }, [api]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
 
   const copyMarkdown = async () => {
     try {
