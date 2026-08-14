@@ -9,54 +9,51 @@ from app.schema_migrations import apply_schema_migrations
 if TYPE_CHECKING:
     from app.memory.store._monolith import MemoryStore
 
-def _ensure_memories_usage_columns(connection: sqlite3.Connection) -> None:
-    columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(memories)").fetchall()
+def _ensure_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    column_defs: dict[str, str],
+) -> None:
+    """Add missing columns to a table without touching existing ones."""
+    existing = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
     }
-    if "last_used_at" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN last_used_at TEXT")
-    if "usage_count" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN usage_count REAL DEFAULT 0.0")
-    if "valence" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN valence REAL DEFAULT 0.5")
-    if "arousal" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN arousal REAL DEFAULT 0.3")
-    if "stability" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN stability TEXT DEFAULT 'stable'")
-    if "valid_from" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN valid_from TEXT")
-    if "valid_until" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
-    if "review_after" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN review_after TEXT")
-    if "sensitivity" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN sensitivity TEXT DEFAULT 'normal'")
-    if "origin" not in columns:
-        connection.execute(
-            "ALTER TABLE memories ADD COLUMN origin TEXT DEFAULT 'user_asserted'"
-        )
-    if "evidence_memory_ids_json" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN evidence_memory_ids_json TEXT")
-    if "topics_json" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN topics_json TEXT")
-    if "entities_json" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN entities_json TEXT")
-    if "archived_at" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN archived_at TEXT")
-    if "temporal_subject" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN temporal_subject TEXT")
-    if "temporal_predicate" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN temporal_predicate TEXT")
-    if "status" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN status TEXT DEFAULT 'dynamic'")
-    if "digested" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN digested INTEGER DEFAULT 0")
-    if "decay_lambda" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN decay_lambda REAL")
-    if "supersedes" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN supersedes TEXT")
-    if "superseded_by" not in columns:
-        connection.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+    for name, definition in column_defs.items():
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            )
+
+
+def _ensure_memories_usage_columns(connection: sqlite3.Connection) -> None:
+    _ensure_columns(
+        connection,
+        "memories",
+        {
+            "last_used_at": "TEXT",
+            "usage_count": "REAL DEFAULT 0.0",
+            "valence": "REAL DEFAULT 0.5",
+            "arousal": "REAL DEFAULT 0.3",
+            "stability": "TEXT DEFAULT 'stable'",
+            "valid_from": "TEXT",
+            "valid_until": "TEXT",
+            "review_after": "TEXT",
+            "sensitivity": "TEXT DEFAULT 'normal'",
+            "origin": "TEXT DEFAULT 'user_asserted'",
+            "evidence_memory_ids_json": "TEXT",
+            "topics_json": "TEXT",
+            "entities_json": "TEXT",
+            "archived_at": "TEXT",
+            "temporal_subject": "TEXT",
+            "temporal_predicate": "TEXT",
+            "status": "TEXT DEFAULT 'dynamic'",
+            "digested": "INTEGER DEFAULT 0",
+            "decay_lambda": "REAL",
+            "supersedes": "TEXT",
+            "superseded_by": "TEXT",
+        },
+    )
     connection.execute(
         """
         UPDATE memories
@@ -128,11 +125,11 @@ def _ensure_revision_columns(connection: sqlite3.Connection) -> None:
         }
         if not columns:
             continue
-        if "revision" not in columns:
-            connection.execute(
-                f"ALTER TABLE {table_name} "
-                "ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
-            )
+        _ensure_columns(
+            connection,
+            table_name,
+            {"revision": "INTEGER NOT NULL DEFAULT 1"},
+        )
         connection.execute(
             f"UPDATE {table_name} SET revision = 1 "
             "WHERE revision IS NULL OR revision < 1"

@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import partial
 import inspect
 import json
 import logging
@@ -12,7 +11,6 @@ import re
 import time
 from typing import Any, Literal, Protocol
 
-import anyio
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -906,16 +904,13 @@ class KnowledgeSearchAgent:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
-        # The store API is synchronous SQLite; keep it off the event loop.
-        value = await anyio.to_thread.run_sync(
-            partial(
-                method,
-                user_id=user_id,
-                query=query,
-                limit=limit,
-                document_refs=document_refs,
-                include_sensitive=include_sensitive,
-            )
+        # The retrieval service methods are async; await them with a deadline.
+        value = method(
+            user_id=user_id,
+            query=query,
+            limit=limit,
+            document_refs=document_refs,
+            include_sensitive=include_sensitive,
         )
         result = await _await_with_timeout(value, remaining)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
@@ -936,14 +931,11 @@ class KnowledgeSearchAgent:
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
-        # The store API is synchronous SQLite; keep it off the event loop.
-        value = await anyio.to_thread.run_sync(
-            partial(
-                method,
-                user_id=user_id,
-                chunk_refs=chunk_refs,
-                include_sensitive=include_sensitive,
-            )
+        # The retrieval service methods are async; await them with a deadline.
+        value = method(
+            user_id=user_id,
+            chunk_refs=chunk_refs,
+            include_sensitive=include_sensitive,
         )
         result = await _await_with_timeout(value, remaining)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):

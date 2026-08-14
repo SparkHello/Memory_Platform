@@ -247,8 +247,10 @@ class KnowledgeRetrievalService:
             vector_weight=self.vector_weight,
         )
 
-    def get_chunks_by_refs(self, **kwargs):
-        return self.store.get_chunks_by_refs(**kwargs)
+    async def get_chunks_by_refs(self, **kwargs):
+        return await anyio.to_thread.run_sync(
+            partial(self.store.get_chunks_by_refs, **kwargs)
+        )
 
 
 def _weighted_rrf(
