@@ -32,6 +32,7 @@ _PDF_CPU_SECONDS: Final = 20
 _PDF_ADDRESS_SPACE_BYTES: Final = 512 * 1024 * 1024
 _PDF_MEMORY_EXIT_CODE: Final = 75
 _PDF_PARSE_SLOTS = threading.BoundedSemaphore(1)
+_PDF_WINDOWS_JOB = None
 _WORD_NS: Final = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _CONTAINER_NS: Final = "urn:oasis:names:tc:opendocument:xmlns:container"
 _OPF_NS: Final = "http://www.idpf.org/2007/opf"
@@ -168,6 +169,9 @@ def _pdf_worker_entry(data: bytes, filename: str, sender: Connection) -> None:
 
 
 def _apply_pdf_worker_limits() -> None:
+    if os.name == "nt":
+        _apply_windows_pdf_worker_limits()
+        return
     try:
         import resource
     except ImportError as exc:
@@ -195,6 +199,42 @@ def _apply_pdf_worker_limits() -> None:
             args=(resource,),
             daemon=True,
         ).start()
+
+
+def _apply_windows_pdf_worker_limits() -> None:
+    """Constrain the spawned parser with a native Windows Job Object."""
+
+    global _PDF_WINDOWS_JOB
+    try:
+        import win32api
+        import win32job
+
+        job = win32job.CreateJobObject(None, "")
+        limits = win32job.QueryInformationJobObject(
+            job,
+            win32job.JobObjectExtendedLimitInformation,
+        )
+        basic = limits["BasicLimitInformation"]
+        basic["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | win32job.JOB_OBJECT_LIMIT_PROCESS_TIME
+        )
+        basic["PerProcessUserTimeLimit"] = _PDF_CPU_SECONDS * 10_000_000
+        limits["ProcessMemoryLimit"] = _PDF_ADDRESS_SPACE_BYTES
+        win32job.SetInformationJobObject(
+            job,
+            win32job.JobObjectExtendedLimitInformation,
+            limits,
+        )
+        win32job.AssignProcessToJobObject(job, win32api.GetCurrentProcess())
+        # Keep the handle alive for this worker's lifetime. Closing the final
+        # Job Object handle would remove its limits.
+        _PDF_WINDOWS_JOB = job
+    except Exception as exc:
+        raise KnowledgeFileParseError(
+            "knowledge_pdf_sandbox_unavailable",
+            "PDF parsing is unavailable because Windows Job Object limits failed",
+        ) from exc
 
 
 def _darwin_memory_watchdog(resource_module) -> None:

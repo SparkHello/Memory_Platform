@@ -7,6 +7,12 @@ import subprocess
 import pytest
 
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the POSIX installer is covered only where a native sh is available",
+)
+
+
 PLATFORM_ROOT = Path(__file__).resolve().parents[3]
 INSTALLER = PLATFORM_ROOT / "deploy" / "install.sh"
 

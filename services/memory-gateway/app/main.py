@@ -83,7 +83,10 @@ async def _daily_usage_prune(store: UsageStore) -> None:
 
 
 def _normalized_ui_request_path(path: str) -> str | None:
-    candidate = PurePosixPath(path)
+    # Starlette normalizes mounted static paths with the host separator before
+    # calling ``get_response``. Convert Windows ``assets\\app.js`` back to the
+    # URL separator used by the allowlist below.
+    candidate = PurePosixPath(path.replace("\\", "/"))
     if any(part == ".." or part.startswith(".") for part in candidate.parts):
         return None
     normalized = candidate.as_posix()

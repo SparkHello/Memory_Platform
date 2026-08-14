@@ -211,8 +211,11 @@ def control_plane_lock(paths: GatewayPaths) -> Iterator[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            # Do not read byte zero before locking it: another writer may
+            # already hold that byte-range lock, in which case Windows raises
+            # PermissionError instead of letting us queue for the lock.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
@@ -544,7 +547,10 @@ def _copy_durable(source: Path, destination: Path, mode: int) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
     _chmod(destination, mode)
-    with destination.open("rb") as handle:
+    # Windows rejects fsync on read-only descriptors.  The rollback copy is a
+    # private file created by this transaction, so reopen it read/write there.
+    open_mode = "r+b" if os.name == "nt" else "rb"
+    with destination.open(open_mode) as handle:
         os.fsync(handle.fileno())
     _fsync_directory(destination.parent)
 
@@ -641,7 +647,12 @@ def _atomic_write(path: Path, content: str, mode: int, *, backup: bool = True) -
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        # Keep the serialized bytes identical on every platform.  In
+        # particular, Windows text-mode newline translation would otherwise
+        # write CRLF while ``_write_config_unlocked`` records the revision of
+        # the LF-only ``content`` string.  That makes a config unequal to the
+        # same config immediately reloaded from disk and breaks revision CAS.
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())

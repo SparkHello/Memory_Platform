@@ -33,7 +33,8 @@ def test_scoped_token_store_hashes_secrets_and_revokes_immediately(tmp_path) -> 
     database_bytes = database.read_bytes()
     assert created.token.encode() not in database_bytes
     assert secret.encode() not in database_bytes
-    assert os.stat(database).st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert os.stat(database).st_mode & 0o777 == 0o600
 
     authenticated = store.authenticate(created.token)
     assert authenticated is not None

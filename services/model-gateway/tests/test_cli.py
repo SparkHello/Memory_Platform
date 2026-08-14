@@ -235,7 +235,11 @@ def test_cli_background_start_status_and_stop(tmp_path: Path, capsys) -> None:
     try:
         assert run_cli(home, "start", "--port", str(port)) == 0
         assert run_cli(home, "status") == 0
-        response = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2)
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/health",
+            timeout=2,
+            trust_env=False,
+        )
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
     finally:
@@ -277,7 +281,11 @@ def test_cli_background_start_tracks_symlinked_home(tmp_path: Path, capsys) -> N
     try:
         assert run_cli(home, "start", "--port", str(port)) == 0
         assert run_cli(home, "status") == 0
-        response = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2)
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/health",
+            timeout=2,
+            trust_env=False,
+        )
         assert response.status_code == 200
     finally:
         run_cli(home, "stop", "--timeout", "5", "--force")

@@ -54,15 +54,21 @@ def test_private_settings_file_rejects_unsafe_mode_and_symlink(
 ) -> None:
     settings_path = tmp_path / "settings.env"
     write_env_atomic(settings_path, {"GATEWAY_API_KEY": "synthetic-secret"})
-    settings_path.chmod(0o640)
-    monkeypatch.setenv("MEMGW_SETTINGS_PATH", str(settings_path))
-    get_settings.cache_clear()
-    with pytest.raises(ValueError, match="0600"):
-        get_settings()
+    if os.name == "posix":
+        settings_path.chmod(0o640)
+        monkeypatch.setenv("MEMGW_SETTINGS_PATH", str(settings_path))
+        get_settings.cache_clear()
+        with pytest.raises(ValueError, match="0600"):
+            get_settings()
 
     settings_path.chmod(0o600)
     linked = tmp_path / "linked.env"
-    linked.symlink_to(settings_path)
+    try:
+        linked.symlink_to(settings_path)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     monkeypatch.setenv("MEMGW_SETTINGS_PATH", str(linked))
     get_settings.cache_clear()
     with pytest.raises(ValueError, match="安全读取"):

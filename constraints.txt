@@ -7,6 +7,7 @@ mcp==1.29.0
 pydantic==2.13.4
 pydantic-settings==2.14.2
 pypdf==6.14.2
+pywin32==312; sys_platform == "win32"
 pytest==9.1.1
 pytest-asyncio==1.4.0
 python-dotenv==1.2.2

@@ -1137,6 +1137,24 @@ def _cmd_start(args: argparse.Namespace) -> int:
     ]
     if not args.access_log:
         command.append("--no-access-log")
+    child_environment = None
+    creation_flags = 0
+    if os.name == "nt":
+        # Python 3.14's Windows venv launcher starts the base interpreter as a
+        # child and exits, so Popen.pid would otherwise describe a short-lived
+        # redirector instead of the managed gateway.  Invoke the base
+        # interpreter directly while preserving the venv identity.
+        base_executable = str(
+            Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+        )
+        venv_executable = str(Path(sys.executable).resolve())
+        if base_executable != venv_executable:
+            command[0] = base_executable
+            child_environment = os.environ.copy()
+            child_environment["__PYVENV_LAUNCHER__"] = venv_executable
+        creation_flags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
     paths.log.parent.mkdir(parents=True, exist_ok=True)
     with paths.log.open("a", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
@@ -1146,6 +1164,8 @@ def _cmd_start(args: argparse.Namespace) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=(os.name != "nt"),
             close_fds=True,
+            env=child_environment,
+            creationflags=creation_flags,
         )
     state = {
         "schema_version": 1,

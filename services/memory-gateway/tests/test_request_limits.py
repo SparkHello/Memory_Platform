@@ -349,7 +349,8 @@ async def test_large_request_spool_uses_private_matching_data_volume(
     expected = tmp_path / "knowledge" / ".request-spool"
     assert captured[0]["dir"] == expected
     assert captured[0]["prefix"] == "memgw-request-"
-    assert stat_mode(expected) == 0o700
+    if os.name == "posix":
+        assert stat_mode(expected) == 0o700
     assert outgoing[0]["status"] == 204
 
 

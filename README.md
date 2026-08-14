@@ -79,6 +79,17 @@ curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSIO
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
+Windows PowerShell 5.1+（同样固定到明确的 release）：
+
+```powershell
+$Version = "v0.2.0"
+irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
+$env:MEMORY_PLATFORM_VERSION = $Version
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-memory-platform.ps1
+```
+
+Windows 安装器目前仍标记为实验性；正式数据请先阅读[栈运维指南](docs/stack-operations.md)，并额外保留一份手动备份。
+
 安装完成后记住两枚密钥文件、三步用法：
 
 1. 用 `credentials/gateway.txt`（旧版为 `gateway.key`）里的 token 登录网页控制台 `http://127.0.0.1:2026/ui/`；

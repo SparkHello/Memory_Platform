@@ -14,6 +14,12 @@ from app.auth.tokens import AuthTokenStore
 from app.cli_config import read_env_file, write_env_atomic
 
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="split topology helpers run inside Linux containers",
+)
+
+
 ROOT = Path(__file__).resolve().parents[3]
 
 

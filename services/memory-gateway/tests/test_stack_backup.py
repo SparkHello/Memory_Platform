@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from hashlib import sha256
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import zipfile
@@ -61,11 +65,11 @@ def _database(path: Path, value: str) -> None:
         store = AuthTokenStore(path)
         store.init_db()
         store.create_token(name="fixture", user_id="default", role="console")
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE sample (value TEXT NOT NULL)")
             connection.execute("INSERT INTO sample(value) VALUES (?)", (value,))
         return
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("CREATE TABLE sample (value TEXT NOT NULL)")
         connection.execute("INSERT INTO sample(value) VALUES (?)", (value,))
         if path.name == "memory.db":
@@ -109,8 +113,30 @@ def _database(path: Path, value: str) -> None:
 
 
 def _database_value(path: Path) -> str:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         return str(connection.execute("SELECT value FROM sample").fetchone()[0])
+
+
+def _leave_committed_wal(path: Path, value: str) -> None:
+    """Simulate a stopped/crashed service whose committed WAL still exists."""
+
+    script = (
+        "import os, sqlite3, sys; "
+        "connection = sqlite3.connect(sys.argv[1]); "
+        "connection.execute('PRAGMA journal_mode = WAL'); "
+        "connection.execute('PRAGMA wal_autocheckpoint = 0'); "
+        "connection.execute('UPDATE sample SET value = ?', (sys.argv[2],)); "
+        "connection.commit(); os._exit(0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path), value],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert path.with_name(path.name + "-wal").is_file()
 
 
 def _replace_archive_payload(
@@ -380,7 +406,7 @@ def test_sqlite_staging_recovers_readonly_wal_copy_without_touching_source(
         )
 
         assert staged == {"memory/memory.db": destination}
-        with sqlite3.connect(destination) as recovered:
+        with closing(sqlite3.connect(destination)) as recovered, recovered:
             assert recovered.execute("SELECT value FROM sample").fetchone()[0] == (
                 "wal-new"
             )
@@ -466,7 +492,7 @@ def test_normal_rollback_durably_removes_new_sqlite_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "new-usage.db"
-    with sqlite3.connect(target) as connection:
+    with closing(sqlite3.connect(target)) as connection, connection:
         connection.execute("CREATE TABLE usage_events (id TEXT)")
     target.with_name(target.name + "-wal").write_bytes(b"stale")
     target.with_name(target.name + "-shm").write_bytes(b"stale")
@@ -559,12 +585,14 @@ def test_stack_restore_verifies_then_restores_with_rollback(tmp_path: Path) -> N
     assert (rollback / "model-gateway/config.json").is_file()
     assert not (rollback / "memory/settings.env").exists()
     assert secret_rollback.parent.parent == paths.settings_env.parent
-    assert (secret_rollback / "settings.env").stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert (secret_rollback / "settings.env").stat().st_mode & 0o777 == 0o600
     assert not paths.settings_env.with_suffix(".env.bak").exists()
     assert result["secrets_restored"] is False
     journal = json.loads((rollback / "restore-journal.json").read_text())
     assert journal["status"] == "complete"
-    assert (rollback / "restore-journal.json").stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert (rollback / "restore-journal.json").stat().st_mode & 0o777 == 0o600
     assert "new-device-secret" not in json.dumps(journal)
 
 
@@ -642,12 +670,7 @@ def test_stack_restore_rollback_preserves_committed_wal_pages(
         model_gateway_home=model_home,
     )
 
-    with sqlite3.connect(memory_database) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA wal_autocheckpoint = 0")
-        connection.execute("UPDATE sample SET value = 'memory-wal-current'")
-        connection.commit()
-    assert memory_database.with_name(memory_database.name + "-wal").is_file()
+    _leave_committed_wal(memory_database, "memory-wal-current")
 
     original_atomic_restore = stack_backup_module._atomic_restore
     call_count = 0
@@ -769,12 +792,7 @@ def test_stack_restore_checkpoints_and_discards_stale_sqlite_sidecars(
         model_gateway_home=model_home,
     )
 
-    with sqlite3.connect(memory_database) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA wal_autocheckpoint = 0")
-        connection.execute("UPDATE sample SET value = 'after-backup'")
-        connection.commit()
-    assert memory_database.with_name(memory_database.name + "-wal").is_file()
+    _leave_committed_wal(memory_database, "after-backup")
 
     restore_stack_backup(
         archive_path=archive_path,
@@ -891,7 +909,7 @@ def test_stack_restore_rejects_future_memory_schema_before_writing(
     )
     with zipfile.ZipFile(archive_path) as archive:
         future_database.write_bytes(archive.read("memory/memory.db"))
-    with sqlite3.connect(future_database) as connection:
+    with closing(sqlite3.connect(future_database)) as connection, connection:
         connection.execute("PRAGMA user_version = 999")
     _replace_archive_payload(
         archive_path,
@@ -918,9 +936,9 @@ def _rewrite_auth_payload_version(
     patched_database = tmp_path / f"auth-v{version}.db"
     with zipfile.ZipFile(archive_path) as archive:
         patched_database.write_bytes(archive.read("memory/auth.db"))
-    with sqlite3.connect(patched_database) as connection:
+    with closing(sqlite3.connect(patched_database)) as connection, connection:
         connection.execute(f"PRAGMA user_version = {version}")
-    with sqlite3.connect(patched_database) as connection:
+    with closing(sqlite3.connect(patched_database)) as connection, connection:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     _replace_archive_payload(
         archive_path,
@@ -954,11 +972,11 @@ def test_stack_restore_accepts_older_supported_auth_schema(tmp_path: Path) -> No
 
     assert "memory/auth.db" in result["restored"]
     auth_database = memory_database.with_name("auth.db")
-    with sqlite3.connect(auth_database) as connection:
+    with closing(sqlite3.connect(auth_database)) as connection, connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
     # The regular startup path upgrades the restored older database in place.
     AuthTokenStore(auth_database).init_db()
-    with sqlite3.connect(auth_database) as connection:
+    with closing(sqlite3.connect(auth_database)) as connection, connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == AUTH_SCHEMA_VERSION

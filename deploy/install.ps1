@@ -1,4 +1,4 @@
-# Memory Platform release installer for Windows PowerShell 5.1+.
+﻿# Memory Platform release installer for Windows PowerShell 5.1+.
 #
 # Download and run a fixed release; never pipe a mutable branch into iex:
 #   $Version = "v0.2.0"
@@ -52,6 +52,29 @@ function Stop-Install([string] $Message) {
     throw "安装失败：$Message"
 }
 
+function Invoke-NativeCapture([scriptblock] $Command) {
+    # Windows PowerShell 5.1 turns redirected native stderr into error records.
+    # With the installer's fail-fast preference, ordinary Docker progress on
+    # stderr would otherwise abort a successful command before $LASTEXITCODE
+    # can be checked.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& $Command 2>$null)
+        $exitCode = $LASTEXITCODE
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            Output = $output
+        }
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+}
+
+function Invoke-NativeSilently([scriptblock] $Command) {
+    return [int](Invoke-NativeCapture $Command).ExitCode
+}
+
 function New-TemporarySibling([string] $Path, [string] $Purpose) {
     $directory = [IO.Path]::GetDirectoryName($Path)
     $filename = [IO.Path]::GetFileName($Path)
@@ -69,7 +92,7 @@ function Write-TextAtomic([string] $Path, [string] $Content) {
     try {
         [IO.File]::WriteAllText($temporary, $Content, $utf8NoBom)
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            [IO.File]::Replace($temporary, $Path, $null)
+            Move-PathWriteThrough $temporary $Path
         } else {
             [IO.File]::Move($temporary, $Path)
         }
@@ -158,7 +181,7 @@ function Write-BytesAtomic([string] $Path, [byte[]] $Bytes) {
     try {
         [IO.File]::WriteAllBytes($temporary, $Bytes)
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            [IO.File]::Replace($temporary, $Path, $null)
+            Move-PathWriteThrough $temporary $Path
         } else {
             [IO.File]::Move($temporary, $Path)
         }
@@ -238,7 +261,11 @@ function Protect-PrivatePath([string] $Path) {
             )
         }
         [void] $acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $Path -AclObject $acl
+        # Set-Acl on Windows PowerShell 5.1 can request SeSecurityPrivilege
+        # when rewriting an already protected ACL, even though only the DACL
+        # is changing.  FileSystemInfo.SetAccessControl writes the intended
+        # access section directly and keeps repeated installer runs idempotent.
+        $item.SetAccessControl($acl)
     } catch {
         Stop-Install "无法把私有文件权限限制为当前 Windows 用户；请使用本机 NTFS 目录后重试。"
     }
@@ -341,10 +368,22 @@ function Write-CandidateEnvironment(
 function Get-ExistingInstallDirectories {
     $directories = New-Object System.Collections.Generic.List[string]
     foreach ($service in @("model-gateway", "memory-gateway", "memory-platform")) {
-        $found = @(& docker ps -a `
-            --filter "label=com.docker.compose.service=$service" `
-            --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>$null)
-        foreach ($directory in $found) {
+        $native = Invoke-NativeCapture {
+            & docker ps -a `
+                --filter "label=com.docker.compose.service=$service" `
+                --format '{{json .Labels}}'
+        }
+        $found = @($native.Output)
+        foreach ($labelJson in $found) {
+            try {
+                $labels = ([string] $labelJson) | ConvertFrom-Json
+                $property = $labels.PSObject.Properties[
+                    "com.docker.compose.project.working_dir"
+                ]
+                $directory = if ($null -eq $property) { "" } else { $property.Value }
+            } catch {
+                continue
+            }
             if (-not [string]::IsNullOrWhiteSpace($directory) -and
                 -not $directories.Contains($directory.Trim())) {
                 [void] $directories.Add($directory.Trim())
@@ -358,18 +397,40 @@ function Get-ProjectsForInstallDirectory([string] $InstallDirectory) {
     $projects = New-Object System.Collections.Generic.List[string]
     $expected = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\', '/')
     foreach ($service in @("model-gateway", "memory-gateway", "memory-platform")) {
-        $found = @(& docker ps -a `
-            --filter "label=com.docker.compose.service=$service" `
-            --format '{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project"}}' `
-            2>$null)
-        foreach ($entry in $found) {
-            $parts = ([string] $entry).Split('|', 2)
-            if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or
-                [string]::IsNullOrWhiteSpace($parts[1])) {
+        $native = Invoke-NativeCapture {
+            & docker ps -a `
+                --filter "label=com.docker.compose.service=$service" `
+                --format '{{json .Labels}}'
+        }
+        $found = @($native.Output)
+        foreach ($labelJson in $found) {
+            try {
+                $labels = ([string] $labelJson) | ConvertFrom-Json
+                $workingDirectoryProperty = $labels.PSObject.Properties[
+                    "com.docker.compose.project.working_dir"
+                ]
+                $projectProperty = $labels.PSObject.Properties[
+                    "com.docker.compose.project"
+                ]
+                $directory = if ($null -eq $workingDirectoryProperty) {
+                    ""
+                } else {
+                    [string] $workingDirectoryProperty.Value
+                }
+                $project = if ($null -eq $projectProperty) {
+                    ""
+                } else {
+                    [string] $projectProperty.Value
+                }
+            } catch {
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($directory) -or
+                [string]::IsNullOrWhiteSpace($project)) {
                 continue
             }
             try {
-                $workingDirectory = [IO.Path]::GetFullPath($parts[0]).TrimEnd('\', '/')
+                $workingDirectory = [IO.Path]::GetFullPath($directory).TrimEnd('\', '/')
             } catch {
                 continue
             }
@@ -377,8 +438,8 @@ function Get-ProjectsForInstallDirectory([string] $InstallDirectory) {
                 $workingDirectory,
                 $expected,
                 [StringComparison]::OrdinalIgnoreCase
-            ) -and -not $projects.Contains($parts[1])) {
-                [void] $projects.Add($parts[1])
+            ) -and -not $projects.Contains($project)) {
+                [void] $projects.Add($project)
             }
         }
     }
@@ -386,18 +447,23 @@ function Get-ProjectsForInstallDirectory([string] $InstallDirectory) {
 }
 
 function Get-ComposeServices([string] $ComposeFile) {
-    $services = @(& docker compose -p $script:ProjectName -f $ComposeFile `
-        config --services 2>$null)
-    if ($LASTEXITCODE -ne 0) { return @() }
+    $native = Invoke-NativeCapture {
+        & docker compose -p $script:ProjectName -f $ComposeFile config --services
+    }
+    $services = @($native.Output)
+    if ($native.ExitCode -ne 0) { return @() }
     return @($services | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
 function Test-ComposeOwnsPort([string] $ComposeFile, [int] $Port) {
     if (-not (Test-Path -LiteralPath $ComposeFile -PathType Leaf)) { return $false }
     foreach ($service in @("model-gateway", "memory-gateway", "memory-platform")) {
-        $published = @(& docker compose -p $script:ProjectName -f $ComposeFile `
-            port $service 2026 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $published.Count -gt 0 -and
+        $native = Invoke-NativeCapture {
+            & docker compose -p $script:ProjectName -f $ComposeFile `
+                port $service 2026
+        }
+        $published = @($native.Output)
+        if ($native.ExitCode -eq 0 -and $published.Count -gt 0 -and
             $published[-1].Trim() -match ":$Port$") {
             return $true
         }
@@ -455,10 +521,12 @@ try:
 except Exception:
     raise SystemExit(1)
 '@
-    & docker compose --env-file $EnvironmentFile -p $script:ProjectName `
-        -f $ComposeFile -f $OverrideFile exec -T $Service `
-        python -c $code $Url *> $null
-    return $LASTEXITCODE -eq 0
+    $exitCode = Invoke-NativeSilently {
+        & docker compose --env-file $EnvironmentFile -p $script:ProjectName `
+            -f $ComposeFile -f $OverrideFile exec -T $Service `
+            python -c $code $Url
+    }
+    return $exitCode -eq 0
 }
 
 function Wait-CandidateContainerHttp(
@@ -577,10 +645,13 @@ function Get-FirstLanIp {
 }
 
 function Get-ProjectVolume([string] $VolumeKey) {
-    $volumes = @(& docker volume ls `
-        --filter "label=com.docker.compose.project=$script:ProjectName" `
-        --filter "label=com.docker.compose.volume=$VolumeKey" `
-        --format '{{.Name}}' 2>$null)
+    $native = Invoke-NativeCapture {
+        & docker volume ls `
+            --filter "label=com.docker.compose.project=$script:ProjectName" `
+            --filter "label=com.docker.compose.volume=$VolumeKey" `
+            --format '{{.Name}}'
+    }
+    $volumes = @($native.Output)
     return [string](@($volumes | Where-Object { $_ } | Select-Object -First 1))
 }
 
@@ -589,8 +660,11 @@ function Test-LegacyTargetVolumeExists([string] $VolumeKey) {
         return $true
     }
     $expected = "$($script:ProjectName)_$VolumeKey"
-    $names = @(& docker volume inspect $expected --format '{{.Name}}' 2>$null)
-    return $LASTEXITCODE -eq 0 -and
+    $native = Invoke-NativeCapture {
+        & docker volume inspect $expected --format '{{.Name}}'
+    }
+    $names = @($native.Output)
+    return $native.ExitCode -eq 0 -and
         [string](@($names | Where-Object { $_ } | Select-Object -First 1)) -eq $expected
 }
 
@@ -604,27 +678,34 @@ function Remove-LegacyTransactionVolumes {
         if ((Get-JsonPropertyValue $metadata "legacy_targets_absent") -ne $true) {
             return $false
         }
-        $containers = @(& docker ps -aq `
-            --filter "label=com.docker.compose.project=$($script:ProjectName)" 2>$null)
+        $native = Invoke-NativeCapture {
+            & docker ps -aq `
+                --filter "label=com.docker.compose.project=$($script:ProjectName)"
+        }
+        $containers = @($native.Output)
         foreach ($container in @($containers | Where-Object { $_ })) {
-            & docker rm -f $container *> $null
-            if ($LASTEXITCODE -ne 0) { return $false }
+            if ((Invoke-NativeSilently { & docker rm -f $container }) -ne 0) {
+                return $false
+            }
         }
         foreach ($key in @(
             "memory-data", "memory-secrets", "model-data", "model-secrets"
         )) {
             $volume = Get-ProjectVolume $key
             if ([string]::IsNullOrWhiteSpace($volume)) { continue }
-            $labels = @(& docker volume inspect $volume --format `
-                '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}' `
-                2>$null)
+            $native = Invoke-NativeCapture {
+                & docker volume inspect $volume --format `
+                    '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}'
+            }
+            $labels = @($native.Output)
             $labelValue = [string](@($labels | Where-Object { $_ } | Select-Object -First 1))
-            if ($LASTEXITCODE -ne 0 -or
+            if ($native.ExitCode -ne 0 -or
                 $labelValue -ne "$($script:ProjectName)|$key") {
                 return $false
             }
-            & docker volume rm $volume *> $null
-            if ($LASTEXITCODE -ne 0) { return $false }
+            if ((Invoke-NativeSilently { & docker volume rm $volume }) -ne 0) {
+                return $false
+            }
         }
         return $true
     } catch {
@@ -634,19 +715,23 @@ function Remove-LegacyTransactionVolumes {
 
 function Get-ContainerVolume([string] $Container, [string] $Destination) {
     $format = "{{range .Mounts}}{{if eq .Destination `"$Destination`"}}{{.Name}}{{end}}{{end}}"
-    $values = @(& docker inspect $Container --format $format 2>$null)
-    if ($LASTEXITCODE -ne 0) { return "" }
+    $native = Invoke-NativeCapture { & docker inspect $Container --format $format }
+    $values = @($native.Output)
+    if ($native.ExitCode -ne 0) { return "" }
     return [string](@($values | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1))
 }
 
 function Get-ServiceImageId([string] $ComposeFile, [string] $Service) {
-    $containers = @(& docker compose -p $script:ProjectName -f $ComposeFile `
-        ps -aq $Service 2>$null)
+    $native = Invoke-NativeCapture {
+        & docker compose -p $script:ProjectName -f $ComposeFile ps -aq $Service
+    }
+    $containers = @($native.Output)
     $container = [string](@($containers | ForEach-Object { $_.Trim() } |
         Where-Object { $_ } | Select-Object -First 1))
     if ([string]::IsNullOrWhiteSpace($container)) { return "" }
-    $images = @(& docker inspect $container --format '{{.Image}}' 2>$null)
-    if ($LASTEXITCODE -ne 0) { return "" }
+    $native = Invoke-NativeCapture { & docker inspect $container --format '{{.Image}}' }
+    $images = @($native.Output)
+    if ($native.ExitCode -ne 0) { return "" }
     return [string](@($images | ForEach-Object { $_.Trim() } |
         Where-Object { $_ } | Select-Object -First 1))
 }
@@ -655,9 +740,12 @@ function Resolve-ImageDigest([string] $Tag) {
     $separator = $Tag.LastIndexOf(":")
     if ($separator -lt 1) { Stop-Install "发布镜像名称无效。" }
     $repository = $Tag.Substring(0, $separator)
-    $references = @(& docker image inspect $Tag `
-        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $native = Invoke-NativeCapture {
+        & docker image inspect $Tag `
+            --format '{{range .RepoDigests}}{{println .}}{{end}}'
+    }
+    $references = @($native.Output)
+    if ($native.ExitCode -ne 0) {
         Stop-Install "无法检查已拉取镜像的 digest。"
     }
     $pattern = "^$([Regex]::Escape($repository))@sha256:[0-9a-f]{64}$"
@@ -709,23 +797,27 @@ function Test-ReleaseComposeSignature(
     [string] $Release
 ) {
     $identity = "https://github.com/SparkHello/Memory_Platform/.github/workflows/docker.yml@refs/tags/$Release"
-    & $script:CosignPath verify-blob `
-        --bundle $Bundle `
-        --certificate-identity $identity `
-        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
-        $ComposeFile *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $exitCode = Invoke-NativeSilently {
+        & $script:CosignPath verify-blob `
+            --bundle $Bundle `
+            --certificate-identity $identity `
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+            $ComposeFile
+    }
+    if ($exitCode -ne 0) {
         Stop-Install "发布 Compose 的 Sigstore 签名无效。"
     }
 }
 
 function Test-ReleaseSignature([string] $Image, [string] $Release) {
     $identity = "https://github.com/SparkHello/Memory_Platform/.github/workflows/docker.yml@refs/tags/$Release"
-    & $script:CosignPath verify `
-        --certificate-identity $identity `
-        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
-        $Image *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $exitCode = Invoke-NativeSilently {
+        & $script:CosignPath verify `
+            --certificate-identity $identity `
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+            $Image
+    }
+    if ($exitCode -ne 0) {
         Stop-Install "发布镜像签名无效或不是由固定 tag 的官方工作流生成。"
     }
 }
@@ -754,10 +846,13 @@ function Test-CandidateCompose(
     [string] $EnvironmentFile,
     [hashtable] $ExpectedImages
 ) {
-    $jsonLines = @(& docker compose --env-file $EnvironmentFile `
-        -p $script:ProjectName --profile maintenance `
-        -f $ComposeFile config --format json 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $jsonLines.Count -eq 0) {
+    $native = Invoke-NativeCapture {
+        & docker compose --env-file $EnvironmentFile `
+            -p $script:ProjectName --profile maintenance `
+            -f $ComposeFile config --format json
+    }
+    $jsonLines = @($native.Output)
+    if ($native.ExitCode -ne 0 -or $jsonLines.Count -eq 0) {
         Stop-Install "候选 Compose 语法无效。"
     }
     try {
@@ -799,10 +894,12 @@ function Test-InternalOverrideCompose(
     [string] $OverrideFile,
     [string] $EnvironmentFile
 ) {
-    & docker compose --env-file $EnvironmentFile `
-        -p $script:ProjectName --profile maintenance `
-        -f $ComposeFile -f $OverrideFile config *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $exitCode = Invoke-NativeSilently {
+        & docker compose --env-file $EnvironmentFile `
+            -p $script:ProjectName --profile maintenance `
+            -f $ComposeFile -f $OverrideFile config
+    }
+    if ($exitCode -ne 0) {
         Stop-Install "本地验收 override 无法生成 Compose 配置。"
     }
 }
@@ -960,8 +1057,10 @@ function Invoke-OldComposeUp(
                 Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
             }
         }
-        & docker compose -p $Project -f $ComposeFile up -d --pull never *> $null
-        return $LASTEXITCODE -eq 0
+        $exitCode = Invoke-NativeSilently {
+            & docker compose -p $Project -f $ComposeFile up -d --pull never
+        }
+        return $exitCode -eq 0
     } finally {
         foreach ($name in $saved.Keys) {
             if ($null -eq $saved[$name]) {
@@ -1118,8 +1217,7 @@ for member in archive.namelist():
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=268435456",
         "--entrypoint", "python", $VerifyImage, "-c", $verifyScript
     )
-    & docker @arguments *> $null
-    return $LASTEXITCODE -eq 0
+    return (Invoke-NativeSilently { & docker @arguments }) -eq 0
 }
 
 function New-QuiescedBackup(
@@ -1131,7 +1229,10 @@ function New-QuiescedBackup(
     $backupDirectory = Join-Path $script:InstallDirectory "backups"
     $backupPath = Join-Path $backupDirectory $backupName
     $runner = "$($script:ProjectName)-cutover-backup-$PID"
-    $existing = @(& docker ps -aq --filter "name=^/$runner$" 2>$null)
+    $native = Invoke-NativeCapture {
+        & docker ps -aq --filter "name=^/$runner$"
+    }
+    $existing = @($native.Output)
     if (@($existing | Where-Object { $_ }).Count -gt 0) { return $false }
     $directBackup = $false
 
@@ -1188,19 +1289,21 @@ function New-QuiescedBackup(
         $verifyImage = $script:InitImage
     }
 
-    & docker @arguments *> $null
-    if ($LASTEXITCODE -ne 0) {
-        & docker rm -f $runner *> $null
+    $backupExitCode = Invoke-NativeSilently { & docker @arguments }
+    if ($backupExitCode -ne 0) {
+        [void](Invoke-NativeSilently { & docker rm -f $runner })
         Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
         return $false
     }
     if (-not $directBackup) {
-        & docker cp "${runner}:/data/$backupName" $backupPath *> $null
-        $copied = $LASTEXITCODE -eq 0 -and
+        $copyExitCode = Invoke-NativeSilently {
+            & docker cp "${runner}:/data/$backupName" $backupPath
+        }
+        $copied = $copyExitCode -eq 0 -and
             (Test-Path -LiteralPath $backupPath -PathType Leaf) -and
             (Get-Item -LiteralPath $backupPath).Length -gt 0
-        & docker rm -f $runner *> $null
-        if (-not $copied -or $LASTEXITCODE -ne 0) { return $false }
+        $removeExitCode = Invoke-NativeSilently { & docker rm -f $runner }
+        if (-not $copied -or $removeExitCode -ne 0) { return $false }
         $cleanupArguments = @(
             "run", "--rm", "--network", "none", "--read-only",
             "--user", "10001:10001", "--cap-drop", "ALL",
@@ -1208,8 +1311,9 @@ function New-QuiescedBackup(
             "--entrypoint", "python", $cleanupImage,
             "-c", "import os,sys; os.unlink(sys.argv[1])", "/data/$backupName"
         )
-        & docker @cleanupArguments *> $null
-        if ($LASTEXITCODE -ne 0) { return $false }
+        if ((Invoke-NativeSilently { & docker @cleanupArguments }) -ne 0) {
+            return $false
+        }
     }
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
         (Get-Item -LiteralPath $backupPath).Length -le 0) {
@@ -1351,9 +1455,11 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
         }
         $script:ProjectName = $project
         $script:Layout = $layout
-        & docker compose --env-file $EnvironmentPath -p $project `
-            -f $script:ComposePath up -d *> $null
-        if ($LASTEXITCODE -ne 0 -or
+        $publishExitCode = Invoke-NativeSilently {
+            & docker compose --env-file $EnvironmentPath -p $project `
+                -f $script:ComposePath up -d
+        }
+        if ($publishExitCode -ne 0 -or
             -not (Wait-HttpEndpoint "http://127.0.0.1:$publishPort/health" 180) -or
             -not (Wait-HttpEndpoint "http://127.0.0.1:$publishPort/readyz" 90)) {
             Stop-Install "已提交升级尚未完成端口发布；journal 已保留供下次幂等恢复。"
@@ -1376,11 +1482,12 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
     Write-Step "检测到中断的升级事务，先幂等恢复旧栈"
     $script:ProjectName = $project
     $script:Layout = $layout
-    $containers = @(& docker ps -aq `
-        --filter "label=com.docker.compose.project=$project" 2>$null)
+    $native = Invoke-NativeCapture {
+        & docker ps -aq --filter "label=com.docker.compose.project=$project"
+    }
+    $containers = @($native.Output)
     foreach ($container in @($containers | Where-Object { $_ })) {
-        & docker stop $container *> $null
-        if ($LASTEXITCODE -ne 0) {
+        if ((Invoke-NativeSilently { & docker stop $container }) -ne 0) {
             Stop-Install "无法停止中断事务中的容器；journal 已保留。"
         }
     }
@@ -1436,8 +1543,7 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
             "--entrypoint", "python", $initImage,
             "/usr/local/libexec/memory-platform/restore_split.py"
         )
-        & docker @restoreArguments *> $null
-        if ($LASTEXITCODE -ne 0) {
+        if ((Invoke-NativeSilently { & docker @restoreArguments }) -ne 0) {
             Stop-Install "中断事务的数据恢复失败；journal 已保留。"
         }
     }
@@ -1453,7 +1559,7 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
 
 function Replace-ComposeAtomically([string] $Source, [string] $Destination) {
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        [IO.File]::Replace($Source, $Destination, $null)
+        Move-PathWriteThrough $Source $Destination
     } else {
         [IO.File]::Move($Source, $Destination)
     }
@@ -1462,7 +1568,9 @@ function Replace-ComposeAtomically([string] $Source, [string] $Destination) {
 function Invoke-Rollback {
     if ($script:Layout -eq "fresh") { return $false }
     Write-Step "新版本未通过验收，恢复旧 Compose"
-    & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
+    [void](Invoke-NativeSilently {
+        & docker compose -p $script:ProjectName -f $script:ComposePath stop
+    })
 
     if ($script:Layout -eq "legacy" -and
         -not (Remove-LegacyTransactionVolumes)) {
@@ -1498,8 +1606,9 @@ function Invoke-Rollback {
             "--entrypoint", "python", $restoreImage,
             "/usr/local/libexec/memory-platform/restore_split.py"
         )
-        & docker @restoreArguments *> $null
-        if ($LASTEXITCODE -ne 0) { return $false }
+        if ((Invoke-NativeSilently { & docker @restoreArguments }) -ne 0) {
+            return $false
+        }
     }
 
     try {
@@ -1605,10 +1714,12 @@ function Invoke-MemoryPlatformInstall {
     if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
         Stop-Install "未找到 Docker。请先安装并启动 Docker Desktop。"
     }
-    & docker info *> $null
-    if ($LASTEXITCODE -ne 0) { Stop-Install "Docker Desktop 尚未运行。" }
-    & docker compose version *> $null
-    if ($LASTEXITCODE -ne 0) { Stop-Install "需要 Docker Compose v2。" }
+    if ((Invoke-NativeSilently { & docker info }) -ne 0) {
+        Stop-Install "Docker Desktop 尚未运行。"
+    }
+    if ((Invoke-NativeSilently { & docker compose version }) -ne 0) {
+        Stop-Install "需要 Docker Compose v2。"
+    }
 
     $installDirectory = [Environment]::GetEnvironmentVariable("MEMORY_PLATFORM_DIR")
     if ([string]::IsNullOrWhiteSpace($installDirectory)) {
@@ -1812,8 +1923,11 @@ function Invoke-MemoryPlatformInstall {
     $oldMemoryContainer = ""
     if ($script:Layout -ne "fresh") {
         $oldService = if ($script:Layout -eq "legacy") { "memory-platform" } else { "memory-gateway" }
-        $containers = @(& docker compose -p $script:ProjectName -f $script:ComposePath `
-            ps -q $oldService 2>$null)
+        $native = Invoke-NativeCapture {
+            & docker compose -p $script:ProjectName -f $script:ComposePath `
+                ps -q $oldService
+        }
+        $containers = @($native.Output)
         $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
         if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
             $identityVolumeKey = if ($script:Layout -eq "legacy") {
@@ -1825,13 +1939,18 @@ function Invoke-MemoryPlatformInstall {
                 Stop-Install "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移。"
             }
             if ($script:Layout -eq "legacy") {
-                & docker compose -p $script:ProjectName -f $script:ComposePath `
-                    up -d --pull never *> $null
-                if ($LASTEXITCODE -ne 0) {
+                $oldStartExitCode = Invoke-NativeSilently {
+                    & docker compose -p $script:ProjectName -f $script:ComposePath `
+                        up -d --pull never
+                }
+                if ($oldStartExitCode -ne 0) {
                     Stop-Install "无法按旧 Compose 启动服务以定位旧数据卷；现有数据未修改。"
                 }
-                $containers = @(& docker compose -p $script:ProjectName -f $script:ComposePath `
-                    ps -q $oldService 2>$null)
+                $native = Invoke-NativeCapture {
+                    & docker compose -p $script:ProjectName -f $script:ComposePath `
+                        ps -q $oldService
+                }
+                $containers = @($native.Output)
                 $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
             }
         }
@@ -1839,8 +1958,10 @@ function Invoke-MemoryPlatformInstall {
             if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
                 Stop-Install "找不到旧 Memory 容器；拒绝在未备份状态下升级。"
             }
-            $legacyImages = @(& docker inspect $oldMemoryContainer `
-                --format '{{.Image}}' 2>$null)
+            $native = Invoke-NativeCapture {
+                & docker inspect $oldMemoryContainer --format '{{.Image}}'
+            }
+            $legacyImages = @($native.Output)
             $script:RollbackMemoryImage = [string](@(
                 $legacyImages | Where-Object { $_ } | Select-Object -First 1
             ))
@@ -1969,8 +2090,10 @@ function Invoke-MemoryPlatformInstall {
     }
 
     if ($script:Layout -ne "fresh") {
-        & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
-        if ($LASTEXITCODE -ne 0) {
+        $stopExitCode = Invoke-NativeSilently {
+            & docker compose -p $script:ProjectName -f $script:ComposePath stop
+        }
+        if ($stopExitCode -ne 0) {
             Restore-ComposeEnvironmentSnapshot
             if (-not (Invoke-OldComposeUp `
                 $script:ComposePath $script:ProjectName $script:Layout `
@@ -2004,7 +2127,7 @@ function Invoke-MemoryPlatformInstall {
     $script:CandidateCompose = ""
     try {
         if (Test-Path -LiteralPath $environmentPath -PathType Leaf) {
-            [IO.File]::Replace($script:CandidateEnvironment, $environmentPath, $null)
+            Move-PathWriteThrough $script:CandidateEnvironment $environmentPath
         } else {
             [IO.File]::Move($script:CandidateEnvironment, $environmentPath)
         }
@@ -2027,24 +2150,28 @@ function Invoke-MemoryPlatformInstall {
             }
             Stop-Install "无法定位旧单卷且自动回滚不完整；请保留 backups 与所有 Docker 卷。"
         }
-        & docker compose --env-file $environmentPath `
-            -p $script:ProjectName -f $script:ComposePath `
-            create stack-init *> $null
-        if ($LASTEXITCODE -ne 0) {
+        $createExitCode = Invoke-NativeSilently {
+            & docker compose --env-file $environmentPath `
+                -p $script:ProjectName -f $script:ComposePath create stack-init
+        }
+        if ($createExitCode -ne 0) {
             if (Invoke-Rollback) { Stop-Install "无法创建新分卷；旧栈已恢复。" }
             Stop-Install "无法创建新分卷且自动回滚不完整。"
         }
-        $initContainers = @(& docker compose --env-file $environmentPath `
-            -p $script:ProjectName -f $script:ComposePath `
-            ps -aq stack-init 2>$null)
+        $native = Invoke-NativeCapture {
+            & docker compose --env-file $environmentPath `
+                -p $script:ProjectName -f $script:ComposePath ps -aq stack-init
+        }
+        $initContainers = @($native.Output)
         $initContainer = [string](@($initContainers | Where-Object { $_ } | Select-Object -First 1))
         $memoryData = Get-ContainerVolume $initContainer "/memory-data"
         $memorySecrets = Get-ContainerVolume $initContainer "/memory-secrets"
         $modelData = Get-ContainerVolume $initContainer "/model-data"
         $modelSecrets = Get-ContainerVolume $initContainer "/model-secrets"
-        & docker compose --env-file $environmentPath `
-            -p $script:ProjectName -f $script:ComposePath `
-            rm -f stack-init *> $null
+        [void](Invoke-NativeSilently {
+            & docker compose --env-file $environmentPath `
+                -p $script:ProjectName -f $script:ComposePath rm -f stack-init
+        })
         $missingVolumes = @(@($memoryData, $memorySecrets, $modelData, $modelSecrets) |
             Where-Object { [string]::IsNullOrWhiteSpace($_) })
         if ($missingVolumes.Count -gt 0) {
@@ -2067,8 +2194,7 @@ function Invoke-MemoryPlatformInstall {
             "--entrypoint", "python", $script:InitImage,
             "/usr/local/libexec/memory-platform/migrate_legacy.py"
         )
-        & docker @migrationArguments *> $null
-        if ($LASTEXITCODE -ne 0) {
+        if ((Invoke-NativeSilently { & docker @migrationArguments }) -ne 0) {
             if (Invoke-Rollback) {
                 Stop-Install "旧单卷离线迁移失败；旧栈已恢复。请保留旧卷和 backups，并改用固定 release 的 WSL 安装器排查。"
             }
@@ -2077,32 +2203,35 @@ function Invoke-MemoryPlatformInstall {
     }
 
     Write-Step "在无宿主发布端口的隔离模式启动候选服务"
-    & docker compose --env-file $environmentPath -p $script:ProjectName `
-        -f $script:ComposePath -f $script:CandidateInternalOverride up -d *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $candidateStartExitCode = Invoke-NativeSilently {
+        & docker compose --env-file $environmentPath -p $script:ProjectName `
+            -f $script:ComposePath -f $script:CandidateInternalOverride up -d
+    }
+    if ($candidateStartExitCode -ne 0) {
         if (Invoke-Rollback) { Stop-Install "新栈启动失败；旧服务和数据已恢复。" }
         Stop-Install "新栈启动失败且自动回滚不完整；请保留 backups 与旧卷。"
     }
 
-    # Only Docker's own port mapping tables are consulted: a host HTTP probe
-    # could be answered by an unrelated third-party process on the same port.
-    $candidatePublished = @(& docker compose --env-file $environmentPath `
-        -p $script:ProjectName -f $script:ComposePath `
-        -f $script:CandidateInternalOverride port memory-gateway 2026 2>$null)
+    # Query each candidate container's actual port bindings. Compose v5 prints
+    # the synthetic value "invalid IP:0" for an exposed-but-unpublished port,
+    # so `docker compose port` cannot distinguish that safe state here.
     $runtimePublished = @()
     foreach ($candidateService in @("memory-gateway", "model-gateway")) {
-        $candidateIds = @(& docker compose --env-file $environmentPath `
-            -p $script:ProjectName -f $script:ComposePath `
-            -f $script:CandidateInternalOverride ps -q $candidateService 2>$null)
+        $native = Invoke-NativeCapture {
+            & docker compose --env-file $environmentPath `
+                -p $script:ProjectName -f $script:ComposePath `
+                -f $script:CandidateInternalOverride ps -q $candidateService
+        }
+        $candidateIds = @($native.Output)
         $candidateId = [string](@(
             $candidateIds | Where-Object { $_ } | Select-Object -First 1
         ))
         if (-not [string]::IsNullOrWhiteSpace($candidateId)) {
-            $runtimePublished += @(& docker port $candidateId 2>$null)
+            $native = Invoke-NativeCapture { & docker port $candidateId }
+            $runtimePublished += @($native.Output)
         }
     }
-    if (@($candidatePublished | Where-Object { $_ }).Count -gt 0 -or
-        @($runtimePublished | Where-Object { $_ }).Count -gt 0) {
+    if (@($runtimePublished | Where-Object { $_ }).Count -gt 0) {
         if (Invoke-Rollback) {
             Stop-Install "候选验收阶段意外发布宿主端口；旧服务和数据已恢复。"
         }
@@ -2147,7 +2276,9 @@ function Invoke-MemoryPlatformInstall {
             Stop-Install "新栈未交付完整 credentials 文件；旧服务和数据已恢复。"
         }
         if ($script:Layout -eq "fresh") {
-            & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
+            [void](Invoke-NativeSilently {
+                & docker compose -p $script:ProjectName -f $script:ComposePath stop
+            })
         }
         Stop-Install "离线初始化没有交付完整 credentials 文件；未从日志读取或显示密钥。"
     }
@@ -2161,7 +2292,9 @@ function Invoke-MemoryPlatformInstall {
             Stop-Install "无法验证 credentials 私有权限；旧服务和数据已恢复。"
         }
         if ($script:Layout -eq "fresh") {
-            & docker compose -p $script:ProjectName -f $script:ComposePath stop *> $null
+            [void](Invoke-NativeSilently {
+                & docker compose -p $script:ProjectName -f $script:ComposePath stop
+            })
         }
         Stop-Install "无法验证 credentials 私有权限；新栈已停止，请使用本机 NTFS 目录重试。"
     }
@@ -2188,10 +2321,12 @@ function Invoke-MemoryPlatformInstall {
     }
 
     Write-Step "发布已验收的 Memory 入口"
-    & docker compose --env-file $environmentPath -p $script:ProjectName `
-        -f $script:ComposePath up -d --no-deps --force-recreate `
-        memory-gateway *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $publishExitCode = Invoke-NativeSilently {
+        & docker compose --env-file $environmentPath -p $script:ProjectName `
+            -f $script:ComposePath up -d --no-deps --force-recreate `
+            memory-gateway
+    }
+    if ($publishExitCode -ne 0) {
         Stop-Install "升级已提交但入口发布失败；不会回滚已接受的新数据，journal 已保留供重试。"
     }
     if (-not (Wait-HttpEndpoint "http://127.0.0.1:$port/health" 180) -or
@@ -2199,9 +2334,12 @@ function Invoke-MemoryPlatformInstall {
          -not (Wait-HttpEndpoint "http://127.0.0.1:$port/readyz" 90))) {
         Stop-Install "升级已提交但宿主入口尚未就绪；不会回滚，journal 已保留供重试。"
     }
-    $published = @(& docker compose --env-file $environmentPath `
-        -p $script:ProjectName -f $script:ComposePath `
-        port memory-gateway 2026 2>$null)
+    $native = Invoke-NativeCapture {
+        & docker compose --env-file $environmentPath `
+            -p $script:ProjectName -f $script:ComposePath `
+            port memory-gateway 2026
+    }
+    $published = @($native.Output)
     if (@($published | Where-Object { $_ -and $_.Trim() -match ":$port$" }).Count -eq 0) {
         Stop-Install "升级已提交但宿主端口契约不匹配；journal 已保留供重试。"
     }

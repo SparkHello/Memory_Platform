@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import stat
 
@@ -196,7 +197,8 @@ def test_config_is_atomic_private_and_backed_up(tmp_path: Path) -> None:
 
     assert load_config(paths.config) == config
     assert json.loads(paths.config.read_text(encoding="utf-8"))["schema_version"] == 2
-    assert stat.S_IMODE(paths.config.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(paths.config.stat().st_mode) == 0o600
     assert paths.config.with_suffix(".json.bak").exists()
 
 

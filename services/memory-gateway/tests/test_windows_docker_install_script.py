@@ -11,6 +11,10 @@ def _installer() -> str:
     return INSTALLER.read_text(encoding="utf-8")
 
 
+def test_windows_installer_has_utf8_bom_for_powershell_51() -> None:
+    assert INSTALLER.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
 def test_windows_installer_uses_a_fixed_release_and_three_digest_images() -> None:
     text = _installer()
 
@@ -50,6 +54,25 @@ def test_windows_installer_never_accepts_or_recovers_secret_values_from_logs() -
     assert "generatedGatewayKey" not in text
     assert "generatedAdminKey" not in text
     assert "Get-Content" not in text
+
+
+def test_windows_private_acl_rewrite_is_idempotent_without_security_privilege() -> None:
+    text = _installer()
+
+    assert "$item.SetAccessControl($acl)" in text
+    assert "Set-Acl -LiteralPath $Path" not in text
+
+
+def test_windows_installer_suppresses_native_stderr_without_powershell_51_abort() -> None:
+    text = _installer()
+
+    assert "function Invoke-NativeCapture" in text
+    assert "function Invoke-NativeSilently" in text
+    assert '$ErrorActionPreference = "Continue"' in text
+    # The helper owns the sole redirected native invocation. Call sites must
+    # not redirect Docker stderr while the script-wide preference is Stop.
+    assert text.count("2>$null") == 1
+    assert "*> $null" not in text
 
 
 def test_windows_upgrade_backs_up_before_candidate_replacement_and_cleans_temp() -> None:
@@ -107,6 +130,8 @@ def test_windows_acceptance_keeps_model_private_and_checks_health_regression() -
 
     # 意外发布宿主端口的检查改为查 Docker 端口映射，而非宿主 curl。
     assert "docker port $candidateId" in text
+    assert "invalid IP:0" in text
+    assert "$candidatePublished" not in text
     assert "意外发布宿主端口" in text
     assert "Model Gateway 2030 仅位于 Docker 内部网络" in text
     assert 'Wait-HttpEndpoint "http://127.0.0.1:$port/health" 180' in text
@@ -163,6 +188,7 @@ def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> N
 
     assert "MoveFileExW" in text
     assert "MOVEFILE_WRITE_THROUGH" in text
+    assert "[IO.File]::Replace" not in text
     assert "Write-DurableTextAtomic" in text
     assert '"committed`n"' in text
     assert "CutoverCommittedCleanup" in text
@@ -195,6 +221,8 @@ def test_windows_installer_pins_existing_project_and_candidate_environment() -> 
 
     assert "Get-ProjectsForInstallDirectory" in text
     assert "com.docker.compose.project.working_dir" in text
+    assert "--format '{{json .Labels}}'" in text
+    assert '{{.Label "com.docker.compose.project.working_dir"}}' not in text
     assert "与旧容器 project 身份冲突" in text
     assert "现有 Compose 没有同 project 的容器或数据卷" in text
     for name in (

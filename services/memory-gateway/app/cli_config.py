@@ -334,7 +334,11 @@ def _quote_env_value(value: str) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    # Windows rejects ``fsync`` on a descriptor opened read-only (EBADF).
+    # These are files managed by this process, so reopen them read/write for
+    # the durability barrier there while preserving the POSIX read-only path.
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:
@@ -342,6 +346,8 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except OSError:

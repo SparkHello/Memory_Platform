@@ -1428,6 +1428,8 @@ def _write_journal(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except OSError:
@@ -1439,7 +1441,8 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:

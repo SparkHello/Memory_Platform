@@ -22,9 +22,35 @@ $functionsPath = Join-Path $temporaryRoot "installer-functions.ps1"
 [IO.File]::WriteAllText(
     $functionsPath,
     ([string]::Join("`n`n", $definitions)),
-    (New-Object Text.UTF8Encoding($false))
+    # Windows PowerShell 5.1 treats UTF-8 without a BOM as the active ANSI
+    # code page.  The extracted functions contain Chinese diagnostics whose
+    # quote characters must survive the round trip before dot-sourcing.
+    (New-Object Text.UTF8Encoding($true))
 )
 . $functionsPath
+
+$runningOnWindows = [Environment]::OSVersion.Platform -eq `
+    [PlatformID]::Win32NT
+if ($runningOnWindows) {
+    $aclProbe = Join-Path $temporaryRoot "private-acl-probe"
+    [IO.File]::WriteAllText($aclProbe, "synthetic")
+    Protect-PrivatePath $aclProbe
+    Protect-PrivatePath $aclProbe
+    $protectedAcl = Get-Acl -LiteralPath $aclProbe
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if (-not $protectedAcl.AreAccessRulesProtected -or
+        @($protectedAcl.Access).Count -ne 1 -or
+        $protectedAcl.Access[0].IdentityReference.Value -ne $currentIdentity -or
+        $protectedAcl.Access[0].FileSystemRights -ne `
+            [Security.AccessControl.FileSystemRights]::FullControl) {
+        throw "private ACL was not restricted to the current Windows user"
+    }
+    $lockProbe = Join-Path $temporaryRoot "installer-lock-probe"
+    Acquire-InstallerLock $lockProbe
+    Release-InstallerLock
+    Acquire-InstallerLock $lockProbe
+    Release-InstallerLock
+}
 
 # Native MoveFileEx is Windows-only. The journal state machine itself is
 # exercised cross-platform with an atomic same-filesystem move substitute;
@@ -56,8 +82,26 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 try {
-    $runningOnWindows = [Environment]::OSVersion.Platform -eq `
-        [PlatformID]::Win32NT
+    if ($runningOnWindows) {
+        $nativeSuccess = Invoke-NativeSilently {
+            & cmd.exe /d /c 'echo normal-progress 1>&2 & exit /b 0'
+        }
+        $nativeFailure = Invoke-NativeSilently {
+            & cmd.exe /d /c 'echo expected-failure 1>&2 & exit /b 7'
+        }
+    } else {
+        $nativeSuccess = Invoke-NativeSilently {
+            & sh -c 'echo normal-progress >&2; exit 0'
+        }
+        $nativeFailure = Invoke-NativeSilently {
+            & sh -c 'echo expected-failure >&2; exit 7'
+        }
+    }
+    Assert-True ($nativeSuccess -eq 0) `
+        "native stderr converted a successful command into an installer failure"
+    Assert-True ($nativeFailure -eq 7) `
+        "native command exit status was not preserved"
+
     if (-not $runningOnWindows) {
         $nativeBin = Join-Path $temporaryRoot "native-bin"
         New-Item -ItemType Directory -Path $nativeBin | Out-Null
@@ -252,7 +296,10 @@ IFS= read -r value
         $Arguments = @($args)
         $global:LASTEXITCODE = 0
         if ($Arguments[0] -eq "ps") {
-            "$identityDirectory|authoritative-project"
+            @{
+                "com.docker.compose.project.working_dir" = $identityDirectory
+                "com.docker.compose.project" = "authoritative-project"
+            } | ConvertTo-Json -Compress
         }
     }
     $projects = @(Get-ProjectsForInstallDirectory $identityDirectory)

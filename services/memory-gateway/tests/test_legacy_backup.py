@@ -5,6 +5,14 @@ import os
 from pathlib import Path
 import sqlite3
 
+import pytest
+
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="legacy volume helpers run inside the Linux migration container",
+)
+
 
 ROOT = Path(__file__).resolve().parents[3]
 

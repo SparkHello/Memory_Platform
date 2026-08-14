@@ -1039,7 +1039,9 @@ def _cmd_run(args: Any, paths: CliPaths, project_root: Path) -> int:
 def _cmd_start(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
     state = _read_state(paths)
-    if state and _pid_running(int(state.get("pid", 0))):
+    if state and _pid_running(int(state.get("pid", 0))) and _pid_matches_gateway(
+        int(state.get("pid", 0))
+    ):
         print(f"服务已经在运行，PID {state['pid']}。")
         return 0
     command, environment, port = _server_command(args, paths, project_root)
@@ -1099,7 +1101,14 @@ def _cmd_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
             "确认后可使用 --force。"
         )
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T"], check=False)
+        # Detached console processes do not receive a graceful CTRL event.
+        # Terminate the already identity-checked process tree explicitly.
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     else:
         os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 10
@@ -1134,7 +1143,7 @@ def _cmd_status(args: Any, paths: CliPaths, project_root: Path) -> int:
         return 1
     pid = int(state.get("pid", 0))
     port = int(state.get("port", 2026))
-    running = _pid_running(pid)
+    running = _pid_running(pid) and _pid_matches_gateway(pid)
     healthy = _health_ok(port) if running else False
     print(f"状态：{'运行中' if running else '已停止'}")
     print(f"PID：{pid}")
@@ -1807,6 +1816,14 @@ def _server_command(args: Any, paths: CliPaths, project_root: Path) -> tuple[lis
         if not is_secret_name(name)
     }
     environment["MEMGW_SETTINGS_PATH"] = str(paths.settings_env)
+    if os.name == "nt":
+        base_python = _windows_venv_base_python(python)
+        if base_python != python.resolve():
+            # Python 3.14's Windows venv launcher starts the base interpreter
+            # as a child and exits.  Launch the interpreter directly so the
+            # recorded PID remains the gateway PID, while preserving the venv.
+            command[0] = str(base_python)
+            environment["__PYVENV_LAUNCHER__"] = str(python.resolve())
     return command, environment, port
 
 
@@ -1816,6 +1833,28 @@ def _project_python(project_root: Path) -> Path:
         if os.name == "nt"
         else project_root / ".venv" / "bin" / "python"
     )
+
+
+def _windows_venv_base_python(venv_python: Path) -> Path:
+    configuration = venv_python.parent.parent / "pyvenv.cfg"
+    try:
+        values = {
+            key.strip().lower(): value.strip()
+            for line in configuration.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+            for key, value in [line.split("=", 1)]
+        }
+    except OSError:
+        return venv_python.resolve()
+    candidates = []
+    if values.get("executable"):
+        candidates.append(Path(values["executable"]))
+    if values.get("home"):
+        candidates.append(Path(values["home"]) / "python.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return venv_python.resolve()
 
 
 def _read_state(paths: CliPaths) -> dict[str, Any] | None:
@@ -1830,6 +1869,33 @@ def _read_state(paths: CliPaths) -> dict[str, Any] | None:
 def _pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # signal 0 is CTRL_C_EVENT on Windows, so os.kill(pid, 0) is not a
+        # harmless existence probe and can interrupt the managed process.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            close_handle(handle)
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
@@ -1839,14 +1905,39 @@ def _pid_running(pid: int) -> bool:
 
 def _pid_matches_gateway(pid: int) -> bool:
     if os.name == "nt":
-        return True
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    command = result.stdout.lower()
+        script = (
+            '$p = Get-CimInstance Win32_Process -Filter "ProcessId = '
+            f'{pid}"; if ($null -ne $p) {{ $p.CommandLine }}'
+        )
+        command = ""
+        for executable in ("powershell.exe", "pwsh.exe"):
+            try:
+                result = subprocess.run(
+                    [
+                        executable,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                command = result.stdout.lower()
+                break
+    else:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        command = result.stdout.lower()
     return "uvicorn" in command and "app.main:app" in command
 
 

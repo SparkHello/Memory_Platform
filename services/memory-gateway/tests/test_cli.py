@@ -4,10 +4,12 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 from types import SimpleNamespace
 import sys
 
+import httpx
 import pytest
 
 from app.auth.tokens import AuthTokenStore
@@ -327,7 +329,7 @@ def test_user_menu_opens_independent_model_service_menu(
     )
 
     assert main([*args, "menu"]) == 0
-    assert calls == [["/fake/modelgw"]]
+    assert calls == [[str(Path("/fake/modelgw"))]]
 
 
 def test_user_menu_creates_scoped_device_token_instead_of_legacy_key(
@@ -385,6 +387,29 @@ def test_stack_lifecycle_starts_model_first_and_stops_memory_first(
     calls.clear()
     assert main([*args, "stack", "stop"]) == 0
     assert calls == ["memory:stop", "model:stop"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows venv process regression")
+def test_windows_background_start_tracks_the_gateway_process(tmp_path) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    try:
+        assert main([*args, "start", "--port", str(port)]) == 0
+        assert main([*args, "status"]) == 0
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/health",
+            timeout=2,
+            trust_env=False,
+        )
+        assert response.status_code == 200
+    finally:
+        main([*args, "stop", "--force"])
+
+    assert main([*args, "status"]) == 1
 
 
 def test_stack_install_rotates_and_syncs_backend_key_without_echo(
@@ -531,8 +556,9 @@ def test_stack_install_provisions_scoped_console_credential_without_echo(
         "default",
         "console",
     )
-    assert paths.credentials.stat().st_mode & 0o777 == 0o700
-    assert credential_path.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert paths.credentials.stat().st_mode & 0o777 == 0o700
+        assert credential_path.stat().st_mode & 0o777 == 0o600
     assert token not in output
     assert str(credential_path) in output
 
@@ -611,7 +637,8 @@ def test_stack_install_generates_admin_key_once_when_missing(
     assert len(admin_key) >= 32
     admin_path = cli_paths(tmp_path / "memgw-home").credentials / "admin.key"
     assert admin_path.read_text(encoding="ascii").strip() == admin_key
-    assert admin_path.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert admin_path.stat().st_mode & 0o777 == 0o600
     assert admin_key not in output
     assert str(admin_path) in output
 
@@ -648,7 +675,8 @@ def test_stack_install_supports_private_custom_credential_directory(
         credential = credential_dir / name
         value = credential.read_text(encoding="ascii").strip()
         assert value
-        assert credential.stat().st_mode & 0o777 == 0o600
+        if os.name == "posix":
+            assert credential.stat().st_mode & 0o777 == 0o600
         assert value not in output
         assert str(credential) in output
 
@@ -698,7 +726,12 @@ def test_stack_install_rejects_symlink_credential_directory(
     target = tmp_path / "target"
     target.mkdir()
     linked = tmp_path / "credentials-link"
-    linked.symlink_to(target, target_is_directory=True)
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
 
     assert (
         main(
@@ -817,6 +850,7 @@ def test_settings_error_redaction_and_secret_name_suffixes() -> None:
     assert not _is_secret_name("LOG_LEVEL")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="root source setup is a POSIX script")
 def test_root_setup_returns_machine_readable_error_before_any_mutation() -> None:
     platform_root = Path(__file__).resolve().parents[3]
     result = subprocess.run(
@@ -842,6 +876,7 @@ def test_root_setup_returns_machine_readable_error_before_any_mutation() -> None
     assert "provider API key is required" in result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="root source setup is a POSIX script")
 def test_root_setup_rejects_access_secrets_from_environment_before_bootstrap() -> None:
     platform_root = Path(__file__).resolve().parents[3]
     environment = dict(os.environ)

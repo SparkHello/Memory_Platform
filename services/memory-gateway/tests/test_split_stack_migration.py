@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -10,6 +11,12 @@ import pytest
 from app.cli_config import read_env_file, write_env_atomic
 from model_gateway.config_store import load_config, write_config, write_secrets
 from model_gateway.models import GatewayConfig
+
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="split migration helpers run inside the Linux migration container",
+)
 
 
 def _load_migrator():
