@@ -286,13 +286,6 @@ async def test_model_gateway_does_not_retry_failed_central_route() -> None:
 
 @pytest.mark.asyncio
 async def test_model_gateway_usage_is_not_duplicated_in_local_ledger() -> None:
-    class CapturingUsageRecorder:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        def record_response(self, **kwargs) -> None:
-            self.calls.append(kwargs)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode("utf-8"))
         return httpx.Response(
@@ -313,12 +306,10 @@ async def test_model_gateway_usage_is_not_duplicated_in_local_ledger() -> None:
             },
         )
 
-    recorder = CapturingUsageRecorder()
     settings = _central_settings()
     client = OpenAICompatibleClient(
         settings=settings,
         transport=httpx.MockTransport(handler),
-        usage_recorder=recorder,  # type: ignore[arg-type]
     )
     request = ChatCompletionRequest(
         model="memory-review-editor",
@@ -331,7 +322,6 @@ async def test_model_gateway_usage_is_not_duplicated_in_local_ledger() -> None:
     )
 
     assert response["model"] == "route.review"
-    assert recorder.calls == []
 
 
 def json_module_dumps(value: dict) -> str:

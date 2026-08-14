@@ -148,11 +148,11 @@ def _memory_to_dict(memory: MemoryRecord) -> dict:
         "space_ids": memory.space_ids,
         "temporal_subject": memory.temporal_subject,
         "temporal_predicate": memory.temporal_predicate,
-        "status": getattr(memory, "status", "dynamic"),
-        "digested": getattr(memory, "digested", False),
-        "decay_lambda": getattr(memory, "decay_lambda", None),
-        "supersedes": getattr(memory, "supersedes", None),
-        "superseded_by": getattr(memory, "superseded_by", None),
+        "status": memory.status,
+        "digested": memory.digested,
+        "decay_lambda": memory.decay_lambda,
+        "supersedes": memory.supersedes,
+        "superseded_by": memory.superseded_by,
         "created_at": memory.created_at,
         "updated_at": memory.updated_at,
         "archived_at": memory.archived_at,
@@ -228,12 +228,6 @@ def _knowledge_model_dump(value: object) -> dict:
         payload = model_dump()
         if isinstance(payload, dict):
             return payload
-    if hasattr(value, "__dict__"):
-        return {
-            key: item
-            for key, item in vars(value).items()
-            if not key.startswith("_")
-        }
     raise TypeError("knowledge result is not serializable")
 
 

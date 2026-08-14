@@ -26,9 +26,6 @@ from model_gateway.http_safety import (
 
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
-# Historical label only: plan type no longer forces usage_scope. Operators who
-# want interactive-only may still set usage_scope explicitly.
-RESTRICTED_PLAN_TYPES: frozenset[str] = frozenset()
 FORBIDDEN_UPSTREAM_FORWARD_HEADERS = frozenset(
     {
         "api-key",

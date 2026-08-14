@@ -155,7 +155,6 @@ def get_knowledge_search_agent(
     return KnowledgeSearchAgent(
         store=retrieval,
         config=config,
-        usage_recorder=None,
     )
 
 

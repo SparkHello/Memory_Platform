@@ -15,6 +15,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.knowledge.store import detect_knowledge_text_sensitivity
+from app.knowledge.retrieval import KnowledgeRetrievalService
 from app.llm.model_gateway import (
     MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER,
     MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER,
@@ -24,7 +25,6 @@ from app.llm.model_gateway import (
 )
 from app.llm.runtime import ModelRuntime
 from app.usage.context import model_usage_scope
-from app.usage.recorder import UsageRecorder
 from app.usage.attribution import model_gateway_usage_headers
 
 
@@ -148,12 +148,10 @@ class OpenAICompatibleKnowledgeAgentClient:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         wall_clock: Any = time.time,
-        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.config = config
         self.transport = transport
         self._wall_clock = wall_clock
-        self.usage_recorder = usage_recorder
         self._central_affinity: dict[str, str] = {}
 
     async def create_chat_completion(
@@ -403,19 +401,15 @@ class KnowledgeSearchAgent:
 
     def __init__(
         self,
-        store: Any,
+        store: KnowledgeRetrievalService,
         config: KnowledgeAgentConfig,
         *,
         client: KnowledgeCompletionClient | None = None,
         clock: Any = time.monotonic,
-        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.store = store
         self.config = config
-        self.client = client or OpenAICompatibleKnowledgeAgentClient(
-            config,
-            usage_recorder=usage_recorder,
-        )
+        self.client = client or OpenAICompatibleKnowledgeAgentClient(config)
         self._clock = clock
 
     async def search(
@@ -898,14 +892,11 @@ class KnowledgeSearchAgent:
         include_sensitive: bool,
         deadline: float,
     ) -> Sequence[Any]:
-        method = getattr(self.store, "search_chunks", None)
-        if method is None:
-            raise RuntimeError("KnowledgeStore lacks search_chunks")
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
         # The retrieval service methods are async; await them with a deadline.
-        value = method(
+        value = self.store.search_chunks(
             user_id=user_id,
             query=query,
             limit=limit,
@@ -925,14 +916,11 @@ class KnowledgeSearchAgent:
         include_sensitive: bool,
         deadline: float,
     ) -> Sequence[Any]:
-        method = getattr(self.store, "get_chunks_by_refs", None)
-        if method is None:
-            raise RuntimeError("KnowledgeStore lacks get_chunks_by_refs")
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise asyncio.TimeoutError
         # The retrieval service methods are async; await them with a deadline.
-        value = method(
+        value = self.store.get_chunks_by_refs(
             user_id=user_id,
             chunk_refs=chunk_refs,
             include_sensitive=include_sensitive,

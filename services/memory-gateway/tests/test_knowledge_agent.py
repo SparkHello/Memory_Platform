@@ -586,7 +586,6 @@ async def test_model_gateway_knowledge_client_keeps_phase_deployment_affinity(
     monkeypatch,
 ) -> None:
     requests: list[dict] = []
-    local_usage_calls: list[dict] = []
     client_options: list[dict] = []
     original_client = httpx.AsyncClient
 
@@ -627,11 +626,6 @@ async def test_model_gateway_knowledge_client_keeps_phase_deployment_affinity(
     client = OpenAICompatibleKnowledgeAgentClient(
         _central_config(),
         transport=httpx.MockTransport(handler),
-        usage_recorder=type(
-            "Recorder",
-            (),
-            {"record_response": lambda _self, **kwargs: local_usage_calls.append(kwargs)},
-        )(),
     )
     for _ in range(2):
         await client.create_chat_completion(
@@ -654,7 +648,6 @@ async def test_model_gateway_knowledge_client_keeps_phase_deployment_affinity(
     assert requests[0]["operation"] == "knowledge_agent_flash"
     assert requests[0]["correlation"].startswith("mgc_")
     assert requests[0]["user_tag"].startswith("usr_")
-    assert local_usage_calls == []
     assert all(options["trust_env"] is False for options in client_options)
     assert all(options["follow_redirects"] is False for options in client_options)
 

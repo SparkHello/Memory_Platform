@@ -29,14 +29,10 @@ class OpenAICompatibleClient:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         wall_clock: Any = time.time,
-        usage_recorder: Any = None,
     ):
         self.settings = settings
         self.transport = transport
         self._wall_clock = wall_clock
-        # Central gateway records usage itself; keep the argument for call-site
-        # compatibility during the dual-path removal.
-        self.usage_recorder = usage_recorder
 
     async def create_chat_completion(
         self,

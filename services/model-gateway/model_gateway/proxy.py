@@ -150,7 +150,7 @@ class RawOpenAIProxy:
                 break
             if not self.router.runtime_health.available(target):
                 continue
-            url = self._url(target, stream=False)
+            url = self._url(target)
             if self.transport is None:
                 try:
                     await require_safe_destination(
@@ -305,7 +305,7 @@ class RawOpenAIProxy:
                 break
             if not self.router.runtime_health.available(target):
                 continue
-            url = self._url(target, stream=True)
+            url = self._url(target)
             if self.transport is None:
                 try:
                     await require_safe_destination(
@@ -321,7 +321,7 @@ class RawOpenAIProxy:
                     continue
             attempts += 1
             attempt_started = time.monotonic()
-            client = self._client(target, stream=True)
+            client = self._client(target)
             response: httpx.Response | None = None
             try:
                 request = client.build_request(
@@ -527,8 +527,7 @@ class RawOpenAIProxy:
             attempt_traces=tuple(attempt_traces),
         )
 
-    def _client(self, target: RouteTarget, *, stream: bool = False) -> httpx.AsyncClient:
-        del stream
+    def _client(self, target: RouteTarget) -> httpx.AsyncClient:
         connection = target.connection
         key = (
             float(connection.connect_timeout_seconds),
@@ -565,8 +564,7 @@ class RawOpenAIProxy:
             await client.aclose()
 
     @staticmethod
-    def _url(target: RouteTarget, *, stream: bool) -> str:
-        del stream
+    def _url(target: RouteTarget) -> str:
         endpoint = (
             target.connection.chat_endpoint
             if target.deployment.kind == "chat"

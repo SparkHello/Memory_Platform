@@ -12,7 +12,6 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import stat
 import subprocess
@@ -70,6 +69,7 @@ from model_gateway.process import (
     _state_process_matches,
     _write_state,
 )
+from model_gateway.quickstart import _default_secret_ref
 from model_gateway.routing import RouteTarget
 from model_gateway.usage import AttemptTrace, UsageCapture, UsageStore
 
@@ -2672,15 +2672,6 @@ def _resolve_secret_ref(config: GatewayConfig, name: str) -> str:
     return validate_id(normalized, "secret_ref")
 
 
-def _default_secret_ref(prefix: str, item_id: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", item_id).strip("_").upper()
-    value = f"{prefix}_{slug}_API_KEY"
-    if len(value) <= 120:
-        return value
-    digest = sha256(item_id.encode("utf-8")).hexdigest()[:8].upper()
-    return f"{value[:111]}_{digest}"
-
-
 def _secret_references(config: GatewayConfig) -> dict[str, list[str]]:
     references: dict[str, list[str]] = {}
     for client_id, client in config.clients.items():
@@ -2968,5 +2959,3 @@ def _clean_error(exc: BaseException) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    commit_control_plane,
-    configuration_revision,

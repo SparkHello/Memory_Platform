@@ -442,7 +442,6 @@ async def test_failover_is_billed_to_the_actual_successful_provider(
     client = OpenAICompatibleClient(
         settings=settings,
         transport=httpx.MockTransport(handler),
-        usage_recorder=UsageRecorder(database_path),
     )
     request = ChatCompletionRequest(
         model="memory-review-editor",

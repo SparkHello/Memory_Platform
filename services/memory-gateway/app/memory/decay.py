@@ -17,8 +17,6 @@ def _load_sector_lambda_map() -> dict[str, float]:
     if SECTOR_LAMBDA_MAP:
         return SECTOR_LAMBDA_MAP
     try:
-        from app.config import get_settings
-
         raw = get_settings().decay_sector_lambda_map
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
