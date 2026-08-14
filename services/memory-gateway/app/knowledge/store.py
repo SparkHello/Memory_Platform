@@ -32,6 +32,7 @@ from app.schema_migrations import (
     validated_schema_version,
 )
 from app.schema_versions import KNOWLEDGE_SCHEMA_VERSION
+from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK, detect_text_sensitivity
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -41,7 +42,6 @@ _ID_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SHA256_RE: Final = re.compile(r"^[0-9a-fA-F]{64}$")
 _CONTENT_TYPES: Final = {"text/plain", "text/markdown"}
 _SENSITIVITIES: Final = {"normal", "private", "sensitive"}
-_SENSITIVITY_RANK: Final = {"normal": 0, "private": 1, "sensitive": 2}
 _UPLOAD_PART_MAX_CHARS: Final = 1_048_576
 _UPLOAD_TTL_HOURS: Final = 24
 _MAX_RESTORE_TOTAL_BYTES: Final = 100 * 1024 * 1024
@@ -58,50 +58,6 @@ def _serialize_knowledge_init(method):
             return method(*args, **kwargs)
 
     return wrapped
-
-# This deliberately small, deterministic floor protects the most common
-# credential and personal-data forms without involving a remote model.  It is
-# enforced again at the storage boundary, including metadata-only updates and
-# historical-version restores.
-_SENSITIVE_PATTERNS: Final = (
-    re.compile(
-        r"密码|口令|验证码|密钥|私钥|助记词|身份证|护照号|社保号|驾驶证号|"
-        r"健康隐私|病历|确诊|诊断|疾病|患有|过敏|用药|药物|处方|病史|症状|治疗|"
-        r"手术|血糖|血压|心率|糖尿病|癌症|抑郁症|焦虑症|银行卡|信用卡|银行账户|"
-        r"银行账号|支付账号|账户余额|家庭住址|家庭地址|详细地址|门牌号|收货地址",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:password|passcode|pin\s*(?:code)?|otp|api[-_ ]?key|"
-        r"access[-_ ]?token|secret[-_ ]?key|private[-_ ]?key|seed phrase|"
-        r"passport (?:number|no\.?|id)|social security|ssn|medical|"
-        r"diagnos(?:is|ed)|disease|allerg(?:y|ic)|medication|prescription|"
-        r"credit card|debit card|bank account|account balance|home address|"
-        r"street address)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret)\b\s*[:=]"),
-    re.compile(r"(?i)\b(?:sk|pk|token)[-_][A-Za-z0-9_-]{4,}\b"),
-    re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
-    re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
-    re.compile(r"\b\d{15,19}\b"),
-    re.compile(r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(r"(?:省|市|区|县).{0,20}(?:路|街|道|巷|弄).{0,10}\d+\s*号"),
-    re.compile(
-        r"\b\d{1,6}\s+[A-Za-z][A-Za-z .'-]{1,40}\s+(?:Street|St|Road|Rd|Avenue|Ave)\b",
-        re.IGNORECASE,
-    ),
-)
-_PRIVATE_PATTERNS: Final = (
-    re.compile(
-        r"手机号|电话号码|电子邮箱|邮箱地址|工资|收入|债务|负债|"
-        r"\b(?:phone number|e-?mail address|salary|income|debt)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
-    re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
-    re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
-)
 
 
 class KnowledgeError(Exception):
@@ -3294,11 +3250,7 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 def _detect_sensitivity(text: str) -> KnowledgeSensitivity:
-    if any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS):
-        return "sensitive"
-    if any(pattern.search(text) for pattern in _PRIVATE_PATTERNS):
-        return "private"
-    return "normal"
+    return detect_text_sensitivity(text)  # type: ignore[return-value]
 
 
 def detect_knowledge_text_sensitivity(text: str) -> KnowledgeSensitivity:
