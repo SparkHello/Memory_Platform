@@ -8,6 +8,11 @@ from app.memory.models import (
     MemoryStability,
     MemoryType,
 )
+from app.memory.review_signals import (
+    AGE_CONTEXT_PATTERN,
+    is_time_variable_memory,
+    parse_bare_age_answer,
+)
 
 
 def review_after_for_days(days: int, *, now: datetime | None = None) -> str:
@@ -69,25 +74,6 @@ def normalize_time_uncertain_candidate(
     return candidate
 
 
-def is_time_variable_memory(content: str) -> bool:
-    lowered = content.lower()
-    patterns = (
-        r"\d{1,3}\s*岁",
-        r"years?\s+old",
-        r"\by/o\b",
-        r"年龄",
-        r"自称",
-        r"截至\s*\d{4}[-年]\d{1,2}",
-        r"现在",
-        r"目前",
-        r"当前",
-        r"正在",
-        r"current(?:ly)?",
-        r"\bnow\b",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
-
-
 def _review_policy_parts(
     *,
     content: str,
@@ -147,18 +133,9 @@ def _contextual_age_answer(
 ) -> int | None:
     if context_quote not in context_text:
         return None
-    if not re.search(
-        r"(?:多少\s*岁|多大(?:了)?|年龄(?:是)?多少|几岁)"
-        r"|\bhow\s+old\b|\bage\b",
-        context_quote,
-        re.IGNORECASE,
-    ):
+    if not AGE_CONTEXT_PATTERN.search(context_quote):
         return None
-    match = re.fullmatch(r"\s*(\d{1,3})\s*[。.!！]?\s*", source_quote)
-    if not match:
-        return None
-    age = int(match.group(1))
-    return age if 0 < age < 130 else None
+    return parse_bare_age_answer(source_quote)
 
 
 def _utc_now(now: datetime | None) -> datetime:

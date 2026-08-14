@@ -13,6 +13,16 @@ from app.memory.models import (
     MemoryReviewRiskTag,
     MemoryReviewSeverity,
 )
+from app.memory.review_signals import (
+    LOW_LIFE_THRESHOLD,
+    STALE_DAYS,
+    is_emotion_uncertain,
+    is_expired,
+    is_low_life,
+    is_review_due,
+    is_stale,
+    is_time_variable_memory,
+)
 from app.memory.store import MemoryStore
 from app.memory.utils import (
     _has_negation,
@@ -20,10 +30,6 @@ from app.memory.utils import (
     _parse_iso_datetime,
     _terms,
 )
-
-
-_STALE_DAYS = 90.0
-_LOW_LIFE_THRESHOLD = 30.0
 
 
 class MemoryReviewer:
@@ -115,7 +121,7 @@ def _validity_recommendations(
     recommendations: list[MemoryReviewRecommendation] = []
     for memory in memories:
         valid_until = _parse_iso_datetime(memory.valid_until)
-        if valid_until is None or valid_until >= now:
+        if not is_expired(valid_until, now=now):
             continue
 
         if memory.stability == "temporary":
@@ -208,7 +214,7 @@ def _emotion_uncertain_recommendations(
 ) -> list[MemoryReviewRecommendation]:
     recommendations: list[MemoryReviewRecommendation] = []
     for memory in memories:
-        if memory.arousal < 0.7 or memory.confidence > 0.55:
+        if not is_emotion_uncertain(memory.arousal, memory.confidence):
             continue
         recommendations.append(
             _recommendation(
@@ -237,7 +243,7 @@ def _stale_recommendations(
         if _has_due_or_expired_marker(memory, now=now):
             continue
         decay = score_memory(memory, now=now)
-        if decay.days_since_last_active < _STALE_DAYS or memory.importance < 6:
+        if not is_stale(decay.days_since_last_active, memory.importance):
             continue
         recommendations.append(
             _recommendation(
@@ -266,7 +272,7 @@ def _low_life_recommendations(
         if memory.importance > 3 or _has_due_or_expired_marker(memory, now=now):
             continue
         decay = score_memory(memory, now=now)
-        if life_score(memory, now=now, decay=decay) > _LOW_LIFE_THRESHOLD:
+        if not is_low_life(life_score(memory, now=now, decay=decay)):
             continue
         recommendations.append(
             _recommendation(
@@ -572,30 +578,10 @@ def _is_time_variable_fact(memory: MemoryRecord) -> bool:
     content = memory.content.lower()
     if "截至 " in memory.content or "as of" in content:
         return False
-    markers = (
-        "现在",
-        "目前",
-        "最近",
-        "近期",
-        "正在",
-        "计划",
-        "准备",
-        "打算",
-        "临时",
-        "当前",
-        "岁",
-        "年龄",
-        "now",
-        "currently",
-        "recently",
-        "planning",
-    )
-    return any(marker in content for marker in markers)
+    return is_time_variable_memory(memory.content)
 
 
 def _has_due_or_expired_marker(memory: MemoryRecord, *, now: datetime) -> bool:
-    review_after = _parse_iso_datetime(memory.review_after)
-    if review_after is not None and review_after <= now:
-        return True
-    valid_until = _parse_iso_datetime(memory.valid_until)
-    return valid_until is not None and valid_until < now
+    return is_review_due(
+        _parse_iso_datetime(memory.review_after), now=now
+    ) or is_expired(_parse_iso_datetime(memory.valid_until), now=now)

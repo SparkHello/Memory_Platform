@@ -17,6 +17,7 @@ from app.memory.redaction import (
     sensitivity_floor,
 )
 from app.memory.review_policy import normalize_time_uncertain_candidate
+from app.memory.review_signals import AGE_CONTEXT_PATTERN, parse_bare_age_answer
 from app.memory.utils import _has_negation, _parse_json_object, _terms
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.context import model_usage_scope
@@ -121,12 +122,6 @@ _AGE_MEMORY_PATTERN = re.compile(
     r"|年龄\s*(?:是|为)?\s*(\d{1,3})\s*岁?"
     r"|(\d{1,3})\s*岁"
     r"|(?:currently\s*)?(\d{1,3})(?:\s*years?\s+old)",
-    re.IGNORECASE,
-)
-_BARE_AGE_ANSWER_PATTERN = re.compile(r"^\s*(\d{1,3})\s*[。.!！]?\s*$")
-_AGE_CONTEXT_PATTERN = re.compile(
-    r"(?:多少\s*岁|多大(?:了)?|年龄(?:是)?多少|几岁)"
-    r"|\bhow\s+old\b|\bage\b",
     re.IGNORECASE,
 )
 _CURRENT_DATE_PREFIX_PATTERN = re.compile(
@@ -1013,23 +1008,20 @@ def _context_quote_gate_reason(
     if _bare_age_answer(candidate.source_quote, candidate.memory) is not None:
         if not context_quote:
             return "仅凭数字无法判断年龄语义，缺少 context_quote"
-        if not _AGE_CONTEXT_PATTERN.search(context_quote):
+        if not AGE_CONTEXT_PATTERN.search(context_quote):
             return "context_quote 未明确询问年龄，无法解释本轮数字回答"
     return None
 
 
 def _contextual_age_answer(source_quote: str, context_quote: str) -> int | None:
-    if not _AGE_CONTEXT_PATTERN.search(context_quote):
+    if not AGE_CONTEXT_PATTERN.search(context_quote):
         return None
     return _bare_age_answer(source_quote, "")
 
 
 def _bare_age_answer(source_quote: str, memory: str) -> int | None:
-    match = _BARE_AGE_ANSWER_PATTERN.fullmatch(source_quote)
-    if match is None:
-        return None
-    age = int(match.group(1))
-    if not 0 < age < 130:
+    age = parse_bare_age_answer(source_quote)
+    if age is None:
         return None
     if memory:
         memory_age = _matched_age(_AGE_MEMORY_PATTERN.search(memory))

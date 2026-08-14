@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from functools import partial
 import hashlib
 import heapq
@@ -21,6 +21,14 @@ from app.llm.model_gateway import (
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
 from app.memory.redaction import detect_text_sensitivity
+from app.memory.review_signals import (
+    is_emotion_uncertain,
+    is_expired,
+    is_low_life,
+    is_near_expiry,
+    is_review_due,
+    is_stale,
+)
 from app.memory.store import MemoryStore
 from app.memory.temporal import (
     memory_matches_temporal_mode,
@@ -180,9 +188,6 @@ _SURFACE_MODES: set[MemorySurfaceMode] = {
     "stale",
     "review_due",
 }
-_STALE_DAYS = 90.0
-_NEAR_EXPIRY_DAYS = 14
-_LOW_LIFE_THRESHOLD = 30.0
 
 
 def _record_cache_metric(user_id: str, name: str) -> None:
@@ -1673,23 +1678,21 @@ def _surface_review_signals(
 ) -> list[MemorySurfaceSignal]:
     signals: list[MemorySurfaceSignal] = []
     valid_until = _parse_iso_datetime(memory.valid_until)
-    if valid_until is not None:
-        if valid_until < now:
-            signals.append("expired")
-        elif valid_until <= now + timedelta(days=_NEAR_EXPIRY_DAYS):
-            signals.append("near_expiry")
+    if is_expired(valid_until, now=now):
+        signals.append("expired")
+    elif is_near_expiry(valid_until, now=now):
+        signals.append("near_expiry")
 
-    review_after = _parse_iso_datetime(memory.review_after)
-    if review_after is not None and review_after <= now:
+    if is_review_due(_parse_iso_datetime(memory.review_after), now=now):
         signals.append("review_due")
 
     if memory.sensitivity != "normal":
         signals.append("sensitive")
-    if decay.days_since_last_active >= _STALE_DAYS and memory.importance >= 6:
+    if is_stale(decay.days_since_last_active, memory.importance):
         signals.append("stale")
-    if memory.arousal >= 0.7 and memory.confidence <= 0.55:
+    if is_emotion_uncertain(memory.arousal, memory.confidence):
         signals.append("emotion_uncertain")
-    if life <= _LOW_LIFE_THRESHOLD:
+    if is_low_life(life):
         signals.append("low_life")
     return signals
 
