@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from model_gateway import cli as cli_module
+from model_gateway import process as process_module
 from model_gateway.cli import main
 from model_gateway.config_store import gateway_paths, load_config, read_secrets
 
@@ -571,17 +572,17 @@ def test_windows_managed_process_requires_command_identity(
 ) -> None:
     paths = gateway_paths(tmp_path / "home")
     state = {"pid": 42, "home": str(paths.home.resolve())}
-    monkeypatch.setattr(cli_module.os, "name", "nt")
-    monkeypatch.setattr(cli_module, "_pid_alive", lambda pid: True)
-    monkeypatch.setattr(cli_module, "_process_command", lambda pid: "unrelated.exe")
+    monkeypatch.setattr(process_module.os, "name", "nt")
+    monkeypatch.setattr(process_module, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(process_module, "_process_command", lambda pid: "unrelated.exe")
 
-    assert cli_module._state_process_matches(state, paths) is False
+    assert process_module._state_process_matches(state, paths) is False
 
     monkeypatch.setattr(
-        cli_module,
+        process_module,
         "_process_command",
         lambda pid: (
             f'python -m model_gateway.cli --home "{paths.home.resolve()}" serve'
         ),
     )
-    assert cli_module._state_process_matches(state, paths) is True
+    assert process_module._state_process_matches(state, paths) is True

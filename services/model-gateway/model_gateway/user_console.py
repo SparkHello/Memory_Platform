@@ -712,18 +712,19 @@ def _diagnostics(paths: GatewayPaths, args: argparse.Namespace) -> None:
 
 
 def _gateway_managed(paths: GatewayPaths) -> bool:
-    from model_gateway import cli as cli_module
+    from model_gateway import process as process_module
 
-    state = cli_module._read_state(paths)
-    return bool(state and cli_module._state_process_matches(state, paths))
+    state = process_module._read_state(paths)
+    return bool(state and process_module._state_process_matches(state, paths))
 
 
 def _gateway_healthy(paths: GatewayPaths, config: GatewayConfig) -> bool:
     from model_gateway import cli as cli_module
+    from model_gateway import process as process_module
 
     if not _gateway_managed(paths):
         return False
-    return cli_module._gateway_responding(cli_module._server_url(config.server))
+    return process_module._gateway_responding(cli_module._server_url(config.server))
 
 
 def _find_memgw() -> Path | None:
