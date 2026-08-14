@@ -222,6 +222,18 @@ Never commit `.env`, real SQLite files, logs, evaluation snapshots, or portable 
 
 Re-running either Docker release installer creates and re-verifies a portable archive under the install directory's `backups/` folder before pulling replacement images, then removes the temporary copy from the data volume. The default retention is the five newest upgrade archives (`MEMORY_BACKUP_RETENTION=1..50` changes it). Backup or safe-cleanup failure stops the upgrade before replacing the existing service.
 
+### Legacy single-volume layout migration
+
+Legacy all-in-one single-volume layouts are not migrated by the installers. Run the one-shot migration tool from the same release first, then re-run the installer:
+
+```bash
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py
+python3 legacy-cutover.py
+```
+
+The tool stops the old stack, creates and re-verifies a complete v2 portable backup from the read-only mounted legacy volume, migrates the data offline into the four split volumes, re-checks the completion markers and credential delivery, then swaps in the split release Compose and starts the new stack. The legacy volume stays read-only and is never deleted, serving as the rollback anchor during the observation period; delete it explicitly only after validating the new stack and backups. On Windows hosts, run the tool inside WSL.
+
 ### Source installation
 
 Create a portable archive from the repository root:

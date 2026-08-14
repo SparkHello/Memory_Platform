@@ -391,7 +391,10 @@ def test_installer_does_not_accept_or_print_secret_values():
     assert "ADMIN_KEY=" not in installer
     assert "credentials/gateway.txt" in installer
     assert "credentials/gateway.key" in installer  # legacy fallback
-    assert "migrate_legacy.py" in installer
+    # 旧单卷一次性迁移已拆分为 deploy/legacy_cutover.py，安装器只处理
+    # fresh/split 布局并在检测到 legacy 时 fail-closed 指向该工具。
+    assert "migrate_legacy.py" not in installer
+    assert "legacy_cutover.py" in installer
     assert "restore_split.py" in installer
     assert "MEMORY_BACKUP_RETENTION" in installer
     assert "create_quiesced_backup" in installer
@@ -408,8 +411,8 @@ def test_installer_does_not_accept_or_print_secret_values():
     # 完整拓扑校验已移入 CI（validate_compose.py 门禁），安装路径不再内联执行。
     assert "validate_compose.py" in installer
     assert "commit_cutover_journal" in installer
-    assert "legacy_targets_absent" in installer
-    assert "cleanup_legacy_transaction_volumes" in installer
+    assert "legacy_targets_absent" not in installer
+    assert "cleanup_legacy_transaction_volumes" not in installer
     assert "Console token:" in installer
     assert "ports: !reset []" in installer
     assert "mark_cutover_committed" in installer

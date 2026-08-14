@@ -94,9 +94,3 @@ COPY deploy/backup_legacy.py /usr/local/libexec/memory-platform/backup_legacy.py
 COPY deploy/restore_split.py /usr/local/libexec/memory-platform/restore_split.py
 COPY deploy/validate_compose.py /usr/local/libexec/memory-platform/validate_compose.py
 ENTRYPOINT ["python", "/usr/local/libexec/memory-platform/init_stack.py"]
-
-# Maintenance deliberately has no default secret mounts.  Compose grants only
-# the paths required by an explicitly requested backup/restore operation.
-FROM runtime-common AS stack-maintenance
-ENV MEMGW_PROJECT_ROOT=/app/services/memory-gateway
-ENTRYPOINT ["memgw"]

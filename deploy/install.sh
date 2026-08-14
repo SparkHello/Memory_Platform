@@ -303,41 +303,6 @@ journal_volume_for() {
     --format '{{.Name}}' | awk 'NF {print; exit}'
 }
 
-legacy_target_volume_exists() {
-  legacy_project=$1
-  legacy_key=$2
-  [ -n "$(journal_volume_for "$legacy_project" "$legacy_key")" ] && return 0
-  legacy_expected="${legacy_project}_${legacy_key}"
-  legacy_inspected=$(docker volume inspect "$legacy_expected" \
-    --format '{{.Name}}' 2>/dev/null || true)
-  [ "$legacy_inspected" = "$legacy_expected" ]
-}
-
-cleanup_legacy_transaction_volumes() {
-  cleanup_project=$1
-  [ "$(journal_value legacy_targets_absent)" = 1 ] || return 1
-  cleanup_containers=$(docker ps -aq \
-    --filter "label=com.docker.compose.project=$cleanup_project")
-  for cleanup_container in $cleanup_containers; do
-    docker rm -f "$cleanup_container" >/dev/null || return 1
-  done
-  for cleanup_key in memory-data memory-secrets model-data model-secrets; do
-    cleanup_volume=$(journal_volume_for "$cleanup_project" "$cleanup_key")
-    if [ -z "$cleanup_volume" ]; then
-      # A Compose-created target always carries both exact labels.  Never
-      # delete an unlabeled look-alike volume, even if its conventional name
-      # happens to match this project.
-      continue
-    fi
-    cleanup_labels=$(docker volume inspect "$cleanup_volume" \
-      --format '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}' \
-      2>/dev/null) || return 1
-    [ "$cleanup_labels" = "$cleanup_project|$cleanup_key" ] || return 1
-    docker volume rm "$cleanup_volume" >/dev/null || return 1
-  done
-  return 0
-}
-
 recover_interrupted_cutover() {
   [ -e "$CUTOVER_JOURNAL" ] || return 0
   [ -d "$CUTOVER_JOURNAL" ] && [ ! -L "$CUTOVER_JOURNAL" ] \
@@ -403,14 +368,16 @@ recover_interrupted_cutover() {
   journal_init_image=$(journal_value old_init_image)
   journal_model_image=$(journal_value old_model_image)
   journal_memory_image=$(journal_value old_memory_image)
-  journal_legacy_targets_absent=$(journal_value legacy_targets_absent)
   journal_old_env_exists=$(journal_value old_env_exists)
   case "$journal_version" in 1) journal_old_env_exists=1 ;; 2) ;; *) fail "升级事务 journal 版本不受支持" ;; esac
   case "$journal_old_env_exists" in 0|1) ;; *) fail "升级事务 journal 的旧环境状态无效" ;; esac
   case "$journal_project" in
     ''|*[!a-z0-9_-]*) fail "升级事务 journal 的项目名无效" ;;
   esac
-  case "$journal_layout" in split|legacy) ;; *) fail "升级事务 journal 的布局无效" ;; esac
+  # Legacy single-volume cutovers are owned by deploy/legacy_cutover.py; an
+  # interrupted legacy journal from an older installer fails closed here so
+  # its rollback material is never silently discarded.
+  case "$journal_layout" in split) ;; legacy) fail "升级事务 journal 来自旧版安装器的 legacy 迁移；请先用 deploy/legacy_cutover.py 或旧版安装器完成恢复" ;; *) fail "升级事务 journal 的布局无效" ;; esac
   case "$journal_phase" in prepared|data_may_change) ;; *) fail "升级事务 journal 的阶段无效" ;; esac
   case "$journal_backup" in
     pre-upgrade-*.zip) ;;
@@ -423,15 +390,10 @@ recover_interrupted_cutover() {
       ;;
     *) fail "升级事务 journal 的备份名无效" ;;
   esac
-  if [ "$journal_layout" = split ]; then
-    valid_old_image_ref "$journal_init_image" sparkhello/memory-platform-init \
-      && valid_old_image_ref "$journal_model_image" sparkhello/memory-platform-model \
-      && valid_old_image_ref "$journal_memory_image" sparkhello/memory-platform-memory \
-      || fail "升级事务 journal 的旧镜像引用无效"
-  else
-    [ "$journal_legacy_targets_absent" = 1 ] \
-      || fail "legacy 升级事务没有可验证的新卷所有权边界"
-  fi
+  valid_old_image_ref "$journal_init_image" sparkhello/memory-platform-init \
+    && valid_old_image_ref "$journal_model_image" sparkhello/memory-platform-model \
+    && valid_old_image_ref "$journal_memory_image" sparkhello/memory-platform-memory \
+    || fail "升级事务 journal 的旧镜像引用无效"
   journal_backup_path="$INSTALL_DIR/backups/$journal_backup"
   if [ "$journal_backup" != pending ]; then
     [ -s "$journal_backup_path" ] || fail "升级事务 journal 对应的备份不存在"
@@ -444,10 +406,6 @@ recover_interrupted_cutover() {
     docker stop "$journal_container" >/dev/null \
       || fail_journal "无法停止中断事务中的容器"
   done
-  if [ "$journal_layout" = legacy ]; then
-    cleanup_legacy_transaction_volumes "$journal_project" \
-      || fail_journal "无法安全清理中断 legacy 迁移创建的 split 卷"
-  fi
 
   recovery_compose=$(mktemp ".$COMPOSE_NAME.recovery.XXXXXX") \
     || fail "无法创建恢复 Compose 临时文件"
@@ -467,7 +425,7 @@ recover_interrupted_cutover() {
     rm -f "$recovery_env"
   fi
 
-  if [ "$journal_layout" = split ] && [ "$journal_phase" = data_may_change ]; then
+  if [ "$journal_phase" = data_may_change ]; then
     journal_memory_data=$(journal_volume_for "$journal_project" memory-data)
     journal_memory_secrets=$(journal_volume_for "$journal_project" memory-secrets)
     journal_model_data=$(journal_volume_for "$journal_project" model-data)
@@ -487,18 +445,12 @@ recover_interrupted_cutover() {
       || fail_journal "中断事务的数据恢复失败"
   fi
 
-  if [ "$journal_layout" = split ]; then
-    MEMORY_PLATFORM_INIT_IMAGE="$journal_init_image" \
-      MEMORY_PLATFORM_MODEL_IMAGE="$journal_model_image" \
-      MEMORY_PLATFORM_MEMORY_IMAGE="$journal_memory_image" \
-      docker compose -p "$journal_project" -f "$COMPOSE_NAME" \
-      up -d --pull never >/dev/null \
-      || fail_journal "旧栈重启失败"
-  else
+  MEMORY_PLATFORM_INIT_IMAGE="$journal_init_image" \
+    MEMORY_PLATFORM_MODEL_IMAGE="$journal_model_image" \
+    MEMORY_PLATFORM_MEMORY_IMAGE="$journal_memory_image" \
     docker compose -p "$journal_project" -f "$COMPOSE_NAME" \
-      up -d --pull never >/dev/null \
-      || fail_journal "旧栈重启失败"
-  fi
+    up -d --pull never >/dev/null \
+    || fail_journal "旧栈重启失败"
   commit_cutover_journal || fail "旧栈已恢复，但无法提交升级事务 journal"
   say "    中断升级已恢复；继续重新执行发布校验。"
 }
@@ -778,14 +730,6 @@ restore_original_environment() {
 create_cutover_journal() {
   [ "$LAYOUT" != fresh ] || return 0
   [ ! -e "$CUTOVER_JOURNAL" ] || fail "已有未恢复的升级事务 journal"
-  legacy_targets_absent=0
-  if [ "$LAYOUT" = legacy ]; then
-    for legacy_key in memory-data memory-secrets model-data model-secrets; do
-      legacy_target_volume_exists "$PROJECT" "$legacy_key" \
-        && fail "legacy 迁移目标卷已存在；拒绝覆盖不明 split 状态"
-    done
-    legacy_targets_absent=1
-  fi
   cutover_pending="$CUTOVER_JOURNAL.pending.$$"
   [ ! -e "$cutover_pending" ] || fail "升级事务临时目录已存在"
   mkdir -m 700 "$cutover_pending" || fail "无法创建升级事务 journal"
@@ -808,7 +752,6 @@ create_cutover_journal() {
     "old_init_image=$OLD_INIT_IMAGE_VALUE" \
     "old_model_image=$OLD_MODEL_IMAGE_VALUE" \
     "old_memory_image=$OLD_MEMORY_IMAGE_VALUE" \
-    "legacy_targets_absent=$legacy_targets_absent" \
     "old_env_exists=$OLD_ENV_EXISTS" \
     "publish_host=$HOST" \
     "publish_port=$PORT" \
@@ -915,15 +858,16 @@ if [ -f "$COMPOSE_NAME" ]; then
     LAYOUT=split
     OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -aq memory-gateway 2>/dev/null || true)
   elif service_in_compose "$ACTIVE_COMPOSE" memory-platform; then
-    LAYOUT=legacy
-    OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -aq memory-platform 2>/dev/null || true)
+    # Legacy single-volume installs migrate through the standalone one-shot
+    # tool; this installer only handles fresh and split layouts.
+    fail "检测到旧单卷（legacy）布局，本安装器不再内嵌一次性迁移；旧服务与数据未修改。请先运行迁移工具（与 install.sh 同一 release）：curl -fsSL \"$REPO_RAW/deploy/legacy_cutover.py\" -o legacy-cutover.py && python3 legacy-cutover.py，完成旧单卷到四卷的迁移后再重跑本安装命令。"
   fi
 fi
 if [ "$LAYOUT" = fresh ] && docker volume ls \
   --filter "label=com.docker.compose.project=$PROJECT" \
   --filter "label=com.docker.compose.volume=memory-platform-data" \
   --format '{{.Name}}' | awk 'NF {found=1} END {exit !found}'; then
-  fail "发现旧数据卷但安装目录没有可验证的旧 Compose；拒绝猜测迁移。"
+  fail "发现旧数据卷但安装目录没有可验证的旧 Compose；拒绝猜测迁移。若是旧单卷（legacy）数据，请先运行 $REPO_RAW/deploy/legacy_cutover.py 对应的一次性迁移工具。"
 fi
 # Lost install directory with the four split volumes still present: a fresh
 # run would reach credential acceptance and fail with an unactionable error.
@@ -961,9 +905,6 @@ if [ "$LAYOUT" = split ]; then
   [ -z "$actual_image" ] || OLD_MODEL_IMAGE_VALUE=$actual_image
   actual_image=$(service_image_id memory-gateway)
   [ -z "$actual_image" ] || OLD_MEMORY_IMAGE_VALUE=$actual_image
-elif [ "$LAYOUT" = legacy ]; then
-  actual_image=$(service_image_id memory-platform)
-  [ -z "$actual_image" ] || OLD_MEMORY_IMAGE_VALUE=$actual_image
 fi
 
 BACKUP_PATH=""
@@ -992,40 +933,21 @@ prune_host_backups() {
 if [ "$LAYOUT" != fresh ]; then
   say "==> 保存旧 Compose 快照"
   if [ -z "$OLD_MEMORY_CONTAINER" ]; then
-    if [ "$LAYOUT" = legacy ]; then
-      identity_volume=memory-platform-data
-    else
-      identity_volume=memory-data
-    fi
     identity_match=$(docker volume ls \
       --filter "label=com.docker.compose.project=$PROJECT" \
-      --filter "label=com.docker.compose.volume=$identity_volume" \
+      --filter "label=com.docker.compose.volume=memory-data" \
       --format '{{.Name}}' | awk 'NF {print; exit}')
     [ -n "$identity_match" ] \
       || fail "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移"
-    if [ "$LAYOUT" = legacy ]; then
-      compose "$ACTIVE_COMPOSE" up -d --pull never >/dev/null \
-        || fail "无法按旧 Compose 启动服务以定位旧数据卷"
-      OLD_MEMORY_CONTAINER=$(compose "$ACTIVE_COMPOSE" ps -aq memory-platform)
-    fi
-  fi
-  if [ "$LAYOUT" = legacy ]; then
-    [ -n "$OLD_MEMORY_CONTAINER" ] || fail "找不到旧 Memory 容器"
   fi
   stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
   OLD_COMPOSE_BACKUP="$INSTALL_DIR/backups/pre-upgrade-$stamp.compose.yml"
   cp "$ACTIVE_COMPOSE" "$OLD_COMPOSE_BACKUP"
   chmod 600 "$OLD_COMPOSE_BACKUP"
-  # Exactly one data backup is created per upgrade.  For split layouts it is
-  # the quiesced snapshot taken right after the old stack stops writing; for
-  # legacy layouts the complete v2 archive is created from the read-only old
-  # volume once the signed init image is available.
+  # Exactly one data backup is created per upgrade: the quiesced snapshot
+  # taken right after the old stack stops writing.
   BACKUP_PATH=""
-  if [ "$LAYOUT" = legacy ]; then
-    say "    旧单卷备份将在签名 init 镜像就绪后从只读卷创建"
-  else
-    say "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）"
-  fi
+  say "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）"
 fi
 
 say "==> 下载 $RELEASE Compose 并校验"
@@ -1114,10 +1036,6 @@ compose_internal_with_images "$CANDIDATE_COMPOSE" "$CANDIDATE_INTERNAL_OVERRIDE"
   config >/dev/null \
   || fail "本地验收 override 未能生成有效候选拓扑"
 
-mount_name() {
-  docker inspect "$1" --format "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}"
-}
-
 volume_for() {
   docker volume ls --filter "label=com.docker.compose.project=$PROJECT" \
     --filter "label=com.docker.compose.volume=$1" --format '{{.Name}}' | awk 'NF {print; exit}'
@@ -1148,8 +1066,6 @@ update_cutover_backup_reference() {
 }
 
 create_quiesced_backup() {
-  update_journal=${1:-1}
-  case "$update_journal" in 0|1) ;; *) return 1 ;; esac
   quiesced_stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$-quiesced
   quiesced_name="pre-upgrade-$quiesced_stamp.zip"
   quiesced_path="$INSTALL_DIR/backups/$quiesced_name"
@@ -1157,77 +1073,43 @@ create_quiesced_backup() {
   # A previous crashed runner is owned by the still-active journal/lock and is
   # never silently reused.
   [ -z "$(docker ps -aq --filter "name=^/$quiesced_runner$")" ] || return 1
-  quiesced_direct=0
 
-  if [ "$LAYOUT" = split ]; then
-    quiesced_memory_data=$(volume_for memory-data)
-    quiesced_memory_secrets=$(volume_for memory-secrets)
-    quiesced_model_data=$(volume_for model-data)
-    [ -n "$quiesced_memory_data" ] \
-      && [ -n "$quiesced_memory_secrets" ] \
-      && [ -n "$quiesced_model_data" ] \
-      && [ -n "$OLD_INIT_IMAGE_VALUE" ] || return 1
-    if ! docker run --name "$quiesced_runner" --network none --read-only \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-      -e MEMGW_HOME=/data/config \
-      -e MEMGW_SETTINGS_PATH=/secrets/settings.env \
-      -e MEMGW_PROJECT_ROOT=/app/services/memory-gateway \
-      -e MODEL_GATEWAY_HOME=/model-data \
-      --mount "type=volume,source=$quiesced_memory_data,target=/data" \
-      --mount "type=volume,source=$quiesced_memory_secrets,target=/secrets" \
-      --mount "type=volume,source=$quiesced_model_data,target=/model-data" \
-      --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
-      --entrypoint memgw "$OLD_INIT_IMAGE_VALUE" \
-      --home /data/config --project-root /app/services/memory-gateway \
-      stack backup --model-gateway-home /model-data \
-      --output "/data/$quiesced_name" >/dev/null; then
-      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
-      return 1
-    fi
-    cleanup_image=$OLD_INIT_IMAGE_VALUE
-    cleanup_volume=$quiesced_memory_data
-    quiesced_verify_image=$OLD_INIT_IMAGE_VALUE
-  else
-    quiesced_legacy_volume=$(mount_name "$OLD_MEMORY_CONTAINER" /data)
-    [ -n "$quiesced_legacy_volume" ] && [ -n "$INIT_IMAGE" ] \
-      || return 1
-    # A pre-scoped-token legacy volume may not contain auth.db.  The signed
-    # candidate init image creates an empty auth database and normalized
-    # SQLite snapshots only in a private sibling stage under the host backup
-    # directory, reads every legacy source from a read-only mount, and stages
-    # the complete v2 archive there. The old volume is never changed.
-    if ! docker run --rm --name "$quiesced_runner" \
-      --network none --read-only --cap-drop ALL \
-      --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-      --mount "type=volume,source=$quiesced_legacy_volume,target=/legacy,readonly" \
-      --mount "type=bind,source=$INSTALL_DIR/backups,target=/backup" \
-      --tmpfs /scratch:rw,noexec,nosuid,size=33554432 \
-      --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
-      --entrypoint python "$INIT_IMAGE" \
-      /usr/local/libexec/memory-platform/backup_legacy.py \
-      "$quiesced_name" "$HOST_UID_VALUE" "$HOST_GID_VALUE" >/dev/null; then
-      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
-      rm -f "$quiesced_path"
-      return 1
-    fi
-    quiesced_direct=1
-    quiesced_verify_image=$INIT_IMAGE
+  quiesced_memory_data=$(volume_for memory-data)
+  quiesced_memory_secrets=$(volume_for memory-secrets)
+  quiesced_model_data=$(volume_for model-data)
+  [ -n "$quiesced_memory_data" ] \
+    && [ -n "$quiesced_memory_secrets" ] \
+    && [ -n "$quiesced_model_data" ] \
+    && [ -n "$OLD_INIT_IMAGE_VALUE" ] || return 1
+  if ! docker run --name "$quiesced_runner" --network none --read-only \
+    --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    -e MEMGW_HOME=/data/config \
+    -e MEMGW_SETTINGS_PATH=/secrets/settings.env \
+    -e MEMGW_PROJECT_ROOT=/app/services/memory-gateway \
+    -e MODEL_GATEWAY_HOME=/model-data \
+    --mount "type=volume,source=$quiesced_memory_data,target=/data" \
+    --mount "type=volume,source=$quiesced_memory_secrets,target=/secrets" \
+    --mount "type=volume,source=$quiesced_model_data,target=/model-data" \
+    --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
+    --entrypoint memgw "$OLD_INIT_IMAGE_VALUE" \
+    --home /data/config --project-root /app/services/memory-gateway \
+    stack backup --model-gateway-home /model-data \
+    --output "/data/$quiesced_name" >/dev/null; then
+    docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
+    return 1
   fi
+  cleanup_image=$OLD_INIT_IMAGE_VALUE
+  cleanup_volume=$quiesced_memory_data
+  quiesced_verify_image=$OLD_INIT_IMAGE_VALUE
 
-  if [ "$quiesced_direct" = 0 ]; then
-    if ! docker cp "$quiesced_runner:/data/$quiesced_name" "$quiesced_path" \
-      >/dev/null 2>&1 \
-      || [ ! -s "$quiesced_path" ]; then
-      docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
-      rm -f "$quiesced_path"
-      return 1
-    fi
-  else
-    [ -s "$quiesced_path" ] || return 1
+  if ! docker cp "$quiesced_runner:/data/$quiesced_name" "$quiesced_path" \
+    >/dev/null 2>&1 \
+    || [ ! -s "$quiesced_path" ]; then
+    docker rm -f "$quiesced_runner" >/dev/null 2>&1 || true
+    rm -f "$quiesced_path"
+    return 1
   fi
-  if [ "$quiesced_direct" = 0 ]; then
-    docker rm -f "$quiesced_runner" >/dev/null 2>&1 || return 1
-  fi
+  docker rm -f "$quiesced_runner" >/dev/null 2>&1 || return 1
   chmod 600 "$quiesced_path" || return 1
   # Re-verify the finished archive for real: every member must pass the ZIP
   # CRC check and every SQLite database inside must reopen with quick_check=ok.
@@ -1257,30 +1139,23 @@ for member in archive.namelist():
     rm -f "$quiesced_path"
     return 1
   fi
-  if [ "$quiesced_direct" = 0 ]; then
-    docker run --rm --network none --read-only --user 10001:10001 \
-      --cap-drop ALL \
-      --mount "type=volume,source=$cleanup_volume,target=/data" \
-      --entrypoint python "$cleanup_image" \
-      -c 'import os,sys; os.unlink(sys.argv[1])' "/data/$quiesced_name" \
-      >/dev/null 2>&1 || return 1
-  fi
+  docker run --rm --network none --read-only --user 10001:10001 \
+    --cap-drop ALL \
+    --mount "type=volume,source=$cleanup_volume,target=/data" \
+    --entrypoint python "$cleanup_image" \
+    -c 'import os,sys; os.unlink(sys.argv[1])' "/data/$quiesced_name" \
+    >/dev/null 2>&1 || return 1
 
   BACKUP_NAME=$quiesced_name
   BACKUP_PATH=$quiesced_path
-  if [ "$update_journal" = 1 ]; then
-    update_cutover_backup_reference "$BACKUP_PATH"
-  fi
+  update_cutover_backup_reference "$BACKUP_PATH"
 }
 
 rollback() {
   [ "$LAYOUT" != fresh ] || return 1
   say "==> 新版本未通过验收，恢复旧 Compose"
   compose "$COMPOSE_NAME" stop >/dev/null 2>&1 || true
-  if [ "$LAYOUT" = legacy ]; then
-    cleanup_legacy_transaction_volumes "$PROJECT" || return 1
-  fi
-  if [ "$LAYOUT" = split ] && [ -n "$BACKUP_PATH" ]; then
+  if [ -n "$BACKUP_PATH" ]; then
     memory_data=$(volume_for memory-data)
     memory_secrets=$(volume_for memory-secrets)
     model_data=$(volume_for model-data)
@@ -1313,11 +1188,6 @@ rollback() {
   return 0
 }
 
-if [ "$LAYOUT" = legacy ]; then
-  say "==> 从只读旧单卷创建并复验 v2 升级前备份"
-  create_quiesced_backup 0 \
-    || fail "无法从只读旧单卷创建完整 v2 备份；旧服务和旧卷未修改"
-fi
 create_cutover_journal
 if [ "$LAYOUT" != fresh ]; then
   if ! compose "$ACTIVE_COMPOSE" stop >/dev/null; then
@@ -1363,33 +1233,6 @@ if ! mv "$CANDIDATE_ENV" .env; then
 fi
 CANDIDATE_ENV=""
 mark_cutover_data_may_change
-
-if [ "$LAYOUT" = legacy ]; then
-  legacy_volume=$(mount_name "$OLD_MEMORY_CONTAINER" /data)
-  [ -n "$legacy_volume" ] || { rollback || true; fail "无法定位旧单卷"; }
-  compose "$COMPOSE_NAME" create stack-init >/dev/null || { rollback || true; fail "无法创建新分卷"; }
-  init_container=$(compose "$COMPOSE_NAME" ps -aq stack-init)
-  memory_data=$(mount_name "$init_container" /memory-data)
-  memory_secrets=$(mount_name "$init_container" /memory-secrets)
-  model_data=$(mount_name "$init_container" /model-data)
-  model_secrets=$(mount_name "$init_container" /model-secrets)
-  compose "$COMPOSE_NAME" rm -f stack-init >/dev/null 2>&1 || true
-  [ -n "$memory_data" ] && [ -n "$memory_secrets" ] && [ -n "$model_data" ] && [ -n "$model_secrets" ] \
-    || { rollback || true; fail "新分卷解析失败"; }
-  docker run --rm --network none --read-only \
-    --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-    --mount "type=volume,source=$legacy_volume,target=/legacy,readonly" \
-    --mount "type=volume,source=$memory_data,target=/memory-data" \
-    --mount "type=volume,source=$memory_secrets,target=/memory-secrets" \
-    --mount "type=volume,source=$model_data,target=/model-data" \
-    --mount "type=volume,source=$model_secrets,target=/model-secrets" \
-    --mount "type=bind,source=$INSTALL_DIR/credentials,target=/credentials" \
-    --tmpfs /tmp:rw,noexec,nosuid,size=134217728 \
-    --entrypoint python "$INIT_IMAGE" \
-    /usr/local/libexec/memory-platform/migrate_legacy.py >/dev/null \
-    || { rollback || true; fail "旧单卷离线迁移失败；旧卷未修改"; }
-fi
 
 say "==> 在无宿主发布端口的隔离模式启动候选服务"
 if ! compose_internal up -d; then
@@ -1587,10 +1430,6 @@ say "（纯文本 .txt，可用文本编辑器打开；旧版 .key 仍兼容）"
 say "密钥值没有进入本脚本输出、Compose 环境或 Docker 日志。"
 if [ "$HOST" != 127.0.0.1 ]; then
   say "已监听可信局域网；请确认路由器没有把端口映射到公网。"
-fi
-if [ "$LAYOUT" = legacy ]; then
-  say "Console 凭据在迁移兼容期可能仍是 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
-  say "旧单卷仍保留用于观察期回滚；完成客户端/备份验证后再显式删除。"
 fi
 if [ -n "$BACKUP_PATH" ]; then
   say "升级前备份: $BACKUP_PATH"

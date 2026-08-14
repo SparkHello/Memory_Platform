@@ -655,72 +655,6 @@ function Get-ProjectVolume([string] $VolumeKey) {
     return [string](@($volumes | Where-Object { $_ } | Select-Object -First 1))
 }
 
-function Test-LegacyTargetVolumeExists([string] $VolumeKey) {
-    if (-not [string]::IsNullOrWhiteSpace((Get-ProjectVolume $VolumeKey))) {
-        return $true
-    }
-    $expected = "$($script:ProjectName)_$VolumeKey"
-    $native = Invoke-NativeCapture {
-        & docker volume inspect $expected --format '{{.Name}}'
-    }
-    $names = @($native.Output)
-    return $native.ExitCode -eq 0 -and
-        [string](@($names | Where-Object { $_ } | Select-Object -First 1)) -eq $expected
-}
-
-function Remove-LegacyTransactionVolumes {
-    try {
-        $metadataPath = Join-Path $script:CutoverJournal "metadata.json"
-        if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
-            return $false
-        }
-        $metadata = [IO.File]::ReadAllText($metadataPath) | ConvertFrom-Json
-        if ((Get-JsonPropertyValue $metadata "legacy_targets_absent") -ne $true) {
-            return $false
-        }
-        $native = Invoke-NativeCapture {
-            & docker ps -aq `
-                --filter "label=com.docker.compose.project=$($script:ProjectName)"
-        }
-        $containers = @($native.Output)
-        foreach ($container in @($containers | Where-Object { $_ })) {
-            if ((Invoke-NativeSilently { & docker rm -f $container }) -ne 0) {
-                return $false
-            }
-        }
-        foreach ($key in @(
-            "memory-data", "memory-secrets", "model-data", "model-secrets"
-        )) {
-            $volume = Get-ProjectVolume $key
-            if ([string]::IsNullOrWhiteSpace($volume)) { continue }
-            $native = Invoke-NativeCapture {
-                & docker volume inspect $volume --format `
-                    '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}'
-            }
-            $labels = @($native.Output)
-            $labelValue = [string](@($labels | Where-Object { $_ } | Select-Object -First 1))
-            if ($native.ExitCode -ne 0 -or
-                $labelValue -ne "$($script:ProjectName)|$key") {
-                return $false
-            }
-            if ((Invoke-NativeSilently { & docker volume rm $volume }) -ne 0) {
-                return $false
-            }
-        }
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Get-ContainerVolume([string] $Container, [string] $Destination) {
-    $format = "{{range .Mounts}}{{if eq .Destination `"$Destination`"}}{{.Name}}{{end}}{{end}}"
-    $native = Invoke-NativeCapture { & docker inspect $Container --format $format }
-    $values = @($native.Output)
-    if ($native.ExitCode -ne 0) { return "" }
-    return [string](@($values | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1))
-}
-
 function Get-ServiceImageId([string] $ComposeFile, [string] $Service) {
     $native = Invoke-NativeCapture {
         & docker compose -p $script:ProjectName -f $ComposeFile ps -aq $Service
@@ -1034,7 +968,6 @@ function Complete-CutoverJournal {
 function Invoke-OldComposeUp(
     [string] $ComposeFile,
     [string] $Project,
-    [string] $Layout,
     [string] $InitImage,
     [string] $ModelImage,
     [string] $MemoryImage
@@ -1048,15 +981,9 @@ function Invoke-OldComposeUp(
         $saved[$name] = [Environment]::GetEnvironmentVariable($name)
     }
     try {
-        if ($Layout -eq "split") {
-            $env:MEMORY_PLATFORM_INIT_IMAGE = $InitImage
-            $env:MEMORY_PLATFORM_MODEL_IMAGE = $ModelImage
-            $env:MEMORY_PLATFORM_MEMORY_IMAGE = $MemoryImage
-        } else {
-            foreach ($name in $saved.Keys) {
-                Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
-            }
-        }
+        $env:MEMORY_PLATFORM_INIT_IMAGE = $InitImage
+        $env:MEMORY_PLATFORM_MODEL_IMAGE = $ModelImage
+        $env:MEMORY_PLATFORM_MEMORY_IMAGE = $MemoryImage
         $exitCode = Invoke-NativeSilently {
             & docker compose -p $Project -f $ComposeFile up -d --pull never
         }
@@ -1090,25 +1017,13 @@ function New-CutoverJournal {
     }
     $pending = "$($script:CutoverJournal).pending.$([Guid]::NewGuid().ToString('N'))"
     try {
-        if ($script:Layout -eq "split" -and
-            (-not (Test-ImmutableOldImageReference $script:RollbackInitImage `
+        if (-not (Test-ImmutableOldImageReference $script:RollbackInitImage `
                 "sparkhello/memory-platform-init") -or
              -not (Test-ImmutableOldImageReference $script:RollbackModelImage `
                 "sparkhello/memory-platform-model") -or
              -not (Test-ImmutableOldImageReference $script:RollbackMemoryImage `
-                "sparkhello/memory-platform-memory"))) {
+                "sparkhello/memory-platform-memory")) {
             Stop-Install "无法把旧 split 栈解析为不可变镜像；拒绝开始 cutover。"
-        }
-        $legacyTargetsAbsent = $false
-        if ($script:Layout -eq "legacy") {
-            foreach ($key in @(
-                "memory-data", "memory-secrets", "model-data", "model-secrets"
-            )) {
-                if (Test-LegacyTargetVolumeExists $key) {
-                    Stop-Install "legacy 迁移目标卷已存在；拒绝覆盖不明 split 状态。"
-                }
-            }
-            $legacyTargetsAbsent = $true
         }
         New-Item -ItemType Directory -Path $pending | Out-Null
         $oldCompose = Join-Path $pending "old-compose.yml"
@@ -1129,7 +1044,6 @@ function New-CutoverJournal {
             old_init_image = $script:RollbackInitImage
             old_model_image = $script:RollbackModelImage
             old_memory_image = $script:RollbackMemoryImage
-            legacy_targets_absent = $legacyTargetsAbsent
             old_env_exists = $script:EnvironmentSnapshotExists
             publish_host = $script:PublishHost
             publish_port = $script:PublishPort
@@ -1220,10 +1134,7 @@ for member in archive.namelist():
     return (Invoke-NativeSilently { & docker @arguments }) -eq 0
 }
 
-function New-QuiescedBackup(
-    [string] $OldMemoryContainer,
-    [bool] $UpdateJournal = $true
-) {
+function New-QuiescedBackup {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-$PID-quiesced"
     $backupName = "pre-upgrade-$stamp.zip"
     $backupDirectory = Join-Path $script:InstallDirectory "backups"
@@ -1234,60 +1145,36 @@ function New-QuiescedBackup(
     }
     $existing = @($native.Output)
     if (@($existing | Where-Object { $_ }).Count -gt 0) { return $false }
-    $directBackup = $false
 
-    if ($script:Layout -eq "split") {
-        $memoryData = Get-ProjectVolume "memory-data"
-        $memorySecrets = Get-ProjectVolume "memory-secrets"
-        $modelData = Get-ProjectVolume "model-data"
-        $missingBackupInputs = @(@(
-            $memoryData, $memorySecrets, $modelData, $script:RollbackInitImage
-        ) | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) })
-        if ($missingBackupInputs.Count -gt 0) {
-            return $false
-        }
-        $arguments = @(
-            "run", "--name", $runner, "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--cap-add", "CHOWN",
-            "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
-            "-e", "MEMGW_HOME=/data/config",
-            "-e", "MEMGW_SETTINGS_PATH=/secrets/settings.env",
-            "-e", "MEMGW_PROJECT_ROOT=/app/services/memory-gateway",
-            "-e", "MODEL_GATEWAY_HOME=/model-data",
-            "--mount", "type=volume,source=$memoryData,target=/data",
-            "--mount", "type=volume,source=$memorySecrets,target=/secrets",
-            "--mount", "type=volume,source=$modelData,target=/model-data",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
-            "--entrypoint", "memgw", $script:RollbackInitImage,
-            "--home", "/data/config", "--project-root", "/app/services/memory-gateway",
-            "stack", "backup", "--model-gateway-home", "/model-data",
-            "--output", "/data/$backupName"
-        )
-        $cleanupImage = $script:RollbackInitImage
-        $cleanupVolume = $memoryData
-        $verifyImage = $script:RollbackInitImage
-    } else {
-        $legacyVolume = Get-ContainerVolume $OldMemoryContainer "/data"
-        if ([string]::IsNullOrWhiteSpace($legacyVolume) -or
-            [string]::IsNullOrWhiteSpace($script:InitImage)) {
-            return $false
-        }
-        $arguments = @(
-            "run", "--rm", "--name", $runner, "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--cap-add", "CHOWN",
-            "--cap-add", "DAC_OVERRIDE",
-            "--cap-add", "FOWNER",
-            "--mount", "type=volume,source=$legacyVolume,target=/legacy,readonly",
-            "--mount", "type=bind,source=$backupDirectory,target=/backup",
-            "--tmpfs", "/scratch:rw,noexec,nosuid,size=33554432",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
-            "--entrypoint", "python", $script:InitImage,
-            "/usr/local/libexec/memory-platform/backup_legacy.py",
-            $backupName, "10001", "10001"
-        )
-        $directBackup = $true
-        $verifyImage = $script:InitImage
+    $memoryData = Get-ProjectVolume "memory-data"
+    $memorySecrets = Get-ProjectVolume "memory-secrets"
+    $modelData = Get-ProjectVolume "model-data"
+    $missingBackupInputs = @(@(
+        $memoryData, $memorySecrets, $modelData, $script:RollbackInitImage
+    ) | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($missingBackupInputs.Count -gt 0) {
+        return $false
     }
+    $arguments = @(
+        "run", "--name", $runner, "--network", "none", "--read-only",
+        "--cap-drop", "ALL", "--cap-add", "CHOWN",
+        "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+        "-e", "MEMGW_HOME=/data/config",
+        "-e", "MEMGW_SETTINGS_PATH=/secrets/settings.env",
+        "-e", "MEMGW_PROJECT_ROOT=/app/services/memory-gateway",
+        "-e", "MODEL_GATEWAY_HOME=/model-data",
+        "--mount", "type=volume,source=$memoryData,target=/data",
+        "--mount", "type=volume,source=$memorySecrets,target=/secrets",
+        "--mount", "type=volume,source=$modelData,target=/model-data",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
+        "--entrypoint", "memgw", $script:RollbackInitImage,
+        "--home", "/data/config", "--project-root", "/app/services/memory-gateway",
+        "stack", "backup", "--model-gateway-home", "/model-data",
+        "--output", "/data/$backupName"
+    )
+    $cleanupImage = $script:RollbackInitImage
+    $cleanupVolume = $memoryData
+    $verifyImage = $script:RollbackInitImage
 
     $backupExitCode = Invoke-NativeSilently { & docker @arguments }
     if ($backupExitCode -ne 0) {
@@ -1295,25 +1182,23 @@ function New-QuiescedBackup(
         Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
         return $false
     }
-    if (-not $directBackup) {
-        $copyExitCode = Invoke-NativeSilently {
-            & docker cp "${runner}:/data/$backupName" $backupPath
-        }
-        $copied = $copyExitCode -eq 0 -and
-            (Test-Path -LiteralPath $backupPath -PathType Leaf) -and
-            (Get-Item -LiteralPath $backupPath).Length -gt 0
-        $removeExitCode = Invoke-NativeSilently { & docker rm -f $runner }
-        if (-not $copied -or $removeExitCode -ne 0) { return $false }
-        $cleanupArguments = @(
-            "run", "--rm", "--network", "none", "--read-only",
-            "--user", "10001:10001", "--cap-drop", "ALL",
-            "--mount", "type=volume,source=$cleanupVolume,target=/data",
-            "--entrypoint", "python", $cleanupImage,
-            "-c", "import os,sys; os.unlink(sys.argv[1])", "/data/$backupName"
-        )
-        if ((Invoke-NativeSilently { & docker @cleanupArguments }) -ne 0) {
-            return $false
-        }
+    $copyExitCode = Invoke-NativeSilently {
+        & docker cp "${runner}:/data/$backupName" $backupPath
+    }
+    $copied = $copyExitCode -eq 0 -and
+        (Test-Path -LiteralPath $backupPath -PathType Leaf) -and
+        (Get-Item -LiteralPath $backupPath).Length -gt 0
+    $removeExitCode = Invoke-NativeSilently { & docker rm -f $runner }
+    if (-not $copied -or $removeExitCode -ne 0) { return $false }
+    $cleanupArguments = @(
+        "run", "--rm", "--network", "none", "--read-only",
+        "--user", "10001:10001", "--cap-drop", "ALL",
+        "--mount", "type=volume,source=$cleanupVolume,target=/data",
+        "--entrypoint", "python", $cleanupImage,
+        "-c", "import os,sys; os.unlink(sys.argv[1])", "/data/$backupName"
+    )
+    if ((Invoke-NativeSilently { & docker @cleanupArguments }) -ne 0) {
+        return $false
     }
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
         (Get-Item -LiteralPath $backupPath).Length -le 0) {
@@ -1325,8 +1210,7 @@ function New-QuiescedBackup(
     }
     try {
         Protect-PrivatePath $backupPath
-        if ($UpdateJournal -and
-            -not (Update-CutoverBackupReference $backupPath)) {
+        if (-not (Update-CutoverBackupReference $backupPath)) {
             return $false
         }
     } catch {
@@ -1394,7 +1278,6 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
     $initImage = [string](Get-JsonPropertyValue $metadata "old_init_image")
     $modelImage = [string](Get-JsonPropertyValue $metadata "old_model_image")
     $memoryImage = [string](Get-JsonPropertyValue $metadata "old_memory_image")
-    $legacyTargetsAbsent = Get-JsonPropertyValue $metadata "legacy_targets_absent"
     $oldEnvironmentExists = Get-JsonPropertyValue $metadata "old_env_exists"
     $publishHost = [string](Get-JsonPropertyValue $metadata "publish_host")
     $publishPortText = [string](Get-JsonPropertyValue $metadata "publish_port")
@@ -1403,6 +1286,12 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
         $layout -notin @("split", "legacy") -or
         $phase -notin @("prepared", "data_may_change", "committed")) {
         Stop-Install "升级事务 journal 字段无效；拒绝继续。"
+    }
+    # 旧版安装器留下的 legacy 迁移 journal 不在本安装器内恢复；保持 fail-closed，
+    # 由 deploy/legacy_cutover.py 或旧版安装器完成，避免静默丢弃回滚材料。
+    # 已 committed 的 legacy journal 例外：新栈已验收，只继续完成发布与清理。
+    if ($layout -eq "legacy" -and -not $committedPhase) {
+        Stop-Install "升级事务 journal 来自旧版安装器的 legacy 迁移；请先用 deploy/legacy_cutover.py 或旧版安装器完成恢复。"
     }
     if ($backupName -eq "pending") {
         # `pending` 在停写备份创建前写入，且总在 data_may_change 之前被替换；
@@ -1421,15 +1310,12 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
          $publishPort -lt 1 -or $publishPort -gt 65535)) {
         Stop-Install "升级事务 journal v2 发布或环境字段无效。"
     }
-    if ($layout -eq "legacy" -and $legacyTargetsAbsent -ne $true) {
-        Stop-Install "legacy 升级事务没有可验证的新卷所有权边界。"
-    }
+    $imageReferences = @(
+        @{ Image = $initImage; Repository = "sparkhello/memory-platform-init" },
+        @{ Image = $modelImage; Repository = "sparkhello/memory-platform-model" },
+        @{ Image = $memoryImage; Repository = "sparkhello/memory-platform-memory" }
+    )
     if ($layout -eq "split") {
-        $imageReferences = @(
-            @{ Image = $initImage; Repository = "sparkhello/memory-platform-init" },
-            @{ Image = $modelImage; Repository = "sparkhello/memory-platform-model" },
-            @{ Image = $memoryImage; Repository = "sparkhello/memory-platform-memory" }
-        )
         foreach ($entry in $imageReferences) {
             $image = [string] $entry.Image
             if (-not (Test-ImmutableOldImageReference `
@@ -1491,9 +1377,6 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
             Stop-Install "无法停止中断事务中的容器；journal 已保留。"
         }
     }
-    if ($layout -eq "legacy" -and -not (Remove-LegacyTransactionVolumes)) {
-        Stop-Install "无法安全清理中断 legacy 迁移创建的 split 卷；journal 已保留。"
-    }
 
     try {
         $composeTemporary = New-TemporarySibling $script:ComposePath "recovery"
@@ -1521,7 +1404,7 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
     $script:RollbackInitImage = $initImage
     $script:RollbackModelImage = $modelImage
     $script:RollbackMemoryImage = $memoryImage
-    if ($layout -eq "split" -and $phase -eq "data_may_change") {
+    if ($phase -eq "data_may_change") {
         $memoryData = Get-ProjectVolume "memory-data"
         $memorySecrets = Get-ProjectVolume "memory-secrets"
         $modelData = Get-ProjectVolume "model-data"
@@ -1548,7 +1431,7 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
         }
     }
     if (-not (Invoke-OldComposeUp `
-        $script:ComposePath $project $layout $initImage $modelImage $memoryImage)) {
+        $script:ComposePath $project $initImage $modelImage $memoryImage)) {
         Stop-Install "旧栈重启失败；journal 已保留。"
     }
     if (-not (Complete-CutoverJournal)) {
@@ -1572,43 +1455,36 @@ function Invoke-Rollback {
         & docker compose -p $script:ProjectName -f $script:ComposePath stop
     })
 
-    if ($script:Layout -eq "legacy" -and
-        -not (Remove-LegacyTransactionVolumes)) {
+    $memoryData = Get-ProjectVolume "memory-data"
+    $memorySecrets = Get-ProjectVolume "memory-secrets"
+    $modelData = Get-ProjectVolume "model-data"
+    if ([string]::IsNullOrWhiteSpace($memoryData) -or
+        [string]::IsNullOrWhiteSpace($memorySecrets) -or
+        [string]::IsNullOrWhiteSpace($modelData) -or
+        [string]::IsNullOrWhiteSpace($script:BackupPath) -or
+        -not (Test-Path -LiteralPath $script:BackupPath -PathType Leaf)) {
         return $false
     }
-
-    if ($script:Layout -eq "split") {
-        $memoryData = Get-ProjectVolume "memory-data"
-        $memorySecrets = Get-ProjectVolume "memory-secrets"
-        $modelData = Get-ProjectVolume "model-data"
-        if ([string]::IsNullOrWhiteSpace($memoryData) -or
-            [string]::IsNullOrWhiteSpace($memorySecrets) -or
-            [string]::IsNullOrWhiteSpace($modelData) -or
-            [string]::IsNullOrWhiteSpace($script:BackupPath) -or
-            -not (Test-Path -LiteralPath $script:BackupPath -PathType Leaf)) {
-            return $false
-        }
-        $restoreImage = if ([string]::IsNullOrWhiteSpace($script:RollbackInitImage)) {
-            $script:InitImage
-        } else {
-            $script:RollbackInitImage
-        }
-        $restoreArguments = @(
-            "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--cap-add", "CHOWN",
-            "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
-            "-e", "RESTORE_ARCHIVE=/backup/restore.zip",
-            "--mount", "type=volume,source=$memoryData,target=/data",
-            "--mount", "type=volume,source=$memorySecrets,target=/secrets",
-            "--mount", "type=volume,source=$modelData,target=/model-data",
-            "--volume", "$($script:BackupPath):/backup/restore.zip:ro",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
-            "--entrypoint", "python", $restoreImage,
-            "/usr/local/libexec/memory-platform/restore_split.py"
-        )
-        if ((Invoke-NativeSilently { & docker @restoreArguments }) -ne 0) {
-            return $false
-        }
+    $restoreImage = if ([string]::IsNullOrWhiteSpace($script:RollbackInitImage)) {
+        $script:InitImage
+    } else {
+        $script:RollbackInitImage
+    }
+    $restoreArguments = @(
+        "run", "--rm", "--network", "none", "--read-only",
+        "--cap-drop", "ALL", "--cap-add", "CHOWN",
+        "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+        "-e", "RESTORE_ARCHIVE=/backup/restore.zip",
+        "--mount", "type=volume,source=$memoryData,target=/data",
+        "--mount", "type=volume,source=$memorySecrets,target=/secrets",
+        "--mount", "type=volume,source=$modelData,target=/model-data",
+        "--volume", "$($script:BackupPath):/backup/restore.zip:ro",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
+        "--entrypoint", "python", $restoreImage,
+        "/usr/local/libexec/memory-platform/restore_split.py"
+    )
+    if ((Invoke-NativeSilently { & docker @restoreArguments }) -ne 0) {
+        return $false
     }
 
     try {
@@ -1617,7 +1493,7 @@ function Invoke-Rollback {
         [IO.File]::Copy($script:OldComposeBackup, $temporary, $false)
         Replace-ComposeAtomically $temporary $script:ComposePath
         if (-not (Invoke-OldComposeUp `
-            $script:ComposePath $script:ProjectName $script:Layout `
+            $script:ComposePath $script:ProjectName `
             $script:RollbackInitImage $script:RollbackModelImage `
             $script:RollbackMemoryImage)) {
             return $false
@@ -1814,14 +1690,21 @@ function Invoke-MemoryPlatformInstall {
         if ($services -contains "memory-gateway") {
             $script:Layout = "split"
         } elseif ($services -contains "memory-platform") {
-            $script:Layout = "legacy"
+            # 旧单卷（legacy）布局的一次性迁移已拆分为独立工具，本安装器只处理
+            # fresh/split 两种布局。
+            Stop-Install ("检测到旧单卷（legacy）布局，本安装器不再内嵌一次性迁移；旧服务与数据未修改。" +
+                "请先运行与 install.ps1 同一 release 的迁移工具：在 WSL 或 macOS/Linux 上执行 " +
+                "curl -fsSL `"$repoRaw/deploy/legacy_cutover.py`" -o legacy-cutover.py 后用 python3 运行，" +
+                "完成旧单卷到四卷的迁移后再重跑本安装命令。")
         } else {
             Stop-Install "现有 Compose 不是可识别的 Memory Platform 栈；拒绝覆盖。请保留该文件并使用 WSL/手工迁移。"
         }
     }
     if ($script:Layout -eq "fresh") {
         if (-not [string]::IsNullOrWhiteSpace((Get-ProjectVolume "memory-platform-data"))) {
-            Stop-Install "发现旧数据卷但没有可验证的旧 Compose；拒绝猜测迁移。请使用固定 release 的 WSL 安装器或手工恢复备份。"
+            Stop-Install ("发现旧数据卷但没有可验证的旧 Compose；拒绝猜测迁移。" +
+                "若是旧单卷（legacy）数据，请先在 WSL 或 macOS/Linux 上运行 " +
+                "$repoRaw/deploy/legacy_cutover.py 对应的一次性迁移工具。")
         }
         # 安装目录丢失但四个分卷仍在：直接跑新安装会走到凭据验收才失败且
         # 提示无法行动，这里提前检测并给出接回旧数据的具体做法。
@@ -1841,13 +1724,6 @@ function Invoke-MemoryPlatformInstall {
                     "数据没有丢：把原安装目录里的 credentials\gateway.txt（或 gateway.key）和 credentials\admin.txt（或 admin.key） " +
                     "放回 $installDirectory\credentials\ 后重跑同一条安装命令即可接回旧数据。" +
                     "若两枚密钥确实遗失，参见 docs/stack-operations.md 的密钥重置章节。")
-            }
-        }
-    }
-    if ($script:Layout -eq "legacy") {
-        foreach ($volumeKey in @("memory-data", "memory-secrets", "model-data", "model-secrets")) {
-            if (-not [string]::IsNullOrWhiteSpace((Get-ProjectVolume $volumeKey))) {
-                Stop-Install "检测到旧单卷旁已有 split 目标卷；拒绝覆盖不明状态。请保留旧卷并使用 WSL/手工迁移。"
             }
         }
     }
@@ -1922,51 +1798,15 @@ function Invoke-MemoryPlatformInstall {
 
     $oldMemoryContainer = ""
     if ($script:Layout -ne "fresh") {
-        $oldService = if ($script:Layout -eq "legacy") { "memory-platform" } else { "memory-gateway" }
         $native = Invoke-NativeCapture {
             & docker compose -p $script:ProjectName -f $script:ComposePath `
-                ps -q $oldService
+                ps -q memory-gateway
         }
         $containers = @($native.Output)
         $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
         if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
-            $identityVolumeKey = if ($script:Layout -eq "legacy") {
-                "memory-platform-data"
-            } else {
-                "memory-data"
-            }
-            if ([string]::IsNullOrWhiteSpace((Get-ProjectVolume $identityVolumeKey))) {
+            if ([string]::IsNullOrWhiteSpace((Get-ProjectVolume "memory-data"))) {
                 Stop-Install "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移。"
-            }
-            if ($script:Layout -eq "legacy") {
-                $oldStartExitCode = Invoke-NativeSilently {
-                    & docker compose -p $script:ProjectName -f $script:ComposePath `
-                        up -d --pull never
-                }
-                if ($oldStartExitCode -ne 0) {
-                    Stop-Install "无法按旧 Compose 启动服务以定位旧数据卷；现有数据未修改。"
-                }
-                $native = Invoke-NativeCapture {
-                    & docker compose -p $script:ProjectName -f $script:ComposePath `
-                        ps -q $oldService
-                }
-                $containers = @($native.Output)
-                $oldMemoryContainer = [string](@($containers | Where-Object { $_ } | Select-Object -First 1))
-            }
-        }
-        if ($script:Layout -eq "legacy") {
-            if ([string]::IsNullOrWhiteSpace($oldMemoryContainer)) {
-                Stop-Install "找不到旧 Memory 容器；拒绝在未备份状态下升级。"
-            }
-            $native = Invoke-NativeCapture {
-                & docker inspect $oldMemoryContainer --format '{{.Image}}'
-            }
-            $legacyImages = @($native.Output)
-            $script:RollbackMemoryImage = [string](@(
-                $legacyImages | Where-Object { $_ } | Select-Object -First 1
-            ))
-            if ([string]::IsNullOrWhiteSpace($script:RollbackMemoryImage)) {
-                Stop-Install "无法解析旧单卷容器镜像；拒绝开始离线迁移。"
             }
         }
         Write-Step "保存旧 Compose 快照"
@@ -1975,16 +1815,10 @@ function Invoke-MemoryPlatformInstall {
         [IO.File]::Copy($script:ComposePath, $script:OldComposeBackup, $false)
         Protect-PrivatePath $script:OldComposeBackup
 
-        # Exactly one data backup is created per upgrade.  For split layouts it
-        # is the quiesced snapshot taken right after the old stack stops
-        # writing; for legacy layouts the complete v2 archive is created from
-        # the read-only old volume once the signed init image is available.
+        # Exactly one data backup is created per upgrade: the quiesced
+        # snapshot taken right after the old stack stops writing.
         $script:BackupPath = ""
-        if ($script:Layout -eq "legacy") {
-            Write-Host "    旧单卷备份将在签名 init 镜像就绪后从只读卷创建。"
-        } else {
-            Write-Host "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）。"
-        }
+        Write-Host "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）。"
     }
 
     Remove-StaleHostBackups $backupDirectory $backupRetention
@@ -2077,12 +1911,6 @@ function Invoke-MemoryPlatformInstall {
     Test-InternalOverrideCompose `
         $script:CandidateCompose $script:CandidateInternalOverride `
         $script:CandidateEnvironment
-    if ($script:Layout -eq "legacy") {
-        Write-Step "从只读旧单卷创建并复验 v2 升级前备份"
-        if (-not (New-QuiescedBackup $oldMemoryContainer $false)) {
-            Stop-Install "无法从只读旧单卷创建完整 v2 备份；旧服务和旧卷未修改。"
-        }
-    }
     try {
         New-CutoverJournal
     } catch {
@@ -2096,7 +1924,7 @@ function Invoke-MemoryPlatformInstall {
         if ($stopExitCode -ne 0) {
             Restore-ComposeEnvironmentSnapshot
             if (-not (Invoke-OldComposeUp `
-                $script:ComposePath $script:ProjectName $script:Layout `
+                $script:ComposePath $script:ProjectName `
                 $script:RollbackInitImage $script:RollbackModelImage `
                 $script:RollbackMemoryImage)) {
                 Stop-Install "无法停止旧服务，且精确旧镜像重启失败；journal 已保留。"
@@ -2105,9 +1933,9 @@ function Invoke-MemoryPlatformInstall {
             Stop-Install "无法停止旧服务；未开始迁移。"
         }
         Write-Step "旧服务已停写，创建并复验最终一致性备份"
-        if (-not (New-QuiescedBackup $oldMemoryContainer)) {
+        if (-not (New-QuiescedBackup)) {
             if (Invoke-OldComposeUp `
-                $script:ComposePath $script:ProjectName $script:Layout `
+                $script:ComposePath $script:ProjectName `
                 $script:RollbackInitImage $script:RollbackModelImage `
                 $script:RollbackMemoryImage) {
                 [void](Complete-CutoverJournal)
@@ -2141,66 +1969,6 @@ function Invoke-MemoryPlatformInstall {
         Stop-Install "无法原子换入候选环境；请保留备份和数据卷。"
     }
     Set-CutoverDataMayChange
-
-    if ($script:Layout -eq "legacy") {
-        $legacyVolume = Get-ContainerVolume $oldMemoryContainer "/data"
-        if ([string]::IsNullOrWhiteSpace($legacyVolume)) {
-            if (Invoke-Rollback) {
-                Stop-Install "无法定位旧单卷；旧栈已恢复。请使用固定 release 的 WSL 安装器或手工迁移。"
-            }
-            Stop-Install "无法定位旧单卷且自动回滚不完整；请保留 backups 与所有 Docker 卷。"
-        }
-        $createExitCode = Invoke-NativeSilently {
-            & docker compose --env-file $environmentPath `
-                -p $script:ProjectName -f $script:ComposePath create stack-init
-        }
-        if ($createExitCode -ne 0) {
-            if (Invoke-Rollback) { Stop-Install "无法创建新分卷；旧栈已恢复。" }
-            Stop-Install "无法创建新分卷且自动回滚不完整。"
-        }
-        $native = Invoke-NativeCapture {
-            & docker compose --env-file $environmentPath `
-                -p $script:ProjectName -f $script:ComposePath ps -aq stack-init
-        }
-        $initContainers = @($native.Output)
-        $initContainer = [string](@($initContainers | Where-Object { $_ } | Select-Object -First 1))
-        $memoryData = Get-ContainerVolume $initContainer "/memory-data"
-        $memorySecrets = Get-ContainerVolume $initContainer "/memory-secrets"
-        $modelData = Get-ContainerVolume $initContainer "/model-data"
-        $modelSecrets = Get-ContainerVolume $initContainer "/model-secrets"
-        [void](Invoke-NativeSilently {
-            & docker compose --env-file $environmentPath `
-                -p $script:ProjectName -f $script:ComposePath rm -f stack-init
-        })
-        $missingVolumes = @(@($memoryData, $memorySecrets, $modelData, $modelSecrets) |
-            Where-Object { [string]::IsNullOrWhiteSpace($_) })
-        if ($missingVolumes.Count -gt 0) {
-            if (Invoke-Rollback) {
-                Stop-Install "新分卷解析失败；旧栈已恢复。请使用 WSL/手工迁移。"
-            }
-            Stop-Install "新分卷解析失败且自动回滚不完整。"
-        }
-        $migrationArguments = @(
-            "run", "--rm", "--network", "none", "--read-only",
-            "--cap-drop", "ALL", "--cap-add", "CHOWN",
-            "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
-            "--mount", "type=volume,source=$legacyVolume,target=/legacy,readonly",
-            "--mount", "type=volume,source=$memoryData,target=/memory-data",
-            "--mount", "type=volume,source=$memorySecrets,target=/memory-secrets",
-            "--mount", "type=volume,source=$modelData,target=/model-data",
-            "--mount", "type=volume,source=$modelSecrets,target=/model-secrets",
-            "--volume", "$credentialDirectory`:/credentials",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=134217728",
-            "--entrypoint", "python", $script:InitImage,
-            "/usr/local/libexec/memory-platform/migrate_legacy.py"
-        )
-        if ((Invoke-NativeSilently { & docker @migrationArguments }) -ne 0) {
-            if (Invoke-Rollback) {
-                Stop-Install "旧单卷离线迁移失败；旧栈已恢复。请保留旧卷和 backups，并改用固定 release 的 WSL 安装器排查。"
-            }
-            Stop-Install "旧单卷离线迁移失败且自动回滚不完整；请勿删除旧卷或 backups。"
-        }
-    }
 
     Write-Step "在无宿主发布端口的隔离模式启动候选服务"
     $candidateStartExitCode = Invoke-NativeSilently {
@@ -2366,10 +2134,6 @@ function Invoke-MemoryPlatformInstall {
     Write-Host "（纯文本 .txt，可用文本编辑器打开；旧版 .key 仍兼容）"
     Write-Host "密钥值没有进入脚本输出、Compose 环境或 Docker 日志。"
     Write-Host "Model Gateway 2030 仅位于 Docker 内部网络，没有发布宿主端口。"
-    if ($script:Layout -eq "legacy") {
-        Write-Host "Console 凭据在迁移兼容期可能仍是 legacy all-scope；请尽快创建按设备 Chat/MCP token。"
-        Write-Host "旧单卷仍保留用于观察期回滚；确认新栈与备份后再显式删除。"
-    }
     if (-not [string]::IsNullOrWhiteSpace($script:BackupPath)) {
         Write-Host "升级前备份：$($script:BackupPath)"
     }

@@ -103,9 +103,9 @@ Windows 安装器目前仍标记为实验性；正式数据请先阅读[栈运�
 <details>
 <summary>安装器实现细节（digest 固定、备份与升级策略、离线迁移）</summary>
 
-脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或迁移 → 启动独立的 Memory/Model 容器。
+脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或升级 → 启动独立的 Memory/Model 容器。
 
-重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。已有已配置安装升级后若 `/readyz` 退化，安装器会自动恢复旧 Compose 和数据；全新安装则只要求 `/health`，以便先打开设置页面。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。
+重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。已有已配置安装升级后若 `/readyz` 退化，安装器会自动恢复旧 Compose 和数据；全新安装则只要求 `/health`，以便先打开设置页面。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。旧单卷（legacy all-in-one）布局不再由安装器内嵌迁移：先运行同一 release 的一次性迁移工具（`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`），完成旧单卷到四卷的迁移后再重跑安装命令。
 
 </details>
 

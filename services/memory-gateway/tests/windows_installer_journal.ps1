@@ -326,61 +326,7 @@ IFS= read -r value
         "post-commit ACL failure left an active rollback journal"
     function Protect-PrivatePath([string] $Path) { }
 
-    $legacy = Join-Path $temporaryRoot "legacy-cleanup"
-    New-Item -ItemType Directory -Path $legacy | Out-Null
-    $script:CutoverJournal = Join-Path $legacy ".memory-platform-cutover"
-    New-Item -ItemType Directory -Path $script:CutoverJournal | Out-Null
-    [IO.File]::WriteAllText(
-        (Join-Path $script:CutoverJournal "metadata.json"),
-        '{"legacy_targets_absent":true}'
-    )
-    $script:ProjectName = "journal-project"
-    $script:LegacyTestVolumes = @{
-        "memory-data" = $true
-        "memory-secrets" = $true
-        "model-data" = $true
-        "model-secrets" = $true
-    }
-    $script:LegacyRemovedContainer = $false
-    function Get-ProjectVolume([string] $VolumeKey) {
-        if ($script:LegacyTestVolumes.ContainsKey($VolumeKey)) {
-            return "journal-project_$VolumeKey"
-        }
-        return ""
-    }
-    function docker {
-        $Arguments = @($args)
-        $global:LASTEXITCODE = 0
-        if ($Arguments[0] -eq "ps") {
-            "candidate-container"
-            return
-        }
-        if ($Arguments[0] -eq "rm") {
-            $script:LegacyRemovedContainer = $true
-            return
-        }
-        if ($Arguments[0] -eq "volume" -and $Arguments[1] -eq "inspect") {
-            $volume = [string] $Arguments[2]
-            $key = $volume.Substring("journal-project_".Length)
-            "journal-project|$key"
-            return
-        }
-        if ($Arguments[0] -eq "volume" -and $Arguments[1] -eq "rm") {
-            $volume = [string] $Arguments[2]
-            $key = $volume.Substring("journal-project_".Length)
-            [void] $script:LegacyTestVolumes.Remove($key)
-            return
-        }
-        throw "unexpected docker invocation: $Arguments"
-    }
-    Assert-True (Remove-LegacyTransactionVolumes) `
-        "legacy transaction volumes were not removed"
-    Assert-True ($script:LegacyTestVolumes.Count -eq 0) `
-        "partial legacy volumes survived cleanup"
-    Assert-True $script:LegacyRemovedContainer `
-        "candidate container was not removed before volume cleanup"
-
-    Write-Output "windows-installer-journal: committed crash shapes and legacy cleanup passed"
+    Write-Output "windows-installer-journal: committed crash shapes passed"
 } finally {
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force `
         -ErrorAction SilentlyContinue

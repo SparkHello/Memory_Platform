@@ -126,36 +126,6 @@ services:
       retries: 12
       start_period: 60s
 
-  # Explicit one-shot maintenance only.  It can read/write both non-secret data
-  # volumes and Memory settings, but Model provider/admin secrets are never
-  # mounted.  Networking remains disabled.
-  stack-maintenance:
-    profiles: [maintenance]
-    build:
-      context: ..
-      dockerfile: Dockerfile
-      target: stack-maintenance
-    image: memory-platform-maintenance:local
-    user: "0:0"
-    network_mode: none
-    environment:
-      MEMGW_HOME: /data/config
-      MEMGW_SETTINGS_PATH: /secrets/settings.env
-      MEMGW_PROJECT_ROOT: /app/services/memory-gateway
-      MODEL_GATEWAY_HOME: /model-data
-    volumes:
-      - memory-data:/data
-      - memory-secrets:/secrets
-      - model-data:/model-data
-    read_only: true
-    tmpfs:
-      - /tmp:size=128m,mode=1777
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
-    security_opt:
-      - no-new-privileges:true
-    restart: "no"
-
 networks:
   backend:
     internal: true

@@ -99,21 +99,15 @@ def test_windows_upgrade_backs_up_before_candidate_replacement_and_cleans_temp()
     assert "Select-Object -Skip $Retention" in text
 
 
-def test_windows_legacy_migration_is_offline_and_fail_closed_with_rollback() -> None:
+def test_windows_legacy_layout_is_referred_to_standalone_cutover_tool() -> None:
     text = _installer()
 
-    migration = text.index(
-        "/usr/local/libexec/memory-platform/migrate_legacy.py"
-    )
-    assert '"--network", "none", "--read-only"' in text[:migration]
-    assert "target=/legacy,readonly" in text[:migration]
-    for destination in (
-        "/memory-data",
-        "/memory-secrets",
-        "/model-data",
-        "/model-secrets",
-    ):
-        assert destination in text[:migration]
+    # 旧单卷一次性迁移已拆分为 deploy/legacy_cutover.py；install.ps1 检测到
+    # legacy 布局时 fail-closed 并给出迁移工具命令，不再内嵌迁移。
+    assert "migrate_legacy.py" not in text
+    assert "backup_legacy.py" not in text
+    assert "legacy_cutover.py" in text
+    assert "检测到旧单卷（legacy）布局" in text
     assert "Invoke-Rollback" in text
     assert "/usr/local/libexec/memory-platform/restore_split.py" in text
     assert "Restore-ComposeEnvironmentSnapshot" in text
@@ -122,7 +116,7 @@ def test_windows_legacy_migration_is_offline_and_fail_closed_with_rollback() -> 
     assert '"--entrypoint", "python", $restoreImage' in text
     assert "up -d --pull never" in text
     assert "WSL/手工迁移" in text
-    assert "拒绝覆盖不明状态" in text
+    assert "拒绝覆盖" in text
 
 
 def test_windows_acceptance_keeps_model_private_and_checks_health_regression() -> None:
@@ -183,7 +177,7 @@ def test_windows_release_authentication_covers_compose_and_all_images() -> None:
     assert "validate_compose.py" in text
 
 
-def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> None:
+def test_windows_cutover_journal_is_durable_one_way_and_retry_safe() -> None:
     text = _installer()
 
     assert "MoveFileExW" in text
@@ -202,10 +196,12 @@ def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> N
     assert "Test-ImmutableOldImageReference" in text
     # 允许 MEMORY_IMAGE_REGISTRY 覆盖 registry 主机，仓库路径保持固定。
     assert "sparkhello/memory-platform-init" in text
-    assert "legacy_targets_absent" in text
-    assert "Test-LegacyTargetVolumeExists" in text
-    assert "Remove-LegacyTransactionVolumes" in text
-    assert "docker volume rm" in text
+    # 旧版安装器留下的 legacy 中断 journal 不再就地恢复，fail-closed 指向
+    # 独立迁移工具；相应的卷清理助手已随内嵌迁移一起删除。
+    assert "legacy_targets_absent" not in text
+    assert "Test-LegacyTargetVolumeExists" not in text
+    assert "Remove-LegacyTransactionVolumes" not in text
+    assert "升级事务 journal 来自旧版安装器的 legacy 迁移" in text
     assert "post-commit" not in text or "must never trigger" in text
 
     dynamic_contract = (
@@ -213,7 +209,7 @@ def test_windows_cutover_journal_is_durable_one_way_and_legacy_retry_safe() -> N
         "windows_installer_journal.ps1"
     ).read_text(encoding="utf-8")
     assert "committed-acl-failure" in dynamic_contract
-    assert "Remove-LegacyTransactionVolumes" in dynamic_contract
+    assert "Remove-LegacyTransactionVolumes" not in dynamic_contract
 
 
 def test_windows_installer_pins_existing_project_and_candidate_environment() -> None:
@@ -236,10 +232,10 @@ def test_windows_installer_pins_existing_project_and_candidate_environment() -> 
     assert '"COMPOSE_PROJECT_NAME" = $script:ProjectName' in text
 
 
-def test_windows_legacy_backup_supports_missing_auth_without_mutating_source() -> None:
+def test_windows_installer_does_not_embed_legacy_backup() -> None:
+    # 旧单卷只读备份编排迁移到 deploy/legacy_cutover.py，其只读/无网络契约由
+    # tests/test_legacy_cutover.py 覆盖；安装器自身不再引用 backup_legacy.py。
     text = _installer()
 
-    assert "/usr/local/libexec/memory-platform/backup_legacy.py" in text
-    assert "target=/legacy,readonly" in text
-    assert "target=/backup" in text
-    assert "/scratch:rw,noexec,nosuid" in text
+    assert "backup_legacy.py" not in text
+    assert "target=/legacy,readonly" not in text

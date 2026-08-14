@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### Changed
+
+- 旧单卷（legacy all-in-one）布局迁移从 Docker 一键安装器拆分为独立一次性工具 `deploy/legacy_cutover.py`；`install.sh` / `install.ps1` 检测到 legacy 布局时 fail-closed 并指向该工具，split 布局的 journal 状态机语义不变。删除未使用的 `stack-maintenance` Dockerfile target 与开发 compose 中的对应 service（发布路径 `docker-compose.user.yml` 的 maintenance 服务继续复用 init 镜像）。
+
 ## 0.5.1 - 2026-08-13
 
 ### Fixed

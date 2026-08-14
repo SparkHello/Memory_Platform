@@ -223,6 +223,18 @@ modelgw discover --preset <id> --non-interactive --json
 
 重新运行 Docker 一键安装脚本升级时，会在拉取新镜像前自动创建并复核便携备份，复制到安装目录的 `backups/` 后删除数据卷内的临时副本。默认只保留最近 5 份升级备份（可用 `MEMORY_BACKUP_RETENTION=1..50` 调整）；备份失败或临时副本无法安全清理时升级都会停止，不会继续替换现有服务。下面的命令用于手动备份、迁移或恢复。
 
+### 旧单卷（legacy）布局迁移
+
+旧版 all-in-one 单卷布局不由安装器内嵌迁移。先运行同一 release 的一次性迁移工具，再重跑安装命令：
+
+```bash
+VERSION=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py
+python3 legacy-cutover.py
+```
+
+工具会停止旧服务写入、从只读挂载的旧单卷创建并复验完整 v2 便携备份、把数据离线迁入四个 split 卷并复验完成标记与凭据交付，最后换入四卷发布 Compose 并启动新栈。旧单卷全程只读、保持未删除，作为观察期回滚来源；确认新栈与备份正常后再显式删除旧卷。Windows 主机可在 WSL 中运行该工具。
+
 ### 源码安装
 
 在仓库根目录创建便携备份：

@@ -278,81 +278,29 @@ exit 0
     assert not list(install_dir.glob(".docker-compose.user.yml.candidate.*"))
 
 
-def test_legacy_migration_failure_restores_old_compose_and_keeps_backup(tmp_path: Path):
+def test_legacy_layout_is_referred_to_standalone_cutover_tool(tmp_path: Path):
     install_dir = tmp_path / "legacy"
     install_dir.mkdir()
     live = install_dir / "docker-compose.user.yml"
     live.write_text("services:\n  memory-platform: {}\n", encoding="utf-8")
+    environment = install_dir / ".env"
+    environment.write_bytes(b"CUSTOM_SETTING=exact\r\n")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     events = tmp_path / "events"
     _executable(
         fake_bin / "curl",
-        f"""#!/bin/sh
-previous=
-for argument in "$@"; do
-  if [ "$previous" = "-o" ]; then
-    printf 'download\n' >> '{events}'
-    printf 'services: {{}}\n' > "$argument"
-    exit 0
-  fi
-  previous=$argument
-done
-exit 1
-""",
+        f"#!/bin/sh\nprintf 'curl:%s\n' \"$*\" >> '{events}'\nexit 99\n",
     )
     _executable(fake_bin / "lsof", "#!/bin/sh\nexit 1\n")
     _executable(
         fake_bin / "docker",
         f"""#!/bin/sh
+printf '%s\n' "$*" >> '{events}'
 if [ "$1" = "info" ]; then exit 0; fi
-if [ "$1" = "cp" ]; then printf 'verified-backup' > "$3"; exit 0; fi
-if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  case "$3" in
-    *-init:*) printf 'ghcr.io/sparkhello/memory-platform-init@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
-    *-model:*) printf 'ghcr.io/sparkhello/memory-platform-model@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
-    *-memory:*) printf 'ghcr.io/sparkhello/memory-platform-memory@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n' ;;
-  esac
-  exit 0
-fi
-if [ "$1" = "inspect" ]; then
-  case "$*" in *'{{.Image}}'*) printf 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'; exit 0;; esac
-  case "$2:$*" in
-    old-container:*'/data'*) printf 'legacy-volume\n' ;;
-    init-container:*'/memory-data'*) printf 'new-memory-data\n' ;;
-    init-container:*'/memory-secrets'*) printf 'new-memory-secrets\n' ;;
-    init-container:*'/model-data'*) printf 'new-model-data\n' ;;
-    init-container:*'/model-secrets'*) printf 'new-model-secrets\n' ;;
-  esac
-  exit 0
-fi
-if [ "$1" = "run" ]; then
-  case "$*" in
-    *'/usr/local/libexec/memory-platform/backup_legacy.py'*)
-      for argument in "$@"; do
-        case "$argument" in pre-upgrade-*.zip) backup_name=$argument ;; esac
-      done
-      printf 'verified-quiesced-backup' > "$MEMORY_PLATFORM_DIR/backups/$backup_name"
-      printf 'backup\n' >> '{events}'
-      exit 0
-      ;;
-    *'/usr/local/libexec/memory-platform/migrate_legacy.py'*) exit 1 ;;
-    *) exit 0 ;;
-  esac
-fi
 case "$*" in
   "compose version") exit 0 ;;
   *" config --services") printf 'memory-platform\n'; exit 0 ;;
-  *" ps -aq memory-platform") printf 'old-container\n'; exit 0 ;;
-  *" ps -aq stack-init") printf 'init-container\n'; exit 0 ;;
-  *" port memory-platform 2026") exit 0 ;;
-  *" exec -T"*"stack backup"*) printf 'backup\n' >> '{events}'; exit 0 ;;
-  *" config") exit 0 ;;
-  *" pull") exit 0 ;;
-  *" stop") exit 0 ;;
-  *" create stack-init") exit 0 ;;
-  *" rm -f stack-init") exit 0 ;;
-  *" up -d --pull never") exit 0 ;;
 esac
 exit 0
 """,
@@ -361,16 +309,16 @@ exit 0
     result = _run(tmp_path, install_dir, fake_bin)
 
     assert result.returncode != 0
-    assert "旧单卷离线迁移失败" in result.stderr
+    assert "旧单卷" in result.stderr
+    assert "legacy_cutover.py" in result.stderr
     assert live.read_text(encoding="utf-8") == "services:\n  memory-platform: {}\n"
-    backup_contents = {
-        backup.read_text(encoding="utf-8")
-        for backup in (install_dir / "backups").glob("pre-upgrade-*.zip")
-    }
-    assert backup_contents == {"verified-quiesced-backup"}
-    event_lines = events.read_text().splitlines()
-    assert event_lines[-1] == "backup"
-    assert "download" in event_lines[:-1]
+    assert environment.read_bytes() == b"CUSTOM_SETTING=exact\r\n"
+    assert not (install_dir / ".memory-platform-cutover").exists()
+    event_text = events.read_text(encoding="utf-8")
+    # 拒绝发生在下载候选、停写或任何卷操作之前。
+    assert "curl:" not in event_text
+    assert " stop" not in event_text
+    assert "volume rm" not in event_text
 
 
 def test_split_readiness_failure_restores_old_compose_images_and_data(
@@ -1094,16 +1042,8 @@ exit 0
     assert not (install_dir / ".memory-platform-cutover").exists()
 
 
-@pytest.mark.parametrize(
-    "partial_keys",
-    (
-        ("memory-data",),
-        ("memory-data", "memory-secrets", "model-data", "model-secrets"),
-    ),
-)
-def test_interrupted_legacy_migration_removes_only_transaction_owned_partial_volumes(
+def test_interrupted_legacy_journal_fails_closed_without_touching_state(
     tmp_path: Path,
-    partial_keys: tuple[str, ...],
 ) -> None:
     install_dir = tmp_path / "legacy-interrupted"
     install_dir.mkdir()
@@ -1130,8 +1070,6 @@ def test_interrupted_legacy_migration_removes_only_transaction_owned_partial_vol
     backups = install_dir / "backups"
     backups.mkdir()
     (backups / "pre-upgrade-legacy.zip").write_bytes(b"synthetic-backup")
-    state = tmp_path / "volume-state"
-    state.write_text("\n".join(partial_keys) + "\n", encoding="ascii")
     events = tmp_path / "events"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1139,57 +1077,19 @@ def test_interrupted_legacy_migration_removes_only_transaction_owned_partial_vol
     _executable(fake_bin / "lsof", "#!/bin/sh\nexit 1\n")
     _executable(
         fake_bin / "docker",
-        f"""#!/bin/sh
-if [ "$1" = info ]; then exit 0; fi
-if [ "$1" = cp ]; then printf 'verified-backup' > "$3"; exit 0; fi
-if [ "$1" = stop ] || [ "$1" = rm ]; then
-  printf '%s\n' "$*" >> '{events}'
-  exit 0
-fi
-if [ "$1" = volume ] && [ "$2" = ls ]; then
-  for key in memory-data memory-secrets model-data model-secrets; do
-    case "$*" in
-      *"volume=$key"*)
-        if grep -qx "$key" '{state}'; then printf 'journal-project_%s\n' "$key"; fi
-        exit 0
-        ;;
-    esac
-  done
-  exit 0
-fi
-if [ "$1" = volume ] && [ "$2" = inspect ]; then
-  key=${{3#journal-project_}}
-  printf 'journal-project|%s\n' "$key"
-  exit 0
-fi
-if [ "$1" = volume ] && [ "$2" = rm ]; then
-  key=${{3#journal-project_}}
-  grep -vx "$key" '{state}' > '{state}.next' || true
-  mv '{state}.next' '{state}'
-  printf 'volume-rm:%s\n' "$key" >> '{events}'
-  exit 0
-fi
-case "$*" in
-  'compose version') exit 0 ;;
-  *'ps -aq --filter label=com.docker.compose.project=journal-project'*) printf 'candidate-container\n'; exit 0 ;;
-  *' config --services') printf 'memory-platform\n'; exit 0 ;;
-  *' ps -aq memory-platform') printf 'old-container\n'; exit 0 ;;
-  *' port memory-platform 2026') exit 0 ;;
-  *' up -d --pull never') printf 'old-up\n' >> '{events}'; exit 0 ;;
-  *' exec -T'*) exit 0 ;;
-esac
-exit 0
-""",
+        f"#!/bin/sh\nprintf '%s\n' \"$*\" >> '{events}'\n"
+        "case \"$*\" in 'info'|'compose version') exit 0;; esac\nexit 0\n",
     )
 
     result = _run(tmp_path, install_dir, fake_bin)
 
+    # 旧版安装器留下的 legacy 中断 journal 不被新安装器静默恢复或丢弃；
+    # fail-closed 并指向独立迁移工具/旧版安装器。
     assert result.returncode != 0
-    assert "下载发布版 Compose 失败" in result.stderr
-    assert live.read_text(encoding="utf-8") == old_compose
-    assert not state.read_text(encoding="ascii").strip()
+    assert "legacy 迁移" in result.stderr
+    assert "legacy_cutover.py" in result.stderr
+    assert live.read_text(encoding="utf-8") == "services:\n  interrupted-candidate: {}\n"
+    assert journal.exists()
     event_text = events.read_text(encoding="utf-8")
-    for key in partial_keys:
-        assert f"volume-rm:{key}" in event_text
-    assert "old-up" in event_text
-    assert not journal.exists()
+    assert "stop" not in event_text
+    assert "volume rm" not in event_text
