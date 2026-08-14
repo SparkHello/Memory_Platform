@@ -1583,9 +1583,6 @@ class KnowledgeStore:
                 signal = "substring"
         return [self._search_hit_from_row(row, query=query, signal=signal) for row in rows]
 
-    # Agent compatibility name.
-    search_index = search_chunks
-
     def egress_override_confirmed(self, user_id: str, version_ref: str) -> bool:
         """Whether the owner explicitly cleared this version's document for egress.
 
@@ -1922,9 +1919,6 @@ class KnowledgeStore:
             if row is not None:
                 result.append(self._search_hit_from_row(row, query="", signal="reference"))
         return result
-
-    # Agent compatibility name.
-    inspect_chunks = get_chunks_by_refs
 
     def read_reference(
         self,
@@ -2455,8 +2449,6 @@ class KnowledgeStore:
             result[f"embedding_{row['embedding_status']}"] = int(row["count"])
         return result
 
-    get_counts = counts
-
     def status(self, user_id: str) -> dict[str, Any]:
         try:
             counts = self.counts(user_id)
@@ -2475,8 +2467,6 @@ class KnowledgeStore:
             "error": "",
             "counts": counts,
         }
-
-    get_status = status
 
     # ------------------------------------------------------------------
     # Internal SQL and mapping helpers

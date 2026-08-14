@@ -247,12 +247,8 @@ class KnowledgeRetrievalService:
             vector_weight=self.vector_weight,
         )
 
-    search_index = search_chunks
-
     def get_chunks_by_refs(self, **kwargs):
         return self.store.get_chunks_by_refs(**kwargs)
-
-    inspect_chunks = get_chunks_by_refs
 
 
 def _weighted_rrf(

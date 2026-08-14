@@ -1074,7 +1074,12 @@ def _unb64(text: str) -> bytes:
 
 
 def _secret_bytes(secret: str) -> bytes:
-    return (secret or "memory-gateway-review-revision").encode("utf-8")
+    # Fail closed: never sign or verify with a well-known fallback key.  The
+    # REST layer already returns 503 for an unset GATEWAY_SIGNING_SECRET; this
+    # guard keeps any direct caller from silently using a forgeable constant.
+    if not secret:
+        raise ReviewRevisionError(503, "GATEWAY_SIGNING_SECRET 未配置")
+    return secret.encode("utf-8")
 
 
 def _decision_log_json(

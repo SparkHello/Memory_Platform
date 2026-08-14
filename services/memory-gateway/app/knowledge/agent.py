@@ -563,26 +563,6 @@ class KnowledgeSearchAgent:
         metadata.fallback_reason = pro.failure_reason
         return self._finish([], metadata, started, baseline_values)
 
-    async def select_references(
-        self,
-        request: str,
-        user_id: str,
-        limit: int = 5,
-        document_refs: Sequence[str] | None = None,
-        quality: KnowledgeAgentQuality = "balanced",
-        include_sensitive: bool = False,
-    ) -> KnowledgeAgentResult:
-        """Compatibility alias that makes the reference-only contract explicit."""
-
-        return await self.search(
-            request=request,
-            user_id=user_id,
-            limit=limit,
-            document_refs=document_refs,
-            quality=quality,
-            include_sensitive=include_sensitive,
-        )
-
     async def _run_loop(
         self,
         *,
@@ -920,11 +900,7 @@ class KnowledgeSearchAgent:
         include_sensitive: bool,
         deadline: float,
     ) -> Sequence[Any]:
-        method = getattr(self.store, "search_chunks", None) or getattr(
-            self.store,
-            "search_index",
-            None,
-        )
+        method = getattr(self.store, "search_chunks", None)
         if method is None:
             raise RuntimeError("KnowledgeStore lacks search_chunks")
         remaining = deadline - self._clock()
@@ -954,11 +930,7 @@ class KnowledgeSearchAgent:
         include_sensitive: bool,
         deadline: float,
     ) -> Sequence[Any]:
-        method = getattr(self.store, "get_chunks_by_refs", None) or getattr(
-            self.store,
-            "inspect_chunks",
-            None,
-        )
+        method = getattr(self.store, "get_chunks_by_refs", None)
         if method is None:
             raise RuntimeError("KnowledgeStore lacks get_chunks_by_refs")
         remaining = deadline - self._clock()

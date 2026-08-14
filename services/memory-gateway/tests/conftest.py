@@ -61,7 +61,8 @@ _SESSION_ORIGINAL_ENVIRONMENT = {
 _SESSION_RUNTIME_ROOT = Path(
     tempfile.mkdtemp(prefix="memory-platform-pytest-session-")
 )
-os.chmod(_SESSION_RUNTIME_ROOT, 0o700)
+if os.name == "posix":
+    os.chmod(_SESSION_RUNTIME_ROOT, 0o700)
 _SESSION_MEMORY_HOME = _SESSION_RUNTIME_ROOT / "memgw-home"
 _SESSION_MODEL_HOME = _SESSION_RUNTIME_ROOT / "modelgw-home"
 _SESSION_SETTINGS = _SESSION_RUNTIME_ROOT / "memory-secrets" / "settings.env"
@@ -88,7 +89,7 @@ try:
     os.fsync(settings_descriptor)
 finally:
     os.close(settings_descriptor)
-if stat.S_IMODE(_SESSION_SETTINGS.stat().st_mode) != 0o600:
+if os.name == "posix" and stat.S_IMODE(_SESSION_SETTINGS.stat().st_mode) != 0o600:
     raise RuntimeError("pytest session settings mode is unsafe")
 for name in list(os.environ):
     if _is_memory_runtime_environment(name):
