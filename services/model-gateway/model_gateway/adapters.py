@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from model_gateway.models import ConnectionConfig, DeploymentConfig
+from model_gateway_contracts import ConnectionConfig, DeploymentConfig
 
 
 _DISABLED_EFFORTS = {"none", "disabled", "off"}

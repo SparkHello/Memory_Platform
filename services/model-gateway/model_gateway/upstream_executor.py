@@ -20,7 +20,7 @@ import httpx
 
 from model_gateway.auth import provider_secret_header_value
 from model_gateway.http_safety import require_safe_destination, upstream_url
-from model_gateway.models import (
+from model_gateway_contracts import (
     FORBIDDEN_UPSTREAM_FORWARD_HEADERS,
     ConnectionConfig,
     PricingConfig,

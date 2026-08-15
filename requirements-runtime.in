@@ -1,4 +1,7 @@
-# Exact runtime graph and wheel-build dependencies exercised by the test suite.
+# Union artifact allowlist for the three release environments. Docker verifies
+# every download against this hash lock, then resolves fresh Memory, Model, and
+# init venvs from the offline wheelhouse so long-lived images do not inherit
+# one another's optional distributions.
 # Compile with:
 #   pip-compile --generate-hashes --allow-unsafe requirements-runtime.in
 annotated-doc==0.0.5

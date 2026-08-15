@@ -13,7 +13,7 @@ from typing import Any, Literal, Mapping
 import httpx
 
 from model_gateway.auth import provider_secret_header_value
-from model_gateway.models import (
+from model_gateway_contracts import (
     AuthConfig,
     Capabilities,
     ConnectionConfig,

@@ -13,6 +13,7 @@ done
 PLATFORM_ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd)
 MEMORY_SERVICE="$PLATFORM_ROOT/services/memory-gateway"
 MODEL_SERVICE="$PLATFORM_ROOT/services/model-gateway"
+CONTRACTS_PACKAGE="$PLATFORM_ROOT/packages/model-gateway-contracts"
 RUNTIME_VENV="$MEMORY_SERVICE/.venv"
 INSTALL_UI=1
 
@@ -63,6 +64,7 @@ fi
 
 "$RUNTIME_VENV/bin/python" -m pip install \
   -c "$PLATFORM_ROOT/constraints.txt" \
+  -e "$CONTRACTS_PACKAGE" \
   -e "${MEMORY_SERVICE}[dev]" \
   -e "${MODEL_SERVICE}[dev]"
 

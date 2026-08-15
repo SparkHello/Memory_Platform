@@ -78,7 +78,7 @@ quickstart 默认拒绝覆盖已有的 `memory.` / `knowledge.` 文字用途 rou
 ```bash
 cd /path/to/Memory_Platform/services/model-gateway
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 .venv/bin/modelgw init
 .venv/bin/modelgw install-path
 ```

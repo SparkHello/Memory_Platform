@@ -12,7 +12,7 @@ from typing import Any, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from model_gateway.routing import RouteTarget
-from model_gateway.models import PricingConfig, PricingTier
+from model_gateway_contracts import PricingConfig, PricingTier
 
 
 _INIT_LOCK = threading.Lock()

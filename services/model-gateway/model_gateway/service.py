@@ -52,7 +52,22 @@ from model_gateway.control_plane import (
     RouteUpdateRequest,
 )
 from model_gateway.health import HealthCheckError, check_health
-from model_gateway.models import AuthConfig, ConnectionConfig, GatewayConfig, PricingConfig
+from model_gateway_contracts import (
+    GatewayErrorCode,
+    MODEL_GATEWAY_ATTEMPTS_HEADER,
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_USAGE_EVENT_ID_HEADER,
+    MODEL_GATEWAY_USAGE_LEDGER_STATUS_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
+    AuthConfig,
+    ConnectionConfig,
+    GatewayConfig,
+    PricingConfig,
+)
 from model_gateway.proxy import (
     ProxyHTTPResult,
     ProxyUpstreamStream,
@@ -311,7 +326,7 @@ def create_app(
             return _error(
                 409,
                 "配置已经被其他操作修改；请重新读取当前 revision 后重试",
-                error_type="model_gateway_config_stale",
+                error_type=GatewayErrorCode.CONFIG_STALE.value,
             )
         try:
             _, changed, warnings = control_plane.route_update(snapshot, payload)
@@ -321,7 +336,7 @@ def create_app(
             return _error(
                 400,
                 f"路由草稿未通过完整配置校验：{_safe_validation_message(exc)}",
-                error_type="model_gateway_config_invalid",
+                error_type=GatewayErrorCode.CONFIG_INVALID.value,
             )
         return JSONResponse(
             {
@@ -358,7 +373,7 @@ def create_app(
                 return _error(
                     400,
                     f"路由草稿未通过完整配置校验：{_safe_validation_message(exc)}",
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
             # The commit-time revision CAS is authoritative; no separate
             # preflight revision read on the apply path.
@@ -401,7 +416,7 @@ def create_app(
                 return _error(
                     400,
                     f"渠道草稿未通过完整配置校验：{_safe_validation_message(exc)}",
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
             if payload.dry_run:
                 # A dry run never reaches the commit CAS, so it keeps its own
@@ -451,7 +466,7 @@ def create_app(
                 return _error(
                     400,
                     f"部署草稿未通过完整配置校验：{_safe_validation_message(exc)}",
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
             if payload.dry_run:
                 # A dry run never reaches the commit CAS, so it keeps its own
@@ -533,7 +548,7 @@ def create_app(
                 return _error(
                     400,
                     "候选渠道密钥未通过只读 models discovery；原密钥保持不变",
-                    error_type="model_gateway_candidate_key_rejected",
+                    error_type=GatewayErrorCode.CANDIDATE_KEY_REJECTED.value,
                 )
             result = _commit_admin_change(candidate)
             if isinstance(result, JSONResponse):
@@ -613,7 +628,7 @@ def create_app(
                     400,
                     "渠道 discovery 草稿未通过安全校验："
                     + _safe_validation_message(exc),
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
         try:
             candidate = control_plane.prepare(
@@ -714,7 +729,7 @@ def create_app(
             return _error(
                 400,
                 "能力探测草稿未通过安全校验：" + _safe_validation_message(exc),
-                error_type="model_gateway_config_invalid",
+                error_type=GatewayErrorCode.CONFIG_INVALID.value,
             )
         try:
             result = await probe_chat_capabilities(
@@ -784,7 +799,7 @@ def create_app(
             return _error(
                 400,
                 f"bundle 未通过完整配置校验：{_safe_validation_message(exc)}",
-                error_type="model_gateway_config_invalid",
+                error_type=GatewayErrorCode.CONFIG_INVALID.value,
             )
         report = await check_health(
             config=candidate.effective_config,
@@ -799,7 +814,7 @@ def create_app(
             return _error(
                 400,
                 "候选渠道密钥未通过只读 models discovery；现有配置和密钥未改变",
-                error_type="model_gateway_candidate_key_rejected",
+                error_type=GatewayErrorCode.CANDIDATE_KEY_REJECTED.value,
             )
         revision = payload.revision
         if apply:
@@ -873,7 +888,7 @@ def create_app(
                 return _error(
                     400,
                     f"对象修改未通过完整配置校验：{_safe_validation_message(exc)}",
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
             commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
@@ -914,7 +929,7 @@ def create_app(
                 return _error(
                     409,
                     "对象仍被引用：" + ", ".join(blockers),
-                    error_type="model_gateway_object_referenced",
+                    error_type=GatewayErrorCode.OBJECT_REFERENCED.value,
                 )
             snapshot = control_plane.from_loaded(config=config, secrets=secrets)
             try:
@@ -931,7 +946,7 @@ def create_app(
                 return _error(
                     400,
                     f"对象删除未通过完整配置校验：{_safe_validation_message(exc)}",
-                    error_type="model_gateway_config_invalid",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
                 )
             commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
@@ -1060,7 +1075,7 @@ def create_app(
             return _error(
                 400,
                 "usage 查询参数无效",
-                error_type="model_gateway_usage_query_invalid",
+                error_type=GatewayErrorCode.USAGE_QUERY_INVALID.value,
             )
         return JSONResponse(
             {
@@ -1083,7 +1098,7 @@ def create_app(
             return _error(
                 400,
                 "usage 查询参数无效",
-                error_type="model_gateway_usage_query_invalid",
+                error_type=GatewayErrorCode.USAGE_QUERY_INVALID.value,
             )
         return JSONResponse(summary)
 
@@ -1114,13 +1129,13 @@ async def _proxy_request(
         return _error(
             403,
             "usage 归因 Header 只允许 backend client 使用",
-            error_type="model_gateway_usage_metadata_forbidden",
+            error_type=GatewayErrorCode.USAGE_METADATA_FORBIDDEN.value,
         )
     except ValueError:
         return _error(
             400,
             "usage 归因 Header 必须是 opaque ASCII ID",
-            error_type="model_gateway_usage_metadata_invalid",
+            error_type=GatewayErrorCode.USAGE_METADATA_INVALID.value,
         )
 
     raw_body = await _read_limited_body(request, config.server.body_limit_bytes)
@@ -1139,10 +1154,14 @@ async def _proxy_request(
         payload["stream"], bool
     ):
         return _error(400, "chat 请求的 stream 必须是布尔值")
-    preferred = request.headers.get("x-model-gateway-preferred-deployment", "").strip()
-    required = request.headers.get("x-model-gateway-require-deployment", "").strip()
+    preferred = request.headers.get(
+        MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER, ""
+    ).strip()
+    required = request.headers.get(
+        MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER, ""
+    ).strip()
     reasoning_origin = request.headers.get(
-        "x-model-gateway-reasoning-origin-deployment", ""
+        MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER, ""
     ).strip()
     requirements = RequestRequirements.from_payload(payload, kind=kind)
     try:
@@ -1169,7 +1188,7 @@ async def _proxy_request(
             return _error(
                 400,
                 "embedding 请求 dimensions 必须与 route 的向量空间声明一致",
-                error_type="model_gateway_embedding_dimensions_mismatch",
+                error_type=GatewayErrorCode.EMBEDDING_DIMENSIONS_MISMATCH.value,
             )
 
     try:
@@ -1436,7 +1455,7 @@ def _insufficient_storage_error() -> JSONResponse:
             "error": {
                 "message": "Model Gateway 可用存储空间不足，请释放空间后重试",
                 "type": "gateway_error",
-                "code": "model_gateway_insufficient_storage",
+                "code": GatewayErrorCode.INSUFFICIENT_STORAGE.value,
                 "attempts": 0,
             }
         },
@@ -1444,7 +1463,7 @@ def _insufficient_storage_error() -> JSONResponse:
         headers={
             "cache-control": "no-store",
             "x-content-type-options": "nosniff",
-            "x-model-gateway-attempts": "0",
+            MODEL_GATEWAY_ATTEMPTS_HEADER.lower(): "0",
         },
     )
 
@@ -1471,10 +1490,10 @@ def _usage_metadata_from_request(
 ) -> UsageMetadata:
     values = {
         "correlation_id": request.headers.get(
-            "x-model-gateway-correlation-id", ""
+            MODEL_GATEWAY_CORRELATION_HEADER, ""
         ).strip(),
-        "operation": request.headers.get("x-model-gateway-operation", "").strip(),
-        "user_tag": request.headers.get("x-model-gateway-user-tag", "").strip(),
+        "operation": request.headers.get(MODEL_GATEWAY_OPERATION_HEADER, "").strip(),
+        "user_tag": request.headers.get(MODEL_GATEWAY_USER_TAG_HEADER, "").strip(),
     }
     if any(values.values()) and client.config.kind != "backend":
         raise PermissionError("usage metadata requires backend client")
@@ -1495,7 +1514,7 @@ async def _usage_query_client(
         return _error(
             403,
             "usage 查询只允许 backend 或 admin client",
-            error_type="model_gateway_usage_query_forbidden",
+            error_type=GatewayErrorCode.USAGE_QUERY_FORBIDDEN.value,
         )
     return client, secrets
 
@@ -1539,11 +1558,11 @@ def _usage_response_headers(
 ) -> dict[str, str]:
     headers = dict(source)
     if event_id:
-        headers["x-model-gateway-usage-event-id"] = event_id
+        headers[MODEL_GATEWAY_USAGE_EVENT_ID_HEADER.lower()] = event_id
     if metadata.correlation_id:
-        headers["x-model-gateway-correlation-id"] = metadata.correlation_id
+        headers[MODEL_GATEWAY_CORRELATION_HEADER.lower()] = metadata.correlation_id
     if ledger_status:
-        headers["x-model-gateway-usage-ledger-status"] = ledger_status
+        headers[MODEL_GATEWAY_USAGE_LEDGER_STATUS_HEADER.lower()] = ledger_status
     return headers
 
 
@@ -1553,7 +1572,7 @@ def _require_admin(client: AuthenticatedClient) -> JSONResponse | None:
     return _error(
         403,
         "该操作需要 Model Gateway admin 客户端密钥",
-        error_type="model_gateway_admin_required",
+        error_type=GatewayErrorCode.ADMIN_REQUIRED.value,
     )
 
 
@@ -1613,7 +1632,7 @@ def _error(
     status_code: int,
     message: str,
     *,
-    error_type: str = "model_gateway_error",
+    error_type: str = GatewayErrorCode.ERROR.value,
 ) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": message, "type": error_type}},
@@ -1625,7 +1644,7 @@ def _config_stale_error() -> JSONResponse:
     return _error(
         409,
         "配置已经被其他操作修改；请重新读取当前 revision 后重试",
-        error_type="model_gateway_config_stale",
+        error_type=GatewayErrorCode.CONFIG_STALE.value,
     )
 
 
@@ -1636,23 +1655,23 @@ def _candidate_validation_error(
         return _error(
             400,
             "候选密钥格式或强度无效",
-            error_type="model_gateway_secret_invalid",
+            error_type=GatewayErrorCode.SECRET_INVALID.value,
         )
     if exc.reason == "secret_domain_conflict":
         return _error(
             400,
             "候选密钥与现有 client/provider 密钥冲突",
-            error_type="model_gateway_secret_domain_conflict",
+            error_type=GatewayErrorCode.SECRET_DOMAIN_CONFLICT.value,
         )
     return _error(
         400,
         "候选配置未通过完整安全校验",
-        error_type="model_gateway_config_invalid",
+        error_type=GatewayErrorCode.CONFIG_INVALID.value,
     )
 
 
 def _configuration_invalid_error() -> JSONResponse:
-    code = "model_gateway_configuration_invalid"
+    code = GatewayErrorCode.CONFIGURATION_INVALID.value
     return JSONResponse(
         {
             "error": {
@@ -1662,7 +1681,7 @@ def _configuration_invalid_error() -> JSONResponse:
             }
         },
         status_code=503,
-        headers={"x-model-gateway-attempts": "0"},
+        headers={MODEL_GATEWAY_ATTEMPTS_HEADER.lower(): "0"},
     )
 
 
@@ -1756,7 +1775,7 @@ def _reject_json_constant(value: str) -> None:
 
 def _routing_error(exc: RoutingError) -> JSONResponse:
     if isinstance(exc, RouteCapabilityUnavailable):
-        code = "model_gateway_capability_unavailable"
+        code = GatewayErrorCode.CAPABILITY_UNAVAILABLE.value
         return JSONResponse(
             {
                 "error": {
@@ -1769,7 +1788,7 @@ def _routing_error(exc: RoutingError) -> JSONResponse:
             status_code=exc.status_code,
         )
     if isinstance(exc, RouteAffinityUnavailable):
-        code = "model_gateway_affinity_unavailable"
+        code = GatewayErrorCode.AFFINITY_UNAVAILABLE.value
         return JSONResponse(
             {"error": {"message": str(exc), "type": code, "code": code}},
             status_code=exc.status_code,

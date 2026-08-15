@@ -12,6 +12,16 @@ from typing import Literal, Self
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
+from model_gateway_contracts import (
+    KNOWLEDGE_FAST_ROUTE,
+    KNOWLEDGE_PRO_ROUTE,
+    MEMORY_CHAT_ROUTE,
+    MEMORY_COMPACT_ROUTE,
+    MEMORY_CORE_ROUTE,
+    MEMORY_EMBEDDING_ROUTE,
+    MEMORY_EXTRACT_ROUTE,
+    MEMORY_REVIEW_ROUTE,
+)
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -156,35 +166,35 @@ class Settings(BaseSettings):
         validation_alias="MODEL_GATEWAY_API_KEY",
     )
     model_gateway_chat_model: str = Field(
-        default="memory.chat",
+        default=MEMORY_CHAT_ROUTE,
         validation_alias="MODEL_GATEWAY_CHAT_MODEL",
     )
     model_gateway_memory_extract_model: str = Field(
-        default="memory.extract",
+        default=MEMORY_EXTRACT_ROUTE,
         validation_alias="MODEL_GATEWAY_MEMORY_EXTRACT_MODEL",
     )
     model_gateway_memory_compact_model: str = Field(
-        default="memory.compact",
+        default=MEMORY_COMPACT_ROUTE,
         validation_alias="MODEL_GATEWAY_MEMORY_COMPACT_MODEL",
     )
     model_gateway_memory_core_model: str = Field(
-        default="memory.core",
+        default=MEMORY_CORE_ROUTE,
         validation_alias="MODEL_GATEWAY_MEMORY_CORE_MODEL",
     )
     model_gateway_memory_review_model: str = Field(
-        default="memory.review",
+        default=MEMORY_REVIEW_ROUTE,
         validation_alias="MODEL_GATEWAY_MEMORY_REVIEW_MODEL",
     )
     model_gateway_knowledge_fast_model: str = Field(
-        default="knowledge.fast",
+        default=KNOWLEDGE_FAST_ROUTE,
         validation_alias="MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL",
     )
     model_gateway_knowledge_pro_model: str = Field(
-        default="knowledge.pro",
+        default=KNOWLEDGE_PRO_ROUTE,
         validation_alias="MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL",
     )
     model_gateway_embedding_model: str = Field(
-        default="memory.embedding",
+        default=MEMORY_EMBEDDING_ROUTE,
         validation_alias="MODEL_GATEWAY_EMBEDDING_MODEL",
     )
     model_gateway_embedding_space_id: str = Field(

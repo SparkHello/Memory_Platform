@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import HTTPException, status
 import httpx
+from model_gateway_contracts import MODEL_GATEWAY_ATTRIBUTION_RESPONSE_HEADERS
 
 from app.config import Settings
 from app.llm.model_gateway import (
@@ -37,20 +38,7 @@ _PASSTHROUGH_RESPONSE_HEADERS = {
     "openai-version",
 }
 _MODEL_GATEWAY_RESPONSE_HEADERS = {
-    "x-model-gateway-route",
-    "x-model-gateway-deployment",
-    "x-model-gateway-connection",
-    "x-model-gateway-channel-operator",
-    "x-model-gateway-model-author",
-    "x-model-gateway-vendor",
-    "x-model-gateway-upstream-model",
-    "x-model-gateway-attempts",
-    "x-model-gateway-pricing",
-    "x-model-gateway-embedding-space",
-    "x-model-gateway-embedding-dimensions",
-    "x-model-gateway-usage-event-id",
-    "x-model-gateway-correlation-id",
-    "x-model-gateway-usage-ledger-status",
+    header.lower() for header in MODEL_GATEWAY_ATTRIBUTION_RESPONSE_HEADERS
 }
 
 

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-gateway-contracts"
+version = "0.5.1"
+description = "Pure configuration and wire contracts shared by Memory Platform gateways."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model_gateway_contracts*"]

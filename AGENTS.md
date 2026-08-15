@@ -6,10 +6,11 @@
 
 - `services/memory-gateway`：长期记忆、知识库、MCP、OpenAI-compatible 代理和 Web Console。
 - `services/model-gateway`：模型连接、deployment、route、pricing、usage 和管理接口。
+- `packages/model-gateway-contracts`：只含纯配置/schema、稳定 route、归因 Header 和错误枚举；不得依赖 HTTP、CLI、settings 或任一服务启动代码。
 - `scripts/bootstrap.sh`：创建统一开发环境并安装两个服务。
 - `scripts/memgw`：根目录统一运行栈入口。
 - `scripts/test.sh`：两个后端测试集和前端构建。
-- `Dockerfile` 与 `deploy/`：单容器一体化镜像、首启接线入口脚本、compose 文件和 `deploy/install.sh` Docker 一键安装脚本；`.github/workflows/docker.yml` 在 tag 时推送 GHCR。旧单卷（legacy）布局的一次性迁移已从安装器拆出为独立工具 `deploy/legacy_cutover.py`（容器内仍复用 `backup_legacy.py` / `migrate_legacy.py`），安装器检测到 legacy 布局时只报错并指向该工具。`install.sh` 与 `install.ps1` 是同一安装器的双实现：改动必须两边同步，默认版本号等共享常量由 `services/memory-gateway/tests/test_installer_parity.py` 钉住。
+- `Dockerfile` 与 `deploy/`：Memory、Model、离线 init/maintenance 三套隔离运行镜像、首启接线入口脚本、compose 文件和 `deploy/install.sh` Docker 一键安装脚本；长期镜像使用各自独立 Python 环境，只共享窄协议包。`.github/workflows/docker.yml` 在 tag 时推送 GHCR。旧单卷（legacy）布局的一次性迁移已从安装器拆出为独立工具 `deploy/legacy_cutover.py`（容器内仍复用 `backup_legacy.py` / `migrate_legacy.py`），安装器检测到 legacy 布局时只报错并指向该工具。`install.sh` 与 `install.ps1` 是同一安装器的双实现：改动必须两边同步，默认版本号等共享常量由 `services/memory-gateway/tests/test_installer_parity.py` 钉住。
 
 ## 开发边界
 

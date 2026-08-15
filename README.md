@@ -123,6 +123,8 @@ docker compose -f docker-compose.user.yml up -d
 
 Compose 拉取同一 semver 的 `memory-platform-memory`、`memory-platform-model` 和 `memory-platform-init` 镜像；正式安装器还会把 tag 固定成实际 digest。首次启动期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后查看密钥文件：
 
+三枚镜像使用同一份哈希校验的依赖制品集合构建，但不会共享完整 Python 环境：Memory 长期镜像只安装 Memory、Web UI、窄协议包及自身依赖，Model 长期镜像只安装 Model、窄协议包及自身依赖；只有离线 init/maintenance 镜像同时包含两侧维护工具。
+
 ```bash
 cat credentials/gateway.txt   # 或旧版 gateway.key
 cat credentials/admin.txt     # 或旧版 admin.key

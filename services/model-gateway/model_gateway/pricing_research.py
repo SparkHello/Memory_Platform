@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from model_gateway.models import (
+from model_gateway_contracts import (
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,

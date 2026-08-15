@@ -38,7 +38,7 @@ from model_gateway.config_store import (
 )
 from model_gateway.control_plane import ControlPlaneCandidate, ControlPlaneService
 from model_gateway.ids import default_secret_ref
-from model_gateway.models import (
+from model_gateway_contracts import (
     ADAPTER_NAMES,
     BILLING_PLAN_TYPES,
     AuthConfig,

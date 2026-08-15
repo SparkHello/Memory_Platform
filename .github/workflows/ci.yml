@@ -19,10 +19,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install both services with dev extras
+      - name: Install contracts and both services with dev extras
         run: >-
           python -m pip install
           -c constraints.txt
+          -e packages/model-gateway-contracts
           -e 'services/memory-gateway[dev]'
           -e 'services/model-gateway[dev]'
 

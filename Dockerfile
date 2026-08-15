@@ -8,49 +8,89 @@ RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY services/memory-gateway/ui/ ./
 RUN npm run build
 
-FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS python-build
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS python-wheelhouse
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /build
 
-# Every third-party runtime/build artifact is hash-locked.  Project packages
-# are then built as ordinary wheels; release containers never use editable
-# installs or import the repository checkout as their primary code path.
+# Download the union dependency graph once, with hashes enforced, into an
+# offline wheelhouse.  The three runtime environments below resolve only their
+# own project wheels from this trusted artifact set; they do not clone a shared
+# union venv into every image.
 COPY requirements-runtime.lock ./requirements-runtime.lock
-RUN python -m venv /opt/venv \
- && /opt/venv/bin/pip install --require-hashes -r requirements-runtime.lock
+RUN mkdir -p /wheelhouse \
+ && python -m pip download \
+      --require-hashes --only-binary=:all: \
+      --dest /wheelhouse \
+      -r requirements-runtime.lock
 
+COPY packages/model-gateway-contracts/pyproject.toml ./model-gateway-contracts/pyproject.toml
+COPY packages/model-gateway-contracts/model_gateway_contracts ./model-gateway-contracts/model_gateway_contracts
 COPY services/memory-gateway/pyproject.toml services/memory-gateway/README.md ./memory-gateway/
 COPY services/memory-gateway/app ./memory-gateway/app
 COPY services/model-gateway/pyproject.toml services/model-gateway/README.md ./model-gateway/
 COPY services/model-gateway/model_gateway ./model-gateway/model_gateway
-RUN mkdir -p /wheels \
- && /opt/venv/bin/pip wheel \
+RUN python -m venv /opt/build-venv \
+ && /opt/build-venv/bin/pip install \
+      --no-index --find-links=/wheelhouse \
+      setuptools==83.0.0 wheel==0.46.3 \
+ && mkdir -p /wheels \
+ && /opt/build-venv/bin/pip wheel \
       --no-deps --no-build-isolation --wheel-dir /wheels \
-      ./memory-gateway ./model-gateway \
- && /opt/venv/bin/pip install --no-deps /wheels/*.whl \
+      ./model-gateway-contracts ./memory-gateway ./model-gateway \
+ && cp /wheels/*.whl /wheelhouse/
+
+# Each target starts from a fresh venv.  pip resolves against only the
+# hash-verified offline wheelhouse, so Model cannot accidentally inherit MCP,
+# pypdf, or other Memory-only distributions.
+FROM python-wheelhouse AS memory-python-build
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install \
+      --no-index --find-links=/wheelhouse \
+      /wheelhouse/memory_gateway-*.whl \
+      /wheelhouse/model_gateway_contracts-*.whl \
  && /opt/venv/bin/pip check \
+ && touch /opt/venv/.pip-check-ok \
  && /opt/venv/bin/pip uninstall -y pip setuptools wheel
 
-FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime-common
+FROM python-wheelhouse AS model-python-build
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install \
+      --no-index --find-links=/wheelhouse \
+      /wheelhouse/local_model_gateway-*.whl \
+      /wheelhouse/model_gateway_contracts-*.whl \
+ && /opt/venv/bin/pip check \
+ && touch /opt/venv/.pip-check-ok \
+ && /opt/venv/bin/pip uninstall -y pip setuptools wheel
+
+FROM python-wheelhouse AS init-python-build
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install \
+      --no-index --find-links=/wheelhouse \
+      /wheelhouse/memory_gateway-*.whl \
+      /wheelhouse/local_model_gateway-*.whl \
+      /wheelhouse/model_gateway_contracts-*.whl \
+ && /opt/venv/bin/pip check \
+ && touch /opt/venv/.pip-check-ok \
+ && /opt/venv/bin/pip uninstall -y pip setuptools wheel
+
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS runtime-base
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-COPY --from=python-build /opt/venv /opt/venv
 
-# Keep a validated CLI project root without making it an editable install.
-# `memgw` uses this path for portable backup/doctor operations in one-shot
-# maintenance containers; the installed wheel remains the runtime import.
-COPY services/memory-gateway/pyproject.toml /app/services/memory-gateway/pyproject.toml
-COPY services/memory-gateway/app /app/services/memory-gateway/app
-
-FROM runtime-common AS memory-runtime
+FROM runtime-base AS memory-runtime
 ENV MEMGW_HOME=/data/config \
     MEMGW_SETTINGS_PATH=/secrets/settings.env \
     MEMGW_PROJECT_ROOT=/app/services/memory-gateway \
     UI_DIST_DIR=/app/ui/dist
+COPY --from=memory-python-build /opt/venv /opt/venv
+# Keep a validated CLI project root without making it an editable install.
+# The installed wheel remains the runtime import; Model source is absent.
+COPY services/memory-gateway/pyproject.toml /app/services/memory-gateway/pyproject.toml
+COPY services/memory-gateway/app /app/services/memory-gateway/app
 COPY --from=ui-build /build/ui/dist /app/ui/dist
 COPY deploy/memory-entrypoint.sh /usr/local/bin/memory-gateway-entrypoint
 RUN groupadd --gid 10001 memory-gateway \
@@ -64,9 +104,10 @@ VOLUME ["/data", "/secrets"]
 EXPOSE 2026
 ENTRYPOINT ["memory-gateway-entrypoint"]
 
-FROM runtime-common AS model-runtime
+FROM runtime-base AS model-runtime
 ENV MODEL_GATEWAY_HOME=/data \
     MODEL_GATEWAY_SECRETS_PATH=/secrets/secrets.env
+COPY --from=model-python-build /opt/venv /opt/venv
 COPY deploy/model-entrypoint.sh /usr/local/bin/model-gateway-entrypoint
 RUN groupadd --gid 10002 model-gateway \
  && useradd --uid 10002 --gid 10002 --no-create-home \
@@ -82,12 +123,15 @@ ENTRYPOINT ["model-gateway-entrypoint"]
 # One-shot root image.  It is run with networking disabled, initializes or
 # migrates only explicitly mounted volumes, drops credentials into a host bind
 # as 0600 files, and exits before either long-lived service starts.
-FROM runtime-common AS stack-init
+FROM runtime-base AS stack-init
 ENV MEMGW_HOME=/memory-data/config \
     MEMGW_SETTINGS_PATH=/memory-secrets/settings.env \
     MEMGW_PROJECT_ROOT=/app/services/memory-gateway \
     MODEL_GATEWAY_HOME=/model-data \
     MODEL_GATEWAY_SECRETS_PATH=/model-secrets/secrets.env
+COPY --from=init-python-build /opt/venv /opt/venv
+COPY services/memory-gateway/pyproject.toml /app/services/memory-gateway/pyproject.toml
+COPY services/memory-gateway/app /app/services/memory-gateway/app
 COPY deploy/init_stack.py /usr/local/libexec/memory-platform/init_stack.py
 COPY deploy/migrate_legacy.py /usr/local/libexec/memory-platform/migrate_legacy.py
 COPY deploy/backup_legacy.py /usr/local/libexec/memory-platform/backup_legacy.py

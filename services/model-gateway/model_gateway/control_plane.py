@@ -18,7 +18,7 @@ from model_gateway.config_store import (
 )
 from model_gateway.http_safety import normalize_base_url
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
-from model_gateway.models import (
+from model_gateway_contracts import (
     AdapterName,
     AuthConfig,
     BillingPlan,

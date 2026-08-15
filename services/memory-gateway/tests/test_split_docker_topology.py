@@ -340,8 +340,11 @@ def test_release_compose_and_dockerfile_never_use_main_latest_or_mutable_bases()
     assert "/main" not in compose_text
     assert dockerfile.count("@sha256:") >= 3
     assert "-e ./services" not in dockerfile
-    assert "pip install --no-deps /wheels/*.whl" in dockerfile
-    assert "pip install --require-hashes" in dockerfile
+    assert "pip download" in dockerfile
+    assert "--require-hashes --only-binary=:all:" in dockerfile
+    assert "FROM python-wheelhouse AS memory-python-build" in dockerfile
+    assert "FROM python-wheelhouse AS model-python-build" in dockerfile
+    assert "FROM python-wheelhouse AS init-python-build" in dockerfile
     assert "gosu" not in dockerfile
     assert "deploy/validate_compose.py" in dockerfile
     assert "deploy/plan_install.py" in dockerfile

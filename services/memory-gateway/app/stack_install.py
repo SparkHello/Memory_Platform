@@ -11,6 +11,17 @@ import subprocess
 from typing import Any, Callable, Literal, Mapping
 from urllib.parse import urlparse
 
+from model_gateway_contracts import (
+    KNOWLEDGE_FAST_ROUTE,
+    KNOWLEDGE_PRO_ROUTE,
+    MEMORY_CHAT_ROUTE,
+    MEMORY_COMPACT_ROUTE,
+    MEMORY_CORE_ROUTE,
+    MEMORY_EMBEDDING_ROUTE,
+    MEMORY_EXTRACT_ROUTE,
+    MEMORY_REVIEW_ROUTE,
+)
+
 from app.auth.tokens import AuthTokenStore
 from app.cli_config import (
     CliPaths,
@@ -307,7 +318,7 @@ def _model_gateway_embedding_space(config: dict[str, Any]) -> str:
     deployments = config.get("deployments")
     if not isinstance(routes, dict) or not isinstance(deployments, dict):
         return ""
-    route = routes.get("memory.embedding")
+    route = routes.get(MEMORY_EMBEDDING_ROUTE)
     if not isinstance(route, dict):
         return ""
     targets = route.get("targets")
@@ -451,14 +462,14 @@ def apply_stack_install(
         dict.fromkeys(
             environment.get(name, default).strip() or default
             for name, default in (
-                ("MODEL_GATEWAY_CHAT_MODEL", "memory.chat"),
-                ("MODEL_GATEWAY_MEMORY_EXTRACT_MODEL", "memory.extract"),
-                ("MODEL_GATEWAY_MEMORY_COMPACT_MODEL", "memory.compact"),
-                ("MODEL_GATEWAY_MEMORY_CORE_MODEL", "memory.core"),
-                ("MODEL_GATEWAY_MEMORY_REVIEW_MODEL", "memory.review"),
-                ("MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL", "knowledge.fast"),
-                ("MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL", "knowledge.pro"),
-                ("MODEL_GATEWAY_EMBEDDING_MODEL", "memory.embedding"),
+                ("MODEL_GATEWAY_CHAT_MODEL", MEMORY_CHAT_ROUTE),
+                ("MODEL_GATEWAY_MEMORY_EXTRACT_MODEL", MEMORY_EXTRACT_ROUTE),
+                ("MODEL_GATEWAY_MEMORY_COMPACT_MODEL", MEMORY_COMPACT_ROUTE),
+                ("MODEL_GATEWAY_MEMORY_CORE_MODEL", MEMORY_CORE_ROUTE),
+                ("MODEL_GATEWAY_MEMORY_REVIEW_MODEL", MEMORY_REVIEW_ROUTE),
+                ("MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL", KNOWLEDGE_FAST_ROUTE),
+                ("MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL", KNOWLEDGE_PRO_ROUTE),
+                ("MODEL_GATEWAY_EMBEDDING_MODEL", MEMORY_EMBEDDING_ROUTE),
             )
         )
     )

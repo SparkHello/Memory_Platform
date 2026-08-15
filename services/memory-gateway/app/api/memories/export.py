@@ -13,6 +13,7 @@ import anyio.to_thread
 import httpx
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, PlainTextResponse, Response
+from model_gateway_contracts import GatewayConfig
 from starlette.background import BackgroundTask
 
 from app.api.deps import get_memory_store, get_user_id
@@ -360,8 +361,6 @@ async def _fetch_model_portable_config(
         )
     try:
         # Validate schema before packaging.
-        from model_gateway.models import GatewayConfig
-
         GatewayConfig.model_validate_json(response.content)
     except Exception as exc:
         raise HTTPException(

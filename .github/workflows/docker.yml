@@ -60,13 +60,25 @@ jobs:
         run: |
           docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
             exec -T memory-gateway sh -ec \
-            'test "$(id -u)" = 10001; test ! -e /secrets/secrets.env; test ! -e /model-data'
+            'test "$(id -u)" = 10001; test ! -e /secrets/secrets.env; test ! -e /model-data; test -f /opt/venv/.pip-check-ok'
           docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
             exec -T model-gateway sh -ec \
-            'test "$(id -u)" = 10002; test ! -e /secrets/settings.env; test ! -e /memory-data'
+            'test "$(id -u)" = 10002; test ! -e /secrets/settings.env; test ! -e /memory-data; test -f /opt/venv/.pip-check-ok'
           test -z "$(docker port memory-platform-ci-model-gateway-1 2030/tcp)"
           test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/gateway.txt")" = 600
           test "$(stat -c %a "$MEMORY_CREDENTIAL_DIR/admin.txt")" = 600
+
+      - name: Verify runtime package and import boundaries
+        run: |
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T memory-gateway python -c \
+            'import importlib.metadata as m,importlib.util as u; names={d.metadata["Name"].lower() for d in m.distributions()}; assert {"memory-gateway","model-gateway-contracts","mcp","pypdf"} <= names; assert "local-model-gateway" not in names; assert u.find_spec("app") is not None; assert u.find_spec("model_gateway_contracts") is not None; assert u.find_spec("model_gateway") is None'
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            exec -T model-gateway python -c \
+            'import importlib.metadata as m,importlib.util as u; names={d.metadata["Name"].lower() for d in m.distributions()}; assert {"local-model-gateway","model-gateway-contracts"} <= names; assert {"memory-gateway","mcp","pypdf","pydantic-settings"}.isdisjoint(names); assert u.find_spec("model_gateway") is not None; assert u.find_spec("model_gateway_contracts") is not None; assert u.find_spec("app") is None'
+          docker compose -p memory-platform-ci -f deploy/docker-compose.yml \
+            run --rm --no-deps --entrypoint python stack-init -c \
+            'import importlib.metadata as m,importlib.util as u,runpy; from pathlib import Path; names={d.metadata["Name"].lower() for d in m.distributions()}; assert {"memory-gateway","local-model-gateway","model-gateway-contracts"} <= names; assert u.find_spec("app") is not None; assert u.find_spec("model_gateway") is not None; assert u.find_spec("model_gateway_contracts") is not None; assert Path("/opt/venv/.pip-check-ok").is_file(); root="/usr/local/libexec/memory-platform"; [runpy.run_path(f"{root}/{name}",run_name="_image_smoke") for name in ("init_stack.py","migrate_legacy.py","backup_legacy.py","restore_split.py","validate_compose.py","plan_install.py","verify_backup.py")]'
 
       - name: Verify split network topology
         run: |
@@ -120,10 +132,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install both services with dev extras
+      - name: Install contracts and both services with dev extras
         run: >-
           python -m pip install
           -c constraints.txt
+          -e packages/model-gateway-contracts
           -e 'services/memory-gateway[dev]'
           -e 'services/model-gateway[dev]'
 

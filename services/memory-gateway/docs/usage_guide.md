@@ -15,11 +15,11 @@
 ### 2.1 安装后端依赖
 
 ```bash
-cd /path/to/memory-gateway
+cd /path/to/Memory_Platform/services/memory-gateway
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 ```
 
 ### 2.2 创建配置文件

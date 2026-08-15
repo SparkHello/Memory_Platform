@@ -12,6 +12,7 @@ import stat
 import threading
 from typing import Iterable, Protocol
 
+from model_gateway_contracts import GatewayErrorCode, MODEL_GATEWAY_ATTEMPTS_HEADER
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 
@@ -285,14 +286,14 @@ async def send_insufficient_storage(
             "error": {
                 "message": "Model Gateway 可用存储空间不足，请释放空间后重试",
                 "type": "gateway_error",
-                "code": "model_gateway_insufficient_storage",
+                "code": GatewayErrorCode.INSUFFICIENT_STORAGE.value,
                 "attempts": 0,
             }
         }
     else:
         payload = {
             "detail": {
-                "code": "model_gateway_insufficient_storage",
+                "code": GatewayErrorCode.INSUFFICIENT_STORAGE.value,
                 "message": "可用存储空间不足，请释放空间后重试",
             }
         }
@@ -306,7 +307,7 @@ async def send_insufficient_storage(
                 (b"content-length", str(len(body)).encode("ascii")),
                 (b"cache-control", b"no-store"),
                 (b"x-content-type-options", b"nosniff"),
-                (b"x-model-gateway-attempts", b"0"),
+                (MODEL_GATEWAY_ATTEMPTS_HEADER.lower().encode("ascii"), b"0"),
             ],
         }
     )

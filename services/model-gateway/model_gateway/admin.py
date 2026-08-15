@@ -23,7 +23,7 @@ from model_gateway.control_plane import (
     deployment_candidate,
     route_candidate,
 )
-from model_gateway.models import AdapterName, GatewayConfig, StrictModel, validate_id
+from model_gateway_contracts import AdapterName, GatewayConfig, StrictModel, validate_id
 
 
 def _valid_revision(value: str) -> str:

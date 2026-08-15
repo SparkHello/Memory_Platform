@@ -10,7 +10,7 @@ from __future__ import annotations
 from hashlib import sha256
 import re
 
-from model_gateway.models import validate_id
+from model_gateway_contracts import validate_id
 
 
 def slug_id(value: str) -> str:

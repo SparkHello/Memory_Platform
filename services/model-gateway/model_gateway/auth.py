@@ -6,7 +6,7 @@ import hmac
 from math import log2
 import re
 
-from model_gateway.models import ClientConfig, GatewayConfig
+from model_gateway_contracts import ClientConfig, GatewayConfig
 
 
 class AuthenticationError(ValueError):

@@ -8,6 +8,7 @@ import threading
 from typing import Any, Literal
 
 import httpx
+from model_gateway_contracts import MEMORY_EMBEDDING_ROUTE
 
 
 EmbeddingMode = Literal["auto", "pinned"]
@@ -381,8 +382,8 @@ def _settings_fingerprint(settings: Any) -> str:
 
 def _route_model(settings: Any) -> str:
     return str(
-        getattr(settings, "model_gateway_embedding_model", "memory.embedding")
-        or "memory.embedding"
+        getattr(settings, "model_gateway_embedding_model", MEMORY_EMBEDDING_ROUTE)
+        or MEMORY_EMBEDDING_ROUTE
     ).strip()
 
 

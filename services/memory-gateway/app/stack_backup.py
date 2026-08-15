@@ -16,6 +16,8 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 import zipfile
 
+from model_gateway_contracts import GatewayConfig
+
 from app.cli_config import (
     CliPaths,
     _fsync_directory,
@@ -1202,11 +1204,7 @@ _COMPONENT_VALIDATORS: dict[str, Callable[[Path], None]] = {
 
 def _validate_model_gateway_config(path: Path) -> None:
     try:
-        from model_gateway.models import GatewayConfig
-
         GatewayConfig.model_validate_json(path.read_text(encoding="utf-8"))
-    except ImportError as exc:
-        raise ValueError("当前环境缺少 Model Gateway，无法校验其恢复配置") from exc
     except Exception as exc:
         raise ValueError("Model Gateway 配置未通过完整 schema 校验") from exc
 

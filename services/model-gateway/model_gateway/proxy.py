@@ -7,6 +7,20 @@ import time
 from typing import Any, AsyncIterator, Literal, Mapping
 
 import httpx
+from model_gateway_contracts import (
+    GatewayErrorCode,
+    MODEL_GATEWAY_ATTEMPTS_HEADER,
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_EMBEDDING_DIMENSIONS_HEADER,
+    MODEL_GATEWAY_EMBEDDING_SPACE_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_PRICING_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+    MODEL_GATEWAY_VENDOR_HEADER,
+)
 
 from model_gateway.adapters import (
     apply_connection_adapter,
@@ -445,8 +459,8 @@ def _network_error_result(
                         f"上游{phase}中断：{error_type}；"
                         "为避免请求可能已计费，不自动切换 deployment"
                     ),
-                    "type": "model_gateway_ambiguous_upstream_error",
-                    "code": "model_gateway_ambiguous_upstream_error",
+                    "type": GatewayErrorCode.AMBIGUOUS_UPSTREAM_ERROR.value,
+                    "code": GatewayErrorCode.AMBIGUOUS_UPSTREAM_ERROR.value,
                 }
             },
             ensure_ascii=False,
@@ -581,8 +595,8 @@ def _invalid_embedding_result(
             {
                 "error": {
                     "message": "上游 embedding 响应与配置的向量维度不一致",
-                    "type": "model_gateway_invalid_embedding_response",
-                    "code": "model_gateway_invalid_embedding_response",
+                    "type": GatewayErrorCode.INVALID_EMBEDDING_RESPONSE.value,
+                    "code": GatewayErrorCode.INVALID_EMBEDDING_RESPONSE.value,
                 }
             },
             ensure_ascii=False,
@@ -641,24 +655,30 @@ def target_attribution_headers(
     attempts: int,
 ) -> dict[str, str]:
     headers = {
-        "x-model-gateway-route": route.route_id,
-        "x-model-gateway-deployment": target.deployment_id,
-        "x-model-gateway-connection": target.connection_id,
-        "x-model-gateway-channel-operator": target.connection.channel_operator,
-        "x-model-gateway-model-author": target.deployment.model_author,
+        MODEL_GATEWAY_ROUTE_HEADER.lower(): route.route_id,
+        MODEL_GATEWAY_DEPLOYMENT_HEADER.lower(): target.deployment_id,
+        MODEL_GATEWAY_CONNECTION_HEADER.lower(): target.connection_id,
+        MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER.lower(): (
+            target.connection.channel_operator
+        ),
+        MODEL_GATEWAY_MODEL_AUTHOR_HEADER.lower(): target.deployment.model_author,
         # Compatibility alias from the first protocol revision. Its value
         # remains the channel operator, never the model author.
-        "x-model-gateway-vendor": target.connection.channel_operator,
-        "x-model-gateway-upstream-model": target.deployment.upstream_model,
-        "x-model-gateway-attempts": str(attempts),
+        MODEL_GATEWAY_VENDOR_HEADER.lower(): target.connection.channel_operator,
+        MODEL_GATEWAY_UPSTREAM_MODEL_HEADER.lower(): (
+            target.deployment.upstream_model
+        ),
+        MODEL_GATEWAY_ATTEMPTS_HEADER.lower(): str(attempts),
     }
     if target.deployment.kind == "embedding":
-        headers["x-model-gateway-embedding-space"] = target.deployment.embedding_space
-        headers["x-model-gateway-embedding-dimensions"] = str(
+        headers[MODEL_GATEWAY_EMBEDDING_SPACE_HEADER.lower()] = (
+            target.deployment.embedding_space
+        )
+        headers[MODEL_GATEWAY_EMBEDDING_DIMENSIONS_HEADER.lower()] = str(
             target.deployment.dimensions
         )
     if target.deployment.pricing:
-        headers["x-model-gateway-pricing"] = target.deployment.pricing
+        headers[MODEL_GATEWAY_PRICING_HEADER.lower()] = target.deployment.pricing
     return headers
 
 
@@ -697,8 +717,8 @@ def affinity_unavailable_result(
             {
                 "error": {
                     "message": "要求的原 deployment 当前不可用；调用方必须移除该来源的私有推理后再重试",
-                    "type": "model_gateway_affinity_unavailable",
-                    "code": "model_gateway_affinity_unavailable",
+                    "type": GatewayErrorCode.AFFINITY_UNAVAILABLE.value,
+                    "code": GatewayErrorCode.AFFINITY_UNAVAILABLE.value,
                 }
             },
             ensure_ascii=False,

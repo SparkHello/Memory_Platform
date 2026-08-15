@@ -4,6 +4,17 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
+from model_gateway_contracts import (
+    KNOWLEDGE_FAST_ROUTE,
+    KNOWLEDGE_PRO_ROUTE,
+    MEMORY_CHAT_ROUTE,
+    MEMORY_COMPACT_ROUTE,
+    MEMORY_CORE_ROUTE,
+    MEMORY_EMBEDDING_ROUTE,
+    MEMORY_EXTRACT_ROUTE,
+    MEMORY_REVIEW_ROUTE,
+)
+
 from app.llm.embedding_contract import (
     EmbeddingMode,
     EmbeddingState,
@@ -24,20 +35,20 @@ MODEL_GATEWAY_REQUIRED_MESSAGE = (
 
 _OPERATION_ROUTE_FIELDS = {
     "chat": "model_gateway_chat_model",
-    "memory.chat": "model_gateway_chat_model",
+    MEMORY_CHAT_ROUTE: "model_gateway_chat_model",
     "memory-extractor": "model_gateway_memory_extract_model",
     "memory-ingester": "model_gateway_memory_extract_model",
-    "memory.extract": "model_gateway_memory_extract_model",
+    MEMORY_EXTRACT_ROUTE: "model_gateway_memory_extract_model",
     "memory-context-compactor": "model_gateway_memory_compact_model",
-    "memory.compact": "model_gateway_memory_compact_model",
+    MEMORY_COMPACT_ROUTE: "model_gateway_memory_compact_model",
     "core-memory-consolidator": "model_gateway_memory_core_model",
-    "memory.core": "model_gateway_memory_core_model",
+    MEMORY_CORE_ROUTE: "model_gateway_memory_core_model",
     "memory-review-editor": "model_gateway_memory_review_model",
-    "memory.review": "model_gateway_memory_review_model",
-    "knowledge.fast": "model_gateway_knowledge_fast_model",
-    "knowledge.pro": "model_gateway_knowledge_pro_model",
+    MEMORY_REVIEW_ROUTE: "model_gateway_memory_review_model",
+    KNOWLEDGE_FAST_ROUTE: "model_gateway_knowledge_fast_model",
+    KNOWLEDGE_PRO_ROUTE: "model_gateway_knowledge_pro_model",
     "embedding": "model_gateway_embedding_model",
-    "memory.embedding": "model_gateway_embedding_model",
+    MEMORY_EMBEDDING_ROUTE: "model_gateway_embedding_model",
 }
 
 

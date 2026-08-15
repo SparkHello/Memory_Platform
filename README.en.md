@@ -117,6 +117,8 @@ docker compose -f docker-compose.user.yml up -d
 
 The release Compose file starts separate Memory, Model, and one-shot initializer images. The installer resolves the selected semver images to immutable digests; do the same when maintaining a manual deployment. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists versions and digests.
 
+All three images are built from one hash-verified artifact set, but they do not share a complete Python environment. The long-lived Memory image installs only Memory, the Web UI, the narrow contracts package, and Memory dependencies; the long-lived Model image installs only Model, contracts, and Model dependencies. Only the offline init/maintenance image contains both services' maintenance tools.
+
 First start takes 1–2 minutes of offline initialization, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Generated credentials are host files, not log output:
 
 ```bash

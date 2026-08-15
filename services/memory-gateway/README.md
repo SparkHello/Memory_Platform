@@ -131,7 +131,7 @@ memgw stack restore memory-stack.zip \
 ```bash
 cd ../model-gateway
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 .venv/bin/modelgw init
 .venv/bin/modelgw install-path
 ```
@@ -198,7 +198,7 @@ cd /path/to/Memory_Platform/services/memory-gateway
 
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 
 cp .env.example .env
 ```

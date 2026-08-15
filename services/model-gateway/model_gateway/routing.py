@@ -10,7 +10,7 @@ import time
 from typing import Any, Literal, Mapping
 
 from model_gateway.auth import AuthenticatedClient
-from model_gateway.models import (
+from model_gateway_contracts import (
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,

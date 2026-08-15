@@ -38,7 +38,7 @@ MODEL_MARKER = MODEL_DATA / ".stack-installed-v2"
 # (UTI com.apple.iwork.keynote.sffkey). Legacy .key remains accepted for upgrades.
 GATEWAY_CREDENTIAL_NAMES = ("gateway.txt", "gateway.key")
 ADMIN_CREDENTIAL_NAMES = ("admin.txt", "admin.key")
-MODELGW = Path("/usr/local/bin/modelgw")
+MODELGW = Path("/opt/venv/bin/modelgw")
 PROJECT_ROOT = Path("/app/services/memory-gateway")
 
 

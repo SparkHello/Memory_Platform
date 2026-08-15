@@ -21,6 +21,17 @@ from urllib.parse import quote, urlsplit
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse
 import httpx
+from model_gateway_contracts import (
+    DEFAULT_MEMORY_CHAT_ROUTES,
+    KNOWLEDGE_FAST_ROUTE,
+    KNOWLEDGE_PRO_ROUTE,
+    MEMORY_CHAT_ROUTE,
+    MEMORY_COMPACT_ROUTE,
+    MEMORY_CORE_ROUTE,
+    MEMORY_EMBEDDING_ROUTE,
+    MEMORY_EXTRACT_ROUTE,
+    MEMORY_REVIEW_ROUTE,
+)
 
 from app.api.deps import get_settings, require_api_key
 from app.config import Settings
@@ -53,26 +64,18 @@ _MAX_CONTROL_RESPONSE_BYTES = 2 * 1024 * 1024
 
 ROUTE_DESCRIPTIONS: dict[str, str] = {
     "chat": "透明聊天代理",
-    "memory.chat": "透明聊天代理",
-    "memory.extract": "从对话提取长期记忆",
-    "memory.compact": "压缩较早的会话上下文",
-    "memory.core": "整理核心记忆",
-    "memory.review": "记忆体检与修改建议",
-    "knowledge.fast": "知识检索快速阶段",
-    "knowledge.pro": "知识检索升级阶段",
-    "memory.embedding": "记忆与知识语义搜索",
+    MEMORY_CHAT_ROUTE: "透明聊天代理",
+    MEMORY_EXTRACT_ROUTE: "从对话提取长期记忆",
+    MEMORY_COMPACT_ROUTE: "压缩较早的会话上下文",
+    MEMORY_CORE_ROUTE: "整理核心记忆",
+    MEMORY_REVIEW_ROUTE: "记忆体检与修改建议",
+    KNOWLEDGE_FAST_ROUTE: "知识检索快速阶段",
+    KNOWLEDGE_PRO_ROUTE: "知识检索升级阶段",
+    MEMORY_EMBEDDING_ROUTE: "记忆与知识语义搜索",
     "pricing.research": "价格信息提取",
 }
 
-REQUIRED_CHAT_ROUTES: tuple[str, ...] = (
-    "memory.chat",
-    "memory.extract",
-    "memory.compact",
-    "memory.core",
-    "memory.review",
-    "knowledge.fast",
-    "knowledge.pro",
-)
+REQUIRED_CHAT_ROUTES = DEFAULT_MEMORY_CHAT_ROUTES
 
 _PRIVATE_MODEL_GATEWAY_NETWORKS = (
     ip_network("10.0.0.0/8"),
@@ -815,17 +818,11 @@ async def _execute_live_probe(
 
 
 def _required_model_routes(model_runtime: ModelRuntime) -> list[str]:
-    operations = (
-        "chat",
-        "memory.extract",
-        "memory.compact",
-        "memory.core",
-        "memory.review",
-        "knowledge.fast",
-        "knowledge.pro",
-    )
     return list(
-        dict.fromkeys(model_runtime.route_for(operation) for operation in operations)
+        dict.fromkeys(
+            model_runtime.route_for(operation)
+            for operation in DEFAULT_MEMORY_CHAT_ROUTES
+        )
     )
 
 

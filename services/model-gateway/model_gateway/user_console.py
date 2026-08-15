@@ -22,14 +22,23 @@ from model_gateway.control_plane import ControlPlaneService
 from model_gateway.health import HEALTH_STATUS_LABELS
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.memory_client import provision_memory_gateway_client
-from model_gateway.models import (
+from model_gateway_contracts import (
     ADAPTER_NAMES,
     AuthConfig,
     Capabilities,
     ConnectionConfig,
+    DEFAULT_MEMORY_GATEWAY_ROUTES,
     DeploymentConfig,
     derive_embedding_space,
     GatewayConfig,
+    KNOWLEDGE_FAST_ROUTE,
+    KNOWLEDGE_PRO_ROUTE,
+    MEMORY_CHAT_ROUTE,
+    MEMORY_COMPACT_ROUTE,
+    MEMORY_CORE_ROUTE,
+    MEMORY_EMBEDDING_ROUTE,
+    MEMORY_EXTRACT_ROUTE,
+    MEMORY_REVIEW_ROUTE,
     PricingConfig,
     PricingTier,
     RequestTransform,
@@ -37,15 +46,19 @@ from model_gateway.models import (
 )
 
 
-PURPOSES: tuple[tuple[str, str, str], ...] = (
-    ("memory.chat", "日常聊天", "chat"),
-    ("memory.extract", "从对话中整理长期记忆", "chat"),
-    ("memory.compact", "压缩较早的对话上下文", "chat"),
-    ("memory.core", "整理核心记忆", "chat"),
-    ("memory.review", "检查和改进记忆", "chat"),
-    ("knowledge.fast", "快速查找知识资料", "chat"),
-    ("knowledge.pro", "处理复杂的知识检索", "chat"),
-    ("memory.embedding", "语义搜索（向量模型）", "embedding"),
+_PURPOSE_METADATA: dict[str, tuple[str, str]] = {
+    MEMORY_CHAT_ROUTE: ("日常聊天", "chat"),
+    MEMORY_EXTRACT_ROUTE: ("从对话中整理长期记忆", "chat"),
+    MEMORY_COMPACT_ROUTE: ("压缩较早的对话上下文", "chat"),
+    MEMORY_CORE_ROUTE: ("整理核心记忆", "chat"),
+    MEMORY_REVIEW_ROUTE: ("检查和改进记忆", "chat"),
+    KNOWLEDGE_FAST_ROUTE: ("快速查找知识资料", "chat"),
+    KNOWLEDGE_PRO_ROUTE: ("处理复杂的知识检索", "chat"),
+    MEMORY_EMBEDDING_ROUTE: ("语义搜索（向量模型）", "embedding"),
+}
+PURPOSES: tuple[tuple[str, str, str], ...] = tuple(
+    (route_id, *_PURPOSE_METADATA[route_id])
+    for route_id in DEFAULT_MEMORY_GATEWAY_ROUTES
 )
 CHAT_PURPOSES = tuple(item[0] for item in PURPOSES if item[2] == "chat")
 PURPOSE_LABELS = {route_id: label for route_id, label, _ in PURPOSES}
@@ -230,7 +243,7 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
             _assign_deployment_to_routes(
                 paths,
                 deployment_id,
-                ("memory.chat",),
+                (MEMORY_CHAT_ROUTE,),
                 confirm_overwrite=True,
             )
         elif answer != "3":
@@ -239,7 +252,7 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
         _assign_deployment_to_routes(
             paths,
             deployment_id,
-            ("memory.embedding",),
+            (MEMORY_EMBEDDING_ROUTE,),
             confirm_overwrite=True,
         )
 
@@ -471,7 +484,7 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
     ) != 0:
         raise ValueError("记忆服务没有通过连接检查；密钥已经安全保存，可检查日志后重试")
 
-    embedding_route = updated.routes.get("memory.embedding")
+    embedding_route = updated.routes.get(MEMORY_EMBEDDING_ROUTE)
     if embedding_route:
         deployment = updated.deployments[embedding_route.targets[0]]
         run_memgw(

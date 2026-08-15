@@ -30,7 +30,7 @@
 cd /path/to/Memory_Platform/services/memory-gateway
 python3 -m venv .venv
 source .venv/bin/activate
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 ```
 
 启动开发服务：
@@ -180,7 +180,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 模型用量：中央响应只记录 Model Gateway Header 给出的实际 vendor/model，渠道价格以 Model Gateway deployment pricing 为权威，Memory 不得用本地 catalog 对中央事件套价。Token 以上游 `usage` 为准；缺少 usage 必须保持不完整。任何事件都不得保存提示词、回复或知识正文，并继续按 user id 隔离。
 - 记忆和知识 embedding 必须带非空 `embedding_space_id`（`MODEL_GATEWAY_EMBEDDING_SPACE_ID`）才能参与向量比较；查询向量、SQLite 向量、缓存和网络/解析缓存都不得跨空间复用。memory/knowledge schema v2 只新增空间列，不猜测或回填旧向量；旧记录必须 re-embed 后才进入当前空间。经 Model Gateway 调用时必须核对完整归因 Header、`X-Model-Gateway-Embedding-Space`、`X-Model-Gateway-Embedding-Dimensions` 与实际向量长度；配置为空、缺失或不匹配都安全回退关键词/FTS。
 - `/v1` 透明代理必须保留原始 tools/tool_calls、tool_call_id、多模态 part、reasoning_content、usage-only SSE chunk 和未知扩展字段。记忆上下文只能插在初始 system 区域，不能插入 assistant tool_calls 与 tool result 之间；流式内容边转发边旁路解析，只有收到完整 `[DONE]`、无工具调用且非 length/content_filter 截断的最终文本才可触发后台 ingest。
-- FLIT 工具链会用新 HTTP 请求重复发送同一 user 前缀，且不发送动态 conversation ID。动态 `X-Conversation-Id`/`conversation_id` 最多 200 个字符，超长值必须拒绝，不能静默截断后造成会话键碰撞。每个工具步骤都根据最后 user 消息重新组装上下文；搜索服务的 L2 缓存会复用召回并校验数据库状态，不得另缓存原始记忆正文，以免删除/敏感度变更后泄露。进程内短 TTL cache 作为快速路径，最终激活和近期上下文另用 SQLite TTL claim 在 worker/重启间去重；ingest 在执行前先写入持久 `chat_finalize_jobs` outbox（done 为终态不回翻），不使用通用副作用 claim，进程崩溃后由周期 drainer 重放补做且不重复提取。完整最终回答还会按可见 user/assistant 历史写入持久化 `conversation_branch_nodes`；下一请求精确匹配父历史，编辑旧消息或重新生成回答会形成独立节点。没有命中分支且没有真实动态会话 ID 时不得读取“该用户最新的任意近期摘要”，避免跨聊天串话。FLIT 的 `memory-auto` 无法按模型名回放已完成工具轮次的 reasoning；网关以 `(user_id, conversation_id/turn_fingerprint, tool_call_id)` 在进程内限量、短 TTL 缓存工具响应推理，并以同一 turn key 缓存工具轮次最终 assistant 推理，下一腿优先固定原 provider 并补回；跨 provider 故障切换或来源缓存丢失时必须删除不可信的 provider 推理原文。`stream_options` 原样透传，usage-only SSE chunk 原样保留；上游不兼容 `stream_options` 时由 Model Gateway 渠道适配层处理，本网关不做按 provider 的特判。
+- FLIT 工具链会用新 HTTP 请求重复发送同一 user 前缀，且不发送动态 conversation ID。动态 `X-Conversation-Id`/`conversation_id` 最多 200 个字符，超长值必须拒绝，不能静默截断后造成会话键碰撞。每个工具步骤都根据最后 user 消息重新组装上下文；搜索服务的 L2 缓存会复用召回并校验数据库状态，不得另缓存原始记忆正文，以免删除/敏感度变更后泄露。进程内短 TTL cache 作为快速路径，最终激活和近期上下文另用 SQLite TTL claim 在 worker/重启间去重；ingest 在执行前先写入持久 `chat_finalize_jobs` outbox，worker 与 drainer 都以 lease token CAS 领取，过期 lease 可重领而旧 token 无权提交结果。outbox 提供 at-least-once 与并发排他，不宣称 exactly-once；`done`/`failed` 都立即清空正文，只保留有界终态元数据。完整最终回答还会按可见 user/assistant 历史写入持久化 `conversation_branch_nodes`；下一请求精确匹配父历史，编辑旧消息或重新生成回答会形成独立节点。没有命中分支且没有真实动态会话 ID 时不得读取“该用户最新的任意近期摘要”，也不得调用 compactor；无 ID 节点仍保存分支元数据和最近原始轮次，但 `compressed_summary` 通常为空。FLIT 的 `memory-auto` 无法按模型名回放已完成工具轮次的 reasoning；网关以 `(user_id, conversation_id/turn_fingerprint, tool_call_id)` 在进程内限量、短 TTL 缓存工具响应推理，并以同一 turn key 缓存工具轮次最终 assistant 推理，下一腿优先固定原 provider 并补回；跨 provider 故障切换或来源缓存丢失时必须删除不可信的 provider 推理原文。`stream_options` 原样透传，usage-only SSE chunk 原样保留；上游不兼容 `stream_options` 时由 Model Gateway 渠道适配层处理，本网关不做按 provider 的特判。
 - 知识导入以用户选择的敏感级别为最终值，但本地检测级别更高时必须先返回结构化确认要求，只有 Web 用户明确点击后才可带 `confirm_sensitivity_override=true` 重试；该确认需持久化审计，MCP 不得暴露绕过参数。
 - ingest 决策日志不得复制完整 `source_quote`；敏感候选正文只记录长度、哈希、敏感级别和关联 memory ID。提取模型返回空候选时，自由文本理由也只记录长度/哈希，但必须保留经过枚举校验的 `model_reason_code`；无效或缺失代码记为 `unclassified`。
 - 模型提取候选必须通过逐字 quote、事实锚点、否定一致性和子句级敏感授权；记忆的 direct/update/restore 仍须在 MemoryStore 边界强制 sensitivity 下限，不受知识导入确认机制影响。
@@ -208,8 +208,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/mcp_server/server.py`：FastMCP server、instructions 和全部 MCP 工具。记忆返回字段由 `MemoryRecord.model_dump(exclude={"embedding_json"})` 派生，与 REST 保持一致，不再手写字段清单；消化情感启发式已移至 `app/memory/affect.py`。
 - `app/memory/models.py`：记忆、核心记忆、候选记忆、体检建议、决策日志等 Pydantic 模型。
 - `app/schema_migrations.py`：记忆库与知识库共用的 `PRAGMA user_version` 校验与迁移执行器，以及 `_ensure_columns` 条件补列原语（两侧 store 的 `_ensure_*` 兼容函数都基于它）；拒绝非正整数、重复、乱序迁移版本和高于当前程序支持范围的未来数据库。
-- `app/memory/store/`：SQLite 记忆存储 package（`__init__` 再导出 `MemoryStore` 与历史符号）；实现按 schema/crud/merge/temporal/export_import/purge/core/conversation 等模块拆分，`_monolith.py` 为编排壳。子模块首参只依赖 `helpers._ConnectableStore` Protocol（`_connect` 等最小能力），不再类型引用 `MemoryStore`；跨模块共享的 row→model 映射与 connection 级原语（`_row_to_*`、`_insert_memory_row`、`_rows_to_memories*`、`_space_ids_for_memory_ids_on_connection`、`_temporal_snapshot`）是 `helpers.py` 里的自由函数。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`ClosingSQLiteConnection`）。
-- `app/memory/conversation_context.py`：会话/分支级滚动上下文。以无存储副作用的状态演进生成压缩摘要和最近原始轮次，为记忆提取构造敏感过滤后的消歧上下文，并在阈值到达时通过共享 LLM provider 后台压缩较早普通轮次。
+- `app/memory/store/`：SQLite 记忆存储 package（`__init__` 再导出兼容的 `MemoryStore` 与历史符号）；`repository.py` 组合按领域划分的 repository mixin，并把领域函数直接绑定为方法，使每个操作的签名只定义一次。子模块首参依赖 `helpers.py` 中按实际能力拆分的显式 Protocol，不类型引用组合后的 `MemoryStore`；row→model 映射与 connection 级原语仍是 `helpers.py` 里的自由函数。分支节点和决策日志分别按每用户保留最近 5000 条，超出自动裁剪；`_connect()` 返回的连接在退出 `with` 块时会真正 close（`ClosingSQLiteConnection`）。
+- `app/memory/conversation_context.py`：会话/分支级滚动上下文。以无存储副作用的状态演进生成压缩摘要和最近原始轮次，为记忆提取构造敏感过滤后的消歧上下文；只有真实 conversation ID 的 fallback 场景会在阈值到达时压缩较早普通轮次，无 conversation ID 的分支不调用 compactor。
 - `app/memory/search.py`：embedding/中文关键词召回、拒绝阈值、多模式自然浮现、敏感硬过滤、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
 - `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。
@@ -221,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/affect.py`：消化产物（reflection/feel）的 valence/arousal 领域启发式（源记忆均值 + 中英关键词增减量），供 MCP digest 工具 import 使用。
 - `app/usage/`：模型调用计量上下文、实际 provider/model 识别、上游 usage 兼容解析、事件价格快照、SQLite 汇总和公开价格目录。记录失败必须保持 best-effort，不能改变模型调用结果。
 - `app/knowledge/`：独立知识文档、不可变版本、FTS5 chunk 索引、持久化分段上传、精确引用读取、受限搜索代理与知识备份；不得反向依赖或写入 MemoryStore。
-- `app/knowledge/store/`：SQLite 知识存储 package（`__init__` 再导出 `KnowledgeStore`、错误类型、`detect_knowledge_text_sensitivity` 以及供测试 monkeypatch 的 `chunk_knowledge_text`/`_MAX_RESTORE_TOTAL_BYTES`）；实现按 schema/migrations/uploads/documents/search/references/export_import/status 模块拆分，`_monolith.py` 为编排壳，`utils.py` 收纯函数（校验、JSON、时间戳、FTS 查询、excerpt、游标签名、参数化 `_safe_error`），`helpers.py` 收 `_ConnectableStore` Protocol 与 row→model 映射、`_index_version_in_connection` 等 connection 级原语。子模块首参只依赖 Protocol，不类型引用 `KnowledgeStore`，也不得新增对 `app.memory` 的 import；`KNOWLEDGE_DATABASE_PATH` 必须保持独立。
+- `app/knowledge/store/`：SQLite 知识存储 package（`__init__` 再导出兼容的 `KnowledgeStore`、错误类型、`detect_knowledge_text_sensitivity` 以及供测试 monkeypatch 的 `chunk_knowledge_text`/`_MAX_RESTORE_TOTAL_BYTES`）；`repository.py` 组合 uploads/documents/search/references/export_import/status 等领域 repository mixin，领域函数签名只定义一次。`utils.py` 收纯函数，`helpers.py` 收按实际能力拆分的显式 Protocol、row→model 映射与 `_index_version_in_connection` 等 connection 级原语。子模块不类型引用组合后的 `KnowledgeStore`，也不得新增对 `app.memory` 的 import；`KNOWLEDGE_DATABASE_PATH` 必须保持独立。
 - `app/knowledge/parsing.py`：本地 TXT/Markdown/PDF/DOCX/EPUB 解析；PDF 依赖 pypdf 文本层，DOCX/EPUB 使用受限 ZIP/XML/HTML 解析，不执行宏、脚本或文档内指令。
 - `app/knowledge/retrieval.py`：知识 chunk embedding 构建、SQLite 向量扫描与 FTS/向量加权 RRF；embedding 失败必须回退本地 FTS。
 - `app/api/knowledge.py`：`/knowledge/*` REST 管理与调试接口；与记忆 REST 共用鉴权和 `X-User-Id`，数据源保持物理隔离。
@@ -257,7 +257,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 ## 已知限制
 
 - MCP 模式依赖模型主动调用工具，效果受客户端系统提示词影响。
-- `/v1` 工具轮次的激活与近期上下文副作用由进程内 cache 加 SQLite TTL claim 去重；ingest 经持久 outbox 在重启后补做，已完成轮次不会重复提取。FLIT reasoning 回放仍只在当前进程短期保存，多 worker 或进程重启不共享。个人服务默认使用单 worker。
+- `/v1` 工具轮次的激活与近期上下文副作用由进程内 cache 加 SQLite TTL claim 去重；ingest 经带 lease 的持久 outbox 在重启后以 at-least-once 语义补做，终态会清空正文。FLIT reasoning 回放仍只在当前进程短期保存，多 worker 或进程重启不共享。个人服务默认使用单 worker。
 - 模型用量从部署包含计量表的版本后开始记录，不反向估算历史；provider 未返回 usage 或模型没有明确公开单价时只能报告不完整状态。
 - FLIT 当前不发送动态 conversation ID；缺省时网关不自动读取或持久化跨会话近期摘要，只使用核心记忆、按当前 user 消息召回的长期记忆，以及当前请求内最近两轮可见对话作为记忆提取消歧上下文。不要用用户最新任意摘要代替缺失的会话 ID。
 - embedding 存在 SQLite JSON 字段中，没有向量数据库或向量索引。

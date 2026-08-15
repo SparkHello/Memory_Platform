@@ -24,7 +24,7 @@ from model_gateway.memory_client import (
     EMBEDDING_ROUTE,
     provision_memory_gateway_client,
 )
-from model_gateway.models import (
+from model_gateway_contracts import (
     ADAPTER_NAMES,
     BILLING_PLAN_TYPES,
     AdapterName,

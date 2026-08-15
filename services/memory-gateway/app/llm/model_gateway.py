@@ -5,25 +5,23 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
+from model_gateway_contracts import (
+    GatewayErrorCode,
+    MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER,
+    MODEL_GATEWAY_CONNECTION_HEADER,
+    MODEL_GATEWAY_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_EMBEDDING_DIMENSIONS_HEADER,
+    MODEL_GATEWAY_EMBEDDING_SPACE_HEADER,
+    MODEL_GATEWAY_MODEL_AUTHOR_HEADER,
+    MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER,
+    MODEL_GATEWAY_ROUTE_HEADER,
+    MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
+    MODEL_GATEWAY_VENDOR_HEADER,
+)
+
 from app.llm.runtime import resolve_model_runtime
-
-
-MODEL_GATEWAY_ROUTE_HEADER = "X-Model-Gateway-Route"
-MODEL_GATEWAY_DEPLOYMENT_HEADER = "X-Model-Gateway-Deployment"
-MODEL_GATEWAY_CONNECTION_HEADER = "X-Model-Gateway-Connection"
-MODEL_GATEWAY_CHANNEL_OPERATOR_HEADER = "X-Model-Gateway-Channel-Operator"
-MODEL_GATEWAY_MODEL_AUTHOR_HEADER = "X-Model-Gateway-Model-Author"
-MODEL_GATEWAY_VENDOR_HEADER = "X-Model-Gateway-Vendor"
-MODEL_GATEWAY_UPSTREAM_MODEL_HEADER = "X-Model-Gateway-Upstream-Model"
-MODEL_GATEWAY_EMBEDDING_SPACE_HEADER = "X-Model-Gateway-Embedding-Space"
-MODEL_GATEWAY_EMBEDDING_DIMENSIONS_HEADER = "X-Model-Gateway-Embedding-Dimensions"
-MODEL_GATEWAY_PREFERRED_DEPLOYMENT_HEADER = (
-    "X-Model-Gateway-Preferred-Deployment"
-)
-MODEL_GATEWAY_REQUIRE_DEPLOYMENT_HEADER = "X-Model-Gateway-Require-Deployment"
-MODEL_GATEWAY_REASONING_ORIGIN_DEPLOYMENT_HEADER = (
-    "X-Model-Gateway-Reasoning-Origin-Deployment"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +152,8 @@ def is_model_gateway_affinity_unavailable(
     if not isinstance(error, dict):
         return False
     return (
-        error.get("code") == "model_gateway_affinity_unavailable"
-        or error.get("type") == "model_gateway_affinity_unavailable"
+        error.get("code") == GatewayErrorCode.AFFINITY_UNAVAILABLE.value
+        or error.get("type") == GatewayErrorCode.AFFINITY_UNAVAILABLE.value
     )
 
 

@@ -21,7 +21,7 @@
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ../../packages/model-gateway-contracts -e ".[dev]"
 .venv/bin/pytest
 .venv/bin/modelgw --home /tmp/modelgw-test init
 ```

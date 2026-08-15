@@ -11,7 +11,7 @@ from model_gateway.discovery import (
     fetch_model_listing,
     parse_model_listing,
 )
-from model_gateway.models import (
+from model_gateway_contracts import (
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,

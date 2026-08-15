@@ -12,6 +12,7 @@ import time
 
 import anyio
 import httpx
+from model_gateway_contracts import MEMORY_EMBEDDING_ROUTE
 
 from app.llm.model_gateway import (
     ModelGatewayProtocolError,
@@ -377,7 +378,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
                     operation=(
                         context_operation
                         if context_operation != "unspecified"
-                        else "memory.embedding"
+                        else MEMORY_EMBEDDING_ROUTE
                     ),
                 )
             )

@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
     "httpx>=0.27.0",
+    "model-gateway-contracts==0.5.1",
     # v1.10 introduces transport_security; v2 removes the FastMCP v1 import paths.
     "mcp>=1.10.0,<2",
     "pydantic>=2.7.0",
@@ -26,6 +27,7 @@ dev = [
     "httpx2>=2.7.0,<3",
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.0",
+    "setuptools>=69",
 ]
 
 [project.scripts]

@@ -5,12 +5,15 @@ import hmac
 import re
 from uuid import uuid4
 
+from model_gateway_contracts import (
+    MODEL_GATEWAY_CORRELATION_HEADER,
+    MODEL_GATEWAY_OPERATION_HEADER,
+    MODEL_GATEWAY_USER_TAG_HEADER,
+)
+
 from app.usage.context import current_usage_context
 
 
-MODEL_GATEWAY_CORRELATION_HEADER = "X-Model-Gateway-Correlation-ID"
-MODEL_GATEWAY_OPERATION_HEADER = "X-Model-Gateway-Operation"
-MODEL_GATEWAY_USER_TAG_HEADER = "X-Model-Gateway-User-Tag"
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 _USER_TAG_DOMAIN = b"memory-gateway:model-usage-user:v1\0"
 

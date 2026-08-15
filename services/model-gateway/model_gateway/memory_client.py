@@ -6,23 +6,20 @@ import secrets
 
 from model_gateway.auth import client_token_bytes
 from model_gateway.ids import default_secret_ref
-from model_gateway.models import ClientConfig, GatewayConfig
+from model_gateway_contracts import (
+    DEFAULT_MEMORY_CHAT_ROUTES,
+    DEFAULT_MEMORY_GATEWAY_ROUTES,
+    MEMORY_EMBEDDING_ROUTE,
+    ClientConfig,
+    GatewayConfig,
+)
 
 
 # The eight stable business routes Memory Gateway calls by default. Keeping the
 # bootstrap policy exact prevents a future matching route from gaining access
 # merely because Model Gateway learned about it.
-CHAT_ROUTES: tuple[str, ...] = (
-    "memory.chat",
-    "memory.extract",
-    "memory.compact",
-    "memory.core",
-    "memory.review",
-    "knowledge.fast",
-    "knowledge.pro",
-)
-EMBEDDING_ROUTE = "memory.embedding"
-DEFAULT_MEMORY_GATEWAY_ROUTES = (*CHAT_ROUTES, EMBEDDING_ROUTE)
+CHAT_ROUTES = DEFAULT_MEMORY_CHAT_ROUTES
+EMBEDDING_ROUTE = MEMORY_EMBEDDING_ROUTE
 
 
 @dataclass(frozen=True, slots=True)

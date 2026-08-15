@@ -18,7 +18,7 @@ from uuid import uuid4
 from dotenv import dotenv_values
 
 from model_gateway.auth import SecretSnapshotError, validate_secret_snapshot
-from model_gateway.models import GatewayConfig, validate_id
+from model_gateway_contracts import GatewayConfig, validate_id
 from model_gateway.storage import ensure_write_capacity
 
 

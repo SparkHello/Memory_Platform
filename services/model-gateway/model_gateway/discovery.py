@@ -23,7 +23,7 @@ from model_gateway.http_safety import (
     require_safe_destination_sync,
     upstream_url,
 )
-from model_gateway.models import ConnectionConfig
+from model_gateway_contracts import ConnectionConfig
 
 
 class DiscoveryResponseTooLarge(ValueError):
