@@ -171,6 +171,8 @@ export function DashboardPage({
   const [state, setState] = useState<LoadState<DashboardData>>({ loading: true, error: null, data: null });
   const [surfaceLoading, setSurfaceLoading] = useState(false);
   const [networkLoading, setNetworkLoading] = useState(false);
+  const [networkLoaded, setNetworkLoaded] = useState(false);
+  const [networkError, setNetworkError] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("balanced");
   const [networkDensity, setNetworkDensity] = useState<NetworkDensity>("overview");
@@ -179,50 +181,42 @@ export function DashboardPage({
 
   const load = useCallback(async (
     nextSurfaceMode: SurfaceMode,
-    nextDensity: NetworkDensity,
-    nextFilters: NetworkFilters,
     signal?: AbortSignal
   ) => {
     setState((current) => ({ ...current, loading: true, error: null }));
     try {
-      const density =
-        NETWORK_DENSITY_OPTIONS.find((option) => option.key === nextDensity) ||
-        NETWORK_DENSITY_OPTIONS[0];
-      const [health, report, review, logs, surfaced, network, spaces, providers, tokens] =
+      const [health, report, logs, surfaced, spaces, providers, tokens] =
         await Promise.all([
           api.health(signal),
           api.memoryReport(signal),
-          api.reviewMemories(signal),
           api.decisionLogs(10, {}, signal),
           api.surfaceMemories(6, nextSurfaceMode, { redactSensitive: true }, signal),
-          api.memoryNetwork({
-            limit: density.limit,
-            similarityThreshold: 0.42,
-            maxSimilarityEdges: density.maxSimilarityEdges,
-            spaceId: nextFilters.spaceId === "all" ? undefined : nextFilters.spaceId,
-            type: nextFilters.type === "all" ? undefined : nextFilters.type,
-            sensitivity:
-              nextFilters.sensitivity === "all" ? undefined : nextFilters.sensitivity,
-            valenceMin: nextFilters.valenceMin,
-            valenceMax: nextFilters.valenceMax,
-            arousalMin: nextFilters.arousalMin,
-            arousalMax: nextFilters.arousalMax,
-            redactSensitive: true
-          }, signal),
           api.listMemorySpaces({ signal }),
           api.providersStatus(signal).catch(() => null),
           api.authTokens(signal).catch(() => null)
         ]);
+      setNetworkLoaded(false);
+      setNetworkError(null);
+      setSelectedNodeId(null);
       setState({
         loading: false,
         error: null,
         data: {
           health: health.status,
           report,
-          review,
+          review: { total: 0, recommendations: [] },
           logs,
           surfaced,
-          network,
+          network: {
+            nodes: [],
+            edges: [],
+            meta: {
+              memory_count: 0,
+              core_count: 0,
+              similarity_threshold: 0.42,
+              max_similarity_edges: 0
+            }
+          },
           spaces,
           evalProgress: null,
           setup: providers?.setup || null,
@@ -244,7 +238,7 @@ export function DashboardPage({
 
   useEffect(() => {
     const controller = new AbortController();
-    void load("balanced", "overview", DEFAULT_NETWORK_FILTERS, controller.signal);
+    void load("balanced", controller.signal);
     return () => controller.abort();
   }, [load]);
 
@@ -254,8 +248,8 @@ export function DashboardPage({
   useEffect(() => {
     if (refreshKey === seenRefreshKeyRef.current) return;
     seenRefreshKeyRef.current = refreshKey;
-    void load(surfaceMode, networkDensity, networkFilters);
-  }, [refreshKey, load, surfaceMode, networkDensity, networkFilters]);
+    void load(surfaceMode);
+  }, [refreshKey, load, surfaceMode]);
 
   const surfaceRequestRef = useRef<AbortController | null>(null);
   const networkRequestRef = useRef<AbortController | null>(null);
@@ -296,6 +290,7 @@ export function DashboardPage({
     const controller = new AbortController();
     networkRequestRef.current = controller;
     setNetworkLoading(true);
+    setNetworkError(null);
     try {
       const network = await api.memoryNetwork({
         limit: density.limit,
@@ -315,8 +310,9 @@ export function DashboardPage({
         ...current,
         data: { ...current.data, network }
       } : current);
+      setNetworkLoaded(true);
     } catch (error) {
-      if (!isAbortError(error)) notify(errorMessage(error), "error");
+      if (!isAbortError(error)) setNetworkError(errorMessage(error));
     } finally {
       if (networkRequestRef.current === controller) setNetworkLoading(false);
     }
@@ -395,7 +391,7 @@ export function DashboardPage({
   return (
     <div className="page-stack studio-page">
       {state.loading && !state.data && <LoadingBlock label="正在整理记忆工作室" />}
-      {state.error && !state.data && <ErrorBlock message={state.error} onRetry={() => void load(surfaceMode, networkDensity, networkFilters)} />}
+      {state.error && !state.data && <ErrorBlock message={state.error} onRetry={() => void load(surfaceMode)} />}
 
       {data && (
         <>
@@ -432,7 +428,7 @@ export function DashboardPage({
                 <button
                   className={`icon-button studio-refresh ${state.loading ? "is-loading" : ""}`}
                   type="button"
-                  onClick={() => void load(surfaceMode, networkDensity, networkFilters)}
+                  onClick={() => void load(surfaceMode)}
                   title="刷新数据"
                   aria-label="刷新整页数据"
                   disabled={state.loading}
@@ -562,7 +558,14 @@ export function DashboardPage({
             </div>
           </div>
 
-          <details className="panel studio-explore">
+          <details
+            className="panel studio-explore"
+            onToggle={(event) => {
+              if (event.currentTarget.open && !networkLoaded && !networkLoading) {
+                void refreshNetwork(networkDensity, networkFilters);
+              }
+            }}
+          >
             <summary>探索情绪、网络与计数</summary>
             <MetricStrip metrics={metrics} />
             <div className="studio-explore-grid">
@@ -635,20 +638,29 @@ export function DashboardPage({
                 onChange={changeNetworkFilters}
               />
             )}
-            <div className="network-workspace" aria-busy={networkLoading}>
-              <MemoryNetwork
-                network={data.network}
-                selectedId={selectedNodeId}
-                onSelect={(node) => setSelectedNodeId(node.id)}
+            {networkLoading && !networkLoaded && <LoadingBlock label="正在加载记忆网络" />}
+            {networkError && (
+              <ErrorBlock
+                message={`记忆网络加载失败：${networkError}`}
+                onRetry={() => void refreshNetwork(networkDensity, networkFilters)}
               />
-              <NetworkDetail
-                node={selectedNode}
-                spaces={data.spaces}
-                api={api}
-                onOpenMemory={() => selectedNode && openMemory(selectedNode.id)}
-                onBrowseMemories={() => setPage("memories")}
-              />
-            </div>
+            )}
+            {networkLoaded && !networkError && (
+              <div className="network-workspace" aria-busy={networkLoading}>
+                <MemoryNetwork
+                  network={data.network}
+                  selectedId={selectedNodeId}
+                  onSelect={(node) => setSelectedNodeId(node.id)}
+                />
+                <NetworkDetail
+                  node={selectedNode}
+                  spaces={data.spaces}
+                  api={api}
+                  onOpenMemory={() => selectedNode && openMemory(selectedNode.id)}
+                  onBrowseMemories={() => setPage("memories")}
+                />
+              </div>
+            )}
           </section>
           </details>
 

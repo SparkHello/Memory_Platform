@@ -356,6 +356,7 @@ async def test_enqueue_failure_calls_pure_ingest_exactly_once(
         extraction_context_messages=[],
         conversation_id=None,
         previous_context=None,
+        branch_state="root",
         parent_history_fingerprint="",
         branch_messages=[],
         turn_fingerprint="turn",

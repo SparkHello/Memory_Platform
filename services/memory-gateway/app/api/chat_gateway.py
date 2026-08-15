@@ -348,7 +348,11 @@ async def chat_completions(
         context = await _build_turn_context(
             user_id=user_id,
             query=user_text,
-            recent_context=previous_context,
+            recent_context=(
+                previous_context
+                if branch_state == "conversation-fallback"
+                else None
+            ),
             store=store,
             search_service=search_service,
             settings=settings,
@@ -375,6 +379,7 @@ async def chat_completions(
         extraction_context_messages=extraction_context_messages,
         conversation_id=conversation_id,
         previous_context=previous_context,
+        branch_state=branch_state,
         parent_history_fingerprint=parent_history_fingerprint,
         branch_messages=_branch_visible_messages(
             messages[: latest_user_index + 1]
@@ -1399,6 +1404,7 @@ async def _finalize_turn(
     extraction_context_messages: list[dict[str, str]],
     conversation_id: str | None,
     previous_context: RecentContextSummary | None,
+    branch_state: str,
     parent_history_fingerprint: str,
     branch_messages: list[dict[str, str]],
     turn_fingerprint: str,
@@ -1439,15 +1445,18 @@ async def _finalize_turn(
             )
             logger.exception("聊天网关记录记忆激活失败；不影响聊天响应。")
 
+    fallback_context = (
+        previous_context if branch_state == "conversation-fallback" else None
+    )
     extraction_context = safe_extraction_context(
-        state=previous_context,
+        state=fallback_context,
         request_messages=extraction_context_messages,
         allow_sensitive_egress=settings.allow_sensitive_egress,
         recent_turn_limit=settings.chat_gateway_extraction_context_turns,
         max_chars=settings.chat_gateway_extraction_context_max_chars,
     )
     context_quote_source = safe_context_quote_source(
-        state=previous_context,
+        state=fallback_context,
         request_messages=extraction_context_messages,
         allow_sensitive_egress=settings.allow_sensitive_egress,
         recent_turn_limit=settings.chat_gateway_extraction_context_turns,
@@ -1482,6 +1491,8 @@ async def _finalize_turn(
                 compact_after_turns=settings.chat_gateway_context_compact_after_turns,
                 compact_after_chars=settings.chat_gateway_context_compact_after_chars,
                 summary_max_chars=settings.chat_gateway_compacted_summary_max_chars,
+                enable_compaction=branch_state == "conversation-fallback",
+                preserve_compressed_summary=conversation_id is not None,
             )
             if draft is not None:
                 node = await anyio.to_thread.run_sync(

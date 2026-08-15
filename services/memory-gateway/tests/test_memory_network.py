@@ -442,6 +442,35 @@ def test_memory_network_traverse_spends_edge_budget_from_seed_frontier(
     assert payload["meta"]["edge_count"] <= 2
 
 
+def test_memory_network_traverse_bounds_induced_candidate_graph(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+) -> None:
+    seed = memory_store.create_memory(
+        user_id="default",
+        content="bounded traversal seed",
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
+    )
+    for index in range(70):
+        memory_store.create_memory(
+            user_id="default",
+            content=f"candidate-{index}",
+            embedding_json=json.dumps([1.0, index / 1000]),
+            embedding_space_id="test-space",
+        )
+
+    response = client.post(
+        "/memories/network/traverse",
+        headers=auth_headers,
+        json={"seed_id": seed.id, "max_candidates": 500, "max_edges": 1500},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["meta"]["candidate_count"] == 50
+
+
 def test_memory_network_traverse_uses_explicit_evidence_edge(
     client: TestClient,
     auth_headers: dict[str, str],

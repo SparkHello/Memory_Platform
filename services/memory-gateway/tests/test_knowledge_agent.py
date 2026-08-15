@@ -332,7 +332,7 @@ async def test_unknown_chunk_refs_are_rejected_without_store_read_and_fail_close
 
     result = await agent.search("读取未知片段", "alice", quality="fast")
 
-    assert result.selected_refs == []
+    assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.agent_used is False
     assert result.metadata.fallback_reason == "unknown_chunk_reference"
     assert store.inspect_calls == []
@@ -468,14 +468,17 @@ async def test_scoped_unknown_document_does_not_reach_remote_agent() -> None:
         ),
     ],
 )
-async def test_remote_failures_return_safe_empty_result(error: Exception, reason: str) -> None:
+async def test_remote_failures_fall_back_to_local_baseline(
+    error: Exception,
+    reason: str,
+) -> None:
     store = FakeStore([_hit()])
     remote = FakeCompletionClient([error])
     agent = KnowledgeSearchAgent(store, _central_config(), client=remote)
 
     result = await agent.search("仍应本地召回", "alice")
 
-    assert result.selected_refs == []
+    assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.agent_used is False
     assert result.metadata.agent_attempted is True
     assert result.metadata.fallback_reason == reason
@@ -491,7 +494,7 @@ async def test_prompt_injection_cannot_add_tools_or_read_arbitrary_data() -> Non
 
     result = await agent.search("查找相关资料", "alice", quality="fast")
 
-    assert result.selected_refs == []
+    assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.agent_used is False
     assert result.metadata.fallback_reason == "forbidden_tool"
     assert store.inspect_calls == []
@@ -517,7 +520,7 @@ async def test_explicit_request_injection_is_rejected_before_remote_agent() -> N
         quality="deep",
     )
 
-    assert result.selected_refs == []
+    assert result.selected_refs == [CHUNK_REF]
     assert result.metadata.agent_attempted is False
     assert result.metadata.agent_used is False
     assert result.metadata.fallback_reason == "request_policy_rejected"
@@ -821,8 +824,12 @@ async def test_result_carries_baseline_candidates_without_a_second_search() -> N
         client=FakeCompletionClient([]),
     )
 
-    result = await agent.search("原始需求", "alice")
+    result = await agent.search(
+        "原始需求",
+        "alice",
+        baseline_candidates=[_hit()],
+    )
 
-    assert len(store.search_calls) == 1
+    assert store.search_calls == []
     assert [item["chunk_ref"] for item in result.baseline_candidates] == [CHUNK_REF]
     assert result.metadata.baseline_refs == [CHUNK_REF]

@@ -84,6 +84,9 @@ export function MemoryDetailDrawer({
   const [why, setWhy] = useState<MemorySourceExplanation | null>(null);
   const [traverse, setTraverse] = useState<TraversalResponse | null>(null);
   const [traverseError, setTraverseError] = useState<string | null>(null);
+  const [traverseStatus, setTraverseStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [reviewStatus, setReviewStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState<MemoryEditDraft | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
@@ -105,6 +108,9 @@ export function MemoryDetailDrawer({
       setWhy(null);
       setTraverse(null);
       setTraverseError(null);
+      setTraverseStatus("idle");
+      setReviewStatus("idle");
+      setReviewError(null);
       setEditing(false);
       setEditDraft(null);
       setEditError(null);
@@ -157,24 +163,6 @@ export function MemoryDetailDrawer({
           .catch(() => {
             if (alive()) setWhy(null);
           });
-        void api
-          .traverseMemoryNetwork(memoryId, { redactSensitive: true }, signal)
-          .then((value) => {
-            if (alive()) setTraverse(value);
-          })
-          .catch((error) => {
-            if (alive()) setTraverseError(errorMessage(error));
-          });
-        void api
-          .reviewMemories(signal)
-          .then((result) => {
-            if (alive())
-              setGovernance((current) => ({
-                ...current,
-                review: result.recommendations.filter((rec) => rec.memory_ids.includes(memoryId))
-              }));
-          })
-          .catch(() => undefined);
       }
     },
     [api, memoryId]
@@ -214,11 +202,31 @@ export function MemoryDetailDrawer({
     if (!memory) return;
     setTraverse(null);
     setTraverseError(null);
+    setTraverseStatus("loading");
     try {
       const value = await api.traverseMemoryNetwork(memory.id, { redactSensitive: true });
       setTraverse(value);
+      setTraverseStatus("ready");
     } catch (error) {
       setTraverseError(errorMessage(error));
+      setTraverseStatus("error");
+    }
+  };
+
+  const loadReview = async () => {
+    if (!memory) return;
+    setReviewStatus("loading");
+    setReviewError(null);
+    try {
+      const result = await api.reviewMemories();
+      setGovernance((current) => ({
+        ...current,
+        review: result.recommendations.filter((rec) => rec.memory_ids.includes(memory.id))
+      }));
+      setReviewStatus("ready");
+    } catch (error) {
+      setReviewError(errorMessage(error));
+      setReviewStatus("error");
     }
   };
 
@@ -527,11 +535,16 @@ export function MemoryDetailDrawer({
                   关联记忆
                   {traverse && <small>{related.length ? `按图关系强度排序` : ""}</small>}
                 </h3>
-                {!traverse && !traverseError && <LoadingBlock label="正在遍历记忆网络" />}
-                {traverseError && (
+                {traverseStatus === "idle" && (
+                  <button className="secondary-button compact" type="button" onClick={() => void retryTraverse()}>
+                    加载关联分析（实验）
+                  </button>
+                )}
+                {traverseStatus === "loading" && <LoadingBlock label="正在遍历记忆网络" />}
+                {traverseStatus === "error" && traverseError && (
                   <ErrorBlock message={`关联记忆加载失败：${traverseError}`} onRetry={() => void retryTraverse()} />
                 )}
-                {traverse && related.length === 0 && (
+                {traverseStatus === "ready" && traverse && related.length === 0 && (
                   <EmptyBlock compact label="这条记忆暂时没有足够强的关联。" />
                 )}
                 {related.map((item) => (
@@ -553,9 +566,21 @@ export function MemoryDetailDrawer({
               </section>
             )}
 
-            {(governance.review.length > 0 || governance.logs.length > 0) && (
+            {(!state.deleted || governance.logs.length > 0) && (
               <section className="subpanel profile-governance">
                 <h3>治理记录</h3>
+                {!state.deleted && reviewStatus === "idle" && (
+                  <button className="secondary-button compact" type="button" onClick={() => void loadReview()}>
+                    加载治理建议
+                  </button>
+                )}
+                {!state.deleted && reviewStatus === "loading" && <LoadingBlock label="正在运行记忆体检" />}
+                {!state.deleted && reviewStatus === "error" && reviewError && (
+                  <ErrorBlock message={`治理建议加载失败：${reviewError}`} onRetry={() => void loadReview()} />
+                )}
+                {!state.deleted && reviewStatus === "ready" && governance.review.length === 0 && (
+                  <EmptyBlock compact label="这条记忆目前没有治理建议。" />
+                )}
                 {governance.review.map((rec, index) => (
                   <div className="profile-review-item" key={`review-${index}`}>
                     <span className={`severity-pill severity-${rec.severity}`}>

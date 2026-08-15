@@ -356,7 +356,7 @@ curl \
 
 Memory Gateway 只通过 Model Gateway 的稳定 route 调用模型：聊天、记忆提取、压缩、核心整理、体检、知识 fast/pro 和 embedding 各使用上面 `MODEL_GATEWAY_*` 配置的 route，用途与 fallback 由中央 route 明确控制。模型、deployment、功能路由与官方价格一律在 Model Gateway 中用 `modelgw connection/deployment/route/pricing` 或 Web 控制台「模型与路由」页管理。旧的项目内 `memgw model` / `memgw route` / `memgw pricing` 子命令只打印迁移提示并以退出码 2 结束；从 direct-provider 部署升级见 [迁移到 Model Gateway](../../docs/migrate-to-model-gateway.md)。
 
-知识代理多轮工具调用仍会保留并回传 `reasoning_content`，每个多轮阶段锁定首次实际 deployment；思考/工具组合兼容性由中央网关按 deployment 声明在付费请求前校验。远程知识代理失败、越权引用或工具拒绝时返回安全空结果；只有明确关闭外发的本地模式继续使用本地检索结果。
+知识代理多轮工具调用仍会保留并回传 `reasoning_content`，每个多轮阶段锁定首次实际 deployment；思考/工具组合兼容性由中央网关按 deployment 声明在付费请求前校验。检索始终先生成受用户与文档范围约束的本地 baseline；关闭外发时直接返回它，启用 Agent 后若远程失败、请求注入、越权引用或工具拒绝，也只回退同一 baseline，不让远程步骤抹掉本地可用结果。
 
 ## FLIT / OpenAI Chat Completions 接入
 

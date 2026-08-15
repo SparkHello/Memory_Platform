@@ -81,7 +81,7 @@ export function App() {
         : "ok";
   }, [settings.apiKey, credentialsBlocked]);
 
-  // 侧栏待办角标：体检建议、回收站。失败时静默，不影响主流程。
+  // 侧栏待办角标只读取轻量状态；完整记忆体检必须由用户显式触发。
   const refreshSignals = useCallback(async () => {
     if (!settings.apiKey || credentialsBlocked) {
       setNavSignals({});
@@ -90,16 +90,12 @@ export function App() {
     }
     const next: NavSignals = {};
     try {
-      const [report, review, knowledge, providers, tokens] = await Promise.all([
+      const [report, knowledge, providers, tokens] = await Promise.all([
         api.memoryReport(),
-        api.reviewMemories(),
         api.knowledgeStatus().catch(() => null),
         api.providersStatus().catch(() => null),
         api.authTokens().catch(() => null)
       ]);
-      if (review.recommendations.length > 0) {
-        next.review = { text: String(review.recommendations.length), tone: "warning" };
-      }
       if (report.counts.deleted_memories > 0) {
         next.memories = { text: String(report.counts.deleted_memories), tone: "muted" };
       }
@@ -137,8 +133,8 @@ export function App() {
   const seenKnowledgeRefreshKeyRef = useRef(knowledgeRefreshKey);
 
   useEffect(() => {
-    // 角标刷新节流：切页 60s 内不重复拉取（reviewMemories 是服务端全库扫描）；
-    // 首次加载和记忆变更（memoryRefreshKey 递增）仍立即刷新。
+    // 角标刷新节流：切页 60s 内不重复拉取；首次加载和记忆/知识变更
+    // （refreshKey 递增）仍立即刷新。
     const now = Date.now();
     const forced =
       memoryRefreshKey !== seenRefreshKeyRef.current ||

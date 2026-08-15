@@ -42,16 +42,22 @@ def _control_payload(
     *,
     embedding_space_id: str | None = None,
     embedding_dimensions: int | None = None,
+    include_knowledge_routes: bool = True,
 ) -> dict[str, object]:
-    chat_routes = (
+    chat_routes = [
         settings.model_gateway_chat_model,
         settings.model_gateway_memory_extract_model,
         settings.model_gateway_memory_compact_model,
         settings.model_gateway_memory_core_model,
         settings.model_gateway_memory_review_model,
-        settings.model_gateway_knowledge_fast_model,
-        settings.model_gateway_knowledge_pro_model,
-    )
+    ]
+    if include_knowledge_routes:
+        chat_routes.extend(
+            [
+                settings.model_gateway_knowledge_fast_model,
+                settings.model_gateway_knowledge_pro_model,
+            ]
+        )
     return {
         "connections": [
             {
@@ -151,6 +157,63 @@ def test_readyz_checks_databases_model_ready_backend_scope_and_embedding(
         ("/admin/configuration", "Bearer central-backend-key"),
     ]
     assert "central-backend-key" not in response.text
+
+
+def test_readyz_does_not_require_agent_routes_for_local_knowledge(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    assert settings.knowledge_agent_egress_policy == "none"
+    client.app.dependency_overrides[get_settings] = lambda: settings
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(
+            200,
+            json=_control_payload(
+                settings,
+                include_knowledge_routes=False,
+            ),
+        )
+
+    _install_model_transport(monkeypatch, handler)
+
+    assert client.get("/readyz").status_code == 200
+
+
+def test_readyz_requires_agent_routes_when_knowledge_egress_is_enabled(
+    client,
+    memory_store,
+    knowledge_store,
+    monkeypatch,
+) -> None:
+    settings = _central_settings(memory_store, knowledge_store)
+    settings.knowledge_agent_egress_policy = "normal"
+    client.app.dependency_overrides[get_settings] = lambda: settings
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready"})
+        return httpx.Response(
+            200,
+            json=_control_payload(
+                settings,
+                include_knowledge_routes=False,
+            ),
+        )
+
+    _install_model_transport(monkeypatch, handler)
+
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "code": "model_gateway_route_visibility_mismatch",
+    }
 
 
 def test_readyz_rejects_bad_database_before_network(

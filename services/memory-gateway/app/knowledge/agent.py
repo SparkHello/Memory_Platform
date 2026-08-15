@@ -117,8 +117,8 @@ class KnowledgeAgentResult(BaseModel):
     Excerpts and full text are intentionally absent from ``selected_refs``.  The
     search service must resolve ``selected_refs`` again through KnowledgeStore
     under the current user id before returning verbatim content to a caller.
-    ``baseline_candidates`` carries the local baseline hits already produced by
-    the internal baseline search so callers do not run the same query twice.
+    ``baseline_candidates`` carries local hits supplied by the retrieval
+    boundary so callers do not run the same query twice.
     It is excluded from serialization to keep the reference-only contract.
     """
 
@@ -397,6 +397,7 @@ class KnowledgeSearchAgent:
         document_refs: Sequence[str] | None = None,
         quality: KnowledgeAgentQuality = "balanced",
         include_sensitive: bool = False,
+        baseline_candidates: Sequence[Any] | None = None,
     ) -> KnowledgeAgentResult:
         request = request.strip()
         if not request:
@@ -419,24 +420,30 @@ class KnowledgeSearchAgent:
         deadline = started + self.config.timeout_seconds
         metadata = KnowledgeAgentMetadata()
 
-        try:
-            baseline_values = await self._search_store(
-                user_id=user_id,
-                query=request,
-                limit=min(20, max(10, limit * 3)),
-                document_refs=scoped_documents,
-                include_sensitive=include_sensitive,
-                deadline=deadline,
-            )
-        except asyncio.TimeoutError:
-            metadata.fallback_reason = "local_search_timeout"
-            return self._finish([], metadata, started)
-        except Exception as exc:
-            logger.warning(
-                "knowledge local search failed: %s", exc, exc_info=True
-            )
-            metadata.fallback_reason = "local_search_failed"
-            return self._finish([], metadata, started)
+        if baseline_candidates is None:
+            # Compatibility for direct library callers. Production REST/MCP
+            # paths supply the stable retrieval service's baseline so the
+            # optional agent owns only outbound selection work.
+            try:
+                baseline_values = await self._search_store(
+                    user_id=user_id,
+                    query=request,
+                    limit=min(20, max(10, limit * 3)),
+                    document_refs=scoped_documents,
+                    include_sensitive=include_sensitive,
+                    deadline=deadline,
+                )
+            except asyncio.TimeoutError:
+                metadata.fallback_reason = "local_search_timeout"
+                return self._finish([], metadata, started)
+            except Exception as exc:
+                logger.warning(
+                    "knowledge local search failed: %s", exc, exc_info=True
+                )
+                metadata.fallback_reason = "local_search_failed"
+                return self._finish([], metadata, started)
+        else:
+            baseline_values = list(baseline_candidates)
 
         baseline = self._normalise_candidates(
             baseline_values,
@@ -454,7 +461,12 @@ class KnowledgeSearchAgent:
         # degraded into unrelated lexical baseline hits.
         if _looks_like_request_injection(request):
             metadata.fallback_reason = "request_policy_rejected"
-            return self._finish([], metadata, started, baseline_values)
+            return self._finish(
+                baseline_refs,
+                metadata,
+                started,
+                baseline_values,
+            )
 
         local_only_reason = self._local_only_reason(
             request=request,
@@ -505,7 +517,12 @@ class KnowledgeSearchAgent:
         )
         if not should_escalate:
             metadata.fallback_reason = flash.failure_reason or "agent_round_limit"
-            return self._finish([], metadata, started, baseline_values)
+            return self._finish(
+                baseline_refs,
+                metadata,
+                started,
+                baseline_values,
+            )
 
         metadata.escalated = True
         pro = await self._run_loop(
@@ -530,7 +547,12 @@ class KnowledgeSearchAgent:
             return self._finish(pro.selected_refs, metadata, started, baseline_values)
 
         metadata.fallback_reason = pro.failure_reason
-        return self._finish([], metadata, started, baseline_values)
+        return self._finish(
+            baseline_refs,
+            metadata,
+            started,
+            baseline_values,
+        )
 
     async def _run_loop(
         self,

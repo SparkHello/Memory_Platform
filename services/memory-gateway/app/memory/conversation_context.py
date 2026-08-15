@@ -186,6 +186,8 @@ async def evolve_recent_context(
     compact_after_chars: int,
     summary_max_chars: int,
     user_id: str = "default",
+    enable_compaction: bool = True,
+    preserve_compressed_summary: bool = True,
 ) -> RecentContextDraft | None:
     """Build the next rolling-context snapshot without mutating the store."""
     if not user_text.strip() and not assistant_text.strip():
@@ -195,10 +197,16 @@ async def evolve_recent_context(
     turns: list[RecentContextTurn] = []
     turn_count = 0
     if previous is not None:
-        compressed_summary = previous.compressed_summary.strip()
+        if preserve_compressed_summary:
+            compressed_summary = previous.compressed_summary.strip()
         turns = list(previous.recent_turns)
         turn_count = previous.turn_count
-        if not compressed_summary and not turns and previous.summary.strip():
+        if (
+            preserve_compressed_summary
+            and not compressed_summary
+            and not turns
+            and previous.summary.strip()
+        ):
             compressed_summary = previous.summary.strip()
 
     turn_sensitivity = detect_text_sensitivity(
@@ -222,7 +230,7 @@ async def evolve_recent_context(
     ]
     retained_sensitive = [turn for turn in older_turns if turn not in compactable]
     compactable_text = render_recent_turns(compactable)
-    should_compact = bool(compactable) and (
+    should_compact = enable_compaction and bool(compactable) and (
         len(turns) >= compact_after_turns
         or len(compactable_text) + len(compressed_summary) >= compact_after_chars
     )

@@ -584,6 +584,7 @@ def test_gateway_uses_persisted_recent_turns_with_dynamic_conversation_id(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
+    fake_gateway,
     fake_llm,
 ) -> None:
     fake_llm.extraction_content = json.dumps(
@@ -629,6 +630,10 @@ def test_gateway_uses_persisted_recent_turns_with_dynamic_conversation_id(
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert second.headers["x-memory-branch-state"] == "conversation-fallback"
+    injected = fake_gateway.payloads[-1]["messages"][0]["content"]
+    assert "你猜我现在多少岁" in injected
+    assert "好的，我会参考这些信息。" in injected
     memories = memory_store.list_memories(user_id="default")
     assert len(memories) == 1
     assert memories[0].content.endswith("用户自称 18 岁。")
@@ -741,15 +746,18 @@ def test_gateway_matches_persisted_branch_without_client_conversation_id(
 
     assert second.status_code == 200
     assert second.headers["x-memory-branch-state"] == "matched"
-    injected = fake_gateway.payloads[-1]["messages"][0]["content"]
-    assert "第一轮问题" in injected
-    assert "第一轮回答" in injected
+    forwarded = fake_gateway.payloads[-1]["messages"]
+    assert [message["role"] for message in forwarded] == [
+        "user",
+        "assistant",
+        "user",
+    ]
     nodes = memory_store.list_conversation_branch_nodes(user_id="default")
     assert len(nodes) == 2
     assert max(node.turn_count for node in nodes) == 2
 
 
-def test_gateway_compacts_eight_turn_matched_branch_without_conversation_id(
+def test_gateway_keeps_no_id_branch_without_duplicate_compaction(
     client: TestClient,
     auth_headers: dict[str, str],
     memory_store: MemoryStore,
@@ -787,8 +795,49 @@ def test_gateway_compacts_eight_turn_matched_branch_without_conversation_id(
     nodes = memory_store.list_conversation_branch_nodes(user_id="default")
     latest = max(nodes, key=lambda node: node.turn_count)
     assert latest.turn_count == 8
-    assert latest.compressed_summary == "较早对话的测试压缩摘要。"
-    assert len(latest.recent_turns) == 2
+    assert latest.compressed_summary == ""
+    assert len(latest.recent_turns) == 8
+    assert fake_llm.context_compaction_calls == 0
+
+
+def test_gateway_compacts_only_dynamic_conversation_fallback(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+    fake_llm,
+) -> None:
+    headers = {
+        **auth_headers,
+        "X-Conversation-Id": "compact-fallback-conversation",
+    }
+    for index in range(1, 9):
+        fake_gateway.response["choices"][0]["message"]["content"] = (
+            f"第 {index} 轮回答"
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "memory-auto",
+                "messages": [
+                    {"role": "user", "content": f"第 {index} 轮问题"}
+                ],
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["x-memory-branch-state"] == (
+            "root" if index == 1 else "conversation-fallback"
+        )
+
+    state = memory_store.get_recent_context_summary_for_conversation(
+        user_id="default",
+        conversation_id="compact-fallback-conversation",
+    )
+    assert state is not None
+    assert state.turn_count == 8
+    assert state.compressed_summary == "较早对话的测试压缩摘要。"
+    assert len(state.recent_turns) == 2
     assert fake_llm.context_compaction_calls == 1
 
 
@@ -829,9 +878,10 @@ def test_regenerated_answers_become_sibling_branches(
 
     assert continued.status_code == 200
     assert continued.headers["x-memory-branch-state"] == "matched"
-    injected = fake_gateway.payloads[-1]["messages"][0]["content"]
-    assert "方案 A" in injected
-    assert "方案 B" not in injected
+    forwarded = fake_gateway.payloads[-1]["messages"]
+    assert forwarded[0] == {"role": "user", "content": "给我一个方案"}
+    assert forwarded[1] == {"role": "assistant", "content": "方案 A"}
+    assert all("方案 B" not in str(message) for message in forwarded)
 
 
 def test_edited_visible_history_starts_a_fork_instead_of_mixing_context(

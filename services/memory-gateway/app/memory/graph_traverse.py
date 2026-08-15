@@ -5,7 +5,7 @@ from itertools import combinations
 from app.memory.models import MemoryRecord
 from app.memory.network import memory_similarity
 from app.memory.store import MemoryStore
-from app.memory.utils import _memory_embedding_vector
+from app.memory.utils import _memory_embedding_vector, _terms
 
 
 @dataclass(frozen=True)
@@ -64,11 +64,24 @@ def traverse_memory_network(
 
     capped_depth = max(1, min(depth, 3))
     capped_limit = max(1, min(limit, 50))
-    capped_candidates = max(2, min(max_candidates, 1000))
+    # Traversal is an explicit, per-seed analysis.  Bound the induced graph to
+    # 50 nodes so PageRank never starts with a 500/1000-node all-pairs build.
+    capped_candidates = max(2, min(max_candidates, 50))
     capped_edges = max(0, min(max_edges, 5000))
     threshold = max(0.0, min(similarity_threshold, 1.0))
 
-    memories = store.list_memories(user_id=user_id, limit=capped_candidates)
+    scan_limit = max(capped_candidates, min(max(max_candidates, 500), 1000))
+    scanned = _local_candidate_pool(
+        store=store,
+        user_id=user_id,
+        seed=seed,
+        scan_limit=scan_limit,
+    )
+    memories = _seed_candidate_memories(
+        seed=seed,
+        memories=scanned,
+        limit=capped_candidates,
+    )
     memory_by_id = {memory.id: memory for memory in memories}
     if seed.id not in memory_by_id:
         memories = [seed, *memories]
@@ -132,6 +145,66 @@ def traverse_memory_network(
             converged=converged,
         ),
     )
+
+
+def _local_candidate_pool(
+    *,
+    store: MemoryStore,
+    user_id: str,
+    seed: MemoryRecord,
+    scan_limit: int,
+) -> list[MemoryRecord]:
+    """Reuse local FTS and stored vectors without invoking a remote embedder."""
+    seed_terms = _terms(" ".join((seed.content, *seed.topics, *seed.entities)))
+    indexed: list[MemoryRecord] | None = None
+    if seed_terms:
+        try:
+            indexed = store.keyword_candidate_memories(
+                user_id=user_id,
+                terms=sorted(seed_terms),
+            )
+        except Exception:
+            # Traversal remains available when an older SQLite build has no FTS5.
+            indexed = None
+
+    recent = store.list_memories(user_id=user_id, limit=scan_limit)
+    if indexed is None:
+        return recent
+    return list({memory.id: memory for memory in (*indexed, *recent)}.values())
+
+
+def _seed_candidate_memories(
+    *,
+    seed: MemoryRecord,
+    memories: list[MemoryRecord],
+    limit: int,
+) -> list[MemoryRecord]:
+    """Select a bounded local candidate set before building the induced graph.
+
+    Explicit evidence/temporal neighbours are retained first.  Remaining
+    candidates are the strongest local vector/text matches to the seed, which
+    changes the expensive portion from O(all memories²) to O(scan + 50²).
+    """
+    by_id = {memory.id: memory for memory in memories}
+    by_id[seed.id] = seed
+    explicit_ids = set(seed.evidence_memory_ids)
+    if seed.supersedes:
+        explicit_ids.add(seed.supersedes)
+    for memory in by_id.values():
+        if seed.id in memory.evidence_memory_ids or memory.supersedes == seed.id:
+            explicit_ids.add(memory.id)
+
+    vectors = {memory.id: _memory_embedding_vector(memory) for memory in by_id.values()}
+    ranked = sorted(
+        (memory for memory in by_id.values() if memory.id != seed.id),
+        key=lambda memory: (
+            memory.id in explicit_ids,
+            memory_similarity(seed, memory, vectors=vectors),
+            memory.updated_at,
+        ),
+        reverse=True,
+    )
+    return [seed, *ranked[: max(0, limit - 1)]]
 
 
 def _build_similarity_edges(

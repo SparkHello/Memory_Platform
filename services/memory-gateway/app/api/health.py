@@ -128,6 +128,7 @@ def _readyz_cache_fingerprint(settings: Settings) -> str:
         settings.model_gateway_memory_review_model,
         settings.model_gateway_knowledge_fast_model,
         settings.model_gateway_knowledge_pro_model,
+        settings.knowledge_agent_egress_policy,
         settings.model_gateway_embedding_model,
         settings.model_gateway_embedding_space_id,
         str(settings.embedding_dimensions),
@@ -275,11 +276,18 @@ def _central_contract_code(
         runtime.route_for("memory.compact"): "chat",
         runtime.route_for("memory.core"): "chat",
         runtime.route_for("memory.review"): "chat",
+    }
+    knowledge_kinds = {
         runtime.route_for("knowledge.fast"): "chat",
         runtime.route_for("knowledge.pro"): "chat",
     }
+    if settings.knowledge_agent_egress_policy != "none":
+        expected_kinds.update(knowledge_kinds)
     embedding_route_id = runtime.route_for("memory.embedding")
-    if len(expected_kinds) != 7 or embedding_route_id in expected_kinds:
+    expected_count = (
+        7 if settings.knowledge_agent_egress_policy != "none" else 5
+    )
+    if len(expected_kinds) != expected_count or embedding_route_id in expected_kinds:
         return "model_gateway_route_contract_invalid"
     raw_routes = payload.get("routes")
     raw_deployments = payload.get("deployments")
@@ -298,9 +306,12 @@ def _central_contract_code(
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
     visible_routes = set(routes)
-    if visible_routes not in (
-        set(expected_kinds),
-        set(expected_kinds) | {embedding_route_id},
+    required_routes = set(expected_kinds)
+    allowed_routes = required_routes | set(knowledge_kinds) | {
+        embedding_route_id
+    }
+    if not required_routes.issubset(visible_routes) or not visible_routes.issubset(
+        allowed_routes
     ):
         return "model_gateway_route_visibility_mismatch"
     deployments = {

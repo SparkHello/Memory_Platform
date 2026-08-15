@@ -17,8 +17,11 @@ from app.api.deps import (
 )
 from app.auth.signing import require_signing_secret
 from app.config import get_settings
-from app.knowledge.agent import KnowledgeSearchAgent
-from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
+from app.knowledge.agent import KnowledgeAgentMetadata
+from app.knowledge.retrieval import (
+    KnowledgeEmbeddingIndexer,
+    KnowledgeRetrievalService,
+)
 from app.knowledge.store import (
     KnowledgeConflictError,
     KnowledgeError,
@@ -95,7 +98,7 @@ def _services() -> tuple[MemoryStore, EmbeddingClient]:
     return get_memory_store(settings), get_embedding_client(settings)
 
 
-def _knowledge_services() -> tuple[KnowledgeStore, KnowledgeSearchAgent]:
+def _knowledge_services() -> tuple[KnowledgeStore, KnowledgeRetrievalService]:
     settings = get_settings()
     store = get_knowledge_store(settings)
     embedding_client = get_embedding_client(settings)
@@ -104,7 +107,7 @@ def _knowledge_services() -> tuple[KnowledgeStore, KnowledgeSearchAgent]:
         embedding_client,
         settings,
     )
-    return store, get_knowledge_search_agent(retrieval, settings)
+    return store, retrieval
 
 
 def _knowledge_indexer(store: KnowledgeStore) -> KnowledgeEmbeddingIndexer:
@@ -399,7 +402,8 @@ async def search_knowledge(
             operation="search_knowledge",
         )
     try:
-        store, agent = _knowledge_services()
+        store, retrieval = _knowledge_services()
+        settings = get_settings()
         capped_limit = max(1, min(limit, 10))
         scope_requested = bool(document_refs or tags or metadata_filter)
         scoped_refs = await anyio.to_thread.run_sync(
@@ -433,43 +437,62 @@ async def search_knowledge(
                     },
                 }
             )
-        result = await agent.search(
-            request=request_text,
+        baseline = await retrieval.search_chunks(
             user_id=current_user_id.get(),
-            limit=capped_limit,
+            query=request_text,
+            limit=min(20, max(10, capped_limit * 3)),
             document_refs=scoped_refs if scope_requested else [],
-            quality=quality,
             include_sensitive=include_sensitive,
         )
-        selected = await anyio.to_thread.run_sync(
-            partial(
-                store.get_chunks_by_refs,
-                user_id=current_user_id.get(),
-                chunk_refs=result.selected_refs,
-                include_sensitive=include_sensitive,
+        if settings.knowledge_agent_egress_policy == "none":
+            selected = baseline[:capped_limit]
+            selected_refs = [item.chunk_ref for item in selected]
+            metadata = KnowledgeAgentMetadata(
+                fallback_reason="egress_disabled",
+                baseline_count=len(baseline),
+                baseline_refs=[item.chunk_ref for item in baseline[:20]],
             )
-        )
+        else:
+            agent = get_knowledge_search_agent(retrieval, settings)
+            result = await agent.search(
+                request=request_text,
+                user_id=current_user_id.get(),
+                limit=capped_limit,
+                document_refs=scoped_refs if scope_requested else [],
+                quality=quality,
+                include_sensitive=include_sensitive,
+                baseline_candidates=baseline,
+            )
+            selected_refs = result.selected_refs
+            selected = await anyio.to_thread.run_sync(
+                partial(
+                    store.get_chunks_by_refs,
+                    user_id=current_user_id.get(),
+                    chunk_refs=selected_refs,
+                    include_sensitive=include_sensitive,
+                )
+            )
+            metadata = result.metadata
         excerpts = _knowledge_search_results(
             selected,
-            result.selected_refs,
+            selected_refs,
             limit=capped_limit,
         )
         local_candidates = _knowledge_search_results(
-            result.baseline_candidates,
-            result.metadata.baseline_refs,
+            baseline,
+            [item.chunk_ref for item in baseline[:20]],
             limit=20,
         )
         for candidate in local_candidates:
             candidate.pop("excerpt", None)
 
-        metadata = result.metadata.model_dump()
         return _dump(
             {
                 "ok": True,
                 "request": request_text,
                 "results": excerpts,
                 "local_candidates": local_candidates,
-                "metadata": metadata,
+                "metadata": metadata.model_dump(),
             }
         )
     except Exception as exc:

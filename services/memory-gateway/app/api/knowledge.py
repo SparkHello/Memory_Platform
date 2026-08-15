@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    get_knowledge_retrieval_service,
     get_knowledge_search_agent,
     get_knowledge_embedding_indexer,
     get_knowledge_store,
@@ -16,11 +17,14 @@ from app.api.deps import (
 )
 from app.config import Settings, get_settings
 from app.disk_capacity import DiskCapacityError, is_storage_exhausted
-from app.knowledge.agent import KnowledgeSearchAgent
+from app.knowledge.agent import KnowledgeAgentMetadata
 from app.knowledge.backup import build_knowledge_export, restore_knowledge_export
 from app.knowledge.models import KnowledgeDocument, KnowledgeSearchHit, KnowledgeVersion
 from app.knowledge.parsing import KnowledgeFileParseError, parse_knowledge_file
-from app.knowledge.retrieval import KnowledgeEmbeddingIndexer
+from app.knowledge.retrieval import (
+    KnowledgeEmbeddingIndexer,
+    KnowledgeRetrievalService,
+)
 from app.knowledge.store import (
     KnowledgeConflictError,
     KnowledgeError,
@@ -466,8 +470,15 @@ async def search_knowledge(
     body: KnowledgeSearchRequest,
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
-    agent: Annotated[KnowledgeSearchAgent, Depends(get_knowledge_search_agent)],
+    retrieval: Annotated[
+        KnowledgeRetrievalService,
+        Depends(get_knowledge_retrieval_service),
+    ],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
+    request_text = body.request.strip()
+    if not request_text:
+        raise HTTPException(status_code=422, detail="request must not be blank")
     scope_requested = bool(
         body.document_refs or body.tags or body.metadata_filter
     )
@@ -484,34 +495,53 @@ async def search_knowledge(
     if scope_requested and not scoped_refs:
         return _empty_search_payload(body.request, fallback_reason="scope_empty")
     try:
-        result = await agent.search(
-            request=body.request,
+        baseline = await retrieval.search_chunks(
             user_id=user_id,
-            limit=body.limit,
+            query=request_text,
+            limit=min(20, max(10, body.limit * 3)),
             document_refs=scoped_refs if scope_requested else [],
-            quality=body.quality,
             include_sensitive=body.include_sensitive,
         )
-        selected = await anyio.to_thread.run_sync(
-            partial(
-                store.get_chunks_by_refs,
-                user_id=user_id,
-                chunk_refs=result.selected_refs,
-                include_sensitive=body.include_sensitive,
+        if settings.knowledge_agent_egress_policy == "none":
+            selected = baseline[: body.limit]
+            metadata = KnowledgeAgentMetadata(
+                fallback_reason="egress_disabled",
+                baseline_count=len(baseline),
+                baseline_refs=[item.chunk_ref for item in baseline[:20]],
             )
-        )
+        else:
+            agent = get_knowledge_search_agent(retrieval, settings)
+            result = await agent.search(
+                request=request_text,
+                user_id=user_id,
+                limit=body.limit,
+                document_refs=scoped_refs if scope_requested else [],
+                quality=body.quality,
+                include_sensitive=body.include_sensitive,
+                baseline_candidates=baseline,
+            )
+            selected = await anyio.to_thread.run_sync(
+                partial(
+                    store.get_chunks_by_refs,
+                    user_id=user_id,
+                    chunk_refs=result.selected_refs,
+                    include_sensitive=body.include_sensitive,
+                )
+            )
+            metadata = result.metadata
     except Exception as exc:
         _raise_store_error(exc)
-    by_ref = {item.chunk_ref: item for item in selected}
-    ordered = [by_ref[ref] for ref in result.selected_refs if ref in by_ref]
+    ordered = list(selected)
+    if settings.knowledge_agent_egress_policy != "none":
+        by_ref = {item.chunk_ref: item for item in selected}
+        ordered = [by_ref[ref] for ref in result.selected_refs if ref in by_ref]
     hits = _bounded_search_hit_payloads(ordered)
-    local_candidates = _search_candidate_payloads(list(result.baseline_candidates))
-    metadata = result.metadata.model_dump()
+    local_candidates = _search_candidate_payloads(list(baseline))
     return {
         "request": body.request,
         "data": hits,
         "local_candidates": local_candidates,
-        "metadata": metadata,
+        "metadata": metadata.model_dump(),
     }
 
 
