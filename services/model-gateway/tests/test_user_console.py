@@ -42,7 +42,7 @@ def test_find_memgw_supports_monorepo_sibling(
         str(model_root / "model_gateway" / "user_console.py"),
     )
 
-    assert user_console._find_memgw() == memgw
+    assert user_console.find_memgw() == memgw
 
 
 def test_user_console_adds_channel_model_and_friendly_routes(
@@ -131,11 +131,11 @@ def test_user_console_connects_memory_service_without_showing_client_key(
     )
 
     calls: list[tuple[list[str], str | None]] = []
-    monkeypatch.setattr(user_console, "_find_memgw", lambda: Path("/fake/memgw"))
+    monkeypatch.setattr(user_console, "find_memgw", lambda: Path("/fake/memgw"))
     monkeypatch.setattr(user_console, "_gateway_healthy", lambda paths, config: True)
     monkeypatch.setattr(
         user_console,
-        "_run_memgw",
+        "run_memgw",
         lambda command, arguments, input_text=None: calls.append((arguments, input_text)) or 0,
     )
     answers = iter(["3", "n", "0"])

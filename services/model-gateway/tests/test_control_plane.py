@@ -8,7 +8,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import config_payload
+from conftest import (
+    ADMIN_CLIENT_TOKEN,
+    BACKEND_CLIENT_TOKEN,
+    DESKTOP_CLIENT_TOKEN,
+    config_payload,
+)
 import model_gateway.config_store as config_store
 from model_gateway.config_store import (
     ConfigConflict,
@@ -282,7 +287,7 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
     with TestClient(app) as client:
         revision = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()["revision"]
         base = {
             "revision": revision,
@@ -331,7 +336,7 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
         }
         rejected = client.post(
             "/admin/channel-bundles/apply",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=base,
         )
         assert rejected.status_code == 400
@@ -347,7 +352,7 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
         valid_body["connection"]["secret"] = "replacement-secret"
         preview = client.post(
             "/admin/channel-bundles/validate",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=valid_body,
         )
         assert preview.status_code == 200
@@ -357,7 +362,7 @@ def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> N
 
         applied = client.post(
             "/admin/channel-bundles/apply",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=valid_body,
         )
         assert applied.status_code == 200
@@ -526,11 +531,11 @@ def test_channel_bundle_apply_splits_embedding_and_discovers_chat_only(
     with TestClient(app) as client:
         revision = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()["revision"]
         applied = client.post(
             "/admin/channel-bundles/apply",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=_new_channel_bundle(
                 revision=revision,
                 embedding_base_url=embedding_url,
@@ -586,7 +591,7 @@ def test_ready_requires_a_routable_configured_provider(tmp_path: Path, gateway_h
         write_secrets(
             gateway_home.secrets,
             {
-                "CLIENT_MEMORY_CONSOLE_ADMIN": "admin-token",
+                "CLIENT_MEMORY_CONSOLE_ADMIN": ADMIN_CLIENT_TOKEN,
                 "UPSTREAM_OFFICIAL": "official-secret",
                 "UPSTREAM_RESELLER": "reseller-secret",
             },
@@ -595,9 +600,9 @@ def test_ready_requires_a_routable_configured_provider(tmp_path: Path, gateway_h
         write_secrets(
             gateway_home.secrets,
             {
-                "CLIENT_MEMORY_GATEWAY": "local-client-token",
-                "CLIENT_DESKTOP": "desktop-token",
-                "CLIENT_MEMORY_CONSOLE_ADMIN": "admin-token",
+                "CLIENT_MEMORY_GATEWAY": BACKEND_CLIENT_TOKEN,
+                "CLIENT_DESKTOP": DESKTOP_CLIENT_TOKEN,
+                "CLIENT_MEMORY_CONSOLE_ADMIN": ADMIN_CLIENT_TOKEN,
             },
         )
         response = client.get("/readyz")
@@ -657,7 +662,7 @@ def test_admin_lists_and_manages_unreferenced_objects(gateway_home) -> None:
     with TestClient(app) as client:
         admin = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()
         assert "orphan-channel" in {item["id"] for item in admin["connections"]}
         assert "orphan-deployment" in {
@@ -667,7 +672,7 @@ def test_admin_lists_and_manages_unreferenced_objects(gateway_home) -> None:
 
         filtered = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
         ).json()
         assert "orphan-channel" not in {
             item["id"] for item in filtered["connections"]
@@ -676,14 +681,14 @@ def test_admin_lists_and_manages_unreferenced_objects(gateway_home) -> None:
         blocked = client.request(
             "DELETE",
             "/admin/connections/official",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={"revision": admin["revision"]},
         )
         assert blocked.status_code == 409
 
         disabled = client.patch(
             "/admin/deployments/orphan-deployment",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={"revision": admin["revision"], "enabled": False},
         )
         assert disabled.status_code == 200
@@ -697,7 +702,7 @@ def test_admin_lists_and_manages_unreferenced_objects(gateway_home) -> None:
             deleted = client.request(
                 "DELETE",
                 f"/admin/{collection}/{item_id}",
-                headers={"authorization": "Bearer admin-token"},
+                headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
                 json={"revision": revision},
             )
             assert deleted.status_code == 200

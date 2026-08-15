@@ -195,27 +195,6 @@ def ensure_write_capacity(
         raise StorageCapacityError("storage capacity unavailable") from exc
 
 
-def ensure_ledger_write_capacity(
-    path: Path,
-    settings: StorageSettings,
-    *,
-    expected_write_bytes: int,
-    usage_probe: object,
-) -> None:
-    ensure_write_capacity(
-        (path,),
-        settings,
-        expected_write_bytes=expected_write_bytes,
-    )
-    try:
-        probe = getattr(usage_probe, "probe_writable")
-        probe()
-    except StorageCapacityError:
-        raise
-    except (OSError, sqlite3.Error) as exc:
-        raise StorageCapacityError("usage ledger unavailable") from exc
-
-
 def estimated_ledger_write_bytes(*, body_bytes: int, attempts: int) -> int:
     """Conservative bound for one request and its metadata-only attempt ledger."""
 
@@ -227,58 +206,48 @@ def estimated_ledger_write_bytes(*, body_bytes: int, attempts: int) -> int:
 
 
 def is_storage_exhausted(exc: BaseException) -> bool:
-    pending: list[BaseException] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if isinstance(current, StorageCapacityError):
-            return True
-        if isinstance(current, OSError) and current.errno in {
+    """Storage cannot accept or persist a write (full, read-only or I/O error)."""
+
+    return _matches_storage_failure(
+        exc,
+        os_errnos={
             errno.ENOSPC,
             errno.EDQUOT,
             errno.EROFS,
             errno.EIO,
-        }:
-            return True
-        if isinstance(current, sqlite3.Error):
-            code = getattr(current, "sqlite_errorcode", None)
-            if isinstance(code, int) and code & 0xFF in {
-                sqlite3.SQLITE_FULL,
-                sqlite3.SQLITE_READONLY,
-                sqlite3.SQLITE_CANTOPEN,
-                sqlite3.SQLITE_IOERR,
-            }:
-                return True
-        message = str(current).casefold()
-        if any(
-            marker in message
-            for marker in (
-                "database or disk is full",
-                "no space left on device",
-                "disk quota exceeded",
-                "attempt to write a readonly database",
-                "unable to open database file",
-            )
-        ):
-            return True
-        nested = getattr(current, "exceptions", ())
-        if isinstance(nested, (list, tuple)):
-            pending.extend(item for item in nested if isinstance(item, BaseException))
-        cause = getattr(current, "__cause__", None)
-        context = getattr(current, "__context__", None)
-        if isinstance(cause, BaseException):
-            pending.append(cause)
-        if isinstance(context, BaseException):
-            pending.append(context)
-    return False
+        },
+        sqlite_codes={
+            sqlite3.SQLITE_FULL,
+            sqlite3.SQLITE_READONLY,
+            sqlite3.SQLITE_CANTOPEN,
+            sqlite3.SQLITE_IOERR,
+        },
+    )
 
 
 def is_capacity_exhausted(exc: BaseException) -> bool:
     """Recognize only quota/free-space failures, not read-only/unavailable I/O."""
 
+    return _matches_storage_failure(
+        exc,
+        os_errnos={errno.ENOSPC, errno.EDQUOT},
+        sqlite_codes={sqlite3.SQLITE_FULL},
+    )
+
+
+def _matches_storage_failure(
+    exc: BaseException,
+    *,
+    os_errnos: set[int],
+    sqlite_codes: set[int],
+) -> bool:
+    """Walk an exception tree looking for durable-storage failure codes.
+
+    Classification is deliberately code-based only: real sqlite3 errors always
+    carry ``sqlite_errorcode`` (Python >= 3.11), so provider/OS message text is
+    never inspected — it may contain sensitive paths and varies by locale.
+    """
+
     pending: list[BaseException] = [exc]
     seen: set[int] = set()
     while pending:
@@ -288,25 +257,12 @@ def is_capacity_exhausted(exc: BaseException) -> bool:
         seen.add(id(current))
         if isinstance(current, StorageCapacityError):
             return True
-        if isinstance(current, OSError) and current.errno in {
-            errno.ENOSPC,
-            errno.EDQUOT,
-        }:
+        if isinstance(current, OSError) and current.errno in os_errnos:
             return True
         if isinstance(current, sqlite3.Error):
             code = getattr(current, "sqlite_errorcode", None)
-            if isinstance(code, int) and code & 0xFF == sqlite3.SQLITE_FULL:
+            if isinstance(code, int) and code & 0xFF in sqlite_codes:
                 return True
-        message = str(current).casefold()
-        if any(
-            marker in message
-            for marker in (
-                "database or disk is full",
-                "no space left on device",
-                "disk quota exceeded",
-            )
-        ):
-            return True
         nested = getattr(current, "exceptions", ())
         if isinstance(nested, (list, tuple)):
             pending.extend(item for item in nested if isinstance(item, BaseException))

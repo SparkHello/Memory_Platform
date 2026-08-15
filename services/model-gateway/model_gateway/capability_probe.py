@@ -14,7 +14,11 @@ import httpx
 
 from model_gateway.adapters import apply_connection_adapter
 from model_gateway.auth import provider_secret_header_value
-from model_gateway.health import HealthResponseTooLarge, _auth_headers, _bounded_response, _client
+from model_gateway.discovery import (
+    probe_client,
+    read_bounded_response,
+    upstream_auth_headers,
+)
 from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     AuthConfig,
@@ -104,7 +108,7 @@ async def probe_chat_capabilities(
         "json_schema": False,
     }
 
-    async with _client(connection, timeout_seconds, transport) as client:
+    async with probe_client(connection, timeout_seconds, transport) as client:
         for name in ordered:
             result = await _run_one_probe(
                 client=client,
@@ -118,9 +122,6 @@ async def probe_chat_capabilities(
             if name == "chat" and not result["ok"]:
                 # No point probing features if basic chat fails.
                 break
-            if name == "chat" and result["ok"]:
-                # Chat works; streaming still needs its own probe when requested.
-                pass
             if name == "streaming" and result["ok"]:
                 capabilities["streaming"] = True
             if name == "tools" and result["ok"]:
@@ -177,11 +178,11 @@ async def _run_one_probe(
         async with client.stream(
             "POST",
             url,
-            headers=_auth_headers(connection, secret),
+            headers=upstream_auth_headers(connection, secret),
             json=payload,
         ) as response:
             if response.is_success:
-                content = await _bounded_response(
+                content = await read_bounded_response(
                     response,
                     min(connection.response_limit_bytes, 256 * 1024),
                 )
@@ -206,7 +207,7 @@ async def _run_one_probe(
             "http_status": None,
             "detail": f"网络错误：{type(exc).__name__}",
         }
-    except (HealthResponseTooLarge, ValueError) as exc:
+    except ValueError as exc:
         return {
             "ok": False,
             "http_status": None,

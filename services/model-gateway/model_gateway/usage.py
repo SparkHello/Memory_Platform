@@ -97,10 +97,10 @@ class UsageCapture:
             self.usage = dict(usage)
         model = payload.get("model")
         if isinstance(model, str) and model.strip():
-            self.response_model = _safe_metadata_id(model, max_length=300, allow_slash=True)
+            self.response_model = safe_metadata_id(model, max_length=300, allow_slash=True)
         request_id = payload.get("request_id") or payload.get("id")
         if isinstance(request_id, str) and request_id.strip():
-            self.request_id = _safe_metadata_id(
+            self.request_id = safe_metadata_id(
                 request_id, max_length=300, allow_slash=False
             )
 
@@ -547,6 +547,13 @@ class UsageStore:
             operation=metadata.operation,
             user_tag=metadata.user_tag,
         )
+        joined_where, _ = _usage_filters(
+            since=since.isoformat(),
+            client_id=client_id,
+            operation=metadata.operation,
+            user_tag=metadata.user_tag,
+            alias="u",
+        )
         daily_where, daily_parameters = _daily_filters(
             since=since.date().isoformat(),
             client_id=client_id,
@@ -605,7 +612,7 @@ class UsageStore:
                 f"""
                 SELECT u.currency, u.estimated_cost, u.cost_complete
                 FROM usage_events AS u
-                WHERE {_alias_where(raw_where, 'u')}
+                WHERE {joined_where}
                   AND u.attempts > 0
                   AND NOT EXISTS (
                     SELECT 1 FROM attempt_events AS a
@@ -620,7 +627,7 @@ class UsageStore:
                        a.request_sent, a.billable_unknown
                 FROM attempt_events AS a
                 JOIN usage_events AS u ON u.id = a.usage_event_id
-                WHERE {_alias_where(raw_where, 'u')}
+                WHERE {joined_where}
                 """,
                 raw_parameters,
             ).fetchall()
@@ -1093,9 +1100,15 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
 
 
 def _usage_filters(
-    *, since: str, client_id: str, operation: str, user_tag: str
+    *,
+    since: str,
+    client_id: str,
+    operation: str,
+    user_tag: str,
+    alias: str = "",
 ) -> tuple[str, tuple[Any, ...]]:
-    clauses = ["created_at >= ?"]
+    prefix = f"{alias}." if alias else ""
+    clauses = [f"{prefix}created_at >= ?"]
     parameters: list[Any] = [since]
     for name, value in (
         ("client_id", client_id),
@@ -1103,7 +1116,7 @@ def _usage_filters(
         ("user_tag", user_tag),
     ):
         if value:
-            clauses.append(f"{name} = ?")
+            clauses.append(f"{prefix}{name} = ?")
             parameters.append(value)
     return " AND ".join(clauses), tuple(parameters)
 
@@ -1122,13 +1135,6 @@ def _daily_filters(
             clauses.append(f"{name} = ?")
             parameters.append(value)
     return " AND ".join(clauses), tuple(parameters)
-
-
-def _alias_where(where: str, alias: str) -> str:
-    result = where
-    for name in ("created_at", "client_id", "operation", "user_tag"):
-        result = re.sub(rf"\b{name}\b", f"{alias}.{name}", result)
-    return result
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
@@ -1255,14 +1261,60 @@ def _select_tier(
 
 def _integer(mapping: dict[str, Any], *names: str) -> int | None:
     for name in names:
-        value = mapping.get(name)
-        if (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and 0 <= value <= 9_223_372_036_854_775_807
-        ):
-            return value
+        result = _usage_counter(mapping.get(name))
+        if result is not None:
+            return result
     return None
+
+
+def _usage_counter(value: Any) -> int | None:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 9_223_372_036_854_775_807
+    ):
+        return value
+    return None
+
+
+_METADATA_USAGE_SCALARS = (
+    "prompt_tokens",
+    "input_tokens",
+    "completion_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "prompt_cache_hit_tokens",
+    "cached_tokens",
+)
+_METADATA_USAGE_DETAILS = ("prompt_tokens_details", "input_tokens_details")
+_METADATA_USAGE_DETAIL_KEYS = ("cached_tokens", "cache_read_input_tokens")
+
+
+def metadata_only_usage(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Whitelist scalar token counters from an untrusted ``usage`` object.
+
+    The pricing-research ledger records this shape; ``UsageStore.record`` then
+    normalizes it through ``_parse_usage`` like any other capture.
+    """
+
+    cleaned: dict[str, Any] = {
+        name: value
+        for name in _METADATA_USAGE_SCALARS
+        if (value := _usage_counter(raw.get(name))) is not None
+    }
+    for detail_name in _METADATA_USAGE_DETAILS:
+        details = raw.get(detail_name)
+        if not isinstance(details, dict):
+            continue
+        clean_details = {
+            name: value
+            for name in _METADATA_USAGE_DETAIL_KEYS
+            if (value := _usage_counter(details.get(name))) is not None
+        }
+        if clean_details:
+            cleaned[detail_name] = clean_details
+    return cleaned or None
 
 
 def _first_sse_boundary(buffer: bytes) -> tuple[int, bytes] | None:
@@ -1274,7 +1326,7 @@ def _first_sse_boundary(buffer: bytes) -> tuple[int, bytes] | None:
     return min(matches, key=lambda item: item[0]) if matches else None
 
 
-def _safe_metadata_id(value: str, *, max_length: int, allow_slash: bool) -> str:
+def safe_metadata_id(value: str, *, max_length: int, allow_slash: bool) -> str:
     normalized = value.strip()
     character_class = r"A-Za-z0-9._:/-" if allow_slash else r"A-Za-z0-9._:-"
     if len(normalized) > max_length or not re.fullmatch(

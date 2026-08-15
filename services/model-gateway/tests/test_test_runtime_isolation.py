@@ -16,7 +16,9 @@ def test_global_test_runtime_is_sandboxed(tmp_path: Path) -> None:
     assert not (tmp_path / "modelgw-home").exists()
 
     paths = gateway_paths(tmp_path / "explicit-home")
-    assert paths.secrets.resolve() == (tmp_path / "explicit-home" / "secrets.env").resolve()
+    assert paths.secrets.resolve() == (
+        tmp_path / "explicit-home" / "secrets.env"
+    ).resolve()
 
 
 def test_test_local_monkeypatch_undo_cannot_remove_runtime_sandbox(

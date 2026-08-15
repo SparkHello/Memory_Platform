@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from model_gateway.auth import provider_secret_header_value
 from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     ConnectionConfig,
@@ -25,8 +24,15 @@ from model_gateway.models import (
     PricingConfig,
     PricingTier,
 )
-from model_gateway.proxy import prepare_payload
+from model_gateway.proxy import (
+    classify_network_failure,
+    http_failure_class,
+    prepare_payload,
+    upstream_async_client,
+    upstream_headers,
+)
 from model_gateway.routing import RouteTarget
+from model_gateway.usage import metadata_only_usage, safe_metadata_id
 
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
@@ -91,7 +97,7 @@ class ResearchCallMetadata:
                 (
                     "none"
                     if 200 <= self.status_code < 300
-                    else _research_http_failure_class(self.status_code)
+                    else http_failure_class(self.status_code, b"")
                 ),
             )
         if self.response_complete is None:
@@ -519,29 +525,8 @@ async def _call_research_deployment(
     if deployment.capabilities.json_object:
         payload["response_format"] = {"type": "json_object"}
     forwarded = prepare_payload(payload, route_target)
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
-        "Accept-Encoding": "identity",
-    }
     secret = secrets[connection.auth.secret_ref]
-    provider_secret_header_value(secret)
-    if connection.auth.type == "x-api-key":
-        headers["X-Api-Key"] = secret
-    else:
-        headers["Authorization"] = f"Bearer {secret}"
-    client_args: dict[str, Any] = {
-        "timeout": httpx.Timeout(
-            connect=connection.connect_timeout_seconds,
-            read=connection.read_timeout_seconds,
-            write=connection.write_timeout_seconds,
-            pool=connection.pool_timeout_seconds,
-        ),
-        "follow_redirects": False,
-        "trust_env": False,
-    }
-    if transport is not None:
-        client_args["transport"] = transport
+    headers = upstream_headers(route_target, secret, {})
     url = upstream_url(
         connection.base_url,
         connection.chat_endpoint,
@@ -554,7 +539,7 @@ async def _call_research_deployment(
         )
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(**client_args) as client:
+        async with upstream_async_client(connection, transport=transport) as client:
             async with client.stream(
                 "POST",
                 url,
@@ -571,13 +556,15 @@ async def _call_research_deployment(
                         ),
                     )
                 if not response.is_success:
+                    error_body = await _bounded_error_body(response)
                     raise PricingResearchCallError(
                         f"research deployment 调用失败（HTTP {response.status_code}）",
                         ResearchCallMetadata(
                             status_code=response.status_code,
                             latency_ms=_elapsed_ms(started),
-                            failure_class=_research_http_failure_class(
-                                response.status_code
+                            failure_class=http_failure_class(
+                                response.status_code,
+                                error_body,
                             ),
                         ),
                     )
@@ -601,7 +588,7 @@ async def _call_research_deployment(
     except PricingResearchCallError:
         raise
     except httpx.HTTPError as exc:
-        request_sent, outcome, failure_class = _research_network_failure(exc)
+        request_sent, outcome, failure_class = classify_network_failure(exc)
         raise PricingResearchCallError(
             f"research deployment 网络调用失败：{type(exc).__name__}",
             ResearchCallMetadata(
@@ -780,17 +767,17 @@ def _research_metadata(
     if isinstance(payload, dict):
         raw_usage = payload.get("usage")
         if isinstance(raw_usage, dict):
-            usage = _metadata_only_usage(raw_usage)
+            usage = metadata_only_usage(raw_usage)
         raw_model = payload.get("model")
         if isinstance(raw_model, str):
-            response_model = _safe_metadata_text(
+            response_model = safe_metadata_id(
                 raw_model,
                 max_length=300,
                 allow_slash=True,
             )
         raw_request_id = payload.get("request_id") or payload.get("id")
         if isinstance(raw_request_id, str):
-            request_id = _safe_metadata_text(
+            request_id = safe_metadata_id(
                 raw_request_id, max_length=300, allow_slash=False
             )
     return ResearchCallMetadata(
@@ -806,86 +793,19 @@ def _research_metadata(
     )
 
 
-def _research_http_failure_class(status_code: int) -> str:
-    if status_code == 401:
-        return "http_auth"
-    if status_code == 402:
-        return "http_billing"
-    if status_code == 429:
-        return "http_rate_limit"
-    if 300 <= status_code < 400:
-        return "http_redirect"
-    if status_code >= 500:
-        return "http_server"
-    return "http_other"
+async def _bounded_error_body(response: httpx.Response) -> bytes:
+    """Drain a small error body so HTTP failures classify like the data plane."""
 
-
-def _research_network_failure(exc: httpx.HTTPError) -> tuple[bool, str, str]:
-    if isinstance(exc, httpx.ConnectTimeout):
-        return False, "connect_failure", "connect_timeout"
-    if isinstance(exc, httpx.ConnectError):
-        return False, "connect_failure", "connect_error"
-    if isinstance(exc, httpx.PoolTimeout):
-        return False, "connect_failure", "pool_timeout"
-    if isinstance(exc, httpx.ReadTimeout):
-        return True, "ambiguous_failure", "read_timeout"
-    if isinstance(exc, httpx.WriteTimeout):
-        return True, "ambiguous_failure", "write_timeout"
-    if isinstance(exc, httpx.ReadError):
-        return True, "ambiguous_failure", "read_error"
-    if isinstance(exc, httpx.WriteError):
-        return True, "ambiguous_failure", "write_error"
-    if isinstance(exc, httpx.ProtocolError):
-        return True, "ambiguous_failure", "protocol_error"
-    return True, "ambiguous_failure", "other_network"
+    content = b""
+    async for chunk in response.aiter_bytes():
+        content += chunk
+        if len(content) > 64 * 1024:
+            return content[: 64 * 1024]
+    return content
 
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
-
-
-def _metadata_only_usage(raw: Mapping[str, Any]) -> dict[str, Any] | None:
-    scalar_names = {
-        "prompt_tokens",
-        "input_tokens",
-        "completion_tokens",
-        "output_tokens",
-        "total_tokens",
-        "cache_read_input_tokens",
-        "prompt_cache_hit_tokens",
-        "cached_tokens",
-    }
-    cleaned: dict[str, Any] = {
-        name: value
-        for name in scalar_names
-        if (value := raw.get(name)) is not None
-        and isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 <= value <= 9_223_372_036_854_775_807
-    }
-    for detail_name in ("prompt_tokens_details", "input_tokens_details"):
-        details = raw.get(detail_name)
-        if not isinstance(details, dict):
-            continue
-        clean_details = {
-            name: value
-            for name in ("cached_tokens", "cache_read_input_tokens")
-            if (value := details.get(name)) is not None
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and 0 <= value <= 9_223_372_036_854_775_807
-        }
-        if clean_details:
-            cleaned[detail_name] = clean_details
-    return cleaned or None
-
-
-def _safe_metadata_text(value: str, *, max_length: int, allow_slash: bool) -> str:
-    normalized = value.strip()
-    characters = r"A-Za-z0-9._:/-" if allow_slash else r"A-Za-z0-9._:-"
-    if len(normalized) > max_length or not re.fullmatch(rf"[{characters}]+", normalized):
-        return ""
-    return normalized
 
 
 def _same_organization_domain(left: str, right: str) -> bool:

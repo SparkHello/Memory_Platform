@@ -14,7 +14,10 @@ from model_gateway.adapters import (
 )
 from model_gateway.auth import provider_secret_header_value
 from model_gateway.http_safety import require_safe_destination, upstream_url
-from model_gateway.models import FORBIDDEN_UPSTREAM_FORWARD_HEADERS
+from model_gateway.models import (
+    FORBIDDEN_UPSTREAM_FORWARD_HEADERS,
+    ConnectionConfig,
+)
 from model_gateway.routing import (
     ResolvedRoute,
     RouteTarget,
@@ -172,7 +175,7 @@ class RawOpenAIProxy:
                 request = client.build_request(
                     "POST",
                     url,
-                    headers=self._headers(target, secret, request_headers),
+                    headers=upstream_headers(target, secret, request_headers),
                     json=prepare_payload(
                         payload,
                         target,
@@ -254,34 +257,13 @@ class RawOpenAIProxy:
                 return result
             last_result = result
 
-        if last_result is not None:
-            if route.required_deployment:
-                return affinity_unavailable_result(
-                    last_result.attempts,
-                    last_result.target,
-                    attempt_traces=tuple(attempt_traces),
-                )
-            return last_result
-        if route.required_deployment:
-            return affinity_unavailable_result(
-                attempts,
-                route.targets[0] if route.targets else None,
-                attempt_traces=tuple(attempt_traces),
-            )
-        detail = _network_failure_detail(
-            last_network_error,
-            phase_label="上游网络连接失败",
-        )
-        return ProxyHTTPResult(
-            content=json.dumps(
-                {"error": {"message": detail, "type": "gateway_error"}},
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            status_code=502,
-            headers={"content-type": "application/json; charset=utf-8"},
-            target=None,
+        return _finalize_attempts(
+            route=route,
+            last_result=last_result,
+            last_network_error=last_network_error,
             attempts=attempts,
             attempt_traces=tuple(attempt_traces),
+            phase_label="上游网络连接失败",
         )
 
     async def open_stream(
@@ -327,7 +309,7 @@ class RawOpenAIProxy:
                 request = client.build_request(
                     "POST",
                     url,
-                    headers=self._headers(target, secret, request_headers),
+                    headers=upstream_headers(target, secret, request_headers),
                     json=prepare_payload(
                         payload,
                         target,
@@ -497,34 +479,13 @@ class RawOpenAIProxy:
                 ),
             )
 
-        if last_result is not None:
-            if route.required_deployment:
-                return affinity_unavailable_result(
-                    last_result.attempts,
-                    last_result.target,
-                    attempt_traces=tuple(attempt_traces),
-                )
-            return last_result
-        if route.required_deployment:
-            return affinity_unavailable_result(
-                attempts,
-                route.targets[0] if route.targets else None,
-                attempt_traces=tuple(attempt_traces),
-            )
-        detail = _network_failure_detail(
-            last_network_error,
-            phase_label="上游流连接失败",
-        )
-        return ProxyHTTPResult(
-            content=json.dumps(
-                {"error": {"message": detail, "type": "gateway_error"}},
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            status_code=502,
-            headers={"content-type": "application/json; charset=utf-8"},
-            target=None,
+        return _finalize_attempts(
+            route=route,
+            last_result=last_result,
+            last_network_error=last_network_error,
             attempts=attempts,
             attempt_traces=tuple(attempt_traces),
+            phase_label="上游流连接失败",
         )
 
     def _client(self, target: RouteTarget) -> httpx.AsyncClient:
@@ -538,22 +499,7 @@ class RawOpenAIProxy:
         existing = self._clients.get(key)
         if existing is not None and not existing.is_closed:
             return existing
-        kwargs: dict[str, Any] = {
-            "timeout": httpx.Timeout(
-                connect=connection.connect_timeout_seconds,
-                read=connection.read_timeout_seconds,
-                write=connection.write_timeout_seconds,
-                pool=connection.pool_timeout_seconds,
-            ),
-            # Never forward an upstream credential across a redirect boundary.
-            "follow_redirects": False,
-            # Provider credentials must never be redirected through ambient
-            # HTTP(S)_PROXY settings inherited from a shell or container.
-            "trust_env": False,
-        }
-        if self.transport is not None:
-            kwargs["transport"] = self.transport
-        client = httpx.AsyncClient(**kwargs)
+        client = upstream_async_client(connection, transport=self.transport)
         self._clients[key] = client
         return client
 
@@ -576,33 +522,6 @@ class RawOpenAIProxy:
             allowed_private_networks=target.connection.allowed_private_networks,
         )
 
-    @staticmethod
-    def _headers(
-        target: RouteTarget,
-        secret: str,
-        request_headers: Mapping[str, str],
-    ) -> dict[str, str]:
-        provider_secret_header_value(secret)
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": request_headers.get("accept", "application/json"),
-            "Accept-Encoding": "identity",
-        }
-        if target.connection.auth.type == "bearer":
-            headers["Authorization"] = f"Bearer {secret}"
-        else:
-            headers["X-Api-Key"] = secret
-        allowed = {name.lower() for name in target.connection.forward_headers}
-        for name, value in request_headers.items():
-            normalized = name.lower()
-            if (
-                normalized in allowed
-                and normalized not in FORBIDDEN_UPSTREAM_FORWARD_HEADERS
-                and not normalized.startswith("x-model-gateway-")
-            ):
-                headers[name] = value
-        return headers
-
     def _record_health(
         self,
         target: RouteTarget,
@@ -623,6 +542,101 @@ class RawOpenAIProxy:
 def _destination_validation_message(exc: BaseException) -> str:
     detail = str(exc).strip() or type(exc).__name__
     return f"上游地址安全校验失败：{detail}"
+
+
+def upstream_async_client(
+    connection: ConnectionConfig,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """One upstream client honoring the connection's timeout policy.
+
+    Never follows redirects (a credential must not cross a redirect boundary)
+    and never inherits ambient ``HTTP(S)_PROXY`` environment settings.
+    """
+
+    kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(
+            connect=connection.connect_timeout_seconds,
+            read=connection.read_timeout_seconds,
+            write=connection.write_timeout_seconds,
+            pool=connection.pool_timeout_seconds,
+        ),
+        "follow_redirects": False,
+        "trust_env": False,
+    }
+    if transport is not None:
+        kwargs["transport"] = transport
+    return httpx.AsyncClient(**kwargs)
+
+
+def upstream_headers(
+    target: RouteTarget,
+    secret: str,
+    request_headers: Mapping[str, str],
+) -> dict[str, str]:
+    provider_secret_header_value(secret)
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": request_headers.get("accept", "application/json"),
+        "Accept-Encoding": "identity",
+    }
+    if target.connection.auth.type == "bearer":
+        headers["Authorization"] = f"Bearer {secret}"
+    else:
+        headers["X-Api-Key"] = secret
+    allowed = {name.lower() for name in target.connection.forward_headers}
+    for name, value in request_headers.items():
+        normalized = name.lower()
+        if (
+            normalized in allowed
+            and normalized not in FORBIDDEN_UPSTREAM_FORWARD_HEADERS
+            and not normalized.startswith("x-model-gateway-")
+        ):
+            headers[name] = value
+    return headers
+
+
+def _finalize_attempts(
+    *,
+    route: ResolvedRoute,
+    last_result: ProxyHTTPResult | None,
+    last_network_error: httpx.HTTPError | None,
+    attempts: int,
+    attempt_traces: tuple[AttemptTrace, ...],
+    phase_label: str,
+) -> ProxyHTTPResult:
+    """Shared send-loop epilogue for the non-streaming and streaming paths."""
+
+    if last_result is not None:
+        if route.required_deployment:
+            return affinity_unavailable_result(
+                last_result.attempts,
+                last_result.target,
+                attempt_traces=attempt_traces,
+            )
+        return last_result
+    if route.required_deployment:
+        return affinity_unavailable_result(
+            attempts,
+            route.targets[0] if route.targets else None,
+            attempt_traces=attempt_traces,
+        )
+    detail = _network_failure_detail(
+        last_network_error,
+        phase_label=phase_label,
+    )
+    return ProxyHTTPResult(
+        content=json.dumps(
+            {"error": {"message": detail, "type": "gateway_error"}},
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        status_code=502,
+        headers={"content-type": "application/json; charset=utf-8"},
+        target=None,
+        attempts=attempts,
+        attempt_traces=attempt_traces,
+    )
 
 
 def _network_failure_detail(
@@ -679,20 +693,35 @@ def _network_attempt_trace(
     exc: httpx.HTTPError,
     latency_ms: int,
 ) -> AttemptTrace:
-    request_sent = not _network_error_can_fail_over(exc)
+    request_sent, outcome, failure_class = classify_network_failure(exc)
     return AttemptTrace(
         attempt_index=attempt_index,
         target=target,
         latency_ms=max(0, latency_ms),
-        outcome="ambiguous_failure" if request_sent else "connect_failure",
-        failure_class=_network_failure_class(exc),
+        outcome=outcome,
+        failure_class=failure_class,
         request_sent=request_sent,
         billable_unknown=request_sent,
         response_complete=False,
     )
 
 
-def _http_failure_class(status_code: int, content: bytes) -> str:
+def classify_network_failure(exc: httpx.HTTPError) -> tuple[bool, str, str]:
+    """Classify a transport failure as (request_sent, outcome, failure_class).
+
+    Shared by the data-plane attempt ledger and the pricing-research caller so
+    both record the same finite labels for the same failure.
+    """
+
+    request_sent = not _network_error_can_fail_over(exc)
+    return (
+        request_sent,
+        "ambiguous_failure" if request_sent else "connect_failure",
+        _network_failure_class(exc),
+    )
+
+
+def http_failure_class(status_code: int, content: bytes) -> str:
     if status_code == 401:
         return "http_auth"
     if status_code == 402:
@@ -734,7 +763,7 @@ def _response_attempt_trace(
         failure_class=(
             "none"
             if response.is_success
-            else _http_failure_class(response.status_code, content or b"")
+            else http_failure_class(response.status_code, content or b"")
         ),
         request_sent=True,
         response_complete=content is not None,

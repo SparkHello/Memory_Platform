@@ -12,6 +12,8 @@ from model_gateway.models import GatewayConfig
 from model_gateway.proxy import ProxyHTTPResult, RawOpenAIProxy
 from model_gateway.routing import Router
 
+from conftest import BACKEND_CLIENT_TOKEN
+
 
 class ChunkStream(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes], *, fail_after: int | None = None):
@@ -77,7 +79,7 @@ async def test_transparent_body_and_response_preservation(
         route=resolved_chat(gateway_config, backend_client, router),
         payload=payload,
         secrets={"UPSTREAM_OFFICIAL": "official-secret", "UPSTREAM_RESELLER": "reseller-secret"},
-        request_headers={"authorization": "Bearer local-client-token", "accept": "application/json"},
+        request_headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}", "accept": "application/json"},
     )
 
     expected = dict(payload)
@@ -132,6 +134,7 @@ async def test_fallback_on_rate_limit_before_response(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -152,7 +155,7 @@ async def test_fallback_on_rate_limit_before_response(
     assert calls == ["official.example", "reseller.example"]
     assert result.attempts == 2
     assert result.headers["x-model-gateway-attempts"] == "2"
-    assert router.cooldowns.remaining("official") > 599
+    assert router.runtime_health.remaining("official") > 599
     assert len(result.attempt_traces) == 2
     assert result.attempt_traces[0].failure_class == "http_rate_limit"
     assert result.attempt_traces[0].request_sent is True
@@ -164,6 +167,7 @@ async def test_connect_timeout_can_fallback_before_request_is_sent(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -195,6 +199,9 @@ async def test_connection_breaker_is_rechecked_before_each_attempt(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    # Both deployments share one connection here; same_channel keeps the
+    # second deployment eligible so the connection breaker is what stops it.
+    gateway_config.routes["memory.chat"].fallback_scope = "same_channel"
     gateway_config.deployments["chat-reseller"].connection = "official"
     calls: list[str] = []
 
@@ -223,6 +230,9 @@ async def test_model_not_found_breaker_is_deployment_scoped(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    # Both deployments share one connection here; same_channel keeps the
+    # second deployment eligible while breakers stay deployment-scoped.
+    gateway_config.routes["memory.chat"].fallback_scope = "same_channel"
     gateway_config.deployments["chat-reseller"].connection = "official"
     calls: list[str] = []
 
@@ -258,6 +268,7 @@ async def test_auth_billing_and_plain_not_found_never_replay_to_next_target(
     backend_client: AuthenticatedClient,
     status_code: int,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -285,6 +296,7 @@ async def test_provider_response_is_capped_without_fallback(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     gateway_config.connections["official"].response_limit_bytes = 1024
     calls: list[str] = []
 
@@ -353,6 +365,7 @@ async def test_ambiguous_timeout_does_not_fallback_and_risk_double_billing(
     backend_client: AuthenticatedClient,
     error_type: type[httpx.TimeoutException],
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -385,6 +398,7 @@ async def test_missing_secret_does_not_consume_route_attempt(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     gateway_config.routes["memory.chat"].max_attempts = 1
     calls: list[str] = []
 
@@ -411,6 +425,7 @@ async def test_no_fallback_for_policy_rejection(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -435,6 +450,7 @@ async def test_redirect_never_forwards_credentials_or_location_to_local_client(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:

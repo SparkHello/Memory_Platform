@@ -13,10 +13,8 @@ _RUNTIME_ENVIRONMENT_EXACT = {
     "ALL_PROXY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
-    "MODEL_GATEWAY_CONFIG_PATH",
     "MODEL_GATEWAY_HOME",
     "MODEL_GATEWAY_SECRETS_PATH",
-    "MODEL_GATEWAY_USAGE_DATABASE_PATH",
     "NO_PROXY",
 }
 _RUNTIME_ENVIRONMENT_PREFIXES = (
@@ -48,16 +46,9 @@ for name in list(os.environ):
 os.environ.update(
     {
         "MODEL_GATEWAY_HOME": str(_SESSION_RUNTIME_ROOT / "modelgw-home"),
-        "MODEL_GATEWAY_CONFIG_PATH": str(
-            _SESSION_RUNTIME_ROOT / "modelgw-home" / "config.json"
-        ),
         # Empty is intentional: an explicit gateway home must use its own
-        # secret store. This also keeps multiprocessing-spawned helpers from
-        # inheriting a parent test's absolute secret path.
+        # secret store, including in multiprocessing-spawned helpers.
         "MODEL_GATEWAY_SECRETS_PATH": "",
-        "MODEL_GATEWAY_USAGE_DATABASE_PATH": str(
-            _SESSION_RUNTIME_ROOT / "modelgw-home" / "usage.db"
-        ),
     }
 )
 _SESSION_ENVIRONMENT_RESTORED = False
@@ -80,7 +71,13 @@ atexit.register(_restore_session_environment)
 import pytest
 
 from model_gateway.auth import AuthenticatedClient
-from model_gateway.config_store import GatewayPaths, gateway_paths, initialize, write_config, write_secrets
+from model_gateway.config_store import (
+    GatewayPaths,
+    gateway_paths,
+    initialize,
+    write_config,
+    write_secrets,
+)
 from model_gateway.models import GatewayConfig
 
 
@@ -91,7 +88,11 @@ def pytest_unconfigure(config) -> None:
 
 @pytest.fixture(autouse=True)
 def isolate_test_runtime(tmp_path: Path) -> Iterator[None]:
-    """Give each test independent Model Gateway paths and secret namespace."""
+    """Give each test independent Model Gateway paths and secret namespace.
+
+    The session sandbox protects collection/import time; this fixture adds
+    independent paths and secret namespaces for each individual test.
+    """
 
     original_environment = {
         name: value
@@ -105,12 +106,10 @@ def isolate_test_runtime(tmp_path: Path) -> Iterator[None]:
     model_home = tmp_path / "modelgw-home"
     sandbox.chdir(tmp_path)
     sandbox.setenv("MODEL_GATEWAY_HOME", str(model_home))
-    sandbox.setenv("MODEL_GATEWAY_CONFIG_PATH", str(model_home / "config.json"))
+    # Empty is intentional: an explicit gateway home must use its own secret
+    # store. This also keeps multiprocessing-spawned helpers from inheriting a
+    # parent test's absolute secret path.
     sandbox.setenv("MODEL_GATEWAY_SECRETS_PATH", "")
-    sandbox.setenv(
-        "MODEL_GATEWAY_USAGE_DATABASE_PATH",
-        str(model_home / "usage.db"),
-    )
 
     try:
         yield
@@ -125,8 +124,27 @@ def isolate_test_runtime(tmp_path: Path) -> Iterator[None]:
             os.environ[name] = value
 
 
+# Fixed schema-v2 client credentials: at least 32 URL-safe bytes with enough
+# estimated entropy to pass the strong policy in auth.py.  Tests must exercise
+# the real strong-secret path instead of the v1 migration escape hatch
+# (``allow_legacy_weak_secret``), so these values are generated once with
+# ``secrets.token_urlsafe(32)`` and pinned here for deterministic tests.
+BACKEND_CLIENT_TOKEN = "A1iG7fr4KyGi42TkddpUHWAXQ359hNlFqNvtEGQLeGk"
+DESKTOP_CLIENT_TOKEN = "xMpmNmooUVy7xxLYkTdC2vds53bsmCV0kxm-4IwgDxg"
+ADMIN_CLIENT_TOKEN = "4VZ2sB3Er0WMRdM5FC1YRNcBHWRmoLSckW_BDVZQhcs"
+
+
 def config_payload() -> dict[str, Any]:
+    """Explicit schema-v2 configuration.
+
+    Nothing here relies on the v1 migration shim: routes keep the v2 default
+    ``fallback_scope="none"`` (tests exercising fallback opt in explicitly),
+    connections keep the v2 default ``response_limit_bytes`` and clients use
+    strong tokens without ``allow_legacy_weak_secret``.
+    """
+
     return {
+        "schema_version": 2,
         "clients": {
             "memory-gateway": {
                 "kind": "backend",
@@ -243,9 +261,9 @@ def gateway_home(tmp_path: Path, gateway_config: GatewayConfig) -> GatewayPaths:
     write_secrets(
         paths.secrets,
         {
-            "CLIENT_MEMORY_GATEWAY": "local-client-token",
-            "CLIENT_DESKTOP": "desktop-token",
-            "CLIENT_MEMORY_CONSOLE_ADMIN": "admin-token",
+            "CLIENT_MEMORY_GATEWAY": BACKEND_CLIENT_TOKEN,
+            "CLIENT_DESKTOP": DESKTOP_CLIENT_TOKEN,
+            "CLIENT_MEMORY_CONSOLE_ADMIN": ADMIN_CLIENT_TOKEN,
             "UPSTREAM_OFFICIAL": "official-secret",
             "UPSTREAM_RESELLER": "reseller-secret",
         },

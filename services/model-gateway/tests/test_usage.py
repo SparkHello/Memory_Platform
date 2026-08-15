@@ -303,6 +303,7 @@ def test_attempt_ledger_records_each_send_and_sums_attempt_costs(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     router = Router()
     route = router.resolve(
         requested_model="memory.chat",

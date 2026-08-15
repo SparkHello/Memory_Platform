@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 from dataclasses import dataclass
 import json
 from typing import Any, Literal, Mapping
 
 import httpx
 
-from model_gateway.adapters import apply_connection_adapter
-from model_gateway.auth import provider_secret_header_value
-from model_gateway.http_safety import (
-    MAX_DISCOVERY_RESPONSE_BYTES,
-    bounded_model_ids,
-    require_safe_destination,
-    upstream_url,
+from model_gateway.discovery import (
+    fetch_model_listing,
+    parse_model_listing,
+    probe_client,
+    read_bounded_response,
+    upstream_auth_headers,
 )
+from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,
 )
+from model_gateway.proxy import prepare_payload
+from model_gateway.routing import RouteTarget
 
 
 HealthLevel = Literal["ok", "warning", "error", "skipped"]
@@ -30,8 +31,28 @@ class HealthCheckError(ValueError):
     """Raised when a requested health-check target does not exist."""
 
 
-class HealthResponseTooLarge(ValueError):
-    pass
+# One shared wording table for the health-check status vocabulary; the CLI and
+# the interactive console both render from it.
+HEALTH_STATUS_LABELS: dict[str, str] = {
+    "available": "可用",
+    "connected": "已连接",
+    "connected_unlisted": "已连接，模型列表中未找到已填模型",
+    "connected_unverified": "已连接，但无法识别模型列表",
+    "check_unsupported": "渠道不提供免费检查",
+    "not_configured": "缺少 API Key",
+    "policy_blocked": "套餐不允许记忆服务后台使用",
+    "auth_failed": "API Key 无效或无权限",
+    "network_error": "网络连接失败",
+    "provider_error": "渠道返回错误",
+    "rate_limited": "渠道当前限流",
+    "model_not_found": "真实请求未找到该模型",
+    "dimension_mismatch": "向量维度与配置不一致",
+    "invalid_response": "响应无法识别或超出安全上限",
+    "live_ok": "真实请求成功",
+    "disabled": "已禁用",
+    "degraded": "部分模型可用",
+    "unavailable": "不可用",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,35 +295,13 @@ async def _check_discovery(
             detail="connection 未配置 models endpoint；未发起推理",
         )
 
-    try:
-        url = upstream_url(
-            connection.base_url,
-            connection.models_endpoint,
-            allowed_private_networks=connection.allowed_private_networks,
-        )
-        if transport is None:
-            await require_safe_destination(
-                url,
-                allowed_private_networks=connection.allowed_private_networks,
-            )
-        async with _client(connection, timeout_seconds, transport) as client:
-            async with client.stream(
-                "GET",
-                url,
-                headers=_auth_headers(connection, secret),
-            ) as response:
-                content = (
-                    await _bounded_response(
-                        response,
-                        min(
-                            connection.response_limit_bytes,
-                            MAX_DISCOVERY_RESPONSE_BYTES,
-                        ),
-                    )
-                    if response.is_success
-                    else b""
-                )
-    except (httpx.HTTPError, OSError):
+    fetch = await fetch_model_listing(
+        connection,
+        secret,
+        timeout_seconds=timeout_seconds,
+        transport=transport,
+    )
+    if fetch.status == "network_error":
         return _uniform_result(
             connection_id,
             connection,
@@ -311,7 +310,7 @@ async def _check_discovery(
             level="error",
             detail="无法连接 provider 的 models endpoint",
         )
-    except HealthResponseTooLarge:
+    if fetch.status == "too_large":
         return _uniform_result(
             connection_id,
             connection,
@@ -320,9 +319,8 @@ async def _check_discovery(
             level="error",
             detail="provider 的 models 响应超过安全上限",
         )
-    except ValueError as exc:
-        # SSRF / fake-ip / URL policy errors carry actionable text for the UI.
-        detail = str(exc).strip() or "provider URL 未通过安全校验"
+    if fetch.status == "unsafe":
+        detail = fetch.error_detail or "provider URL 未通过安全校验"
         return _uniform_result(
             connection_id,
             connection,
@@ -331,9 +329,8 @@ async def _check_discovery(
             level="error",
             detail=detail[:500],
         )
-
-    if not response.is_success:
-        status, level, detail = _http_failure(response.status_code, discovery=True)
+    if fetch.status == "http":
+        status, level, detail = _http_failure(fetch.http_status or 0, discovery=True)
         return _uniform_result(
             connection_id,
             connection,
@@ -341,11 +338,11 @@ async def _check_discovery(
             status=status,
             level=level,
             detail=detail,
-            http_status=response.status_code,
+            http_status=fetch.http_status,
         )
 
-    model_ids, parseable = _extract_model_ids(content)
-    if not parseable:
+    listing = parse_model_listing(fetch.content)
+    if listing.error:
         return _uniform_result(
             connection_id,
             connection,
@@ -353,8 +350,9 @@ async def _check_discovery(
             status="connected_unverified",
             level="warning",
             detail="连接与鉴权正常，但 models 响应无法识别；未判定模型状态",
-            http_status=response.status_code,
+            http_status=fetch.http_status,
         )
+    model_ids = set(listing.model_ids)
 
     deployment_results: list[DeploymentHealth] = []
     for deployment_id, deployment in deployments:
@@ -376,7 +374,7 @@ async def _check_discovery(
                     status="available",
                     level="ok",
                     detail="连接、鉴权和模型列表均正常",
-                    http_status=response.status_code,
+                    http_status=fetch.http_status,
                 )
             )
         else:
@@ -390,7 +388,7 @@ async def _check_discovery(
                         "连接与鉴权正常，但模型未出现在 /models 列表中；"
                         "这不表示模型已废弃"
                     ),
-                    http_status=response.status_code,
+                    http_status=fetch.http_status,
                 )
             )
     return ConnectionHealth(
@@ -400,7 +398,7 @@ async def _check_discovery(
         level="ok",
         detail="models endpoint 连接与鉴权正常",
         deployments=tuple(deployment_results),
-        http_status=response.status_code,
+        http_status=fetch.http_status,
         discovered_model_count=len(model_ids),
         discovered_models=tuple(sorted(model_ids)[:500]),
     )
@@ -427,7 +425,7 @@ async def _check_live(
             detail="connection 没有已启用的 deployment",
         )
 
-    async with _client(connection, timeout_seconds, transport) as client:
+    async with probe_client(connection, timeout_seconds, transport) as client:
         checked = await asyncio.gather(
             *[
                 _check_live_deployment(
@@ -478,21 +476,19 @@ async def _check_live_deployment(
         if deployment.kind == "chat"
         else connection.embeddings_endpoint
     )
-    payload = _minimal_payload(deployment)
-    apply_connection_adapter(
-        payload,
-        connection=connection,
-        deployment=deployment,
+    # The live probe must send exactly what the data plane would send for this
+    # deployment: adapter quirks, request_transform and the authoritative
+    # embedding dimensions all come from the shared payload builder.
+    payload = prepare_payload(
+        _minimal_payload(deployment),
+        RouteTarget(
+            route_id="health.check",
+            deployment_id=deployment_id,
+            deployment=deployment,
+            connection_id=deployment.connection,
+            connection=connection,
+        ),
     )
-    transform = deployment.request_transform
-    for name in transform.remove:
-        payload.pop(name, None)
-    for name, value in transform.set_if_missing.items():
-        payload.setdefault(name, deepcopy(value))
-    for name, value in transform.force.items():
-        payload[name] = deepcopy(value)
-    if deployment.kind == "embedding":
-        payload["dimensions"] = deployment.dimensions
     try:
         url = upstream_url(
             connection.base_url,
@@ -507,11 +503,11 @@ async def _check_live_deployment(
         async with client.stream(
             "POST",
             url,
-            headers=_auth_headers(connection, secret),
+            headers=upstream_auth_headers(connection, secret),
             json=payload,
         ) as response:
             content = (
-                await _bounded_response(
+                await read_bounded_response(
                     response,
                     connection.response_limit_bytes,
                 )
@@ -526,7 +522,7 @@ async def _check_live_deployment(
             level="error",
             detail="最小真实请求无法连接 provider",
         )
-    except (HealthResponseTooLarge, ValueError):
+    except ValueError:
         return _deployment_result(
             deployment_id,
             deployment,
@@ -606,63 +602,6 @@ def _minimal_payload(deployment: DeploymentConfig) -> dict[str, Any]:
     return payload
 
 
-def _client(
-    connection: ConnectionConfig,
-    timeout_seconds: float,
-    transport: httpx.AsyncBaseTransport | None,
-) -> httpx.AsyncClient:
-    connect_timeout = min(timeout_seconds, connection.connect_timeout_seconds)
-    read_timeout = min(timeout_seconds, connection.read_timeout_seconds)
-    write_timeout = min(timeout_seconds, connection.write_timeout_seconds)
-    pool_timeout = min(timeout_seconds, connection.pool_timeout_seconds)
-    arguments: dict[str, Any] = {
-        # A health probe must not carry an upstream credential to another host.
-        "follow_redirects": False,
-        "trust_env": False,
-        "timeout": httpx.Timeout(
-            connect=connect_timeout,
-            read=read_timeout,
-            write=write_timeout,
-            pool=pool_timeout,
-        ),
-    }
-    if transport is not None:
-        arguments["transport"] = transport
-    return httpx.AsyncClient(**arguments)
-
-
-def _auth_headers(connection: ConnectionConfig, secret: str) -> dict[str, str]:
-    provider_secret_header_value(secret)
-    headers = {"Accept": "application/json"}
-    if connection.auth.type == "bearer":
-        headers["Authorization"] = f"Bearer {secret}"
-    else:
-        headers["X-Api-Key"] = secret
-    return headers
-
-
-def _extract_model_ids(content: bytes) -> tuple[set[str], bool]:
-    try:
-        payload = json.loads(content)
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        return set(), False
-
-    candidates: Any
-    if isinstance(payload, list):
-        candidates = payload
-    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
-        candidates = payload["data"]
-    elif isinstance(payload, dict) and isinstance(payload.get("models"), list):
-        candidates = payload["models"]
-    else:
-        return set(), False
-
-    try:
-        return bounded_model_ids(candidates), True
-    except ValueError:
-        return set(), False
-
-
 def _extract_embedding_dimensions(content: bytes) -> list[int] | None:
     try:
         payload = json.loads(content)
@@ -687,17 +626,6 @@ def _is_chat_completion_response(content: bytes) -> bool:
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
     return isinstance(payload, dict) and isinstance(payload.get("choices"), list)
-
-
-async def _bounded_response(response: httpx.Response, limit: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in response.aiter_bytes():
-        total += len(chunk)
-        if total > limit:
-            raise HealthResponseTooLarge
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _http_failure(

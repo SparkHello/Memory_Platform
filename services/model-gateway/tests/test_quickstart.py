@@ -249,7 +249,7 @@ def test_quickstart_file_is_non_secret_and_configures_optional_embedding(
     )
     monkeypatch.setattr(sys, "stdin", io.StringIO("upstream-sensitive-token\n"))
     monkeypatch.setattr(
-        "model_gateway.user_console._find_memgw",
+        "model_gateway.user_console.find_memgw",
         lambda: recipe,
     )
 
@@ -258,7 +258,7 @@ def test_quickstart_file_is_non_secret_and_configures_optional_embedding(
             print("memgw-noise")
         return 0
 
-    monkeypatch.setattr("model_gateway.user_console._run_memgw", fake_run_memgw)
+    monkeypatch.setattr("model_gateway.user_console.run_memgw", fake_run_memgw)
 
     def fake_start(args):
         print("start-noise")

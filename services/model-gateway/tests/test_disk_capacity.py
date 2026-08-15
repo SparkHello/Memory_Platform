@@ -22,6 +22,8 @@ from model_gateway.config_store import (
 from model_gateway.models import GatewayConfig, ServerConfig
 from model_gateway.service import create_app
 
+from conftest import ADMIN_CLIENT_TOKEN, BACKEND_CLIENT_TOKEN
+
 
 MIB = 1024 * 1024
 
@@ -179,7 +181,7 @@ def test_v1_paid_request_preflight_returns_507_with_zero_provider_calls(
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": []},
         )
 
@@ -219,13 +221,15 @@ def test_post_provider_sqlite_full_keeps_upstream_result_and_latches_not_ready(
     app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
 
     def full(**_kwargs) -> str:
-        raise sqlite3.OperationalError("database or disk is full SECRET-BODY")
+        exc = sqlite3.OperationalError("database or disk is full SECRET-BODY")
+        exc.sqlite_errorcode = sqlite3.SQLITE_FULL
+        raise exc
 
     monkeypatch.setattr(app.state.usage_store, "record", full)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": []},
         )
         first_ready = client.get("/readyz")
@@ -329,7 +333,7 @@ def test_admin_secret_enospc_is_stable_507_and_old_secret_survives(
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.put(
             "/admin/connections/official/secret",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={"value": "candidate-secret"},
         )
 
@@ -366,7 +370,7 @@ def test_admin_config_enospc_is_stable_507_and_old_revision_survives(
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.put(
             "/admin/routes",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             content=json.dumps(
                 {
                     "revision": revision,

@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import getpass
-from hashlib import sha256
 from pathlib import Path
-import re
 import secrets
 import shutil
 import subprocess
@@ -23,7 +21,10 @@ from model_gateway.config_store import (
     read_secrets,
     source_revision,
 )
+from model_gateway.health import HEALTH_STATUS_LABELS
+from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.models import (
+    ADAPTER_NAMES,
     AuthConfig,
     BillingPlan,
     Capabilities,
@@ -182,8 +183,8 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
         )
         print(f"已自动生成向量空间 ID：{embedding_space}")
 
-    deployment_id = _unique_id(
-        _slug_id(f"{connection_id}-{upstream_model}"),
+    deployment_id = unique_id(
+        slug_id(f"{connection_id}-{upstream_model}"),
         config.deployments,
     )
     deployment = DeploymentConfig(
@@ -293,18 +294,14 @@ def _choose_connection(
     print("接口兼容方式：1=标准 OpenAI，2=Kimi，3=DeepSeek，4=MiMo，5=百炼 Qwen")
     adapter_choice = _prompt("选择 [1]：", "1")
     adapters = {
-        "1": "generic",
-        "2": "kimi",
-        "3": "deepseek",
-        "4": "mimo",
-        "5": "dashscope_openai",
+        str(index): name for index, name in enumerate(ADAPTER_NAMES, start=1)
     }
     if adapter_choice not in adapters:
-        raise ValueError("兼容方式只能选择 1、2、3、4 或 5")
-    connection_id = _unique_id(_slug_id(f"{operator}-account"), config.connections)
-    from model_gateway import cli as cli_module
-
-    secret_ref = cli_module._default_secret_ref("CONNECTION", connection_id)
+        raise ValueError(
+            "兼容方式只能选择 " + "、".join(adapters) + " 中的一个编号"
+        )
+    connection_id = unique_id(slug_id(f"{operator}-account"), config.connections)
+    secret_ref = default_secret_ref("CONNECTION", connection_id)
     connection = ConnectionConfig(
         channel_operator=operator,
         adapter=adapters[adapter_choice],
@@ -449,7 +446,7 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
         print("请先选择“安排每项用途使用哪个模型”。")
         return
 
-    memgw = _find_memgw()
+    memgw = find_memgw()
     if memgw is None:
         entered = input("没有自动找到记忆项目，请输入 My_Memory 文件夹路径（回车取消）：").strip()
         if not entered:
@@ -465,7 +462,7 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
     secret_ref = (
         existing.secret_ref
         if existing is not None
-        else cli_module._default_secret_ref("CLIENT", "memory-gateway")
+        else default_secret_ref("CLIENT", "memory-gateway")
     )
     clients["memory-gateway"] = ClientConfig(
         kind="backend",
@@ -495,9 +492,9 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
             raise ValueError("模型服务尚未就绪，请先在主菜单检查问题")
 
     base_url = cli_module._server_url(updated.server) + "/v1"
-    if _run_memgw(memgw, ["config", "set", "MODEL_GATEWAY_BASE_URL", base_url]) != 0:
+    if run_memgw(memgw, ["config", "set", "MODEL_GATEWAY_BASE_URL", base_url]) != 0:
         raise ValueError("记忆服务没有接受模型服务地址")
-    if _run_memgw(
+    if run_memgw(
         memgw,
         ["secret", "set", "model-gateway", "--stdin"],
         input_text=client_key + "\n",
@@ -507,17 +504,17 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
     embedding_route = updated.routes.get("memory.embedding")
     if embedding_route:
         deployment = updated.deployments[embedding_route.targets[0]]
-        _run_memgw(
+        run_memgw(
             memgw,
             ["config", "set", "MODEL_GATEWAY_EMBEDDING_SPACE_ID", deployment.embedding_space],
         )
-        _run_memgw(
+        run_memgw(
             memgw,
             ["config", "set", "EMBEDDING_DIMENSIONS", str(deployment.dimensions)],
         )
     print("模型服务已经连接到记忆服务。两边使用独立密钥文件，密钥不会显示。")
     if _confirm("现在重启记忆服务，让新设置立即生效？", True):
-        if _run_memgw(memgw, ["restart"]) != 0:
+        if run_memgw(memgw, ["restart"]) != 0:
             print("记忆服务重启没有完成；设置已经保存，可稍后从 memgw 菜单启动。")
 
 
@@ -553,18 +550,7 @@ def _check_channels(paths: GatewayPaths, args: argparse.Namespace) -> None:
             client_kind="backend",
         )
     )
-    labels = {
-        "available": "可用",
-        "connected": "已连接",
-        "connected_unlisted": "已连接，模型列表中未找到已填模型",
-        "connected_unverified": "已连接，但无法识别模型列表",
-        "check_unsupported": "渠道不提供免费检查",
-        "not_configured": "缺少 API Key",
-        "policy_blocked": "套餐不允许记忆服务后台使用",
-        "auth_failed": "API Key 无效或无权限",
-        "network_error": "网络连接失败",
-        "provider_error": "渠道返回错误",
-    }
+    labels = HEALTH_STATUS_LABELS
     for result in results:
         connection = config.connections[result.connection_id]
         mark = "正常" if result.ok else "注意"
@@ -668,8 +654,8 @@ def _record_price(paths: GatewayPaths) -> None:
         source_url=source_url,
         checked_at=datetime.now(UTC).date().isoformat(),
     )
-    pricing_id = _unique_id(
-        _slug_id(f"{deployment_id}-{pricing.checked_at}"),
+    pricing_id = unique_id(
+        slug_id(f"{deployment_id}-{pricing.checked_at}"),
         config.pricing,
     )
     print(
@@ -727,7 +713,7 @@ def _gateway_healthy(paths: GatewayPaths, config: GatewayConfig) -> bool:
     return process_module._gateway_responding(cli_module._server_url(config.server))
 
 
-def _find_memgw() -> Path | None:
+def find_memgw() -> Path | None:
     installed = shutil.which("memgw")
     if installed:
         return Path(installed)
@@ -743,7 +729,7 @@ def _find_memgw() -> Path | None:
     )
 
 
-def _run_memgw(
+def run_memgw(
     command: Path,
     arguments: list[str],
     *,
@@ -767,28 +753,6 @@ def _run_memgw(
 def _route_model_names(config: GatewayConfig, targets: Iterable[str]) -> str:
     names = [config.deployments[target].upstream_model for target in targets]
     return " → ".join(names)
-
-
-def _slug_id(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9._:-]+", "-", value.lower()).strip("-._:")
-    if not normalized:
-        normalized = "item"
-    if len(normalized) > 120:
-        digest = sha256(normalized.encode("utf-8")).hexdigest()[:8]
-        normalized = f"{normalized[:110].rstrip('-._:')}-{digest}"
-    return normalized
-
-
-def _unique_id(candidate: str, records: Any) -> str:
-    if candidate not in records:
-        return candidate
-    index = 2
-    while True:
-        suffix = f"-{index}"
-        alternate = candidate[: 120 - len(suffix)].rstrip("-._:") + suffix
-        if alternate not in records:
-            return alternate
-        index += 1
 
 
 def _handler_args(base: argparse.Namespace, **values: Any) -> argparse.Namespace:

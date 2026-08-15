@@ -7,10 +7,10 @@ import pytest
 from model_gateway.auth import AuthenticatedClient
 from model_gateway.models import GatewayConfig
 from model_gateway.routing import (
-    CooldownRegistry,
     RequestRequirements,
     RouteCapabilityUnavailable,
     RouteForbidden,
+    RouteUnavailable,
     Router,
     RuntimeHealthRegistry,
     retry_after_seconds,
@@ -24,6 +24,7 @@ def test_preferred_deployment_is_first_even_beyond_normal_attempt_window(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     gateway_config.routes["memory.chat"].max_attempts = 1
     resolved = Router().resolve(
         requested_model="memory.chat",
@@ -53,6 +54,34 @@ def test_required_deployment_disables_fallback(
     assert resolved.required_deployment == "chat-reseller"
 
 
+def test_v2_default_fallback_scope_truncates_to_primary_target(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    # The shared fixture is explicit schema v2, so memory.chat keeps the v2
+    # default fallback_scope="none": only the primary target is eligible and a
+    # cooling primary does not escape to another channel.
+    assert gateway_config.routes["memory.chat"].fallback_scope == "none"
+    resolved = Router().resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    assert [target.deployment_id for target in resolved.targets] == ["chat-official"]
+
+    clock = [10.0]
+    health = RuntimeHealthRegistry(clock=lambda: clock[0])
+    health.defer("official", 60)
+    with pytest.raises(RouteUnavailable, match="限流冷却"):
+        Router(runtime_health=health).resolve(
+            requested_model="memory.chat",
+            kind="chat",
+            client=backend_client,
+            config=gateway_config,
+        )
+
+
 def test_backend_cannot_use_interactive_only_connection() -> None:
     payload = config_payload()
     payload["connections"]["official"]["usage_scope"] = "interactive_only"
@@ -69,10 +98,11 @@ def test_cooling_connection_is_skipped(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     clock = [10.0]
-    cooldowns = CooldownRegistry(clock=lambda: clock[0])
-    cooldowns.defer("official", 60)
-    resolved = Router(cooldowns).resolve(
+    health = RuntimeHealthRegistry(clock=lambda: clock[0])
+    health.defer("official", 60)
+    resolved = Router(runtime_health=health).resolve(
         requested_model="memory.chat",
         kind="chat",
         client=backend_client,
@@ -85,11 +115,12 @@ def test_max_attempts_counts_eligible_targets_not_cooling_targets(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     gateway_config.routes["memory.chat"].max_attempts = 1
     clock = [10.0]
-    cooldowns = CooldownRegistry(clock=lambda: clock[0])
-    cooldowns.defer("official", 60)
-    resolved = Router(cooldowns).resolve(
+    health = RuntimeHealthRegistry(clock=lambda: clock[0])
+    health.defer("official", 60)
+    resolved = Router(runtime_health=health).resolve(
         requested_model="memory.chat",
         kind="chat",
         client=backend_client,
@@ -232,6 +263,7 @@ def test_runtime_capabilities_filter_route_targets(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     gateway_config.deployments["chat-official"].capabilities.json_schema = False
     requirements = RequestRequirements.from_payload(
         {"response_format": {"type": "json_schema"}},
@@ -293,6 +325,7 @@ def test_consecutive_server_failures_open_only_deployment_breaker(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     now = [100.0]
     health = RuntimeHealthRegistry(
         clock=lambda: now[0],

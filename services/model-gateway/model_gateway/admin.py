@@ -6,11 +6,13 @@ from typing import Any, Literal, Mapping
 from pydantic import Field, field_validator, model_validator
 
 from model_gateway.auth import AuthenticatedClient, provider_secret_header_value
-from model_gateway.config_store import configuration_revision
 from model_gateway.http_safety import normalize_base_url
+from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.models import (
+    AdapterName,
     AuthConfig,
     BillingPlan,
+    BillingPlanType,
     Capabilities,
     ConnectionConfig,
     DeploymentConfig,
@@ -22,7 +24,6 @@ from model_gateway.models import (
     StrictModel,
     validate_id,
 )
-from model_gateway.quickstart import _default_secret_ref, _slug, _unique_id
 
 
 class RouteDraft(StrictModel):
@@ -90,19 +91,9 @@ class ConnectionCreateRequest(StrictModel):
 
     revision: str
     channel_operator: str
-    adapter: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] = "generic"
+    adapter: AdapterName = "generic"
     base_url: str
-    plan: Literal[
-        "payg",
-        "subscription",
-        "free_tier",
-        "token_plan",
-        "coding_plan",
-        "direct_tool_only",
-        "custom",
-    ] = "payg"
+    plan: BillingPlanType = "payg"
     dry_run: bool = False
 
     @field_validator("revision")
@@ -179,12 +170,8 @@ class CandidateDiscoverRequest(StrictModel):
     candidate_key: str = Field(default="", max_length=65536)
     channel_operator: str = ""
     base_url: str = ""
-    adapter: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] = "generic"
-    dialect: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] | None = None
+    adapter: AdapterName = "generic"
+    dialect: AdapterName | None = None
     auth_type: Literal["bearer", "x-api-key"] = "bearer"
     allowed_private_networks: list[str] = Field(default_factory=list)
     models_endpoint: str | None = "/models"
@@ -232,9 +219,7 @@ class CapabilityProbeRequest(StrictModel):
     candidate_key: str = Field(min_length=1, max_length=65536)
     channel_operator: str
     base_url: str
-    adapter: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] = "generic"
+    adapter: AdapterName = "generic"
     auth_type: Literal["bearer", "x-api-key"] = "bearer"
     allowed_private_networks: list[str] = Field(default_factory=list)
     upstream_model: str = Field(min_length=1, max_length=300)
@@ -297,21 +282,11 @@ class EnabledUpdateRequest(RevisionRequest):
 class BundleConnectionDraft(StrictModel):
     id: str = ""
     channel_operator: str
-    adapter: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] = "generic"
+    adapter: AdapterName = "generic"
     base_url: str
     secret: str = Field(min_length=1, max_length=65536)
     auth_type: Literal["bearer", "x-api-key"] = "bearer"
-    plan: Literal[
-        "payg",
-        "subscription",
-        "free_tier",
-        "token_plan",
-        "coding_plan",
-        "direct_tool_only",
-        "custom",
-    ] = "payg"
+    plan: BillingPlanType = "payg"
     usage_scope: Literal["backend_allowed", "interactive_only", "disabled"] = (
         "backend_allowed"
     )
@@ -563,14 +538,14 @@ def connection_candidate(
     """
 
     operator = request.channel_operator.strip().lower()
-    connection_id = _unique_id(_slug(f"{operator}-account"), config.connections)
+    connection_id = unique_id(slug_id(f"{operator}-account"), config.connections)
     connection = ConnectionConfig(
         channel_operator=operator,
         adapter=request.adapter,
         base_url=request.base_url,
         auth=AuthConfig(
             type="bearer",
-            secret_ref=_default_secret_ref("CONNECTION", connection_id),
+            secret_ref=default_secret_ref("CONNECTION", connection_id),
         ),
         billing_plan=BillingPlan(type=request.plan),
         usage_scope="backend_allowed",
@@ -604,8 +579,8 @@ def deployment_candidate(
     deployments = dict(payload["deployments"])
     deployment_ids: list[str] = []
     for draft in request.deployments:
-        deployment_id = _unique_id(
-            _slug(f"{request.connection}-{draft.upstream_model}"),
+        deployment_id = unique_id(
+            slug_id(f"{request.connection}-{draft.upstream_model}"),
             deployments,
         )
         deployment = DeploymentConfig(
@@ -699,14 +674,14 @@ def bundle_candidate(
 
     payload = config.model_dump(mode="python", exclude_none=False)
     operator = request.connection.channel_operator.strip().lower()
-    connection_id = request.connection.id or _unique_id(
-        _slug(f"{operator}-account"), config.connections
+    connection_id = request.connection.id or unique_id(
+        slug_id(f"{operator}-account"), config.connections
     )
     existing_connection = config.connections.get(connection_id)
     secret_ref = (
         existing_connection.auth.secret_ref
         if existing_connection is not None
-        else _default_secret_ref("CONNECTION", connection_id)
+        else default_secret_ref("CONNECTION", connection_id)
     )
     connection_payload = (
         existing_connection.model_dump(mode="python", exclude_none=False)
@@ -715,119 +690,78 @@ def bundle_candidate(
     )
     supplied = request.connection.model_fields_set
 
-    def selected(name: str, new_value: Any, old_value: Any) -> Any:
-        if existing_connection is not None and name not in supplied:
-            return old_value
-        return new_value
+    # Fields the bundle draft may override on an existing connection. Each
+    # entry maps the draft attribute to where the value lives on a persisted
+    # ConnectionConfig; an omitted draft field keeps the persisted value.
+    overridable: tuple[tuple[str, str], ...] = (
+        ("adapter", "adapter"),
+        ("allowed_private_networks", "allowed_private_networks"),
+        ("auth_type", "auth.type"),
+        ("plan", "billing_plan.type"),
+        ("usage_scope", "usage_scope"),
+        ("connect_timeout_seconds", "connect_timeout_seconds"),
+        ("read_timeout_seconds", "read_timeout_seconds"),
+        ("write_timeout_seconds", "write_timeout_seconds"),
+        ("pool_timeout_seconds", "pool_timeout_seconds"),
+        ("response_limit_bytes", "response_limit_bytes"),
+        ("enabled", "enabled"),
+    )
+
+    def dig(source: object, dotted: str) -> Any:
+        value = source
+        for part in dotted.split("."):
+            value = getattr(value, part)
+        return value
+
+    merged = {
+        name: (
+            dig(existing_connection, persisted)
+            if existing_connection is not None and name not in supplied
+            else dig(request.connection, name)
+        )
+        for name, persisted in overridable
+    }
 
     candidate_connection = ConnectionConfig(
-            channel_operator=operator,
-            adapter=selected(
-                "adapter", request.connection.adapter, existing_connection.adapter
-                if existing_connection is not None else request.connection.adapter
-            ),
-            allowed_private_networks=selected(
-                "allowed_private_networks",
-                request.connection.allowed_private_networks,
-                existing_connection.allowed_private_networks
-                if existing_connection is not None
-                else request.connection.allowed_private_networks,
-            ),
-            base_url=request.connection.base_url,
-            auth=AuthConfig(
-                type=selected(
-                    "auth_type",
-                    request.connection.auth_type,
-                    existing_connection.auth.type
-                    if existing_connection is not None
-                    else request.connection.auth_type,
-                ),
-                secret_ref=secret_ref,
-            ),
-            models_endpoint=(
-                existing_connection.models_endpoint
-                if existing_connection is not None
-                else "/models"
-            ),
-            chat_endpoint=(
-                existing_connection.chat_endpoint
-                if existing_connection is not None
-                else "/chat/completions"
-            ),
-            embeddings_endpoint=(
-                existing_connection.embeddings_endpoint
-                if existing_connection is not None
-                else "/embeddings"
-            ),
-            forward_headers=(
-                existing_connection.forward_headers
-                if existing_connection is not None
-                else []
-            ),
-            billing_plan=BillingPlan(
-                type=selected(
-                    "plan",
-                    request.connection.plan,
-                    existing_connection.billing_plan.type
-                    if existing_connection is not None
-                    else request.connection.plan,
-                )
-            ),
-            usage_scope=selected(
-                "usage_scope",
-                request.connection.usage_scope,
-                existing_connection.usage_scope
-                if existing_connection is not None
-                else request.connection.usage_scope,
-            ),
-            connect_timeout_seconds=selected(
-                "connect_timeout_seconds",
-                request.connection.connect_timeout_seconds,
-                existing_connection.connect_timeout_seconds
-                if existing_connection is not None
-                else request.connection.connect_timeout_seconds,
-            ),
-            read_timeout_seconds=selected(
-                "read_timeout_seconds",
-                request.connection.read_timeout_seconds,
-                existing_connection.read_timeout_seconds
-                if existing_connection is not None
-                else request.connection.read_timeout_seconds,
-            ),
-            write_timeout_seconds=selected(
-                "write_timeout_seconds",
-                request.connection.write_timeout_seconds,
-                existing_connection.write_timeout_seconds
-                if existing_connection is not None
-                else request.connection.write_timeout_seconds,
-            ),
-            pool_timeout_seconds=selected(
-                "pool_timeout_seconds",
-                request.connection.pool_timeout_seconds,
-                existing_connection.pool_timeout_seconds
-                if existing_connection is not None
-                else request.connection.pool_timeout_seconds,
-            ),
-            response_limit_bytes=selected(
-                "response_limit_bytes",
-                request.connection.response_limit_bytes,
-                existing_connection.response_limit_bytes
-                if existing_connection is not None
-                else request.connection.response_limit_bytes,
-            ),
-            rate_limit_cooldown_seconds=(
-                existing_connection.rate_limit_cooldown_seconds
-                if existing_connection is not None
-                else 300.0
-            ),
-            enabled=selected(
-                "enabled",
-                request.connection.enabled,
-                existing_connection.enabled
-                if existing_connection is not None
-                else request.connection.enabled,
-            ),
-        )
+        channel_operator=operator,
+        adapter=merged["adapter"],
+        allowed_private_networks=merged["allowed_private_networks"],
+        base_url=request.connection.base_url,
+        auth=AuthConfig(type=merged["auth_type"], secret_ref=secret_ref),
+        models_endpoint=(
+            existing_connection.models_endpoint
+            if existing_connection is not None
+            else "/models"
+        ),
+        chat_endpoint=(
+            existing_connection.chat_endpoint
+            if existing_connection is not None
+            else "/chat/completions"
+        ),
+        embeddings_endpoint=(
+            existing_connection.embeddings_endpoint
+            if existing_connection is not None
+            else "/embeddings"
+        ),
+        forward_headers=(
+            list(existing_connection.forward_headers)
+            if existing_connection is not None
+            else []
+        ),
+        billing_plan=BillingPlan(type=merged["plan"]),
+        usage_scope=merged["usage_scope"],
+        connect_timeout_seconds=merged["connect_timeout_seconds"],
+        read_timeout_seconds=merged["read_timeout_seconds"],
+        write_timeout_seconds=merged["write_timeout_seconds"],
+        pool_timeout_seconds=merged["pool_timeout_seconds"],
+        response_limit_bytes=merged["response_limit_bytes"],
+        rate_limit_cooldown_seconds=(
+            existing_connection.rate_limit_cooldown_seconds
+            if existing_connection is not None
+            else 300.0
+        ),
+        enabled=merged["enabled"],
+    )
     connection_payload.update(
         candidate_connection.model_dump(mode="python", exclude_none=False)
     )
@@ -864,8 +798,8 @@ def bundle_candidate(
         target_connection = (
             embedding_connection if draft.kind == "embedding" else candidate_connection
         )
-        deployment_id = draft.id or _unique_id(
-            _slug(f"{target_connection_id}-{draft.upstream_model}"), deployments
+        deployment_id = draft.id or unique_id(
+            slug_id(f"{target_connection_id}-{draft.upstream_model}"), deployments
         )
         current = config.deployments.get(deployment_id)
         if current is not None and current.connection != target_connection_id:
@@ -1004,8 +938,8 @@ def _embedding_target_connection(
         raise ValueError(f"embedding_base_url 无效：{exc}") from exc
     if embedding_url == chat_connection.base_url:
         return chat_connection_id, chat_connection
-    embedding_connection_id = _unique_id(
-        _slug(f"{operator}-embedding-account"),
+    embedding_connection_id = unique_id(
+        slug_id(f"{operator}-embedding-account"),
         connections_payload,
     )
     return (

@@ -34,7 +34,7 @@ from model_gateway.models import (
     derive_embedding_space,
 )
 
-from conftest import config_payload
+from conftest import BACKEND_CLIENT_TOKEN, config_payload
 
 
 @pytest.mark.parametrize("plan_type", ["token_plan", "coding_plan", "direct_tool_only"])
@@ -446,11 +446,11 @@ def test_duplicate_client_secret_values_fail_closed() -> None:
 
     with pytest.raises(AuthenticationError, match="密钥配置冲突"):
         authenticate_client(
-            "Bearer duplicate-value",
+            f"Bearer {BACKEND_CLIENT_TOKEN}",
             config=config,
             secrets={
-                "CLIENT_MEMORY_GATEWAY": "duplicate-value",
-                "CLIENT_DESKTOP": "duplicate-value",
+                "CLIENT_MEMORY_GATEWAY": BACKEND_CLIENT_TOKEN,
+                "CLIENT_DESKTOP": BACKEND_CLIENT_TOKEN,
             },
         )
 
@@ -459,11 +459,11 @@ def test_provider_and_client_secret_values_fail_closed() -> None:
     config = GatewayConfig.model_validate(config_payload())
     with pytest.raises(AuthenticationError, match="上游连接密钥配置冲突"):
         authenticate_client(
-            "Bearer same-value",
+            f"Bearer {BACKEND_CLIENT_TOKEN}",
             config=config,
             secrets={
-                "CLIENT_MEMORY_GATEWAY": "same-value",
-                "UPSTREAM_OFFICIAL": "same-value",
+                "CLIENT_MEMORY_GATEWAY": BACKEND_CLIENT_TOKEN,
+                "UPSTREAM_OFFICIAL": BACKEND_CLIENT_TOKEN,
             },
         )
 

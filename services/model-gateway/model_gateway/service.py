@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Literal
@@ -25,7 +24,6 @@ from model_gateway.admin import (
     RouteUpdateRequest,
     SecretUpdateRequest,
     bundle_candidate,
-    configuration_revision,
     connection_candidate,
     deployment_candidate,
     public_configuration,
@@ -50,6 +48,7 @@ from model_gateway.config_store import (
     ConfigManager,
     GatewayPaths,
     commit_control_plane,
+    configuration_revision,
     initialize,
 )
 from model_gateway.health import HealthCheckError, check_health
@@ -61,9 +60,10 @@ from model_gateway.routing import (
     RouteCapabilityUnavailable,
     Router,
     RoutingError,
+    scoped_route_targets,
+    target_serves_kind,
 )
 from model_gateway.usage import (
-    DAILY_RETENTION_DAYS,
     RAW_RETENTION_DAYS,
     UsageCapture,
     UsageMetadata,
@@ -73,7 +73,7 @@ from model_gateway.storage import (
     StorageCapacityError,
     StorageErrorMiddleware,
     StorageFaultMonitor,
-    ensure_ledger_write_capacity,
+    ensure_write_capacity,
     estimated_ledger_write_bytes,
     is_storage_exhausted,
     storage_readiness_reason,
@@ -98,8 +98,8 @@ def create_app(
         usage_store.init_db()
     except (OSError, sqlite3.Error) as exc:
         # Keep liveness available so /readyz can report only a safe storage
-        # reason. Data-plane preflight remains fail-closed until the ledger is
-        # writable again.
+        # reason. The data plane estimates disk headroom before each write and
+        # the post-write failure latch keeps a broken ledger visible there.
         storage_monitor.mark_unavailable()
         _LOGGER.error(
             "usage ledger initialization failed (%s)",
@@ -141,7 +141,7 @@ def create_app(
     ).strip().lower() in {"1", "true", "yes", "on"}
     app = FastAPI(
         title="Model Gateway",
-        version="0.2.0",
+        version="0.5.1",
         docs_url="/docs" if openapi_enabled else None,
         redoc_url="/redoc" if openapi_enabled else None,
         openapi_url="/openapi.json" if openapi_enabled else None,
@@ -342,13 +342,6 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
-            current_revision = configuration_revision(paths.config)
-            if payload.revision != current_revision:
-                return _error(
-                    409,
-                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
-                    error_type="model_gateway_config_stale",
-                )
             try:
                 candidate, changed, warnings = route_candidate(config, payload)
             except (ValueError, ValidationError) as exc:
@@ -357,6 +350,8 @@ def create_app(
                     f"路由草稿未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
+            # The commit-time revision CAS is authoritative; no separate
+            # preflight revision read on the apply path.
             commit = _commit_admin_change(payload.revision, config=candidate)
             if isinstance(commit, JSONResponse):
                 return commit
@@ -385,13 +380,6 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
-            current_revision = configuration_revision(paths.config)
-            if payload.revision != current_revision:
-                return _error(
-                    409,
-                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
-                    error_type="model_gateway_config_stale",
-                )
             try:
                 candidate, connection_id = connection_candidate(config, payload)
             except (ValueError, ValidationError) as exc:
@@ -400,7 +388,12 @@ def create_app(
                     f"渠道草稿未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
-            if not payload.dry_run:
+            if payload.dry_run:
+                # A dry run never reaches the commit CAS, so it keeps its own
+                # revision check.
+                if payload.revision != configuration_revision(paths.config):
+                    return _config_stale_error()
+            else:
                 commit = _commit_admin_change(payload.revision, config=candidate)
                 if isinstance(commit, JSONResponse):
                     return commit
@@ -432,13 +425,6 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
-            current_revision = configuration_revision(paths.config)
-            if payload.revision != current_revision:
-                return _error(
-                    409,
-                    "配置已经被其他操作修改；请重新读取当前 revision 后重试",
-                    error_type="model_gateway_config_stale",
-                )
             try:
                 candidate, deployment_ids, changed, warnings = deployment_candidate(
                     config, payload
@@ -449,7 +435,12 @@ def create_app(
                     f"部署草稿未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
-            if not payload.dry_run:
+            if payload.dry_run:
+                # A dry run never reaches the commit CAS, so it keeps its own
+                # revision check.
+                if payload.revision != configuration_revision(paths.config):
+                    return _config_stale_error()
+            else:
                 commit = _commit_admin_change(payload.revision, config=candidate)
                 if isinstance(commit, JSONResponse):
                     return commit
@@ -748,7 +739,8 @@ def create_app(
         )
         if isinstance(payload, Response):
             return payload
-        if payload.revision != configuration_revision(paths.config):
+        if not apply and payload.revision != configuration_revision(paths.config):
+            # The validate-only path never reaches the commit CAS.
             return _config_stale_error()
         try:
             (
@@ -1149,20 +1141,22 @@ async def _proxy_request(
     # Authentication, JSON validation and route/capability resolution have all
     # succeeded, but no provider HTTP request has been built or sent yet.  Keep
     # enough durable room for this logical request and every allowed attempt.
+    # The ledger's SQLite-level health is probed by readyz/startup, not here:
+    # the 507 contract is a pre-write capacity estimate, and an unexpected
+    # ledger write failure still latches readiness after the response.
     route_attempts = min(
         len(resolved.targets),
         resolved.route.max_attempts if resolved.route is not None else 1,
     )
     try:
         await asyncio.to_thread(
-            ensure_ledger_write_capacity,
-            usage_store.path,
+            ensure_write_capacity,
+            (usage_store.path,),
             config.server,
             expected_write_bytes=estimated_ledger_write_bytes(
                 body_bytes=len(raw_body),
                 attempts=route_attempts,
             ),
-            usage_probe=usage_store,
         )
     except StorageCapacityError:
         storage_monitor.mark_unavailable()
@@ -1552,41 +1546,15 @@ def _safe_validation_message(exc: Exception) -> str:
     if not isinstance(exc, ValidationError):
         return type(exc).__name__
     locations: list[str] = []
-    categories: set[str] = set()
     for error in exc.errors(include_url=False, include_input=False, include_context=False):
         location = ".".join(str(part) for part in error.get("loc", ()))
         if location and location not in locations:
             locations.append(location[:160])
-        message = str(error.get("msg", "")).lower()
-        if "https" in message:
-            categories.add("必须使用 HTTPS")
-        if "embedding" in message or "向量" in message:
-            categories.add("embedding 配置不兼容")
-        safe_capabilities = tuple(
-            capability
-            for capability in (
-                "streaming",
-                "tools",
-                "parallel_tools",
-                "reasoning",
-                "multimodal_input",
-                "json_object",
-                "json_schema",
-            )
-            if capability in message
-        )
-        if safe_capabilities:
-            categories.add(
-                "deployment capability 不满足 route："
-                + ", ".join(safe_capabilities)
-            )
-        if "引用" in message or "不存在" in message:
-            categories.add("对象引用无效")
     details = []
     if locations:
         details.append("字段 " + ", ".join(locations[:8]))
-    details.extend(sorted(categories))
-    return "；".join(details) or "配置字段未通过安全校验"
+    details.append("配置值未通过安全校验")
+    return "；".join(details)
 
 
 async def _read_limited_body(request: Request, limit: int) -> bytes | None:
@@ -1657,28 +1625,15 @@ def _has_ready_route(config: Any, secrets: dict[str, str]) -> bool:
         ]
         if not allowed_clients:
             continue
-        target_ids = list(route.targets)
-        if route.fallback_scope == "none":
-            target_ids = target_ids[:1]
-        elif route.fallback_scope == "same_channel" and target_ids:
-            primary = config.deployments.get(target_ids[0])
-            if primary is None:
-                continue
-            target_ids = [
-                target_id
-                for target_id in target_ids
-                if config.deployments.get(target_id) is not None
-                and config.deployments[target_id].connection == primary.connection
-            ]
-        for target_id in target_ids:
+        for target_id in scoped_route_targets(route, config.deployments):
             deployment = config.deployments.get(target_id)
-            if deployment is None or not deployment.enabled:
+            if deployment is None:
                 continue
             connection = config.connections.get(deployment.connection)
-            if (
-                connection is None
-                or not connection.enabled
-                or connection.usage_scope == "disabled"
+            if connection is None or not target_serves_kind(
+                deployment,
+                connection,
+                route.kind,
             ):
                 continue
             if connection.usage_scope == "interactive_only" and not any(

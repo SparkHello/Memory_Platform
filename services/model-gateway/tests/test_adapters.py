@@ -199,6 +199,7 @@ def test_mimo_adapter_adds_empty_reasoning_field_to_tool_history() -> None:
 def test_fallback_strips_reasoning_from_a_different_origin(
     gateway_config, backend_client
 ) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
     router = Router()
     target = router.resolve(
         requested_model="memory.chat",

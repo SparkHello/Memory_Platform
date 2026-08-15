@@ -19,7 +19,6 @@ import sys
 import time
 from typing import Any, Iterable, Mapping, Sequence
 
-import httpx
 from pydantic import ValidationError
 
 from model_gateway.auth import (
@@ -32,14 +31,16 @@ from model_gateway.config_store import (
     ConfigError,
     GatewayPaths,
     commit_control_plane,
-    configuration_revision,
     gateway_paths,
     initialize,
     load_config,
     read_secrets,
     source_revision,
 )
+from model_gateway.ids import default_secret_ref
 from model_gateway.models import (
+    ADAPTER_NAMES,
+    BILLING_PLAN_TYPES,
     AuthConfig,
     BillingPlan,
     Capabilities,
@@ -69,7 +70,6 @@ from model_gateway.process import (
     _state_process_matches,
     _write_state,
 )
-from model_gateway.quickstart import _default_secret_ref
 from model_gateway.routing import RouteTarget
 from model_gateway.usage import AttemptTrace, UsageCapture, UsageStore
 
@@ -83,7 +83,6 @@ class ProbeResult:
     connection_id: str
     status: str
     detail: str
-    model_ids: frozenset[str] = frozenset()
     deployment_id: str = ""
     live: bool = False
     level: str = ""
@@ -111,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="以 JSON 输出适合脚本消费的结果",
     )
-    parser.add_argument("--version", action="version", version="modelgw 0.2.0")
+    parser.add_argument("--version", action="version", version="modelgw 0.5.1")
     commands = parser.add_subparsers(dest="command")
 
     menu_parser = commands.add_parser(
@@ -183,20 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_parser.add_argument(
         "--adapter",
         default="",
-        choices=["generic", "kimi", "deepseek", "mimo", "dashscope_openai"],
+        choices=list(ADAPTER_NAMES),
     )
     quickstart_parser.add_argument(
         "--plan",
         default="payg",
-        choices=[
-            "payg",
-            "subscription",
-            "free_tier",
-            "token_plan",
-            "coding_plan",
-            "direct_tool_only",
-            "custom",
-        ],
+        choices=list(BILLING_PLAN_TYPES),
     )
     quickstart_parser.add_argument("--chat-author", default="", help="聊天模型作者简称，默认用渠道名")
     quickstart_parser.add_argument(
@@ -382,21 +373,13 @@ def build_parser() -> argparse.ArgumentParser:
     connection_add.add_argument(
         "--adapter",
         default="generic",
-        choices=["generic", "kimi", "deepseek", "mimo", "dashscope_openai"],
+        choices=list(ADAPTER_NAMES),
     )
     connection_add.add_argument(
         "--plan",
         dest="billing_type",
         default="payg",
-        choices=[
-            "payg",
-            "subscription",
-            "free_tier",
-            "token_plan",
-            "coding_plan",
-            "direct_tool_only",
-            "custom",
-        ],
+        choices=list(BILLING_PLAN_TYPES),
     )
     connection_add.add_argument("--plan-name", default="default")
     connection_add.add_argument(
@@ -660,7 +643,6 @@ def build_parser() -> argparse.ArgumentParser:
     pricing_remove.set_defaults(handler=_cmd_pricing_remove)
 
     check_parser = commands.add_parser("check", help="检查全部或指定连接")
-    check_parser.add_argument("scope", nargs="?", default="all", choices=["all"])
     check_parser.add_argument(
         "--connection", action="append", default=[], dest="connection_ids"
     )
@@ -803,7 +785,7 @@ def _cmd_quickstart(args: argparse.Namespace) -> int:
         get_channel_preset,
         load_quickstart_file,
     )
-    from model_gateway.user_console import _find_memgw, _run_memgw
+    from model_gateway.user_console import find_memgw, run_memgw
 
     paths = _paths(args)
     initialize(paths)
@@ -873,20 +855,20 @@ def _cmd_quickstart(args: argparse.Namespace) -> int:
     # independent secret files and the value is never echoed.
     memgw_wired = False
     if spec.connect_memory:
-        memgw = Path(args.memgw).expanduser() if args.memgw else _find_memgw()
+        memgw = Path(args.memgw).expanduser() if args.memgw else find_memgw()
         if memgw is None or not Path(memgw).is_file():
             result.warnings.append(
                 "没有找到记忆服务 memgw；模型服务已配置，可稍后用 memgw stack install 连接。"
             )
         else:
             base_url = _server_url(load_config(paths.config).server) + "/v1"
-            if _run_memgw(
+            if run_memgw(
                 memgw,
                 ["config", "set", "MODEL_GATEWAY_BASE_URL", base_url],
                 quiet=bool(args.json),
             ) != 0:
                 result.warnings.append("记忆服务没有接受模型服务地址。")
-            elif _run_memgw(
+            elif run_memgw(
                 memgw,
                 ["secret", "set", "model-gateway", "--stdin", "--no-check"],
                 input_text=result.memory_client_key + "\n",
@@ -896,12 +878,12 @@ def _cmd_quickstart(args: argparse.Namespace) -> int:
             else:
                 memgw_wired = True
                 if result.embedding_deployment_id:
-                    _run_memgw(
+                    run_memgw(
                         memgw,
                         ["config", "set", "MODEL_GATEWAY_EMBEDDING_SPACE_ID", result.embedding_space],
                         quiet=bool(args.json),
                     )
-                    _run_memgw(
+                    run_memgw(
                         memgw,
                         ["config", "set", "EMBEDDING_DIMENSIONS", str(result.embedding_dimensions)],
                         quiet=bool(args.json),
@@ -925,8 +907,8 @@ def _cmd_quickstart(args: argparse.Namespace) -> int:
         if start_result == 0:
             started = True
         if memgw_wired:
-            _run_memgw(
-                Path(args.memgw).expanduser() if args.memgw else _find_memgw(),
+            run_memgw(
+                Path(args.memgw).expanduser() if args.memgw else find_memgw(),
                 ["restart"],
                 quiet=bool(args.json),
             )
@@ -1643,7 +1625,7 @@ def _cmd_client_add(args: argparse.Namespace) -> int:
     if client_id in config.clients and not args.replace:
         raise CLIError(f"client 已存在：{client_id}；如需替换请加 --replace")
     secret_ref = validate_id(
-        args.secret_name or _default_secret_ref("CLIENT", client_id), "secret_ref"
+        args.secret_name or default_secret_ref("CLIENT", client_id), "secret_ref"
     )
     routes = _split_values(args.route) or ["*"]
     client = ClientConfig(
@@ -1742,7 +1724,7 @@ def _cmd_connection_add(args: argparse.Namespace) -> int:
     if connection_id in config.connections and not args.replace:
         raise CLIError(f"connection 已存在：{connection_id}；如需替换请加 --replace")
     secret_ref = validate_id(
-        args.secret_name or _default_secret_ref("CONNECTION", connection_id),
+        args.secret_name or default_secret_ref("CONNECTION", connection_id),
         "secret_ref",
     )
     scope = args.scope or "backend_allowed"
@@ -2323,18 +2305,12 @@ def _record_pricing_research_usage(
         connection_id=deployment.connection,
         connection=connection,
     )
-    # Feed UsageCapture a synthetic metadata-only envelope. The source page,
-    # request messages and model answer never enter UsageStore's API.
-    capture = UsageCapture()
-    capture.from_non_stream(
-        json.dumps(
-            {
-                "usage": metadata.usage,
-                "model": metadata.response_model,
-                "request_id": metadata.request_id,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+    # Record only the already-sanitized research call metadata. The source
+    # page, request messages and model answer never enter UsageStore's API.
+    capture = UsageCapture(
+        usage=dict(metadata.usage) if metadata.usage is not None else None,
+        response_model=metadata.response_model,
+        request_id=metadata.request_id,
     )
     pricing_id = deployment.pricing or ""
     pricing = config.pricing.get(pricing_id) if pricing_id else None
@@ -2691,36 +2667,9 @@ async def _run_probes(
     live: bool,
     client_kind: str = "backend",
 ) -> list[ProbeResult]:
-    """Run the bundled, policy-aware health checker.
+    """Run the bundled, policy-aware health checker."""
+    from model_gateway.health import check_health
 
-    Health checking must fail closed if that module is unavailable. Falling
-    back to the old ad-hoc probe would bypass workload policy and redirect
-    protections around restricted credentials.
-    """
-    external = await _try_external_health(
-        config=config,
-        secret_values=secret_values,
-        connection_ids=list(connection_ids),
-        live=live,
-        client_kind=client_kind,
-    )
-    if external is None:
-        raise CLIError("健康检查模块不可用；请重新安装 Model Gateway")
-    return external
-
-
-async def _try_external_health(
-    *,
-    config: GatewayConfig,
-    secret_values: Mapping[str, str],
-    connection_ids: list[str],
-    live: bool,
-    client_kind: str,
-) -> list[ProbeResult] | None:
-    try:
-        from model_gateway.health import check_health
-    except (ImportError, AttributeError):
-        return None
     reports = await asyncio.gather(
         *[
             check_health(
@@ -2769,7 +2718,6 @@ def _probe_dict(result: ProbeResult) -> dict[str, Any]:
         "level": result.level,
         "detail": result.detail,
         "live": result.live,
-        "model_ids": sorted(result.model_ids),
     }
 
 
@@ -2777,8 +2725,6 @@ def _probe_summary(results: Sequence[ProbeResult]) -> dict[str, int]:
     failures = {
         "auth_failed",
         "network_error",
-        "http_error",
-        "live_failed",
     }
     failed = sum(
         item.level == "error" if item.level else item.status in failures
@@ -2787,7 +2733,7 @@ def _probe_summary(results: Sequence[ProbeResult]) -> dict[str, int]:
     warnings = sum(
         item.level == "warning"
         if item.level
-        else item.status in {"connected_unlisted", "unsupported", "disabled"}
+        else item.status in {"connected_unlisted", "disabled"}
         for item in results
     )
     return {
@@ -2804,26 +2750,8 @@ def _probe_summary(results: Sequence[ProbeResult]) -> dict[str, int]:
 
 
 def _print_probe_results(results: Sequence[ProbeResult]) -> None:
-    labels = {
-        "connected": "正常",
-        "available": "正常",
-        "connected_unverified": "警告",
-        "connected_unlisted": "警告",
-        "live_ok": "正常",
-        "not_configured": "未配置",
-        "disabled": "跳过",
-        "unsupported": "警告",
-        "check_unsupported": "警告",
-        "policy_blocked": "跳过",
-        "rate_limited": "警告",
-        "provider_error": "失败",
-        "model_not_found": "失败",
-        "dimension_mismatch": "失败",
-        "auth_failed": "失败",
-        "network_error": "失败",
-        "http_error": "失败",
-        "live_failed": "失败",
-    }
+    from model_gateway.health import HEALTH_STATUS_LABELS
+
     for result in results:
         target = result.connection_id
         if result.deployment_id:
@@ -2835,7 +2763,7 @@ def _print_probe_results(results: Sequence[ProbeResult]) -> None:
             "error": "失败",
             "skipped": "跳过",
         }.get(result.level)
-        status_label = labels.get(result.status)
+        status_label = HEALTH_STATUS_LABELS.get(result.status)
         if result.status in {"not_configured", "disabled", "policy_blocked"}:
             level_label = status_label
         print(f"[{level_label or status_label or '未知'}] {target}{phase}: {result.detail}")

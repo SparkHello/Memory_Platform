@@ -7,7 +7,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from model_gateway.auth import AuthenticatedClient
 from model_gateway.models import (
@@ -159,30 +159,6 @@ class ResolvedRoute:
     required_deployment: str = ""
 
 
-class CooldownRegistry:
-    def __init__(self, *, clock: Any = time.monotonic):
-        self._clock = clock
-        self._deadlines: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def remaining(self, connection_id: str) -> float:
-        now = self._clock()
-        with self._lock:
-            deadline = self._deadlines.get(connection_id, 0.0)
-            if deadline <= now:
-                self._deadlines.pop(connection_id, None)
-                return 0.0
-            return deadline - now
-
-    def defer(self, connection_id: str, seconds: float) -> None:
-        deadline = self._clock() + max(0.0, seconds)
-        with self._lock:
-            self._deadlines[connection_id] = max(
-                deadline,
-                self._deadlines.get(connection_id, 0.0),
-            )
-
-
 MODEL_NOT_FOUND_CODES = frozenset(
     {
         "deployment_not_found",
@@ -194,7 +170,7 @@ MODEL_NOT_FOUND_CODES = frozenset(
 )
 
 
-class RuntimeHealthRegistry(CooldownRegistry):
+class RuntimeHealthRegistry:
     """Process-local, bounded circuit state for upstream routing.
 
     Connection failures (auth, billing and rate limits) suppress every
@@ -211,7 +187,9 @@ class RuntimeHealthRegistry(CooldownRegistry):
         server_failure_cooldown_seconds: float = 30.0,
         deployment_cooldown_seconds: float = 300.0,
     ) -> None:
-        super().__init__(clock=clock)
+        self._clock = clock
+        self._deadlines: dict[str, float] = {}
+        self._lock = threading.Lock()
         self._deployment_deadlines: dict[str, float] = {}
         self._server_failures: dict[str, int] = {}
         self._server_failure_threshold = max(1, int(server_failure_threshold))
@@ -221,6 +199,23 @@ class RuntimeHealthRegistry(CooldownRegistry):
         self._deployment_cooldown_seconds = _finite_cooldown(
             deployment_cooldown_seconds
         )
+
+    def remaining(self, connection_id: str) -> float:
+        now = self._clock()
+        with self._lock:
+            deadline = self._deadlines.get(connection_id, 0.0)
+            if deadline <= now:
+                self._deadlines.pop(connection_id, None)
+                return 0.0
+            return deadline - now
+
+    def defer(self, connection_id: str, seconds: float) -> None:
+        deadline = self._clock() + _finite_cooldown(seconds)
+        with self._lock:
+            self._deadlines[connection_id] = max(
+                deadline,
+                self._deadlines.get(connection_id, 0.0),
+            )
 
     def remaining_target(self, connection_id: str, deployment_id: str) -> float:
         now = self._clock()
@@ -234,9 +229,6 @@ class RuntimeHealthRegistry(CooldownRegistry):
                 self._deployment_deadlines.pop(deployment_id, None)
                 deployment_deadline = 0.0
             return max(0.0, max(connection_deadline, deployment_deadline) - now)
-
-    def defer(self, connection_id: str, seconds: float) -> None:
-        super().defer(connection_id, _finite_cooldown(seconds))
 
     def clear_connection(
         self,
@@ -322,26 +314,10 @@ def _finite_cooldown(seconds: float) -> float:
 class Router:
     def __init__(
         self,
-        cooldowns: CooldownRegistry | None = None,
         *,
         runtime_health: RuntimeHealthRegistry | None = None,
     ):
-        if cooldowns is not None and runtime_health is not None:
-            raise ValueError("cooldowns 与 runtime_health 不能同时设置")
-        if runtime_health is not None:
-            health = runtime_health
-        elif isinstance(cooldowns, RuntimeHealthRegistry):
-            health = cooldowns
-        else:
-            health = RuntimeHealthRegistry()
-            if cooldowns is not None:
-                # Backwards-compatible constructor injection for callers that
-                # pre-populated a legacy connection cooldown registry.
-                health._deadlines = cooldowns._deadlines
-                health._lock = cooldowns._lock
-                health._clock = cooldowns._clock
-        self.runtime_health = health
-        self.cooldowns = health
+        self.runtime_health = runtime_health or RuntimeHealthRegistry()
 
     def resolve(
         self,
@@ -387,18 +363,7 @@ class Router:
             deployment_ids = [required]
         else:
             if route is not None and deployment_ids:
-                if route.fallback_scope == "none":
-                    deployment_ids = deployment_ids[:1]
-                elif route.fallback_scope == "same_channel":
-                    primary_connection = config.deployments[
-                        deployment_ids[0]
-                    ].connection
-                    deployment_ids = [
-                        deployment_id
-                        for deployment_id in deployment_ids
-                        if config.deployments[deployment_id].connection
-                        == primary_connection
-                    ]
+                deployment_ids = scoped_route_targets(route, config.deployments)
             if preferred_deployment in deployment_ids:
                 deployment_ids.remove(preferred_deployment)
                 deployment_ids.insert(0, preferred_deployment)
@@ -411,12 +376,7 @@ class Router:
         for deployment_id in deployment_ids:
             deployment = config.deployments[deployment_id]
             connection = config.connections[deployment.connection]
-            if (
-                not deployment.enabled
-                or not connection.enabled
-                or deployment.kind != kind
-                or connection.usage_scope == "disabled"
-            ):
+            if not target_serves_kind(deployment, connection, kind):
                 continue
             missing = request_requirements.missing_from(deployment)
             if missing:
@@ -470,6 +430,48 @@ class Router:
 
 
 MAX_RETRY_AFTER_SECONDS = 86_400.0
+
+
+def scoped_route_targets(
+    route: RouteConfig,
+    deployments: Mapping[str, DeploymentConfig],
+) -> list[str]:
+    """Apply ``fallback_scope`` to a route's configured target list.
+
+    ``none`` keeps only the primary target; ``same_channel`` keeps the targets
+    sharing the primary target's connection.  Unknown ids (impossible in a
+    validated graph) are dropped instead of raising.
+    """
+
+    target_ids = list(route.targets)
+    if route.fallback_scope == "none":
+        return target_ids[:1]
+    if route.fallback_scope == "same_channel" and target_ids:
+        primary = deployments.get(target_ids[0])
+        if primary is None:
+            return []
+        return [
+            target_id
+            for target_id in target_ids
+            if (deployment := deployments.get(target_id)) is not None
+            and deployment.connection == primary.connection
+        ]
+    return target_ids
+
+
+def target_serves_kind(
+    deployment: DeploymentConfig,
+    connection: ConnectionConfig,
+    kind: Literal["chat", "embedding"],
+) -> bool:
+    """Static target eligibility shared by routing and readiness checks."""
+
+    return (
+        deployment.enabled
+        and connection.enabled
+        and deployment.kind == kind
+        and connection.usage_scope != "disabled"
+    )
 
 
 def retry_after_seconds(

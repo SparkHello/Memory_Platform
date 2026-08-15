@@ -5,7 +5,7 @@ from decimal import Decimal
 from hashlib import sha256
 import re
 from copy import deepcopy
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, get_args
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -24,6 +24,22 @@ from model_gateway.http_safety import (
     normalize_private_networks,
 )
 
+
+# Single source for the connection adapter and billing-plan vocabularies.
+# Admin request models, CLI ``choices=`` and the quickstart recipe all reference
+# these; adding an adapter or plan happens here only.
+AdapterName = Literal["generic", "kimi", "deepseek", "mimo", "dashscope_openai"]
+ADAPTER_NAMES: tuple[str, ...] = get_args(AdapterName)
+BillingPlanType = Literal[
+    "payg",
+    "subscription",
+    "free_tier",
+    "token_plan",
+    "coding_plan",
+    "direct_tool_only",
+    "custom",
+]
+BILLING_PLAN_TYPES: tuple[str, ...] = get_args(BillingPlanType)
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 FORBIDDEN_UPSTREAM_FORWARD_HEADERS = frozenset(
@@ -121,15 +137,7 @@ class AuthConfig(StrictModel):
 
 
 class BillingPlan(StrictModel):
-    type: Literal[
-        "payg",
-        "subscription",
-        "free_tier",
-        "token_plan",
-        "coding_plan",
-        "direct_tool_only",
-        "custom",
-    ] = "payg"
+    type: BillingPlanType = "payg"
     name: str = "default"
 
 
@@ -202,9 +210,7 @@ class PricingConfig(StrictModel):
 class ConnectionConfig(StrictModel):
     channel_operator: str
     protocol: Literal["openai_compatible"] = "openai_compatible"
-    adapter: Literal[
-        "generic", "kimi", "deepseek", "mimo", "dashscope_openai"
-    ] = "generic"
+    adapter: AdapterName = "generic"
     allowed_private_networks: list[str] = Field(default_factory=list)
     base_url: str
     auth: AuthConfig

@@ -10,6 +10,12 @@ from fastapi.testclient import TestClient
 from model_gateway.service import create_app
 from model_gateway.config_store import load_config, read_secrets, write_config
 
+from conftest import (
+    ADMIN_CLIENT_TOKEN,
+    BACKEND_CLIENT_TOKEN,
+    DESKTOP_CLIENT_TOKEN,
+)
+
 
 class _Stream(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes]):
@@ -31,7 +37,7 @@ def test_admin_configuration_is_filtered_and_never_returns_secrets(gateway_home)
     with TestClient(app) as client:
         response = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
         )
 
     assert response.status_code == 200
@@ -42,7 +48,7 @@ def test_admin_configuration_is_filtered_and_never_returns_secrets(gateway_home)
     }
     assert all("secret_ref" not in connection for connection in payload["connections"])
     assert all(
-        connection["response_limit_bytes"] == 64 * 1024 * 1024
+        connection["response_limit_bytes"] == 16 * 1024 * 1024
         for connection in payload["connections"]
     )
     by_deployment = {item["id"]: item for item in payload["deployments"]}
@@ -80,13 +86,13 @@ def test_legacy_admin_aliases_match_canonical_routes(gateway_home) -> None:
             canonical = client.request(
                 canonical_method,
                 canonical_path,
-                headers={"authorization": "Bearer admin-token"},
+                headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
                 json={},
             )
             alias = client.request(
                 alias_method,
                 alias_path,
-                headers={"authorization": "Bearer admin-token"},
+                headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
                 json={},
             )
 
@@ -105,13 +111,13 @@ def test_admin_portable_config_exports_schema_without_secret_values(
     with TestClient(app) as client:
         denied = client.get(
             "/admin/portable-config",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
         )
         assert denied.status_code == 403
 
         response = client.get(
             "/admin/portable-config",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         )
 
     assert response.status_code == 200
@@ -119,8 +125,8 @@ def test_admin_portable_config_exports_schema_without_secret_values(
     assert payload["schema_version"] >= 1
     assert "connections" in payload
     assert "official-secret" not in response.text
-    assert "admin-token" not in response.text
-    assert "local-client-token" not in response.text
+    assert ADMIN_CLIENT_TOKEN not in response.text
+    assert BACKEND_CLIENT_TOKEN not in response.text
 
 
 def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home) -> None:
@@ -131,7 +137,7 @@ def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home)
     with TestClient(app) as client:
         snapshot = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
         ).json()
         body = {
             "revision": snapshot["revision"],
@@ -145,14 +151,14 @@ def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home)
         }
         denied = client.put(
             "/admin/routes",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json=body,
         )
         assert denied.status_code == 403
 
         validated = client.post(
             "/admin/routes/validate",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert validated.status_code == 200
@@ -160,7 +166,7 @@ def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home)
 
         applied = client.put(
             "/admin/routes",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert applied.status_code == 200
@@ -168,7 +174,7 @@ def test_route_changes_require_admin_validate_and_apply_atomically(gateway_home)
 
         stale = client.put(
             "/admin/routes",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert stale.status_code == 409
@@ -190,11 +196,11 @@ def test_admin_secret_write_is_one_way_and_connection_check_is_discovery_only(
         )
 
     app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
-    app.state.router.cooldowns.defer("official", 600)
+    app.state.router.runtime_health.defer("official", 600)
     with TestClient(app) as client:
         updated = client.put(
             "/admin/connections/official/secret",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={"value": "replacement-secret"},
         )
         assert updated.status_code == 200
@@ -202,13 +208,13 @@ def test_admin_secret_write_is_one_way_and_connection_check_is_discovery_only(
 
         checked = client.post(
             "/admin/connections/official/check",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         )
         assert checked.status_code == 200
         assert checked.json()["mode"] == "discovery"
 
     assert read_secrets(gateway_home.secrets)["UPSTREAM_OFFICIAL"] == "replacement-secret"
-    assert app.state.router.cooldowns.remaining("official") == 0
+    assert app.state.router.runtime_health.remaining("official") == 0
     # Candidate validation happens before replacement, then the explicit check
     # performs a second read-only discovery. Neither request sends inference.
     assert requests == [("GET", "/v1/models"), ("GET", "/v1/models")]
@@ -219,8 +225,8 @@ def test_admin_cannot_reuse_local_client_key_as_provider_key(gateway_home) -> No
     with TestClient(app) as client:
         response = client.put(
             "/admin/connections/official/secret",
-            headers={"authorization": "Bearer admin-token"},
-            json={"value": "local-client-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
+            json={"value": BACKEND_CLIENT_TOKEN},
         )
 
     assert response.status_code == 400
@@ -248,7 +254,7 @@ def test_service_auth_models_proxy_and_metadata_only_usage(gateway_home) -> None
     with TestClient(app) as client:
         assert client.get("/v1/models").status_code == 401
         models = client.get(
-            "/v1/models", headers={"authorization": "Bearer local-client-token"}
+            "/v1/models", headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"}
         )
         assert models.status_code == 200
         assert {item["id"] for item in models.json()["data"]} == {
@@ -259,7 +265,7 @@ def test_service_auth_models_proxy_and_metadata_only_usage(gateway_home) -> None
         marker = "request-sensitive-marker"
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={
                 "model": "memory.chat",
                 "messages": [{"role": "user", "content": marker}],
@@ -305,7 +311,7 @@ def test_service_rejects_wrong_route_kind(gateway_home) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/v1/embeddings",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "input": "hello"},
         )
     assert response.status_code == 404
@@ -323,7 +329,7 @@ def test_service_rejects_embedding_dimensions_outside_route_space(gateway_home) 
     with TestClient(app) as client:
         response = client.post(
             "/v1/embeddings",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.embedding", "input": "hello", "dimensions": 3},
         )
 
@@ -339,6 +345,7 @@ def test_service_selects_a_target_that_supports_request_capabilities(
 ) -> None:
     config = load_config(gateway_home.config)
     config.deployments["chat-official"].capabilities.json_schema = False
+    config.routes["memory.chat"].fallback_scope = "any_channel"
     write_config(gateway_home.config, config)
     calls: list[str] = []
 
@@ -350,7 +357,7 @@ def test_service_selects_a_target_that_supports_request_capabilities(
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={
                 "model": "memory.chat",
                 "messages": [],
@@ -380,7 +387,7 @@ def test_service_returns_stable_422_when_capability_is_unavailable(gateway_home)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={
                 "model": "memory.chat",
                 "messages": [],
@@ -412,7 +419,7 @@ def test_service_rejects_specific_tool_choice_with_reasoning_before_upstream(
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={
                 "model": "memory.chat",
                 "messages": [],
@@ -456,7 +463,7 @@ def test_service_rejects_body_while_streaming_past_limit(gateway_home) -> None:
         response = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer local-client-token",
+                "authorization": f"Bearer {BACKEND_CLIENT_TOKEN}",
                 "content-type": "application/json",
             },
             content=json.dumps(
@@ -488,7 +495,7 @@ def test_service_preserves_complete_sse_bytes_and_records_usage(gateway_home) ->
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": [], "stream": True},
         )
     assert response.status_code == 200
@@ -601,7 +608,7 @@ def test_routing_time_affinity_error_uses_stable_protocol_code(gateway_home) -> 
         response = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer local-client-token",
+                "authorization": f"Bearer {BACKEND_CLIENT_TOKEN}",
                 "x-model-gateway-require-deployment": "not-in-this-route",
             },
             json={"model": "memory.chat", "messages": []},
@@ -633,7 +640,7 @@ def test_usage_storage_failure_never_changes_successful_upstream_response(
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": []},
         )
 
@@ -653,7 +660,7 @@ def test_chat_stream_control_must_be_boolean(gateway_home) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": [], "stream": "true"},
         )
 
@@ -674,7 +681,7 @@ def test_non_finite_json_number_is_rejected_before_proxying(gateway_home) -> Non
         response = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer local-client-token",
+                "authorization": f"Bearer {BACKEND_CLIENT_TOKEN}",
                 "content-type": "application/json",
             },
             content=b'{"model":"memory.chat","messages":[],"temperature":NaN}',
@@ -717,7 +724,7 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
     with TestClient(app) as client:
         snapshot = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()
         body = {
             "revision": snapshot["revision"],
@@ -728,14 +735,14 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
 
         denied = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json=body,
         )
         assert denied.status_code == 403
 
         preview = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={**body, "dry_run": True},
         )
         assert preview.status_code == 200
@@ -749,7 +756,7 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
 
         created = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert created.status_code == 200
@@ -757,14 +764,14 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
 
         stale = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert stale.status_code == 409
 
         invalid = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": created.json()["revision"],
                 "channel_operator": "insecure",
@@ -772,11 +779,12 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
             },
         )
         assert invalid.status_code == 400
-        assert "HTTPS" in invalid.json()["error"]["message"]
+        # Value-free wording: field path plus a fixed generic category.
+        assert "base_url" in invalid.json()["error"]["message"]
 
         plan_connection = client.post(
             "/admin/connections",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": created.json()["revision"],
                 "channel_operator": "plan-vendor",
@@ -790,14 +798,14 @@ def test_admin_connection_create_dry_run_apply_and_model_discovery(gateway_home)
 
         updated = client.put(
             "/admin/connections/newvendor-account/secret",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={"value": "channel-secret"},
         )
         assert updated.status_code == 200
 
         checked = client.post(
             "/admin/connections/newvendor-account/check",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         )
         assert checked.status_code == 200
         info = checked.json()["connections"][0]
@@ -835,11 +843,11 @@ def test_admin_discovers_new_channel_draft_without_persisting_or_leaking(
     with TestClient(app) as client:
         revision = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()["revision"]
         discovered = client.post(
             "/admin/channels/discover",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": revision,
                 "channel_operator": "draft-channel",
@@ -874,7 +882,7 @@ def test_admin_discovers_new_channel_draft_without_persisting_or_leaking(
         secret_marker = "URL-CANDIDATE-SECRET"
         rejected = client.post(
             "/admin/channels/discover",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": revision,
                 "channel_operator": "draft-channel",
@@ -918,7 +926,7 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
         response = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer local-client-token",
+                "authorization": f"Bearer {BACKEND_CLIENT_TOKEN}",
                 "x-model-gateway-correlation-id": "turn:abc-123",
                 "x-model-gateway-operation": "memory.chat.answer",
                 "x-model-gateway-user-tag": "user:opaque-7",
@@ -934,7 +942,7 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
 
         events = client.get(
             "/v1/usage/events",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             params={"event_id": event_id},
         )
         assert events.status_code == 200
@@ -948,7 +956,7 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
 
         summary = client.get(
             "/v1/usage/summary",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             params={
                 "operation": "memory.chat.answer",
                 "user_tag": "user:opaque-7",
@@ -961,7 +969,7 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
         forbidden_metadata = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer desktop-token",
+                "authorization": f"Bearer {DESKTOP_CLIENT_TOKEN}",
                 "x-model-gateway-operation": "memory.chat.answer",
             },
             json={"model": "memory.chat", "messages": []},
@@ -974,7 +982,7 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
         invalid_metadata = client.post(
             "/v1/chat/completions",
             headers={
-                "authorization": "Bearer local-client-token",
+                "authorization": f"Bearer {BACKEND_CLIENT_TOKEN}",
                 "x-model-gateway-user-tag": "raw user name",
             },
             json={"model": "memory.chat", "messages": []},
@@ -983,12 +991,12 @@ def test_backend_usage_metadata_and_query_are_central_fact_source(gateway_home) 
 
         forbidden_query = client.get(
             "/v1/usage/summary",
-            headers={"authorization": "Bearer desktop-token"},
+            headers={"authorization": f"Bearer {DESKTOP_CLIENT_TOKEN}"},
         )
         assert forbidden_query.status_code == 403
         cross_client = client.get(
             "/v1/usage/events",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             params={"client_id": "desktop"},
         )
         assert cross_client.status_code == 400
@@ -1005,7 +1013,7 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
     with TestClient(app) as client:
         snapshot = client.get(
             "/admin/configuration",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
         ).json()
         body = {
             "revision": snapshot["revision"],
@@ -1024,14 +1032,14 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
 
         denied = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer local-client-token"},
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json=body,
         )
         assert denied.status_code == 403
 
         preview = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={**body, "dry_run": True},
         )
         assert preview.status_code == 200
@@ -1043,7 +1051,7 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
 
         applied = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json=body,
         )
         assert applied.status_code == 200
@@ -1051,7 +1059,7 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
 
         missing_capability = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": applied.json()["revision"],
                 "connection": "official",
@@ -1060,11 +1068,14 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
             },
         )
         assert missing_capability.status_code == 400
-        assert "tools" in missing_capability.json()["error"]["message"]
+        assert missing_capability.json()["error"]["type"] == (
+            "model_gateway_config_invalid"
+        )
+        assert "配置值未通过安全校验" in missing_capability.json()["error"]["message"]
 
         bad_embedding = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": applied.json()["revision"],
                 "connection": "official",
@@ -1072,11 +1083,13 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
             },
         )
         assert bad_embedding.status_code == 400
-        assert "embedding" in bad_embedding.json()["error"]["message"]
+        assert bad_embedding.json()["error"]["type"] == (
+            "model_gateway_config_invalid"
+        )
 
         unknown_connection = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": applied.json()["revision"],
                 "connection": "ghost",
@@ -1087,7 +1100,7 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
 
         bad_kind = client.post(
             "/admin/deployments",
-            headers={"authorization": "Bearer admin-token"},
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
             json={
                 "revision": applied.json()["revision"],
                 "connection": "official",

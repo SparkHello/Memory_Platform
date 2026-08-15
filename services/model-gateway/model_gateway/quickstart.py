@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from hashlib import sha256
 import json
 from pathlib import Path
-import re
 import secrets
-from typing import Any
+from typing import Any, Literal, get_args
 
 import httpx
+from pydantic import Field, StrictBool, ValidationError, field_validator
 
 from model_gateway.auth import (
     client_token_bytes,
@@ -22,15 +21,15 @@ from model_gateway.config_store import (
     read_secrets,
     source_revision,
 )
-from model_gateway.http_safety import (
-    MAX_DISCOVERY_RESPONSE_BYTES,
-    bounded_model_ids,
-    require_safe_destination_sync,
-    upstream_url,
-)
+from model_gateway.discovery import fetch_model_listing_sync, parse_model_listing
+from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.models import (
+    ADAPTER_NAMES,
+    BILLING_PLAN_TYPES,
+    AdapterName,
     AuthConfig,
     BillingPlan,
+    BillingPlanType,
     Capabilities,
     ClientConfig,
     ConnectionConfig,
@@ -39,7 +38,7 @@ from model_gateway.models import (
     GatewayConfig,
     RequestTransform,
     RouteConfig,
-    validate_id,
+    StrictModel,
 )
 
 
@@ -56,7 +55,6 @@ CHAT_ROUTES: tuple[str, ...] = (
     "knowledge.pro",
 )
 EMBEDDING_ROUTE = "memory.embedding"
-QUICKSTART_FILE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,24 +97,15 @@ CHANNEL_PRESETS: dict[str, ChannelPreset] = {
     ),
 }
 
-_ADAPTERS = ("generic", "kimi", "deepseek", "mimo", "dashscope_openai")
-_PLANS = (
-    "payg",
-    "subscription",
-    "free_tier",
-    "token_plan",
-    "coding_plan",
-    "direct_tool_only",
-    "custom",
-)
-_CHAT_CAPABILITIES = (
+ChatCapabilityName = Literal[
     "tools",
     "parallel_tools",
     "reasoning",
     "multimodal_input",
     "json_object",
     "json_schema",
-)
+]
+_CHAT_CAPABILITIES: tuple[str, ...] = get_args(ChatCapabilityName)
 
 
 class QuickstartError(ValueError):
@@ -147,65 +136,100 @@ def discover_model_ids(
         provider_secret_header_value(api_key)
     except ValueError as exc:
         raise QuickstartError(str(exc)) from exc
-    try:
-        url = upstream_url(
-            base_url,
-            "/models",
-            allowed_private_networks=allowed_private_networks,
-        )
-        if transport is None:
-            require_safe_destination_sync(
-                url,
-                allowed_private_networks=allowed_private_networks,
-            )
-        with httpx.Client(
-            transport=transport,
-            follow_redirects=False,
-            timeout=httpx.Timeout(10.0),
-            trust_env=False,
-        ) as client:
-            with client.stream(
-                "GET",
-                url,
-                headers={"Authorization": f"Bearer {api_key.strip()}"},
-            ) as response:
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > MAX_DISCOVERY_RESPONSE_BYTES:
-                        raise QuickstartError("渠道 /models 响应超过 2 MiB 安全上限")
-                    chunks.append(chunk)
-                content = b"".join(chunks)
-    except QuickstartError:
-        raise
-    except (httpx.HTTPError, ValueError) as exc:
-        raise QuickstartError(f"读取 /models 失败：{type(exc).__name__}") from exc
-    if 300 <= response.status_code < 400:
+    fetch = fetch_model_listing_sync(
+        base_url=base_url,
+        api_key=api_key,
+        transport=transport,
+        allowed_private_networks=allowed_private_networks,
+    )
+    if fetch.status == "too_large":
+        raise QuickstartError("渠道 /models 响应超过 2 MiB 安全上限")
+    if fetch.status in {"network_error", "unsafe"}:
+        raise QuickstartError(f"读取 /models 失败：{fetch.error_type}")
+    status_code = fetch.http_status or 0
+    if 300 <= status_code < 400:
         raise QuickstartError("渠道 /models 返回重定向；为避免凭证泄露已拒绝跟随")
-    if response.status_code in {401, 403}:
-        raise QuickstartError(f"渠道鉴权失败（HTTP {response.status_code}）")
-    if response.status_code != 200:
-        raise QuickstartError(f"渠道 /models 返回 HTTP {response.status_code}")
-    try:
-        payload = json.loads(content)
-    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
-        raise QuickstartError("渠道 /models 没有返回有效 JSON") from exc
-    if isinstance(payload, dict):
-        items = payload.get("data", payload.get("models", []))
-    elif isinstance(payload, list):
-        items = payload
-    else:
-        items = []
-    if not isinstance(items, list):
-        items = []
-    try:
-        model_ids = bounded_model_ids(items)
-    except ValueError as exc:
-        raise QuickstartError("渠道 /models 条目过多或模型 ID 格式无效") from exc
-    if not model_ids:
+    if status_code in {401, 403}:
+        raise QuickstartError(f"渠道鉴权失败（HTTP {status_code}）")
+    if status_code != 200:
+        raise QuickstartError(f"渠道 /models 返回 HTTP {status_code}")
+    listing = parse_model_listing(fetch.content)
+    if listing.error == "invalid_json":
+        raise QuickstartError("渠道 /models 没有返回有效 JSON")
+    if listing.error == "invalid_entries":
+        raise QuickstartError("渠道 /models 条目过多或模型 ID 格式无效")
+    if not listing.model_ids:
         raise QuickstartError("渠道 /models 可访问，但没有解析到模型 ID")
-    return tuple(sorted(model_ids))
+    return tuple(sorted(listing.model_ids))
+
+
+class QuickstartEmbeddingRecipe(StrictModel):
+    """``embedding`` object of a quickstart recipe; both fields are required."""
+
+    model: str = Field(min_length=1)
+    dimensions: int = Field(strict=True, ge=1)
+    space: str = ""
+    author: str = ""
+
+
+class QuickstartRecipe(StrictModel):
+    """The reviewable, non-secret quickstart recipe contract.
+
+    ``docs/ai-quickstart.schema.json`` mirrors this model for external
+    tooling; when the two drift, this model is authoritative.  Secrets are
+    rejected structurally: unknown fields (e.g. ``api_key``) are forbidden.
+    """
+
+    schema_version: Literal[1]
+    preset: str = ""
+    channel: str = ""
+    base_url: str = ""
+    chat_model: str
+    adapter: AdapterName = "generic"
+    plan: BillingPlanType = "payg"
+    chat_author: str = ""
+    chat_capabilities: list[ChatCapabilityName] = Field(default_factory=list)
+    reasoning_default: Literal["inherit", "enabled", "disabled"] = "inherit"
+    embedding: QuickstartEmbeddingRecipe | None = None
+    replace_existing_routes: StrictBool = False
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def schema_version_is_plain_int(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("schema_version 必须是整数")
+        return value
+
+    @field_validator("chat_capabilities")
+    @classmethod
+    def unique_capabilities(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("chat_capabilities 不得包含重复值")
+        return values
+
+
+def _recipe_validation_error(exc: ValidationError) -> QuickstartError:
+    """Map recipe validation failures to safe wording (never echoing values)."""
+
+    extras: list[str] = []
+    locations: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        if error.get("type") == "extra_forbidden":
+            if location and location not in extras:
+                extras.append(location[:160])
+        elif location and location not in locations:
+            locations.append(location[:160])
+    if extras:
+        return QuickstartError(
+            "quickstart 配置含未知字段（配置文件不得保存 API Key 或 secret）："
+            + ", ".join(extras[:8])
+        )
+    if locations:
+        return QuickstartError(
+            "quickstart 配置字段未通过校验：" + ", ".join(locations[:8])
+        )
+    return QuickstartError("quickstart 配置未通过校验")
 
 
 def load_quickstart_file(
@@ -233,98 +257,43 @@ def load_quickstart_file(
     if not isinstance(raw, dict):
         raise QuickstartError("quickstart 配置根节点必须是 JSON 对象")
 
-    allowed = {
-        "schema_version",
-        "preset",
-        "channel",
-        "base_url",
-        "chat_model",
-        "adapter",
-        "plan",
-        "chat_author",
-        "chat_capabilities",
-        "reasoning_default",
-        "embedding",
-        "replace_existing_routes",
-    }
-    unknown = sorted(str(key) for key in raw if key not in allowed)
-    if unknown:
-        raise QuickstartError(
-            "quickstart 配置含未知字段（配置文件不得保存 API Key 或 secret）："
-            + ", ".join(unknown)
-        )
-    schema_version = raw.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != QUICKSTART_FILE_SCHEMA_VERSION:
-        raise QuickstartError(
-            f"quickstart schema_version 必须是 {QUICKSTART_FILE_SCHEMA_VERSION}"
-        )
-
-    def string_value(container: dict[str, Any], name: str, default: str = "") -> str:
-        value = container.get(name, default)
-        if not isinstance(value, str):
-            raise QuickstartError(f"quickstart 字段 {name} 必须是字符串")
-        return value
-
-    raw_capabilities = raw.get("chat_capabilities", [])
-    if not isinstance(raw_capabilities, list) or any(
-        not isinstance(item, str) for item in raw_capabilities
-    ):
-        raise QuickstartError("quickstart 字段 chat_capabilities 必须是字符串数组")
-    if len(set(raw_capabilities)) != len(raw_capabilities):
-        raise QuickstartError("quickstart 字段 chat_capabilities 不得包含重复值")
-
-    raw_embedding = raw.get("embedding")
-    if raw_embedding is None:
-        embedding: dict[str, Any] = {}
-    elif isinstance(raw_embedding, dict):
-        embedding = raw_embedding
-    else:
-        raise QuickstartError("quickstart 字段 embedding 必须是对象或 null")
-    embedding_allowed = {"model", "dimensions", "space", "author"}
-    embedding_unknown = sorted(str(key) for key in embedding if key not in embedding_allowed)
-    if embedding_unknown:
-        raise QuickstartError(
-            "quickstart embedding 含未知字段：" + ", ".join(embedding_unknown)
-        )
-    if raw_embedding is not None:
-        missing_embedding = sorted(
-            name for name in ("model", "dimensions") if name not in embedding
-        )
-        if missing_embedding:
-            raise QuickstartError(
-                "quickstart embedding 缺少字段：" + ", ".join(missing_embedding)
-            )
-    dimensions = embedding.get("dimensions")
-    if dimensions is not None and (
-        isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1
-    ):
-        raise QuickstartError("quickstart embedding.dimensions 必须是正整数")
-    replace_existing_routes = raw.get("replace_existing_routes", False)
-    if not isinstance(replace_existing_routes, bool):
-        raise QuickstartError("quickstart 字段 replace_existing_routes 必须是布尔值")
-
-    preset_id = string_value(raw, "preset")
-    preset = get_channel_preset(preset_id) if preset_id else None
+    try:
+        recipe = QuickstartRecipe.model_validate(raw)
+    except ValidationError as exc:
+        raise _recipe_validation_error(exc) from exc
+    if recipe.preset:
+        # Keeps the actionable wording instead of a bare field path.
+        get_channel_preset(recipe.preset)
+    fields = recipe.model_fields_set
+    preset = CHANNEL_PRESETS.get(recipe.preset)
     spec = QuickstartSpec(
-        channel_operator=string_value(
-            raw,
-            "channel",
-            preset.channel_operator if preset else "",
+        channel_operator=(
+            recipe.channel
+            if "channel" in fields
+            else (preset.channel_operator if preset else "")
         ),
-        base_url=string_value(raw, "base_url", preset.base_url if preset else ""),
-        chat_model=string_value(raw, "chat_model"),
+        base_url=(
+            recipe.base_url
+            if "base_url" in fields
+            else (preset.base_url if preset else "")
+        ),
+        chat_model=recipe.chat_model,
         api_key=api_key,
-        adapter=string_value(raw, "adapter", preset.adapter if preset else "generic"),
-        plan=string_value(raw, "plan", "payg"),
-        chat_author=string_value(raw, "chat_author"),
-        chat_capabilities=tuple(raw_capabilities),
-        reasoning_default=string_value(raw, "reasoning_default", "inherit"),
-        embedding_model=string_value(embedding, "model"),
-        embedding_dimensions=dimensions,
-        embedding_space=string_value(embedding, "space"),
-        embedding_author=string_value(embedding, "author"),
+        adapter=(
+            recipe.adapter
+            if "adapter" in fields
+            else (preset.adapter if preset else "generic")
+        ),
+        plan=recipe.plan,
+        chat_author=recipe.chat_author,
+        chat_capabilities=tuple(recipe.chat_capabilities),
+        reasoning_default=recipe.reasoning_default,
+        embedding_model=recipe.embedding.model if recipe.embedding else "",
+        embedding_dimensions=recipe.embedding.dimensions if recipe.embedding else None,
+        embedding_space=recipe.embedding.space if recipe.embedding else "",
+        embedding_author=recipe.embedding.author if recipe.embedding else "",
         connect_memory=connect_memory,
-        replace_existing_routes=replace_existing_routes,
+        replace_existing_routes=recipe.replace_existing_routes,
     )
     spec.validate()
     return spec
@@ -351,9 +320,9 @@ class QuickstartSpec:
     replace_existing_routes: bool = False
 
     def validate(self) -> None:
-        if self.adapter not in _ADAPTERS:
+        if self.adapter not in ADAPTER_NAMES:
             raise QuickstartError(f"未知 adapter：{self.adapter}")
-        if self.plan not in _PLANS:
+        if self.plan not in BILLING_PLAN_TYPES:
             raise QuickstartError(f"未知套餐类型：{self.plan}")
         if not self.channel_operator.strip():
             raise QuickstartError("渠道简称不能为空")
@@ -412,8 +381,8 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         )
 
     operator = spec.channel_operator.strip().lower()
-    connection_id = _unique_id(_slug(f"{operator}-account"), config.connections)
-    connection_secret_ref = _default_secret_ref("CONNECTION", connection_id)
+    connection_id = unique_id(slug_id(f"{operator}-account"), config.connections)
+    connection_secret_ref = default_secret_ref("CONNECTION", connection_id)
     connection = ConnectionConfig(
         channel_operator=operator,
         adapter=spec.adapter,
@@ -426,8 +395,8 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     chat_capabilities = set(spec.chat_capabilities)
     if "parallel_tools" in chat_capabilities:
         chat_capabilities.add("tools")
-    chat_deployment_id = _unique_id(
-        _slug(f"{connection_id}-{spec.chat_model}"),
+    chat_deployment_id = unique_id(
+        slug_id(f"{connection_id}-{spec.chat_model}"),
         config.deployments,
     )
     chat_deployment = DeploymentConfig(
@@ -466,8 +435,8 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     embedding_deployment_id = ""
     resolved_embedding_space = ""
     if spec.embedding_model.strip():
-        embedding_deployment_id = _unique_id(
-            _slug(f"{connection_id}-{spec.embedding_model}"),
+        embedding_deployment_id = unique_id(
+            slug_id(f"{connection_id}-{spec.embedding_model}"),
             {**config.deployments, chat_deployment_id: chat_deployment},
         )
         resolved_embedding_space = spec.embedding_space.strip() or derive_embedding_space(
@@ -505,7 +474,7 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     if existing_client is not None:
         client_secret_ref = existing_client.secret_ref
     else:
-        client_secret_ref = _default_secret_ref("CLIENT", "memory-gateway")
+        client_secret_ref = default_secret_ref("CLIENT", "memory-gateway")
     clients["memory-gateway"] = ClientConfig(
         kind="backend",
         secret_ref=client_secret_ref,
@@ -555,35 +524,3 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         embedding_dimensions=spec.embedding_dimensions if embedding_deployment_id else None,
         created_memory_client=created_memory_client,
     )
-
-
-def _slug(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9._:-]+", "-", value.lower()).strip("-._:")
-    if not normalized:
-        normalized = "item"
-    if len(normalized) > 120:
-        digest = sha256(normalized.encode("utf-8")).hexdigest()[:8]
-        normalized = f"{normalized[:110].rstrip('-._:')}-{digest}"
-    return normalized
-
-
-def _unique_id(candidate: str, records: object) -> str:
-    container = records if hasattr(records, "__contains__") else {}
-    if candidate not in container:  # type: ignore[operator]
-        return candidate
-    index = 2
-    while True:
-        suffix = f"-{index}"
-        alternate = candidate[: 120 - len(suffix)].rstrip("-._:") + suffix
-        if alternate not in container:  # type: ignore[operator]
-            return alternate
-        index += 1
-
-
-def _default_secret_ref(prefix: str, item_id: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", item_id).strip("_").upper()
-    value = f"{prefix}_{slug}_API_KEY"
-    if len(value) <= 120:
-        return validate_id(value, "secret_ref")
-    digest = sha256(item_id.encode("utf-8")).hexdigest()[:8].upper()
-    return validate_id(f"{value[:111]}_{digest}", "secret_ref")
