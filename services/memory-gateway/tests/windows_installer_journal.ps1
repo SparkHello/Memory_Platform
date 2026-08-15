@@ -15,9 +15,12 @@ $definitions = @($ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
 }, $true) | ForEach-Object { $_.Extent.Text })
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) `
+$temporaryBase = Join-Path ([IO.Path]::GetTempPath()) `
     ("memory-platform-windows-journal-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+$chineseFixtureName = (([string][char]0x4E2D) + [char]0x6587 +
+    " fixture path with spaces")
+$temporaryRoot = Join-Path $temporaryBase $chineseFixtureName
+New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
 $functionsPath = Join-Path $temporaryRoot "installer-functions.ps1"
 [IO.File]::WriteAllText(
     $functionsPath,
@@ -32,18 +35,22 @@ $functionsPath = Join-Path $temporaryRoot "installer-functions.ps1"
 $runningOnWindows = [Environment]::OSVersion.Platform -eq `
     [PlatformID]::Win32NT
 if ($runningOnWindows) {
-    $aclProbe = Join-Path $temporaryRoot "private-acl-probe"
-    [IO.File]::WriteAllText($aclProbe, "synthetic")
-    Protect-PrivatePath $aclProbe
-    Protect-PrivatePath $aclProbe
-    $protectedAcl = Get-Acl -LiteralPath $aclProbe
+    $aclFileProbe = Join-Path $temporaryRoot "private ACL file"
+    $aclDirectoryProbe = Join-Path $temporaryRoot "private ACL directory"
+    [IO.File]::WriteAllText($aclFileProbe, "synthetic")
+    New-Item -ItemType Directory -Path $aclDirectoryProbe | Out-Null
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if (-not $protectedAcl.AreAccessRulesProtected -or
-        @($protectedAcl.Access).Count -ne 1 -or
-        $protectedAcl.Access[0].IdentityReference.Value -ne $currentIdentity -or
-        $protectedAcl.Access[0].FileSystemRights -ne `
-            [Security.AccessControl.FileSystemRights]::FullControl) {
-        throw "private ACL was not restricted to the current Windows user"
+    foreach ($aclProbe in @($aclFileProbe, $aclDirectoryProbe)) {
+        Protect-PrivatePath $aclProbe
+        Protect-PrivatePath $aclProbe
+        $protectedAcl = Get-Acl -LiteralPath $aclProbe
+        if (-not $protectedAcl.AreAccessRulesProtected -or
+            @($protectedAcl.Access).Count -ne 1 -or
+            $protectedAcl.Access[0].IdentityReference.Value -ne $currentIdentity -or
+            $protectedAcl.Access[0].FileSystemRights -ne `
+                [Security.AccessControl.FileSystemRights]::FullControl) {
+            throw "private ACL was not restricted to the current Windows user"
+        }
     }
     $lockProbe = Join-Path $temporaryRoot "installer-lock-probe"
     Acquire-InstallerLock $lockProbe
@@ -82,6 +89,41 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 try {
+    Assert-True ($temporaryRoot.Contains((([string][char]0x4E2D) + [char]0x6587))) `
+        "fixture root did not retain the intended Chinese path component"
+    $retentionCorpusName = (([string][char]0x5907) + [char]0x4EFD +
+        " retention corpus")
+    $retentionDirectory = Join-Path $temporaryRoot $retentionCorpusName
+    New-Item -ItemType Directory -Path $retentionDirectory | Out-Null
+    foreach ($index in 1..4) {
+        $stem = "pre-upgrade-2026010${index}T000000Z-test"
+        [IO.File]::WriteAllText(
+            (Join-Path $retentionDirectory "$stem.zip"),
+            "backup-$index"
+        )
+        [IO.File]::WriteAllText(
+            (Join-Path $retentionDirectory "$stem.compose.yml"),
+            "compose-$index"
+        )
+    }
+    Remove-StaleHostBackups $retentionDirectory 2
+    $retainedArchives = @(Get-ChildItem -LiteralPath $retentionDirectory `
+        -File -Filter "pre-upgrade-*.zip" | Sort-Object Name)
+    Assert-True ($retainedArchives.Count -eq 2) `
+        "retention did not keep exactly N archives"
+    Assert-True `
+        ($retainedArchives[0].Name -match "20260103" -and
+         $retainedArchives[1].Name -match "20260104") `
+        "retention did not keep the newest archives"
+    Assert-True `
+        (-not (Test-Path -LiteralPath (Join-Path $retentionDirectory `
+            "pre-upgrade-20260101T000000Z-test.compose.yml"))) `
+        "retention left the stale compose sidecar"
+    Assert-True `
+        (Test-Path -LiteralPath (Join-Path $retentionDirectory `
+            "pre-upgrade-20260104T000000Z-test.compose.yml")) `
+        "retention removed a retained compose sidecar"
+
     if ($runningOnWindows) {
         $nativeSuccess = Invoke-NativeSilently {
             & cmd.exe /d /c 'echo normal-progress 1>&2 & exit /b 0'
@@ -328,6 +370,6 @@ IFS= read -r value
 
     Write-Output "windows-installer-journal: committed crash shapes passed"
 } finally {
-    Remove-Item -LiteralPath $temporaryRoot -Recurse -Force `
+    Remove-Item -LiteralPath $temporaryBase -Recurse -Force `
         -ErrorAction SilentlyContinue
 }

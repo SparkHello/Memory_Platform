@@ -6,11 +6,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 import yaml
 
-from app.auth.tokens import AuthTokenStore
 from app.cli_config import read_env_file, write_env_atomic
 
 
@@ -287,6 +287,27 @@ def test_signed_compose_runtime_validator_accepts_only_the_split_isolation_contr
                 port="32026",
                 credential_directory=str(ROOT / "deploy" / "credentials"),
             )
+        # Both installers execute this exact CLI from the candidate init
+        # image, so the runtime path must reject the same mutation corpus as
+        # the import-level release gate above.
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "deploy" / "validate_compose.py"),
+                images["init_image"],
+                images["model_image"],
+                images["memory_image"],
+                "127.0.0.1",
+                "32026",
+                str(ROOT / "deploy" / "credentials"),
+            ],
+            input=json.dumps(unsafe),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        assert "unsafe compose topology" in result.stderr
 
 
 def test_init_is_offline_and_only_one_shot_service_sees_all_private_volumes():
@@ -303,8 +324,12 @@ def test_init_is_offline_and_only_one_shot_service_sees_all_private_volumes():
     assert maintenance["network_mode"] == "none"
 
     initializer_source = (ROOT / "deploy" / "init_stack.py").read_text()
-    assert '"MODEL_GATEWAY_BASE_URL": "http://model-gateway:2030/v1"' in initializer_source
-    assert '"MODEL_GATEWAY_ALLOW_PRIVATE_HTTP": "true"' in initializer_source
+    assert 'layout="docker"' in initializer_source
+    assert 'model_gateway_base_url="http://model-gateway:2030/v1"' in initializer_source
+    assert 'memory_database="/data/memory.db"' in initializer_source
+    assert 'auth_store=MEMORY_DATA / "auth.db"' in initializer_source
+    assert "--defer-credential-delivery" not in initializer_source
+    assert "subprocess.run" not in initializer_source
     # Direct-provider catalog paths are no longer seeded by the installer.
 
 
@@ -319,6 +344,8 @@ def test_release_compose_and_dockerfile_never_use_main_latest_or_mutable_bases()
     assert "pip install --require-hashes" in dockerfile
     assert "gosu" not in dockerfile
     assert "deploy/validate_compose.py" in dockerfile
+    assert "deploy/plan_install.py" in dockerfile
+    assert "deploy/verify_backup.py" in dockerfile
     assert "ingress_relay" not in dockerfile
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for secret_pattern in (
@@ -402,77 +429,131 @@ def test_installer_does_not_accept_or_print_secret_values():
     # 国内可达性：验签默认跳过 + registry 主机可覆盖（digest 固定不变）。
     assert "MEMORY_VERIFY_SIGNATURES" in installer
     assert "MEMORY_IMAGE_REGISTRY" in installer
-    assert 'if [ "$LAYOUT" != fresh ]; then' in installer
-    assert 'curl -fsS "http://127.0.0.1:$PORT/readyz"' in installer
-    assert "OLD_READY" not in installer
+    assert "existing_service_readiness" in installer
+    assert "OLD_MEMORY_READINESS=absent" in installer
+    assert "OLD_MODEL_READINESS=absent" in installer
+    assert 'if [ "$PLAN_ACCEPT_MEMORY_READINESS" = 1 ]; then' in installer
+    assert 'if [ "$PLAN_ACCEPT_MODEL_READINESS" = 1 ]; then' in installer
+    assert 'curl -fsS "http://$HOST_PROBE:$PORT/readyz"' in installer
+    assert "*unknown*" in installer
     assert "verify-blob" in installer
     assert "--certificate-identity" in installer
     assert "docker.yml@refs/tags/$RELEASE" in installer
-    # 完整拓扑校验已移入 CI（validate_compose.py 门禁），安装路径不再内联执行。
+    # public/internal 都由候选 init 镜像内的同一份 validator 在停机前校验。
     assert "validate_compose.py" in installer
+    assert installer.count("validate_candidate_topology ") == 2
+    assert "--network none --read-only" in installer
+    assert "--security-opt no-new-privileges:true" in installer
+    assert "--user 65534:65534" in installer
+    assert "/var/run/docker.sock" not in installer
+    validation = installer.index("validate_candidate_topology public")
+    journal = installer.index("create_cutover_journal", validation)
+    stop = installer.index('compose "$ACTIVE_COMPOSE" stop', journal)
+    assert validation < journal < stop
     assert "commit_cutover_journal" in installer
     assert "legacy_targets_absent" not in installer
     assert "cleanup_legacy_transaction_volumes" not in installer
     assert "Console token:" in installer
     assert "ports: !reset []" in installer
     assert "mark_cutover_committed" in installer
-    assert installer.index("mark_cutover_committed") < installer.index(
-        'up -d --no-deps --force-recreate memory-gateway'
+    commit = installer.index("mark_cutover_committed")
+    assert commit < installer.index(
+        'up -d --no-deps --force-recreate memory-gateway', commit
     )
 
 
-def test_fresh_init_delivers_one_scoped_console_token_and_disables_legacy(
-    tmp_path: Path,
-) -> None:
-    module = _load_initializer()
-    settings_path = tmp_path / "settings.env"
-    auth_path = tmp_path / "auth.db"
-    credential_path = tmp_path / "credentials" / "gateway.txt"
-    credential_path.parent.mkdir(mode=0o700)
-    write_env_atomic(
-        settings_path,
-        {
-            "GATEWAY_API_KEY": "fresh-legacy-value-must-be-removed",
-            "GATEWAY_LEGACY_API_KEY_ENABLED": "true",
-        },
-    )
+def test_posix_installer_consumes_shared_typed_plan_before_cutover() -> None:
+    installer = (ROOT / "deploy" / "install.sh").read_text()
 
-    module._provision_first_console_token(
-        settings_path=settings_path,
-        auth_database_path=auth_path,
-        credential_path=credential_path,
-    )
-
-    token = credential_path.read_text(encoding="ascii").strip()
-    assert token.startswith("mgw_")
-    assert credential_path.stat().st_mode & 0o777 == 0o600
-    values = read_env_file(settings_path)
-    assert values["GATEWAY_LEGACY_API_KEY_ENABLED"] == "false"
-    assert "GATEWAY_API_KEY" not in values
-    store = AuthTokenStore(auth_path)
-    record = store.authenticate(token)
-    assert record is not None
-    assert (record.name, record.user_id, record.role) == (
-        "first-console",
-        "default",
-        "console",
-    )
-    assert len([item for item in store.list_tokens() if item.revoked_at is None]) == 1
-    assert token.encode("ascii") not in auth_path.read_bytes()
-
-    # Rerunning before markers are published reuses the exact delivered token
-    # instead of silently creating another active console credential.
-    module._provision_first_console_token(
-        settings_path=settings_path,
-        auth_database_path=auth_path,
-        credential_path=credential_path,
-    )
-    assert credential_path.read_text(encoding="ascii").strip() == token
+    assert "/usr/local/libexec/memory-platform/plan_install.py" in installer
+    assert "run_install_planner" in installer
+    assert "PLAN_ACTION" in installer
+    assert "PLAN_REPAIR_SCOPE" in installer
+    assert "PLAN_ACCEPT_MEMORY_READINESS" in installer
+    assert "PLAN_ACCEPT_MODEL_READINESS" in installer
+    assert "PLAN_ACCEPT_HOST_READINESS" in installer
+    noop = installer.index('if [ "$PLAN_ACTION" = noop ]; then')
+    repair = installer.index('if [ "$PLAN_ACTION" = repair ]; then', noop)
+    snapshot = installer.index('say "==> 保存旧 Compose 快照"', repair)
+    journal = installer.index("create_cutover_journal", snapshot)
+    assert noop < repair < snapshot < journal
+    pre_upgrade = installer[noop:snapshot]
+    assert "create_cutover_journal" not in pre_upgrade
+    assert "create_quiesced_backup" not in pre_upgrade
+    assert 'compose "$ACTIVE_COMPOSE" stop' not in pre_upgrade
+    assert "--no-deps --force-recreate model-gateway" in pre_upgrade
+    assert "--no-deps --force-recreate memory-gateway" in pre_upgrade
+    planner = installer[
+        installer.index("run_install_planner()"):
+        installer.index("restore_original_environment()")
+    ]
+    assert "--network none --read-only" in planner
+    assert "--mount" not in planner
 
 
-def test_completed_init_repairs_credential_mode_and_missing_file_fails_closed(
+def test_posix_host_probe_uses_specific_bind_and_maps_wildcard_to_loopback() -> None:
+    installer = (ROOT / "deploy" / "install.sh").read_text()
+    helper = installer[
+        installer.index("host_probe_address()"):
+        installer.index("# Legacy variables")
+    ]
+    assert '[ "$1" = 0.0.0.0 ]' in helper
+    assert "printf '127.0.0.1\\n'" in helper
+    assert "printf '%s\\n' \"$1\"" in helper
+    assert 'http://$HOST_PROBE:$PORT/health' in installer
+    assert 'http://$committed_probe_host:$committed_port/health' in installer
+
+
+def test_fresh_init_uses_explicit_application_contract_and_publishes_markers(
     tmp_path: Path,
     monkeypatch,
+) -> None:
+    module = _load_initializer()
+    roots = {
+        "MEMORY_DATA": tmp_path / "memory-data",
+        "MEMORY_SECRETS": tmp_path / "memory-secrets",
+        "MODEL_DATA": tmp_path / "model-data",
+        "MODEL_SECRETS": tmp_path / "model-secrets",
+        "CREDENTIALS": tmp_path / "credentials",
+    }
+    for name, path in roots.items():
+        monkeypatch.setattr(module, name, path)
+    monkeypatch.setattr(module, "MEMORY_MARKER", roots["MEMORY_DATA"] / ".stack-installed-v2")
+    monkeypatch.setattr(module, "MODEL_MARKER", roots["MODEL_DATA"] / ".stack-installed-v2")
+    monkeypatch.setattr(module.os, "chown", lambda *_args: None)
+    captured: dict[str, object] = {}
+
+    def fake_apply(**kwargs):
+        captured.update(kwargs)
+        sink = kwargs["credential_sink"]
+        sink.deliver(sink.gateway_path, "synthetic-gateway")
+        sink.deliver(sink.admin_path, "synthetic-admin")
+
+    monkeypatch.setattr(module, "apply_stack_install", fake_apply)
+
+    assert module.main() == 0
+    assert captured["layout"] == "docker"
+    assert captured["model_gateway_base_url"] == "http://model-gateway:2030/v1"
+    data_paths = captured["data_paths"]
+    assert data_paths.memory_database == "/data/memory.db"
+    assert data_paths.auth_database == "/data/auth.db"
+    assert data_paths.auth_store == roots["MEMORY_DATA"] / "auth.db"
+    assert data_paths.model_gateway_secrets == roots["MODEL_SECRETS"] / "secrets.env"
+    assert (roots["CREDENTIALS"] / "gateway.txt").read_text(encoding="ascii") == (
+        "synthetic-gateway\n"
+    )
+    assert (roots["CREDENTIALS"] / "admin.txt").read_text(encoding="ascii") == (
+        "synthetic-admin\n"
+    )
+    assert module.MEMORY_MARKER.read_text(encoding="ascii") == (
+        module.MODEL_MARKER.read_text(encoding="ascii")
+    )
+
+
+def test_completed_init_repairs_present_credentials_and_warns_when_file_missing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
 ) -> None:
     module = _load_initializer()
     roots = {
@@ -502,8 +583,14 @@ def test_completed_init_repairs_credential_mode_and_missing_file_fails_closed(
     )
 
     (roots["CREDENTIALS"] / "gateway.txt").unlink()
-    with pytest.raises(RuntimeError, match="缺少 gateway 凭据文件"):
-        module.main()
+    assert module.main() == 0
+    warning = json.loads(capsys.readouterr().err)
+    assert warning["level"] == "warning"
+    assert warning["code"] == "host_credential_delivery_missing"
+    assert warning["missing"] == ["gateway.txt"]
+    assert "内部凭据保持有效" in warning["message"]
+    assert "stack-maintenance token create" in warning["reset_hint"]
+    assert "modelgw secret set memory-console-admin --stdin" in warning["reset_hint"]
 
     legacy_gateway = roots["CREDENTIALS"] / "gateway.key"
     legacy_gateway.write_text("synthetic-legacy-gateway\n", encoding="ascii")

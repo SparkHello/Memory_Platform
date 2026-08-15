@@ -114,7 +114,7 @@ docker compose -f "$InstallDir\docker-compose.user.yml" config | Select-String "
 
 ### 已知正确行为（实现依据）
 
-- **全新安装只验收 `/health`，不验收 `/readyz`**：安装器的宿主就绪等待为 `/health` 恒等 + `/readyz` 仅在非 fresh 布局时等待（`Invoke-MemoryPlatformInstall` 末尾的 `($script:Layout -ne "fresh" -and ...)` 条件）。`/health` 只证明进程与首次配置 UI 可访问；`/readyz` 还检查数据库、磁盘、Model Gateway 接线、必需聊天 route 与 embedding 契约。首次安装、尚未配置任何渠道时返回 503 `{"status":"not_ready","code":...}` 是**设计如此**。
+- **全新安装只验收 `/health`，不验收 `/readyz`**：typed planner 对 fresh 计划生成 `Accept*Readiness=false`；已有 split 安装则先记录 Memory/Model 的 `ready|not_ready|absent|unknown` 事实，`unknown` 在停机前失败，候选只需达到不低于旧事实的验收级别。`/health` 只证明进程与首次配置 UI 可访问；`/readyz` 还检查数据库、磁盘、Model Gateway 接线、必需聊天 route 与 embedding 契约。首次安装、尚未配置任何渠道时返回 503 `{"status":"not_ready","code":...}` 是**设计如此**。
 - 若机主提供了 provider key：打开 `http://127.0.0.1:2026/ui/`，用 `credentials\gateway.txt` 里的 Console token 登录，按模型向导完成渠道配置（向导只做只读 `/models` 发现，不自动发起推理）。配置完成后 `/readyz` 应在短时间内变为 200。embedding 可选：不创建或关闭 `memory.embedding` route 表示明确 `off`，关键词检索仍可用且不阻断 readiness；启用该 route 表示同意使用语义向量，Memory 的 space 留空会自动采用 route 的唯一 space/dimensions。只有需要锁定既有索引时才固定 space；启用 route 畸形、不可用或与固定契约不匹配时，`/readyz` 应返回 503。
 - 密钥只经 `credentials\gateway.txt`、`credentials\admin.txt` 两个文件交付（旧安装兼容 `.key`；离线 `stack-init` 容器经 bind mount 写入），不进入终端输出、Compose 环境或 Docker 日志。
 - `stack-init` 是一次性离线初始化容器，`network_mode: none`，完成后退出；`stack-maintenance` 只在显式 `--profile maintenance` 时运行。
@@ -195,52 +195,33 @@ whoami
 
 ---
 
-## 场景 C：升级——先备份再升级、readiness 退化自动回滚
+## 场景 C：noop/repair/upgrade 与 readiness 事实门禁
 
 ### 目的
 
-验证升级流程的事务边界：备份先于下载；候选先在无宿主端口的隔离模式验收；readiness 退化时自动回滚到旧栈。
+验证 typed planner 的三条路径：`noop`/`repair` 不进入停机事务；只有 `upgrade` 在旧栈停写后创建一致性备份，并在无宿主端口的隔离模式验收候选；相对旧事实发生 readiness 退化时自动回滚。
 
-### C1 同版本重跑（完整 cutover 周期）
+### C1 同版本重跑（noop 或定向 repair）
 
 ```powershell
 & .\install-memory-platform.ps1 *>&1 | Tee-Object "$env:USERPROFILE\drill-logs\C1-rerun.log"
 ```
 
-预期与判定：
-
-- 输出顺序必须是 `==> 准备升级前备份` → `备份已保存：<...>\backups\pre-upgrade-<时间戳>-<pid>.zip` → `==> 下载 v0.2.0 Compose 并校验` → … → `==> 旧服务已停写，创建并复验最终一致性备份` → 隔离验收 → `==> 发布已验收的 Memory 入口` → 成功总结（含 `升级前备份：<路径>`）。
-- **备份先于下载**是 macOS P1 整改的硬契约，顺序颠倒即 P1。
-- 结束后 `backups\` 应新增两份 zip：在线备份 `pre-upgrade-<时间戳>-<pid>.zip` 与停写时点备份 `pre-upgrade-<时间戳>-<pid>-quiesced.zip`，以及旧 Compose 副本 `pre-upgrade-<时间戳>.compose.yml`。
-- 成功后 journal 已清理：`Test-Path "$InstallDir\.memory-platform-cutover"` 应为 False。
-- `/health` 200；若场景 A 已配置模型，`/readyz` 200。
-- 已知正确行为：**同版本重跑不短路**，仍走完整备份 + journal + cutover（实现不比较新旧版本）；默认只保留最近 5 份 `pre-upgrade-*.zip`（`MEMORY_BACKUP_RETENTION`，1–50）。
+预期与判定：digest、受管配置和健康状态都一致时输出 `noop` 提示；不得创建 journal/备份、不得停止容器。若只有某个服务退化，则输出定向 `repair`，只重建对应服务，同样不得创建全量备份或停止整栈。默认 retention（`MEMORY_BACKUP_RETENTION`，1–50）表示成功 upgrade 后精确保留最近 N 份 `pre-upgrade-*.zip`。
 
 ### C2 跨版本升级（有条件执行）
 
-仅当机主提供第二个已发布 tag 时：把 `MEMORY_PLATFORM_VERSION` 改为新 tag 重跑，预期同 C1，且 `.env` 中 `MEMORY_PLATFORM_*_IMAGE` 变为新 digest、容器镜像随之更新。没有第二个 tag 时记"未覆盖"（单 tag 环境下 C1 已覆盖全部 cutover 机制，唯一未覆盖的是镜像 digest 真实变化）。
+仅当机主提供第二个已发布 tag 时：把 `MEMORY_PLATFORM_VERSION` 改为新 tag 重跑。预期进入 `upgrade`：保存旧 Compose → 建 journal → 停旧栈 → 创建并用候选镜像的权威校验器复验一份 quiesced 备份 → 隔离验收 → commit → 发布；`.env` 中 `MEMORY_PLATFORM_*_IMAGE` 变为新 digest。没有第二个 tag 时记“未覆盖”。
 
 ### C3 readiness 退化自动回滚
 
-按环境二选一：
-
-- **未配置模型的环境**：直接重跑安装器即天然触发——候选内部验收的 `/readyz` 检查（90 次尝试，约 90 秒）必然失败。这本身就是有效的回滚演练。
-- **已配置模型的环境**：先制造退化再重跑：
-  ```powershell
-  docker compose -f "$InstallDir\docker-compose.user.yml" exec -T model-gateway modelgw route list
-  # 记录 knowledge.pro 的 target deployment 名，善后要用
-  docker compose -f "$InstallDir\docker-compose.user.yml" exec -T model-gateway modelgw route remove knowledge.pro
-  & .\install-memory-platform.ps1 *>&1 | Tee-Object "$env:USERPROFILE\drill-logs\C3-rollback.log"
-  ```
+此场景需要可控故障注入：先让旧 Memory/Model 的 `/readyz` 都为 200，待安装器记录 `ready` 基线后、候选内部验收前再使候选 route 或依赖退化。未配置模型时旧事实是 `not_ready`，安装器只要求候选 liveness，直接重跑不会再伪造 rollback 场景；在基线采集前删除持久 route 也只会把 `not_ready` 记录为真实基线。
 
 预期与判定（两种环境相同）：
 
 - 安装器跑到"通过容器内部链路验收"阶段后失败，退出码 1，错误为：`候选内部 readiness 退化；旧服务和数据已恢复。`
 - 回滚后：旧栈容器在跑、`/health` 200；`Test-Path "$InstallDir\.memory-platform-cutover"` 为 False（回滚成功后 journal 按 committed 语义清理）；`docker-compose.user.yml` 与升级前字节一致（可用 `Get-FileHash` 对比 C1 前后）。
-- 已配置环境注意：回滚会把三卷数据回灌到**停写备份时点**（此时 `knowledge.pro` 已删），所以 `/readyz` 仍 503 属预期；善后恢复 route 并确认 `/readyz` 回到 200：
-  ```powershell
-  docker compose -f "$InstallDir\docker-compose.user.yml" exec -T model-gateway modelgw route set knowledge.pro <记录的deployment> --kind chat
-  ```
+- 回滚会把三卷数据恢复到停写备份时点；故障注入必须是候选阶段临时故障，不能在事实基线采集前永久修改旧数据。
 - **P0 判定**：错误变成 `……且自动回滚不完整`；或旧栈起不来；或 journal 消失但运行的是新栈/数据丢失。
 - **P1 判定**：安装器在 readiness 退化后仍然提交并发布新栈（即把"看似成功实际退化"交付给用户）。
 
@@ -285,11 +266,11 @@ $fs.Dispose()
 
 ### D4 旧备份被独占打开时的保留清理（观察项）
 
-先在 `backups\` 制造至少 2 份 `pre-upgrade-*.zip`（跑过 C1 即满足），设 `$env:MEMORY_BACKUP_RETENTION=1`，对较旧那份持 `FileShare.None`，重跑安装器。预期：`Remove-StaleHostBackups` 删除失败 → 安装中止、退出码 1；此刻新备份已完成但旧栈未被修改、journal 未创建（清理发生在下载与停栈之前）。结束后 `Remove-Item Env:MEMORY_BACKUP_RETENTION`。记录实际行为。
+先通过至少 2 次真实 `upgrade` 在 `backups\` 生成 `pre-upgrade-*.zip`，设 `$env:MEMORY_BACKUP_RETENTION=1`，对较旧那份持 `FileShare.None`，再执行一次真实升级。保留清理只在新栈已验收、提交并发布后运行，因此删除失败时安装器退出码为 1，但不得回滚已经提交的新栈；被锁定的旧备份会暂时使数量超过 N。释放锁后应在下一次真实升级重新清理；结束后 `Remove-Item Env:MEMORY_BACKUP_RETENTION`。记录实际行为。
 
 ### 判定总则（D 全场景）
 
-宿主文件被占用的唯一合法后果是安装器中止或回滚；任何"绕开锁继续写"的行为都是 P1。
+在 commit 前，宿主事务文件被占用的唯一合法后果是安装器中止或回滚；任何"绕开锁继续写"的行为都是 P1。commit 后的保留清理失败不得用旧备份覆盖已经接受新写入的栈，只能报告失败并留待后续升级重试。
 
 ---
 
@@ -321,10 +302,10 @@ Stop-Process -Id $proc.Id -Force
 | 窗口（日志中的标志行） | journal 状态 | 重跑预期 |
 | --- | --- | --- |
 | E0 `下载 v0.2.0 Compose 并校验` / `拉取三枚 semver 发布镜像` | 无 journal | 重跑正常；旧栈全程未被触碰。可能残留 `.docker-compose.user.yml.candidate.<32hex>` 等隐藏临时文件（唯一后缀设计，不影响重跑），可安全删除，记录残留情况。 |
-| E1 `准备升级前备份` | 无 journal | 同上；可能多留一份 `backups\pre-upgrade-*` 备份（含明文，按敏感处理）。 |
+| E1 `保存旧 Compose 快照` | 无 journal | 同上；可能多留一份 `backups\pre-upgrade-*.compose.yml` 私有快照；数据备份尚未创建。 |
 | E2 `旧服务已停写，创建并复验最终一致性备份` | `prepared` | 重跑先打印 `==> 检测到中断的升级事务，先幂等恢复旧栈`：原子恢复旧 Compose 与 `.env`、重启旧栈（prepared 阶段不做数据回灌），打印 `中断升级已恢复；继续重新执行发布校验。` 后继续新一轮升级。 |
 | E3 `在无宿主发布端口的隔离模式启动候选服务` / `通过容器内部链路验收…` | `data_may_change` | 恢复流程额外用 quiesced 备份经 `restore_split.py` 回灌三卷，再重启旧栈。数据必须回到停写时点（可用场景 F 的基线方法核对）。 |
-| E4 `发布已验收的 Memory 入口` | `committed` | 重跑打印 `已完成中断升级的端口发布；继续校验当前版本。`：把已验收的新栈发布到宿主端口、等待 `/health`+`/readyz`、清理 journal，**绝不回滚数据**。若发布未完成会报 `已提交升级尚未完成端口发布；journal 已保留供下次幂等恢复。`，再次重跑应继续幂等。E4 只有在场景 A 已配置模型、`/readyz` 可达 200 的环境下才能达到（安装器设计要求候选 readyz 通过才 commit）；未配置环境记"不可达"。 |
+| E4 `发布已验收的 Memory 入口` | `committed` | 重跑打印 `已完成中断升级的端口发布；继续校验当前版本。`：把已验收的新栈发布到宿主端口、等待 `/health`，并仅在旧宿主事实为 ready 时等待 `/readyz`，然后清理 journal，**绝不回滚数据**。若发布未完成会报 `已提交升级尚未完成端口发布；journal 已保留供下次幂等恢复。`，再次重跑应继续幂等。未配置模型的旧栈基线为 not_ready，也可以达到 E4。 |
 | E5 任意窗口退出 Docker Desktop（托盘 Quit） | 视时机 | 安装器因 docker 命令失败走各自 fail-closed 分支退出。Docker 未恢复时重跑：`安装失败：Docker Desktop 尚未运行。`（该检查在碰任何状态之前）。启动 Docker Desktop 后重跑：按上表对应 journal 阶段恢复。 |
 
 ### 每次"kill + 重跑"的通用判定标准
@@ -496,6 +477,6 @@ P2 = 残留文件、文案、时序体验等。）
 2. **整机断电（区别于杀进程）**：无法安全实机模拟；WriteThrough/Flush/MoveFileExW 的断电语义只有代码与 NTFS 保证，本演练以 `Stop-Process -Force` 与退出 Docker Desktop 近似，差距在报告中注明。
 3. **`.memory-platform-cutover.pending.<guid>` staging 残留**：安装器没有清理旧 pending 目录的逻辑；预期不影响重跑，观察并记录。
 4. **未停服误用 `restore_split.py`**：不由安装器覆盖（运维文档要求先停服）；行为需观察记录。
-5. **E4（committed 后中断）在未配置模型的环境不可达**：安装器设计要求候选 `/readyz` 通过才 commit；需要真实 provider 配置后才能达到该窗口。
-6. **跨版本（不同 tag）升级**：需要第二个已发布 tag；单 tag 环境下 C1 同版本重跑已覆盖全部 cutover 机制，仅"镜像 digest 真实变化"未覆盖。
+5. **E4 的 readiness 验收级别取决于升级前事实**：旧栈 ready 时要求候选 `/readyz`；旧栈 not_ready 时只要求 liveness。报告必须记录 planner 输出，不能把未配置模型误判为不可达。
+6. **跨版本（不同 tag）升级**：需要第二个已发布 tag；同版本且状态一致会走 noop，不能替代真实 upgrade/cutover 演练。
 7. **legacy 单卷 → split 迁移**：不在本次范围（需要旧版部署夹具；审计 P2 只要求 NTFS 上的 DACL、FileShare 锁与掉电恢复三项）。

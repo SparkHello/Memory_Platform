@@ -52,6 +52,14 @@ valid_host_ip() {
   '
 }
 
+host_probe_address() {
+  if [ "$1" = 0.0.0.0 ]; then
+    printf '127.0.0.1\n'
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 # Legacy variables would remain visible in docker inspect even though the v2
 # compose ignores them.  Refuse them instead of silently creating that residue.
 if [ -n "${GATEWAY_API_KEY:-}" ] || [ -n "${MEMORY_CONSOLE_ADMIN_KEY:-}" ]; then
@@ -342,8 +350,9 @@ recover_interrupted_cutover() {
           docker compose --env-file "$INSTALL_DIR/.env" \
           -p "$committed_project" -f "$COMPOSE_NAME" up -d \
           >/dev/null || fail_journal "已提交新栈无法完成启动；已验收数据不会回滚"
+        committed_probe_host=$(host_probe_address "$committed_host")
         committed_wait=0
-        until curl -fsS "http://127.0.0.1:$committed_port/health" \
+        until curl -fsS "http://$committed_probe_host:$committed_port/health" \
           >/dev/null 2>&1; do
           committed_wait=$((committed_wait+1))
           [ "$committed_wait" -lt 180 ] \
@@ -570,6 +579,113 @@ compose_internal_with_images() {
       -f "$compose_override_file" "$@"
 }
 
+validate_candidate_topology() {
+  validation_mode=$1
+  CANDIDATE_RENDERED_JSON=$(mktemp .compose.rendered.XXXXXX.json) \
+    || fail "无法创建候选拓扑临时文件"
+  if [ "$validation_mode" = public ]; then
+    if ! compose_candidate_with_images "$CANDIDATE_COMPOSE" \
+        "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+        --profile maintenance config --format json \
+        >"$CANDIDATE_RENDERED_JSON" \
+      || [ ! -s "$CANDIDATE_RENDERED_JSON" ]; then
+      fail "候选 public Compose 无法渲染为可审计配置"
+    fi
+    validation_suffix=""
+  else
+    if ! compose_internal_with_images "$CANDIDATE_COMPOSE" \
+        "$CANDIDATE_INTERNAL_OVERRIDE" \
+        "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+        --profile maintenance config --format json \
+        >"$CANDIDATE_RENDERED_JSON" \
+      || [ ! -s "$CANDIDATE_RENDERED_JSON" ]; then
+      fail "候选 internal Compose 无法渲染为可审计配置"
+    fi
+    validation_suffix=internal
+  fi
+
+  # Run the validator shipped in the exact candidate init image.  The
+  # rendered JSON enters through stdin: the validator receives no Docker
+  # socket, host mounts, volumes, network, or credential values.
+  if [ -n "$validation_suffix" ]; then
+    docker run --rm -i --pull never --network none --read-only \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --user 65534:65534 --entrypoint python "$INIT_IMAGE" \
+      /usr/local/libexec/memory-platform/validate_compose.py \
+      "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+      "$HOST" "$PORT" "$INSTALL_DIR/credentials" "$validation_suffix" \
+      <"$CANDIDATE_RENDERED_JSON" >/dev/null \
+      || fail "候选 $validation_mode Compose 未通过安全拓扑校验"
+  else
+    docker run --rm -i --pull never --network none --read-only \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --user 65534:65534 --entrypoint python "$INIT_IMAGE" \
+      /usr/local/libexec/memory-platform/validate_compose.py \
+      "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
+      "$HOST" "$PORT" "$INSTALL_DIR/credentials" \
+      <"$CANDIDATE_RENDERED_JSON" >/dev/null \
+      || fail "候选 $validation_mode Compose 未通过安全拓扑校验"
+  fi
+  rm -f "$CANDIDATE_RENDERED_JSON" \
+    || fail "无法清理候选拓扑临时文件"
+  CANDIDATE_RENDERED_JSON=""
+}
+
+existing_service_readiness() {
+  readiness_service=$1
+  readiness_url=$2
+  if [ "$LAYOUT" != split ]; then
+    printf 'absent\n'
+    return 0
+  fi
+  if ! readiness_containers=$(compose "$ACTIVE_COMPOSE" ps -aq \
+      "$readiness_service" 2>/dev/null); then
+    printf 'unknown\n'
+    return 0
+  fi
+  readiness_count=$(printf '%s\n' "$readiness_containers" \
+    | awk 'NF { count++ } END { print count+0 }')
+  if [ "$readiness_count" -eq 0 ]; then
+    printf 'absent\n'
+    return 0
+  fi
+  if [ "$readiness_count" -ne 1 ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  readiness_container=$(printf '%s\n' "$readiness_containers" \
+    | awk 'NF { print; exit }')
+  if ! readiness_running=$(docker inspect "$readiness_container" \
+      --format '{{.State.Running}}' 2>/dev/null); then
+    printf 'unknown\n'
+    return 0
+  fi
+  case "$readiness_running" in
+    false) printf 'absent\n'; return 0 ;;
+    true) ;;
+    *) printf 'unknown\n'; return 0 ;;
+  esac
+  if docker exec "$readiness_container" python -c '
+import sys, urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+        raise SystemExit(0 if response.status == 200 else 3)
+except urllib.error.HTTPError:
+    raise SystemExit(3)
+except Exception:
+    raise SystemExit(4)
+' "$readiness_url" >/dev/null 2>&1; then
+    readiness_exit=0
+  else
+    readiness_exit=$?
+  fi
+  case "$readiness_exit" in
+    0) printf 'ready\n' ;;
+    3) printf 'not_ready\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
 compose_internal() {
   docker compose --env-file "$INSTALL_DIR/.env" \
     -p "$PROJECT" -f "$COMPOSE_NAME" \
@@ -646,8 +762,8 @@ verify_release_signature() {
 }
 
 # The split-topology isolation contract (ports, networks, UID, volumes) is
-# enforced against the release Compose by deploy/validate_compose.py in the
-# repository's CI release gates instead of on every install.
+# enforced both in CI and, before any cutover mutation, by the validator
+# shipped in the candidate init image.
 
 stage_compose_image_environment() {
   staged_environment=$1
@@ -713,6 +829,177 @@ stage_compose_image_environment() {
       }
     ' "$staged_source" >"$staged_environment" || return 1
   chmod 600 "$staged_environment" || return 1
+}
+
+env_file_value() {
+  env_value_file=$1
+  env_value_key=$2
+  [ -f "$env_value_file" ] || return 0
+  awk -v wanted="$env_value_key" '
+    {
+      parsed=$0
+      sub(/^[[:space:]]*/, "", parsed)
+      if (parsed ~ /^export[[:space:]]+/) sub(/^export[[:space:]]+/, "", parsed)
+      equals=index(parsed,"=")
+      key=equals ? substr(parsed,1,equals-1) : ""
+      sub(/[[:space:]]+$/, "", key)
+      if (key==wanted) {
+        value=substr(parsed,equals+1)
+        sub(/\r$/, "", value)
+        found=1
+      }
+    }
+    END { if (found) print value }
+  ' "$env_value_file"
+}
+
+env_file_has_key() {
+  env_presence_file=$1
+  env_presence_key=$2
+  [ -f "$env_presence_file" ] || return 1
+  awk -v wanted="$env_presence_key" '
+    {
+      parsed=$0
+      sub(/^[[:space:]]*/, "", parsed)
+      if (parsed ~ /^export[[:space:]]+/) sub(/^export[[:space:]]+/, "", parsed)
+      equals=index(parsed,"=")
+      key=equals ? substr(parsed,1,equals-1) : ""
+      sub(/[[:space:]]+$/, "", key)
+      if (key==wanted) found=1
+    }
+    END { exit !found }
+  ' "$env_presence_file"
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print "sha256:" $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print "sha256:" $1}'
+  else
+    return 1
+  fi
+}
+
+sha256_file() {
+  [ -f "$1" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print "sha256:" $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print "sha256:" $1}'
+  else
+    return 1
+  fi
+}
+
+managed_config_digest() {
+  managed_compose=$1
+  managed_environment=$2
+  managed_environment_exists=$3
+  managed_compose_digest=$(sha256_file "$managed_compose") || return 1
+  {
+    printf 'version=1\n'
+    printf 'compose=%s\n' "$managed_compose_digest"
+    printf 'environment_exists=%s\n' "$managed_environment_exists"
+    for managed_key in MEMORY_CREDENTIAL_DIR HOST_UID HOST_GID MEMORY_HOST \
+      MEMORY_PORT COMPOSE_PROJECT_NAME; do
+      managed_value=$(env_file_value "$managed_environment" "$managed_key")
+      printf '%s=%s\n' "$managed_key" "$managed_value"
+    done
+    for removed_key in GATEWAY_API_KEY MEMORY_CONSOLE_ADMIN_KEY \
+      COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE COMPOSE_PROFILES \
+      COMPOSE_FILE COMPOSE_PATH_SEPARATOR; do
+      if env_file_has_key "$managed_environment" "$removed_key"; then
+        printf '%s_present=1\n' "$removed_key"
+      else
+        printf '%s_present=0\n' "$removed_key"
+      fi
+    done
+  } | sha256_stream
+}
+
+normalized_image_digest() {
+  case "$1" in
+    *@sha256:*) normalized_digest="sha256:${1##*@sha256:}" ;;
+    sha256:*) normalized_digest=$1 ;;
+    *) return 1 ;;
+  esac
+  valid_sha256_image_id "$normalized_digest" || return 1
+  printf '%s\n' "$normalized_digest"
+}
+
+current_service_digest() {
+  current_service=$1
+  current_env_key=$2
+  current_ref=$(env_file_value "$ORIGINAL_ENV_SNAPSHOT" "$current_env_key")
+  if [ -n "$current_service" ] && [ "$LAYOUT" = split ]; then
+    current_containers=$(compose "$ACTIVE_COMPOSE" ps -aq \
+      "$current_service" 2>/dev/null || true)
+    current_count=$(printf '%s\n' "$current_containers" \
+      | awk 'NF { count++ } END { print count+0 }')
+    if [ "$current_count" -eq 1 ]; then
+      current_container=$(printf '%s\n' "$current_containers" \
+        | awk 'NF { print; exit }')
+      current_runtime_ref=$(docker inspect "$current_container" \
+        --format '{{.Config.Image}}' 2>/dev/null || true)
+      [ -z "$current_runtime_ref" ] || current_ref=$current_runtime_ref
+    fi
+  fi
+  normalized_image_digest "$current_ref" 2>/dev/null || printf '%s\n' '-'
+}
+
+run_install_planner() {
+  planner_candidate_init=$1
+  planner_candidate_model=$2
+  planner_candidate_memory=$3
+  planner_current_init=$4
+  planner_current_model=$5
+  planner_current_memory=$6
+  planner_candidate_config=$7
+  planner_current_config=$8
+  if ! planner_line=$(docker run --rm --pull never --network none --read-only \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --user 65534:65534 --entrypoint python "$INIT_IMAGE" \
+      /usr/local/libexec/memory-platform/plan_install.py \
+      "$LAYOUT" \
+      "$planner_candidate_init" "$planner_candidate_model" \
+      "$planner_candidate_memory" \
+      "$planner_current_init" "$planner_current_model" \
+      "$planner_current_memory" \
+      "$planner_candidate_config" "$planner_current_config" \
+      "$OLD_MEMORY_READINESS" "$OLD_MODEL_READINESS" tsv); then
+    fail "候选 init 镜像无法生成安全安装计划"
+  fi
+  case "$planner_line" in *'
+'*) fail "候选安装计划不是单行 typed plan" ;; esac
+  planner_tab=$(printf '\t')
+  planner_field_count=$(printf '%s\n' "$planner_line" \
+    | awk -F "$planner_tab" '{print NF}')
+  [ "$planner_field_count" -eq 7 ] \
+    || fail "候选安装计划字段数量无效"
+  PLAN_VERSION=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $1}')
+  PLAN_ACTION=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $2}')
+  PLAN_REASON=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $3}')
+  PLAN_REPAIR_SCOPE=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $4}')
+  PLAN_ACCEPT_MEMORY_READINESS=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $5}')
+  PLAN_ACCEPT_MODEL_READINESS=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $6}')
+  PLAN_ACCEPT_HOST_READINESS=$(printf '%s\n' "$planner_line" | awk -F "$planner_tab" '{print $7}')
+  [ "$PLAN_VERSION" = 1 ] || fail "候选安装计划版本无效"
+  case "$PLAN_ACTION" in noop|repair|upgrade) ;; *) fail "候选安装计划 action 无效" ;; esac
+  case "$PLAN_REASON" in
+    fresh_install|image_change|managed_config_change|image_and_config_change|already_current|service_repair) ;;
+    *) fail "候选安装计划 reason 无效" ;;
+  esac
+  case "$PLAN_REPAIR_SCOPE" in none|memory|model|both) ;; *) fail "候选安装计划 repair scope 无效" ;; esac
+  for planner_gate in "$PLAN_ACCEPT_MEMORY_READINESS" \
+    "$PLAN_ACCEPT_MODEL_READINESS" "$PLAN_ACCEPT_HOST_READINESS"; do
+    case "$planner_gate" in 0|1) ;; *) fail "候选安装计划 acceptance 无效" ;; esac
+  done
+  if [ "$PLAN_ACTION" = repair ]; then
+    [ "$PLAN_REPAIR_SCOPE" != none ] || fail "repair 安装计划缺少目标服务"
+  else
+    [ "$PLAN_REPAIR_SCOPE" = none ] || fail "非 repair 安装计划包含目标服务"
+  fi
 }
 
 restore_original_environment() {
@@ -930,8 +1217,7 @@ prune_host_backups() {
       done
 }
 
-if [ "$LAYOUT" != fresh ]; then
-  say "==> 保存旧 Compose 快照"
+if [ "$LAYOUT" = split ]; then
   if [ -z "$OLD_MEMORY_CONTAINER" ]; then
     identity_match=$(docker volume ls \
       --filter "label=com.docker.compose.project=$PROJECT" \
@@ -940,20 +1226,13 @@ if [ "$LAYOUT" != fresh ]; then
     [ -n "$identity_match" ] \
       || fail "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移"
   fi
-  stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
-  OLD_COMPOSE_BACKUP="$INSTALL_DIR/backups/pre-upgrade-$stamp.compose.yml"
-  cp "$ACTIVE_COMPOSE" "$OLD_COMPOSE_BACKUP"
-  chmod 600 "$OLD_COMPOSE_BACKUP"
-  # Exactly one data backup is created per upgrade: the quiesced snapshot
-  # taken right after the old stack stops writing.
-  BACKUP_PATH=""
-  say "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）"
 fi
 
 say "==> 下载 $RELEASE Compose 并校验"
 CANDIDATE_COMPOSE=$(mktemp ".$COMPOSE_NAME.candidate.XXXXXX") || fail "无法创建候选文件"
 CANDIDATE_ENV=""
 CANDIDATE_INTERNAL_OVERRIDE=""
+CANDIDATE_RENDERED_JSON=""
 CANDIDATE_EMPTY_ENV=$(mktemp .env.empty.XXXXXX) || fail "无法创建候选空环境文件"
 chmod 600 "$CANDIDATE_EMPTY_ENV"
 COMPOSE_BUNDLE=""
@@ -961,6 +1240,7 @@ cleanup() {
   [ -z "${CANDIDATE_COMPOSE:-}" ] || rm -f "$CANDIDATE_COMPOSE"
   [ -z "${CANDIDATE_ENV:-}" ] || rm -f "$CANDIDATE_ENV"
   [ -z "${CANDIDATE_INTERNAL_OVERRIDE:-}" ] || rm -f "$CANDIDATE_INTERNAL_OVERRIDE"
+  [ -z "${CANDIDATE_RENDERED_JSON:-}" ] || rm -f "$CANDIDATE_RENDERED_JSON"
   [ -z "${CANDIDATE_EMPTY_ENV:-}" ] || rm -f "$CANDIDATE_EMPTY_ENV"
   [ -z "${ORIGINAL_ENV_SNAPSHOT:-}" ] || rm -f "$ORIGINAL_ENV_SNAPSHOT"
   [ -z "${COSIGN_TEMP:-}" ] || rm -f "$COSIGN_TEMP"
@@ -1015,8 +1295,6 @@ if [ "$VERIFY_SIGNATURES" = 1 ]; then
   verify_release_signature "$MODEL_IMAGE"
   verify_release_signature "$MEMORY_IMAGE"
 fi
-compose_candidate_with_images "$CANDIDATE_COMPOSE" "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
-  config >/dev/null || fail "digest 固定后的 Compose 无效"
 CANDIDATE_ENV=$(mktemp .env.candidate.XXXXXX) || fail "无法创建候选环境文件"
 stage_compose_image_environment \
   "$CANDIDATE_ENV" "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
@@ -1031,10 +1309,213 @@ printf '%s\n' \
   >"$CANDIDATE_INTERNAL_OVERRIDE" \
   || fail "无法写入本地验收 override"
 chmod 600 "$CANDIDATE_INTERNAL_OVERRIDE"
-compose_internal_with_images "$CANDIDATE_COMPOSE" "$CANDIDATE_INTERNAL_OVERRIDE" \
-  "$INIT_IMAGE" "$MODEL_IMAGE" "$MEMORY_IMAGE" \
-  config >/dev/null \
-  || fail "本地验收 override 未能生成有效候选拓扑"
+
+say "==> 用候选 init 镜像校验 public/internal 安全拓扑"
+validate_candidate_topology public
+validate_candidate_topology internal
+
+OLD_MEMORY_READINESS=absent
+OLD_MODEL_READINESS=absent
+if [ "$LAYOUT" = split ]; then
+  OLD_MEMORY_READINESS=$(existing_service_readiness \
+    memory-gateway http://127.0.0.1:2026/readyz)
+  OLD_MODEL_READINESS=$(existing_service_readiness \
+    model-gateway http://127.0.0.1:2030/readyz)
+fi
+case "$OLD_MEMORY_READINESS:$OLD_MODEL_READINESS" in
+  *unknown*)
+    fail "无法可靠建立旧服务 readiness 基线（Memory=$OLD_MEMORY_READINESS, Model=$OLD_MODEL_READINESS）；旧服务未停机"
+    ;;
+esac
+
+CANDIDATE_INIT_DIGEST=$(normalized_image_digest "$INIT_IMAGE") \
+  || fail "候选 init 镜像 digest 无效"
+CANDIDATE_MODEL_DIGEST=$(normalized_image_digest "$MODEL_IMAGE") \
+  || fail "候选 model 镜像 digest 无效"
+CANDIDATE_MEMORY_DIGEST=$(normalized_image_digest "$MEMORY_IMAGE") \
+  || fail "候选 memory 镜像 digest 无效"
+CANDIDATE_CONFIG_DIGEST=$(managed_config_digest \
+  "$CANDIDATE_COMPOSE" "$CANDIDATE_ENV" 1) \
+  || fail "无法计算候选 managed config digest"
+CURRENT_INIT_DIGEST=-
+CURRENT_MODEL_DIGEST=-
+CURRENT_MEMORY_DIGEST=-
+CURRENT_CONFIG_DIGEST=-
+if [ "$LAYOUT" = split ]; then
+  CURRENT_INIT_DIGEST=$(current_service_digest "" MEMORY_PLATFORM_INIT_IMAGE)
+  CURRENT_MODEL_DIGEST=$(current_service_digest \
+    model-gateway MEMORY_PLATFORM_MODEL_IMAGE)
+  CURRENT_MEMORY_DIGEST=$(current_service_digest \
+    memory-gateway MEMORY_PLATFORM_MEMORY_IMAGE)
+  CURRENT_CONFIG_DIGEST=$(managed_config_digest \
+    "$ACTIVE_COMPOSE" "$ORIGINAL_ENV_SNAPSHOT" "$OLD_ENV_EXISTS") \
+    || fail "无法计算当前 managed config digest"
+fi
+say "==> 生成 typed 安装计划"
+run_install_planner \
+  "$CANDIDATE_INIT_DIGEST" "$CANDIDATE_MODEL_DIGEST" \
+  "$CANDIDATE_MEMORY_DIGEST" \
+  "$CURRENT_INIT_DIGEST" "$CURRENT_MODEL_DIGEST" "$CURRENT_MEMORY_DIGEST" \
+  "$CANDIDATE_CONFIG_DIGEST" "$CURRENT_CONFIG_DIGEST"
+HOST_PROBE=$(host_probe_address "$HOST")
+
+resolve_credential() {
+  # $1 = role: gateway | admin
+  if [ -s "$INSTALL_DIR/credentials/$1.txt" ]; then
+    printf '%s\n' "$INSTALL_DIR/credentials/$1.txt"
+  elif [ -s "$INSTALL_DIR/credentials/$1.key" ]; then
+    printf '%s\n' "$INSTALL_DIR/credentials/$1.key"
+  else
+    return 1
+  fi
+}
+
+private_credential_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    [ "$(stat -c '%a' "$1")" = 600 ]
+  elif stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    [ "$(stat -f '%Lp' "$1")" = 600 ]
+  else
+    return 1
+  fi
+}
+
+private_credential_directory_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    [ "$(stat -c '%a' "$1")" = 700 ]
+  elif stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    [ "$(stat -f '%Lp' "$1")" = 700 ]
+  else
+    return 1
+  fi
+}
+
+live_http_check() {
+  live_service=$1
+  live_url=$2
+  compose_candidate_live exec -T "$live_service" python -c \
+    'import sys,urllib.request; response=urllib.request.urlopen(sys.argv[1],timeout=3); raise SystemExit(0 if response.status==200 else 1)' \
+    "$live_url" >/dev/null 2>&1
+}
+
+wait_live_http() {
+  wait_live_service=$1
+  wait_live_url=$2
+  wait_live_limit=$3
+  wait_live_count=0
+  until live_http_check "$wait_live_service" "$wait_live_url"; do
+    wait_live_count=$((wait_live_count+1))
+    [ "$wait_live_count" -lt "$wait_live_limit" ] || return 1
+    sleep 1
+  done
+}
+
+accept_existing_stack() {
+  wait_live_http memory-gateway http://127.0.0.1:2026/health 180 \
+    || return 1
+  wait_live_http model-gateway http://127.0.0.1:2030/health 180 \
+    || return 1
+  if [ "$PLAN_ACCEPT_MEMORY_READINESS" = 1 ]; then
+    wait_live_http memory-gateway http://127.0.0.1:2026/readyz 90 \
+      || return 1
+  fi
+  if [ "$PLAN_ACCEPT_MODEL_READINESS" = 1 ]; then
+    wait_live_http model-gateway http://127.0.0.1:2030/readyz 90 \
+      || return 1
+  fi
+  existing_gateway_credential=$(resolve_credential gateway) || return 1
+  existing_admin_credential=$(resolve_credential admin) || return 1
+  private_credential_directory_mode "$INSTALL_DIR/credentials" || return 1
+  private_credential_mode "$existing_gateway_credential" || return 1
+  private_credential_mode "$existing_admin_credential" || return 1
+  compose_candidate_live exec -T memory-gateway python -c \
+    'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2026/auth/tokens",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
+    <"$existing_gateway_credential" >/dev/null 2>&1 || return 1
+  compose_candidate_live exec -T model-gateway python -c \
+    'import sys,urllib.request; key=sys.stdin.buffer.readline().strip().decode("ascii"); request=urllib.request.Request("http://127.0.0.1:2030/admin/configuration",headers={"Authorization":"Bearer "+key}); response=urllib.request.urlopen(request,timeout=5); raise SystemExit(0 if response.status==200 else 1)' \
+    <"$existing_admin_credential" >/dev/null 2>&1 || return 1
+  existing_wait=0
+  until curl -fsS "http://$HOST_PROBE:$PORT/health" >/dev/null 2>&1; do
+    existing_wait=$((existing_wait+1))
+    [ "$existing_wait" -lt 180 ] || return 1
+    sleep 1
+  done
+  if [ "$PLAN_ACCEPT_HOST_READINESS" = 1 ]; then
+    existing_wait=0
+    until curl -fsS "http://$HOST_PROBE:$PORT/readyz" >/dev/null 2>&1; do
+      existing_wait=$((existing_wait+1))
+      [ "$existing_wait" -lt 90 ] || return 1
+      sleep 1
+    done
+  fi
+  existing_memory=$(compose_candidate_live ps -q memory-gateway 2>/dev/null || true)
+  existing_model=$(compose_candidate_live ps -q model-gateway 2>/dev/null || true)
+  existing_memory_port=$(compose_candidate_live port \
+    memory-gateway 2026 2>/dev/null || true)
+  existing_model_ports=""
+  [ -z "$existing_model" ] \
+    || existing_model_ports=$(docker port "$existing_model" 2>/dev/null \
+      | awk 'NF {print; exit}' || true)
+  [ -n "$existing_memory" ] && [ "${existing_memory_port##*:}" = "$PORT" ] \
+    && [ -z "$existing_model_ports" ]
+}
+
+report_existing_plan_success() {
+  say ""
+  say "Memory Platform $RELEASE 已通过 $PLAN_ACTION 验收（$PLAN_REASON）"
+  say "  Web Console:  http://$HOST_PROBE:$PORT/ui/"
+  say "  Client URL:   http://$HOST_PROBE:$PORT/v1"
+  say "  Model:        memory-auto"
+  say "  Console token: $(resolve_credential gateway)"
+  say "  Admin key:    $(resolve_credential admin)"
+  say "密钥值没有进入本脚本输出、Compose 环境或 Docker 日志。"
+  if [ "${MEMORY_NO_OPEN:-0}" != 1 ]; then
+    if command -v open >/dev/null 2>&1; then
+      open "http://$HOST_PROBE:$PORT/ui/" >/dev/null 2>&1 || true
+    elif command -v xdg-open >/dev/null 2>&1 \
+      && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+      xdg-open "http://$HOST_PROBE:$PORT/ui/" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+if [ "$PLAN_ACTION" = noop ]; then
+  say "==> 当前 digest、managed config 与健康状态已满足目标；跳过 cutover"
+  accept_existing_stack || fail "当前栈未通过 noop acceptance；未执行停机或备份"
+  report_existing_plan_success
+  exit 0
+fi
+
+if [ "$PLAN_ACTION" = repair ]; then
+  say "==> 仅修复退化服务（$PLAN_REPAIR_SCOPE），不创建全量备份或停止整栈"
+  case "$PLAN_REPAIR_SCOPE" in
+    model|both)
+      compose_candidate_live up -d --no-deps --force-recreate model-gateway \
+        || fail "Model Gateway 定向 repair 失败；未停止整栈"
+      ;;
+  esac
+  case "$PLAN_REPAIR_SCOPE" in
+    memory|both)
+      compose_candidate_live up -d --no-deps --force-recreate memory-gateway \
+        || fail "Memory Gateway 定向 repair 失败；未停止整栈"
+      ;;
+  esac
+  accept_existing_stack || fail "repair 后栈未通过 typed acceptance；未执行全量回滚"
+  report_existing_plan_success
+  exit 0
+fi
+
+if [ "$LAYOUT" = split ]; then
+  say "==> 保存旧 Compose 快照"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  OLD_COMPOSE_BACKUP="$INSTALL_DIR/backups/pre-upgrade-$stamp.compose.yml"
+  cp "$ACTIVE_COMPOSE" "$OLD_COMPOSE_BACKUP"
+  chmod 600 "$OLD_COMPOSE_BACKUP"
+  # Exactly one data backup is created per upgrade: the quiesced snapshot
+  # taken right after the old stack stops writing.
+  BACKUP_PATH=""
+  say "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）"
+fi
 
 volume_for() {
   docker volume ls --filter "label=com.docker.compose.project=$PROJECT" \
@@ -1100,7 +1581,10 @@ create_quiesced_backup() {
   fi
   cleanup_image=$OLD_INIT_IMAGE_VALUE
   cleanup_volume=$quiesced_memory_data
-  quiesced_verify_image=$OLD_INIT_IMAGE_VALUE
+  # Creation stays on the old runtime so it can read the old schema. The
+  # candidate validator is authoritative for whether the archive is accepted
+  # by the release we are about to install.
+  quiesced_verify_image=$INIT_IMAGE
 
   if ! docker cp "$quiesced_runner:/data/$quiesced_name" "$quiesced_path" \
     >/dev/null 2>&1 \
@@ -1111,31 +1595,15 @@ create_quiesced_backup() {
   fi
   docker rm -f "$quiesced_runner" >/dev/null 2>&1 || return 1
   chmod 600 "$quiesced_path" || return 1
-  # Re-verify the finished archive for real: every member must pass the ZIP
-  # CRC check and every SQLite database inside must reopen with quick_check=ok.
+  # Re-verify the finished archive with the same manifest/hash/schema/SQLite
+  # validator used by legacy cutover and the Windows installer.
   if ! docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true \
     --mount "type=bind,source=$quiesced_path,target=/backup/verify.zip,readonly" \
-    --tmpfs /tmp:rw,noexec,nosuid,size=268435456 \
-    --entrypoint python "$quiesced_verify_image" -c '
-import os, shutil, sqlite3, sys, tempfile, zipfile
-archive = zipfile.ZipFile("/backup/verify.zip")
-corrupt = archive.testzip()
-assert corrupt is None, f"CRC mismatch: {corrupt}"
-for member in archive.namelist():
-    if not member.endswith(".db"):
-        continue
-    with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".db", delete=False) as staged:
-        with archive.open(member) as source:
-            shutil.copyfileobj(source, staged)
-        staged_path = staged.name
-    connection = sqlite3.connect(staged_path)
-    try:
-        row = connection.execute("PRAGMA quick_check").fetchone()
-    finally:
-        connection.close()
-        os.unlink(staged_path)
-    assert row and row[0] == "ok", f"quick_check failed: {member}"
-' >/dev/null 2>&1; then
+    --mount type=volume,target=/tmp,volume-nocopy \
+    --entrypoint python "$quiesced_verify_image" \
+    /usr/local/libexec/memory-platform/verify_backup.py \
+    /backup/verify.zip >/dev/null 2>&1; then
     rm -f "$quiesced_path"
     return 1
   fi
@@ -1286,7 +1754,7 @@ until candidate_http_check model-gateway http://127.0.0.1:2030/health; do
   fi
   sleep 1
 done
-if [ "$LAYOUT" != fresh ]; then
+if [ "$PLAN_ACCEPT_MEMORY_READINESS" = 1 ]; then
   i=0
   until candidate_http_check memory-gateway http://127.0.0.1:2026/readyz; do
     i=$((i+1))
@@ -1296,6 +1764,8 @@ if [ "$LAYOUT" != fresh ]; then
     fi
     sleep 1
   done
+fi
+if [ "$PLAN_ACCEPT_MODEL_READINESS" = 1 ]; then
   i=0
   until candidate_http_check model-gateway http://127.0.0.1:2030/readyz; do
     i=$((i+1))
@@ -1306,18 +1776,6 @@ if [ "$LAYOUT" != fresh ]; then
     sleep 1
   done
 fi
-
-# Prefer .txt (double-click opens as text). Legacy .key remains accepted.
-resolve_credential() {
-  # $1 = role: gateway | admin
-  if [ -s "$INSTALL_DIR/credentials/$1.txt" ]; then
-    printf '%s\n' "$INSTALL_DIR/credentials/$1.txt"
-  elif [ -s "$INSTALL_DIR/credentials/$1.key" ]; then
-    printf '%s\n' "$INSTALL_DIR/credentials/$1.key"
-  else
-    return 1
-  fi
-}
 
 credentials_accepted=1
 GATEWAY_CRED_FILE=""
@@ -1362,15 +1820,15 @@ if ! compose_candidate_live up -d --no-deps --force-recreate memory-gateway; the
   fail_journal "新栈已提交但宿主端口发布失败；数据不会回滚"
 fi
 i=0
-until curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
+until curl -fsS "http://$HOST_PROBE:$PORT/health" >/dev/null 2>&1; do
   i=$((i+1))
   [ "$i" -lt 180 ] \
     || fail_journal "新栈已提交但宿主 liveness 失败；数据不会回滚"
   sleep 1
 done
-if [ "$LAYOUT" != fresh ]; then
+if [ "$PLAN_ACCEPT_HOST_READINESS" = 1 ]; then
   i=0
-  until curl -fsS "http://127.0.0.1:$PORT/readyz" >/dev/null 2>&1; do
+  until curl -fsS "http://$HOST_PROBE:$PORT/readyz" >/dev/null 2>&1; do
     i=$((i+1))
     [ "$i" -lt 90 ] \
       || fail_journal "新栈已提交但宿主 readiness 失败；数据不会回滚"
@@ -1407,8 +1865,8 @@ detect_lan_ip() {
 
 say ""
 say "Memory Platform $RELEASE 已启动"
-say "  Web Console:  http://127.0.0.1:$PORT/ui/"
-say "  Client URL:   http://127.0.0.1:$PORT/v1"
+say "  Web Console:  http://$HOST_PROBE:$PORT/ui/"
+say "  Client URL:   http://$HOST_PROBE:$PORT/v1"
 say "  Model:        memory-auto"
 if [ "$HOST" != 127.0.0.1 ]; then
   if [ "$HOST" = 0.0.0.0 ]; then
@@ -1438,8 +1896,8 @@ prune_host_backups
 
 if [ "${MEMORY_NO_OPEN:-0}" != 1 ]; then
   if command -v open >/dev/null 2>&1; then
-    open "http://127.0.0.1:$PORT/ui/" >/dev/null 2>&1 || true
+    open "http://$HOST_PROBE:$PORT/ui/" >/dev/null 2>&1 || true
   elif command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-    xdg-open "http://127.0.0.1:$PORT/ui/" >/dev/null 2>&1 || true
+    xdg-open "http://$HOST_PROBE:$PORT/ui/" >/dev/null 2>&1 || true
   fi
 fi

@@ -21,13 +21,14 @@ def test_legacy_cutover_script_compiles() -> None:
 def test_legacy_cutover_delegates_sqlite_safety_to_audited_helpers() -> None:
     text = _cutover()
 
-    # 编排入口只驱动容器化执行；SQLite 快照校验仍在 backup_legacy.py /
-    # migrate_legacy.py 内，不在宿主脚本里重写。
+    # 编排入口只驱动容器化执行；创建和迁移仍由 audited helpers 完成，
+    # 归档验收委托给三条部署路径共用的权威校验器。
     assert "/usr/local/libexec/memory-platform/backup_legacy.py" in text
     assert "/usr/local/libexec/memory-platform/migrate_legacy.py" in text
+    assert "/usr/local/libexec/memory-platform/verify_backup.py" in text
     assert "def _copy_sqlite" not in text
-    assert "PRAGMA quick_check" in text  # 仅用于归档复验
-    assert "archive.testzip()" in text
+    assert "PRAGMA quick_check" not in text
+    assert "archive.testzip()" not in text
 
 
 def test_legacy_cutover_is_offline_read_only_and_fail_closed() -> None:

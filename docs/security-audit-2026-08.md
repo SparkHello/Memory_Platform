@@ -135,7 +135,7 @@ Memory 新 token 默认限制 chat 60 次/分钟且最多 4 并发、MCP 120/分
 - 两个长期容器均非 root、只读 rootfs、独立 tmpfs、`cap_drop: ALL`、`no-new-privileges`。Model secret 卷仅 UID 10002 可写以支持原子 key rotation；Memory 无法持久挂载或读取 Model secret。管理 UI 代理渠道配置时，provider/admin secret 会短暂经过 Memory 进程内存，因此这里是持久隔离而不是绝对不可见。
 - 离线 root initializer/migrator 是唯一一次看见四卷的进程，network none，完成后退出。凭据只写宿主 0600 文件，不打印值。
 - portable backup v2 必需 memory/knowledge/auth DB 和脱敏 Model config，usage 明确 present/absent；归档发布前重新校验 hash、SQLite、schema 和 `secrets_included=false`。restore 预检磁盘并使用 journal/rollback。
-- 安装器从入口即持有排他锁，按运行中容器标签确定唯一旧 project，并保存原始 Compose、精确 image ID 与 `.env` 字节快照。候选下载/签名预检后先停止旧栈，再生成停写时点的一致性备份；候选不发布宿主端口，必须从 Model 容器经固定 relay 通过新 `/health`、`/readyz` 后才持久标记 committed。commit 后才发布 2026，之后不再用旧备份反向覆盖可能已接受的新写入；任一更早失败或中断则按 journal 幂等恢复旧 Compose、镜像、环境和数据。
+- 安装器从入口即持有排他锁，按运行中容器标签确定唯一旧 project，并在停机前生成 typed `noop|repair|upgrade` 计划与旧服务 readiness 事实基线；`noop`/`repair` 不创建全量事务。`upgrade` 保存原始 Compose、精确 image ID 与 `.env` 字节快照，停止旧栈后生成并权威复验一致性备份；候选不发布宿主端口，必须通过 `/health` 及不低于旧事实的 `/readyz` 验收后才持久标记 committed。commit 后才发布 2026，之后不再用旧备份反向覆盖可能已接受的新写入；任一更早失败或中断则按 journal 幂等恢复旧 Compose、镜像、环境和数据。
 - Python 使用完整带 hash 的 runtime lock 和非 editable wheel；Node/Python 基础镜像固定 patch+digest。三个 release image 使用 semver、SBOM、provenance 与 keyless 签名；扫描阻断所有已有修复的 HIGH/CRITICAL。未修复项会完整报告，发布操作规范要求人工 VEX/可达性复核，但当前流水线尚未把该人工审批做成强制 gate，不能把“无修复版本”误写成零风险。
 
 ## UX 与普通用户适用性

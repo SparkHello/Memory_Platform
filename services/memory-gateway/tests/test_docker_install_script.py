@@ -58,6 +58,7 @@ for argument in "$@"; do
   fi
   previous=$argument
 done
+[ -z "${{CURL_CAPTURE:-}}" ] || printf '%s\n' "$*" >> "$CURL_CAPTURE"
 test -f "$MEMORY_PLATFORM_DIR/.test-ingress-published"
 """
 
@@ -73,9 +74,18 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   esac
   exit 0
 fi
+if [ "$1" = "run" ]; then
+  case "$*" in
+    *'/usr/local/libexec/memory-platform/plan_install.py'*)
+      printf '1\tupgrade\tfresh_install\tnone\t0\t0\t0\n'
+      exit 0
+      ;;
+  esac
+fi
 case "$*" in
   "compose version") exit 0 ;;
   "volume ls "*) exit 0 ;;
+  *" config --format json"*) printf '{}\n'; exit 0 ;;
   *" config"*) exit 0 ;;
   *" pull"*) exit 0 ;;
   *" ps -q model-gateway"*) printf 'synthetic-model\n'; exit 0 ;;
@@ -86,6 +96,7 @@ case "$*" in
     exit 0
     ;;
   "port synthetic-memory"|"port synthetic-model") exit 0 ;;
+  *" exec -T"*"/readyz"*) exit 99 ;;
   *".compose.internal."*" up -d"*)
     mkdir -p "$MEMORY_PLATFORM_DIR/credentials"
     printf 'synthetic-gateway-value\n' > "$MEMORY_PLATFORM_DIR/credentials/gateway.txt"
@@ -105,7 +116,77 @@ exit 0
 """
 
 
-def test_fresh_install_pins_digests_and_delivers_only_credential_paths(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("containers", "running", "inspect_exit", "probe_exit", "expected"),
+    (
+        ("", "true", "0", "0", "absent"),
+        ("old-memory", "false", "0", "0", "absent"),
+        ("old-memory", "true", "0", "0", "ready"),
+        ("old-memory", "true", "0", "3", "not_ready"),
+        ("old-memory", "true", "0", "4", "unknown"),
+        ("first\nsecond", "true", "0", "0", "unknown"),
+        ("old-memory", "true", "1", "0", "unknown"),
+    ),
+)
+def test_existing_readiness_baseline_distinguishes_observed_states(
+    tmp_path: Path,
+    containers: str,
+    running: str,
+    inspect_exit: str,
+    probe_exit: str,
+    expected: str,
+) -> None:
+    installer = INSTALLER.read_text(encoding="utf-8")
+    start = installer.index("existing_service_readiness() {")
+    end = installer.index("\n}\n\ncompose_internal()", start) + 3
+    readiness_function = installer[start:end]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _executable(
+        fake_bin / "docker",
+        """#!/bin/sh
+if [ "$1" = "inspect" ]; then
+  printf '%s\n' "$READINESS_RUNNING"
+  exit "$READINESS_INSPECT_EXIT"
+fi
+if [ "$1" = "exec" ]; then exit "$READINESS_PROBE_EXIT"; fi
+exit 1
+""",
+    )
+    harness = (
+        readiness_function
+        + "\ncompose() { printf '%s\\n' \"$READINESS_CONTAINERS\"; }\n"
+        + "LAYOUT=split\nACTIVE_COMPOSE=old.yml\n"
+        + "existing_service_readiness memory-gateway "
+        + "http://127.0.0.1:2026/readyz\n"
+    )
+    result = subprocess.run(
+        ["sh", "-c", harness],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "READINESS_CONTAINERS": containers,
+            "READINESS_RUNNING": running,
+            "READINESS_INSPECT_EXIT": inspect_exit,
+            "READINESS_PROBE_EXIT": probe_exit,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("listen_host", "probe_host"),
+    (("0.0.0.0", "127.0.0.1"), ("192.0.2.44", "192.0.2.44")),
+)
+def test_fresh_install_pins_digests_and_delivers_only_credential_paths(
+    tmp_path: Path,
+    listen_host: str,
+    probe_host: str,
+):
     install_dir = tmp_path / "install with spaces"
     install_dir.mkdir()
     (install_dir / ".env").write_text(
@@ -120,8 +201,10 @@ def test_fresh_install_pins_digests_and_delivers_only_credential_paths(tmp_path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture = tmp_path / "capture.txt"
+    curl_capture = tmp_path / "curl-capture.txt"
     _executable(fake_bin / "curl", _curl_script())
     _executable(fake_bin / "lsof", "#!/bin/sh\nexit 1\n")
+    _executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
     _executable(fake_bin / "docker", _fresh_docker_script())
 
     result = _run(
@@ -129,12 +212,14 @@ def test_fresh_install_pins_digests_and_delivers_only_credential_paths(tmp_path:
         install_dir,
         fake_bin,
         DOCKER_CAPTURE=str(capture),
+        CURL_CAPTURE=str(curl_capture),
         MEMORY_PORT="3026",
-        MEMORY_HOST="0.0.0.0",
+        MEMORY_HOST=listen_host,
     )
 
     assert result.returncode == 0, result.stderr
-    assert capture.read_text().strip() == "3026|0.0.0.0"
+    assert capture.read_text().strip() == f"3026|{listen_host}"
+    assert f"http://{probe_host}:3026/health" in curl_capture.read_text()
     env_text = (install_dir / ".env").read_text(encoding="utf-8")
     assert "CUSTOM_SETTING=keep-me" in env_text
     assert "GATEWAY_API_KEY=" not in env_text
@@ -142,7 +227,7 @@ def test_fresh_install_pins_digests_and_delivers_only_credential_paths(tmp_path:
     assert "COMPOSE_PROFILES=" not in env_text
     assert "COMPOSE_ENV_FILES=" not in env_text
     assert "unsafe-old-value" not in env_text
-    assert "MEMORY_HOST=0.0.0.0" in env_text
+    assert f"MEMORY_HOST={listen_host}" in env_text
     assert "MEMORY_CREDENTIAL_DIR=./credentials" in env_text
     assert "memory-platform-init@sha256:" in env_text
     assert "memory-platform-model@sha256:" in env_text
@@ -373,6 +458,9 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit 0
 fi
 if [ "$1" = "inspect" ]; then
+  case "$*" in
+    *'{{.State.Running}}'*) printf 'true\n'; exit 0 ;;
+  esac
   case "$2" in
     old-init) printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n' ;;
     old-model) printf 'sha256:2222222222222222222222222222222222222222222222222222222222222222\n' ;;
@@ -390,6 +478,9 @@ if [ "$1" = "volume" ] && [ "$2" = "ls" ]; then
 fi
 if [ "$1" = "run" ]; then
   case "$*" in
+    *'/usr/local/libexec/memory-platform/plan_install.py'*)
+      printf '1\tupgrade\timage_change\tnone\t1\t1\t1\n'
+      ;;
     *'/usr/local/libexec/memory-platform/restore_split.py'*)
       printf 'restore:%s\n' "$*" >> '{events}'
       ;;
@@ -398,6 +489,7 @@ if [ "$1" = "run" ]; then
   esac
   exit 0
 fi
+if [ "$1" = "exec" ]; then exit 0; fi
 case "$*" in
   'compose version') exit 0 ;;
   *' config --services') printf 'stack-init\nmodel-gateway\nmemory-gateway\n'; exit 0 ;;
@@ -405,6 +497,7 @@ case "$*" in
   *' ps -aq model-gateway') printf 'old-model\n'; exit 0 ;;
   *' ps -aq memory-gateway') printf 'old-memory\n'; exit 0 ;;
   *' port memory-gateway 2026') exit 0 ;;
+  *' config --format json') printf '{{}}\n'; exit 0 ;;
   *' config') exit 0 ;;
   *' pull') exit 0 ;;
   *' exec -T'*'/readyz'*) exit 1 ;;
@@ -462,11 +555,15 @@ def _split_preflight_docker_script(
     fail_second_config: bool,
     fail_stop: bool,
     has_init_container: bool = True,
+    fail_validator: bool = False,
+    old_readiness_exit: int = 0,
+    plan_line: str = "1\\tupgrade\\timage_change\\tnone\\t1\\t1\\t1",
 ) -> str:
     second_config_branch = (
         "if [ \"$count\" -eq 2 ]; then exit 1; fi" if fail_second_config else ":"
     )
     stop_branch = "exit 1" if fail_stop else "exit 0"
+    validator_branch = "exit 1" if fail_validator else "exit 0"
     init_container_branch = "printf 'old-init\\n'" if has_init_container else ":"
     return f"""#!/bin/sh
 if [ "$1" = "info" ]; then exit 0; fi
@@ -480,6 +577,9 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit 0
 fi
 if [ "$1" = "inspect" ]; then
+  case "$*" in
+    *'{{.State.Running}}'*) printf 'true\n'; exit 0 ;;
+  esac
   case "$2" in
     old-init) printf 'sha256:{'1' * 64}\n' ;;
     old-model) printf 'sha256:{'2' * 64}\n' ;;
@@ -487,6 +587,19 @@ if [ "$1" = "inspect" ]; then
   esac
   exit 0
 fi
+if [ "$1" = "run" ]; then
+    case "$*" in
+    *'/usr/local/libexec/memory-platform/plan_install.py'*)
+      printf '{plan_line}\n'
+      exit 0
+      ;;
+    *'/usr/local/libexec/memory-platform/validate_compose.py'*)
+      printf 'candidate-validator\n' >> '{events}'
+      {validator_branch}
+      ;;
+  esac
+fi
+if [ "$1" = "exec" ]; then exit {old_readiness_exit}; fi
 case "$*" in
   'compose version') exit 0 ;;
   'volume ls '*) exit 0 ;;
@@ -494,20 +607,27 @@ case "$*" in
   *' ps -aq stack-init') {init_container_branch}; exit 0 ;;
   *' ps -aq model-gateway') printf 'old-model\n'; exit 0 ;;
   *' ps -aq memory-gateway') printf 'old-memory\n'; exit 0 ;;
-  *' port memory-gateway 2026') exit 0 ;;
+  *' ps -q model-gateway') printf 'old-model\n'; exit 0 ;;
+  *' ps -q memory-gateway') printf 'old-memory\n'; exit 0 ;;
+  *' port memory-gateway 2026') printf '127.0.0.1:2026\n'; exit 0 ;;
   *'--profile maintenance run'*'stack backup'*) printf 'backup\n' >> '{events}'; exit 0 ;;
   *' exec -T'*) exit 0 ;;
-  *' config')
+  *' config'|*' config --format json')
     count=0
     [ ! -f '{config_count}' ] || count=$(cat '{config_count}')
     count=$((count+1))
     printf '%s' "$count" > '{config_count}'
     printf 'candidate-config:%s\n' "$count" >> '{events}'
     {second_config_branch}
+    printf '{{}}\n'
     exit 0
     ;;
   *' pull') printf 'candidate-pull\n' >> '{events}'; exit 0 ;;
   *' stop') printf 'old-stop\n' >> '{events}'; {stop_branch} ;;
+  *' up -d --no-deps --force-recreate model-gateway')
+    printf 'repair-model\n' >> '{events}'; exit 0 ;;
+  *' up -d --no-deps --force-recreate memory-gateway')
+    printf 'repair-memory\n' >> '{events}'; exit 0 ;;
   *' up -d --pull never'*)
     printf 'recovery-images:%s|%s|%s\n' \
       "$MEMORY_PLATFORM_INIT_IMAGE" \
@@ -552,7 +672,7 @@ def _assert_old_live_image_refs(install_dir: Path) -> None:
     assert "@sha256:" not in env_text
 
 
-def test_digest_fixed_candidate_validation_failure_does_not_pollute_live_env(
+def test_shared_candidate_validation_failure_does_not_pollute_live_env(
     tmp_path: Path,
 ) -> None:
     install_dir, fake_bin, events, config_count = _prepare_split_preflight_case(
@@ -572,12 +692,137 @@ def test_digest_fixed_candidate_validation_failure_does_not_pollute_live_env(
     result = _run(tmp_path, install_dir, fake_bin)
 
     assert result.returncode != 0
-    assert "digest 固定后的 Compose 无效" in result.stderr
+    assert "候选 public Compose 无法渲染为可审计配置" in result.stderr
     assert (install_dir / "docker-compose.user.yml").read_text() == original_compose
     _assert_old_live_image_refs(install_dir)
     assert "old-stop" not in events.read_text(encoding="utf-8")
     assert not list(install_dir.glob(".env.candidate.*"))
     assert not list(install_dir.glob(".docker-compose.user.yml.candidate.*"))
+
+
+def test_candidate_validator_failure_precedes_journal_stop_and_volume_mutation(
+    tmp_path: Path,
+) -> None:
+    install_dir, fake_bin, events, config_count = _prepare_split_preflight_case(
+        tmp_path
+    )
+    original_compose = (install_dir / "docker-compose.user.yml").read_text()
+    _executable(
+        fake_bin / "docker",
+        _split_preflight_docker_script(
+            events=events,
+            config_count=config_count,
+            fail_second_config=False,
+            fail_stop=False,
+            fail_validator=True,
+        ),
+    )
+
+    result = _run(tmp_path, install_dir, fake_bin)
+
+    assert result.returncode != 0
+    assert "候选 public Compose 未通过安全拓扑校验" in result.stderr
+    assert (install_dir / "docker-compose.user.yml").read_text() == original_compose
+    _assert_old_live_image_refs(install_dir)
+    event_text = events.read_text(encoding="utf-8")
+    assert "candidate-validator" in event_text
+    assert "old-stop" not in event_text
+    assert "backup" not in event_text
+    assert not (install_dir / ".memory-platform-cutover").exists()
+
+
+def test_unknown_old_readiness_fails_before_journal_and_stop(tmp_path: Path) -> None:
+    install_dir, fake_bin, events, config_count = _prepare_split_preflight_case(
+        tmp_path
+    )
+    original_compose = (install_dir / "docker-compose.user.yml").read_text()
+    _executable(
+        fake_bin / "docker",
+        _split_preflight_docker_script(
+            events=events,
+            config_count=config_count,
+            fail_second_config=False,
+            fail_stop=False,
+            old_readiness_exit=4,
+        ),
+    )
+
+    result = _run(tmp_path, install_dir, fake_bin)
+
+    assert result.returncode != 0
+    assert "无法可靠建立旧服务 readiness 基线" in result.stderr
+    assert (install_dir / "docker-compose.user.yml").read_text() == original_compose
+    _assert_old_live_image_refs(install_dir)
+    event_text = events.read_text(encoding="utf-8")
+    assert "candidate-validator" in event_text
+    assert "old-stop" not in event_text
+    assert "backup" not in event_text
+    assert not (install_dir / ".memory-platform-cutover").exists()
+
+
+@pytest.mark.parametrize(
+    ("action", "readiness_exit", "plan_line", "expected_repairs"),
+    (
+        (
+            "noop",
+            0,
+            "1\\tnoop\\talready_current\\tnone\\t1\\t1\\t1",
+            set(),
+        ),
+        (
+            "repair",
+            3,
+            "1\\trepair\\tservice_repair\\tboth\\t0\\t0\\t0",
+            {"repair-model", "repair-memory"},
+        ),
+    ),
+)
+def test_noop_and_repair_never_enter_upgrade_transaction(
+    tmp_path: Path,
+    action: str,
+    readiness_exit: int,
+    plan_line: str,
+    expected_repairs: set[str],
+) -> None:
+    install_dir, fake_bin, events, config_count = _prepare_split_preflight_case(
+        tmp_path
+    )
+    credentials = install_dir / "credentials"
+    credentials.mkdir()
+    for role in ("gateway", "admin"):
+        credential = credentials / f"{role}.txt"
+        credential.write_text(f"synthetic-{role}\n", encoding="ascii")
+        credential.chmod(0o600)
+    (install_dir / ".test-ingress-published").touch()
+    original_compose = (install_dir / "docker-compose.user.yml").read_text()
+    _executable(
+        fake_bin / "docker",
+        _split_preflight_docker_script(
+            events=events,
+            config_count=config_count,
+            fail_second_config=False,
+            fail_stop=False,
+            old_readiness_exit=readiness_exit,
+            plan_line=plan_line,
+        ),
+    )
+    _executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+
+    result = _run(tmp_path, install_dir, fake_bin)
+
+    assert result.returncode == 0, result.stderr
+    assert f"已通过 {action} 验收" in result.stdout
+    assert (install_dir / "docker-compose.user.yml").read_text() == original_compose
+    _assert_old_live_image_refs(install_dir)
+    event_lines = set(events.read_text(encoding="utf-8").splitlines())
+    assert expected_repairs <= event_lines
+    if action == "noop":
+        assert "repair-model" not in event_lines
+        assert "repair-memory" not in event_lines
+    assert "old-stop" not in event_lines
+    assert "backup" not in event_lines
+    assert not (install_dir / ".memory-platform-cutover").exists()
+    assert not list((install_dir / "backups").glob("pre-upgrade-*"))
 
 
 def test_old_stop_failure_keeps_live_env_and_recovers_with_exact_old_images(
@@ -982,6 +1227,9 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
   exit 0
 fi
 if [ "$1" = inspect ]; then
+  case "$*" in
+    *'{{.State.Running}}'*) printf 'true\n'; exit 0 ;;
+  esac
   case "$2" in
     old-init) printf 'sha256:{'1' * 64}\n' ;;
     old-model) printf 'sha256:{'2' * 64}\n' ;;
@@ -999,6 +1247,10 @@ if [ "$1" = volume ] && [ "$2" = ls ]; then
 fi
 if [ "$1" = run ]; then
   case "$*" in
+    *plan_install.py*)
+      printf '1\tupgrade\timage_change\tnone\t1\t1\t1\n'
+      exit 0
+      ;;
     *restore_split.py*) printf 'restore\n' >> '{events}' ;;
     *) printf 'topology\n' >> '{events}' ;;
   esac
@@ -1013,6 +1265,7 @@ case "$*" in
   *' port memory-gateway 2026') exit 0 ;;
   *'--profile maintenance run'*'stack backup'*) exit 0 ;;
   *' exec -T'*) exit 0 ;;
+  *' config --format json') printf '{{}}\n'; exit 0 ;;
   *' config'|*' pull'|*' stop') exit 0 ;;
   *' up -d --pull never'*)
     printf 'old-up:%s|%s|%s\n' "$MEMORY_PLATFORM_INIT_IMAGE" "$MEMORY_PLATFORM_MODEL_IMAGE" "$MEMORY_PLATFORM_MEMORY_IMAGE" >> '{events}'

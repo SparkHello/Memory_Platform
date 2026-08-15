@@ -239,6 +239,33 @@ def test_validate_stack_backup_accepts_portable_archive(tmp_path: Path) -> None:
     assert "active_memories" in result["stats"]
 
 
+def test_deploy_backup_verifier_accepts_portable_archive(tmp_path: Path) -> None:
+    paths, memory_database, knowledge_database, model_home = _fixture(tmp_path)
+    archive_path = tmp_path / "便携 backup with spaces.zip"
+    create_stack_backup(
+        destination=archive_path,
+        paths=paths,
+        memory_database=memory_database,
+        knowledge_database=knowledge_database,
+        model_gateway_home=model_home,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT.parents[1] / "deploy" / "verify_backup.py"),
+            str(archive_path),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["restorable"] is True
+
+
 def test_validate_stack_backup_rejects_non_zip(tmp_path: Path) -> None:
     junk = tmp_path / "not-a-backup.txt"
     junk.write_text("hello", encoding="utf-8")

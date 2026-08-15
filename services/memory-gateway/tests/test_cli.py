@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,11 @@ from app.cli import (
     main,
 )
 from app.cli_config import cli_paths, read_env_file, update_env_value
+from app.stack_install import (
+    StackCredentialSink,
+    StackInstallDataPaths,
+    apply_stack_install,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +51,27 @@ def _base_args(tmp_path: Path) -> list[str]:
         "--project-root",
         str(PROJECT_ROOT),
     ]
+
+
+def test_stack_install_application_does_not_depend_on_cli_modules() -> None:
+    application_source = (PROJECT_ROOT / "app" / "stack_install.py").read_text(
+        encoding="utf-8"
+    )
+    initializer_source = (
+        PROJECT_ROOT.parents[1] / "deploy" / "init_stack.py"
+    ).read_text(encoding="utf-8")
+
+    assert "import argparse" not in application_source
+    assert "from app import cli" not in application_source
+    assert "from app.cli import" not in application_source
+    assert "from app.cli import" not in initializer_source
+
+
+def test_stack_install_parser_rejects_removed_deferred_delivery_flag() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["stack", "install", "--defer-credential-delivery"])
 
 
 def test_cli_initializes_outside_repo_without_copying_placeholder_keys(
@@ -442,8 +469,8 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
         lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
-        "app.cli._modelgw_json",
-        lambda modelgw, home, arguments: [
+        "app.stack_install._modelgw_json",
+        lambda modelgw, home, arguments, **kwargs: [
             {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
             {"id": "memory-console-admin", "kind": "admin", "secret_configured": True},
         ],
@@ -455,7 +482,7 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
             secret_inputs.append(kwargs["input_text"].strip())
         return 0
 
-    monkeypatch.setattr("app.cli._run_modelgw", fake_modelgw)
+    monkeypatch.setattr("app.stack_install._run_modelgw", fake_modelgw)
 
     assert (
         main(
@@ -559,17 +586,92 @@ def _install_stack_mocks(tmp_path, monkeypatch) -> Path:
         lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
-        "app.cli._modelgw_json",
-        lambda modelgw, home, arguments: [
+        "app.stack_install._modelgw_json",
+        lambda modelgw, home, arguments, **kwargs: [
             {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
             {"id": "memory-console-admin", "kind": "admin", "secret_configured": True},
         ],
     )
     monkeypatch.setattr(
-        "app.cli._run_modelgw",
+        "app.stack_install._run_modelgw",
         lambda modelgw, home, arguments, **kwargs: 0,
     )
     return model_home
+
+
+def test_stack_install_application_accepts_explicit_docker_contract_without_output(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    model_home = _install_stack_mocks(tmp_path, monkeypatch)
+    memory_data = tmp_path / "memory-data"
+    memory_secrets = tmp_path / "memory-secrets"
+    credential_directory = tmp_path / "host-credentials"
+    credential_directory.mkdir(mode=0o700)
+    paths = replace(
+        cli_paths(memory_data / "config"),
+        settings_env=memory_secrets / "settings.env",
+    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_modelgw(modelgw, home, arguments, **kwargs):
+        calls.append((list(arguments), dict(kwargs)))
+        return 0
+
+    monkeypatch.setattr("app.stack_install._run_modelgw", fake_modelgw)
+
+    def read_credential(path: Path) -> str:
+        return path.read_text(encoding="ascii").strip()
+
+    def deliver_credential(path: Path, value: str) -> None:
+        path.write_text(value + "\n", encoding="ascii")
+        path.chmod(0o600)
+
+    capsys.readouterr()
+    result = apply_stack_install(
+        layout="docker",
+        paths=paths,
+        project_root=PROJECT_ROOT,
+        modelgw=Path("/fake/modelgw"),
+        model_gateway_home=model_home,
+        model_gateway_base_url="http://model-gateway:2030/v1",
+        data_paths=StackInstallDataPaths(
+            memory_database="/data/memory.db",
+            knowledge_database="/data/knowledge.db",
+            auth_database="/data/auth.db",
+            auth_store=memory_data / "auth.db",
+            evaluation_directory="/data/eval",
+            ui_directory="/app/ui/dist",
+            model_gateway_secrets=tmp_path / "model-secrets" / "secrets.env",
+        ),
+        credential_sink=StackCredentialSink(
+            gateway_path=credential_directory / "gateway.txt",
+            admin_path=credential_directory / "admin.txt",
+            read=read_credential,
+            deliver=deliver_credential,
+        ),
+        keep_backend_key=False,
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert result.console_credential_path == credential_directory / "gateway.txt"
+    assert result.admin_credential_path == credential_directory / "admin.txt"
+    values = read_env_file(paths.settings_env)
+    assert values["MODEL_GATEWAY_BASE_URL"] == "http://model-gateway:2030/v1"
+    assert values["MODEL_GATEWAY_ALLOW_PRIVATE_HTTP"] == "true"
+    assert values["DATABASE_PATH"] == "/data/memory.db"
+    assert values["KNOWLEDGE_DATABASE_PATH"] == "/data/knowledge.db"
+    assert values["AUTH_DATABASE_PATH"] == "/data/auth.db"
+    assert values["EVAL_DIR"] == "/data/eval"
+    assert values["UI_DIST_DIR"] == "/app/ui/dist"
+    assert all(
+        call_kwargs["environment"]["MODEL_GATEWAY_SECRETS_PATH"]
+        == str(tmp_path / "model-secrets" / "secrets.env")
+        for _, call_kwargs in calls
+    )
 
 
 def test_stack_install_provisions_scoped_console_credential_without_echo(
@@ -653,8 +755,8 @@ def test_stack_install_generates_admin_key_once_when_missing(
         lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
-        "app.cli._modelgw_json",
-        lambda modelgw, home, arguments: [
+        "app.stack_install._modelgw_json",
+        lambda modelgw, home, arguments, **kwargs: [
             {"id": "memory-gateway", "kind": "backend", "secret_configured": True},
             {"id": "memory-console-admin", "kind": "admin", "secret_configured": False},
         ],
@@ -666,7 +768,7 @@ def test_stack_install_generates_admin_key_once_when_missing(
             secret_calls.append((list(arguments), kwargs["input_text"].strip()))
         return 0
 
-    monkeypatch.setattr("app.cli._run_modelgw", fake_modelgw)
+    monkeypatch.setattr("app.stack_install._run_modelgw", fake_modelgw)
 
     assert (
         main([*args, "stack", "install", "--model-gateway-home", str(model_home)])
@@ -750,7 +852,7 @@ def test_stack_install_rerun_fails_closed_before_mutation_when_credential_missin
     (paths.credentials / "gateway.key").unlink()
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "app.cli._run_modelgw",
+        "app.stack_install._run_modelgw",
         lambda modelgw, home, arguments, **kwargs: calls.append(list(arguments)) or 0,
     )
 

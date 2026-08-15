@@ -105,7 +105,7 @@ Windows 安装器目前仍标记为实验性；正式数据请先阅读[栈运�
 
 脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或升级 → 启动独立的 Memory/Model 容器。
 
-重复运行同一版本命令用于修复；升级时显式把 `VERSION` 改为目标 release。已有已配置安装升级后若 `/readyz` 退化，安装器会自动恢复旧 Compose 和数据；全新安装则只要求 `/health`，以便先打开设置页面。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。旧单卷（legacy all-in-one）布局不再由安装器内嵌迁移：先运行同一 release 的一次性迁移工具（`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`），完成旧单卷到四卷的迁移后再重跑安装命令。
+重复运行时，digest、受管配置和健康状态都一致会走 `noop`；只有服务退化时走不备份、不停整栈的定向 `repair`；镜像或受管配置变化才进入带一致性备份与回滚 journal 的 `upgrade`。升级前会记录旧 Memory/Model 的实际 readiness 基线，无法确定时在停机前失败，候选验收不得低于该基线；全新安装只要求 `/health`，以便先打开设置页面。升级时显式把 `VERSION` 改为目标 release。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。旧单卷（legacy all-in-one）布局不再由安装器内嵌迁移：先运行同一 release 的一次性迁移工具（`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`），完成旧单卷到四卷的迁移后再重跑安装命令。
 
 </details>
 
@@ -244,6 +244,7 @@ http://127.0.0.1:2026/mcp
 - [客户端接入指南（Chatbox / RikkaHub / FLIT 等）](docs/client-setup.md)
 - [栈运维、高级配置、备份与迁移](docs/stack-operations.md)
 - [让 AI 帮你安装](docs/ai-install.md)
+- [兼容契约与持久化版本](docs/compatibility-contract-v2.md)
 - [Memory Gateway 完整说明](services/memory-gateway/README.md)
 - [Model Gateway 完整说明](services/model-gateway/README.md)
 - [贡献指南](CONTRIBUTING.md)

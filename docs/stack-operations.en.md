@@ -220,7 +220,7 @@ Never commit `.env`, real SQLite files, logs, evaluation snapshots, or portable 
 
 ## Backup, restore, and migration
 
-Re-running either Docker release installer creates and re-verifies a portable archive under the install directory's `backups/` folder before pulling replacement images, then removes the temporary copy from the data volume. The default retention is the five newest upgrade archives (`MEMORY_BACKUP_RETENTION=1..50` changes it). Backup or safe-cleanup failure stops the upgrade before replacing the existing service.
+Each Docker release installer first derives a typed `noop|repair|upgrade` plan from image digests, managed configuration, and observed service health; `noop` and `repair` do not create full-stack backups. Only `upgrade` stops writers, creates a portable archive, validates it with the candidate init image's authoritative verifier, copies it into the install directory's `backups/` folder, and removes the temporary volume copy. After a committed upgrade, retention keeps exactly the five newest upgrade archives (`MEMORY_BACKUP_RETENTION=1..50` changes it). A consistent-backup or temporary-copy cleanup failure stops the transaction before the existing service is replaced.
 
 ### Legacy single-volume layout migration
 

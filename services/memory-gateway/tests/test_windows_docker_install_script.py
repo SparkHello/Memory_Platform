@@ -33,7 +33,8 @@ def test_windows_installer_uses_a_fixed_release_and_three_digest_images() -> Non
         assert image in text
     assert text.count("Resolve-ImageDigest") >= 4
     assert "@sha256:[0-9a-f]{64}" in text
-    assert "Test-CandidateCompose" in text
+    assert "Test-CandidateComposeSyntax" in text
+    assert "Test-RenderedCandidateTopology" in text
     assert "config --format json" in text
 
 
@@ -60,6 +61,8 @@ def test_windows_private_acl_rewrite_is_idempotent_without_security_privilege() 
     text = _installer()
 
     assert "$item.SetAccessControl($acl)" in text
+    assert '"System.IO.FileSystemAclExtensions" -as [type]' in text
+    assert ".PSObject.BaseObject" in text
     assert "Set-Acl -LiteralPath $Path" not in text
 
 
@@ -80,23 +83,31 @@ def test_windows_upgrade_backs_up_before_candidate_replacement_and_cleans_temp()
 
     snapshot = text.index('Write-Step "保存旧 Compose 快照"')
     download = text.index('Write-Step "下载 $release Compose 并校验"')
+    plan = text.index('Write-Step "生成 typed 安装计划"', download)
     quiesced = text.index('Write-Step "旧服务已停写，创建并复验最终一致性备份"')
     replace = text.index(
         "Replace-ComposeAtomically $script:CandidateCompose $script:ComposePath",
         download,
     )
-    assert snapshot < download < quiesced < replace
+    assert download < plan < snapshot < quiesced < replace
     assert '"stack", "backup", "--model-gateway-home", "/model-data"' in text
     assert "docker cp" in text
-    # 每次升级恰好一份停写一致性备份，并做真实复验（ZIP CRC + SQLite quick_check）。
+    # 每次升级恰好一份停写一致性备份，并调用权威便携包校验器复验。
     assert "Test-BackupArchive" in text
-    assert "archive.testzip()" in text
-    assert "PRAGMA quick_check" in text
+    assert "/usr/local/libexec/memory-platform/verify_backup.py" in text
+    assert "archive.testzip()" not in text
+    assert "PRAGMA quick_check" not in text
+    assert "$verifyImage = $script:InitImage" in text
     assert "import os,sys; os.unlink(sys.argv[1])" in text
     assert "pre-upgrade-$stamp.compose.yml" in text
     assert "MEMORY_BACKUP_RETENTION" in text
     assert "Remove-StaleHostBackups" in text
     assert "Select-Object -Skip $Retention" in text
+    create_backup = text.index("if (-not (New-QuiescedBackup))")
+    prune = text.index(
+        "Remove-StaleHostBackups $backupDirectory $backupRetention"
+    )
+    assert create_backup < prune
 
 
 def test_windows_legacy_layout_is_referred_to_standalone_cutover_tool() -> None:
@@ -128,14 +139,21 @@ def test_windows_acceptance_keeps_model_private_and_checks_health_regression() -
     assert "$candidatePublished" not in text
     assert "意外发布宿主端口" in text
     assert "Model Gateway 2030 仅位于 Docker 内部网络" in text
-    assert 'Wait-HttpEndpoint "http://127.0.0.1:$port/health" 180' in text
-    assert 'Wait-HttpEndpoint "http://127.0.0.1:$port/readyz" 90' in text
-    assert '$script:Layout -ne "fresh" -and' in text
-    assert "$oldReady" not in text
+    assert 'Wait-HttpEndpoint "http://${hostProbe}:$port/health" 180' in text
+    assert 'Wait-HttpEndpoint "http://${hostProbe}:$port/readyz" 90' in text
+    assert "Get-HostProbeAddress" in text
+    assert "Get-ExistingServiceReadiness" in text
+    assert '$oldMemoryReadiness = "absent"' in text
+    assert '$oldModelReadiness = "absent"' in text
+    assert '$oldMemoryReadiness -eq "unknown"' in text
+    assert '$oldModelReadiness -eq "unknown"' in text
+    assert "$installPlan.AcceptMemoryReadiness" in text
+    assert "$installPlan.AcceptModelReadiness" in text
+    assert "$installPlan.AcceptHostReadiness" in text
     assert "readiness 退化" in text
     assert "2030 仅位于 Docker 内部网络" in text
     assert "ports: !reset []" in text
-    assert "Test-InternalOverrideCompose" in text
+    assert "Test-RenderedCandidateTopology" in text
     assert "Wait-CandidateContainerHttp" in text
     assert '"model-gateway"; Url = "http://127.0.0.1:2030/health"' in text
     assert "Test-CandidateCredential" in text
@@ -156,6 +174,33 @@ def test_windows_installer_avoids_powershell_7_only_control_operators() -> None:
     assert "ForEach-Object -Parallel" not in text
 
 
+def test_ci_runs_windows_installer_contract_on_both_powershell_engines() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    journal = (
+        ROOT
+        / "services"
+        / "memory-gateway"
+        / "tests"
+        / "windows_installer_journal.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "windows-installer:" in workflow
+    assert "runs-on: windows-latest" in workflow
+    assert "shell: powershell" in workflow
+    assert "shell: pwsh" in workflow
+    assert workflow.count("test_installer_parity.py") == 2
+    assert workflow.count("test_windows_docker_install_script.py") == 2
+    assert workflow.count("windows_installer_journal.ps1") == 2
+    # Construct non-ASCII names from code points: this remains real Chinese
+    # when Windows PowerShell 5.1 reads the UTF-8-without-BOM harness as ANSI.
+    assert "[char]0x4E2D" in journal and "[char]0x6587" in journal
+    assert "fixture path with spaces" in journal
+    assert "[char]0x5907" in journal and "[char]0x4EFD" in journal
+    assert "retention corpus" in journal
+
+
 def test_windows_release_authentication_covers_compose_and_all_images() -> None:
     text = _installer()
 
@@ -173,8 +218,76 @@ def test_windows_release_authentication_covers_compose_and_all_images() -> None:
     assert "MEMORY_VERIFY_SIGNATURES" in text
     assert "if ($verifySignatures)" in text
     assert "已按默认跳过 Sigstore 签名验证" in text
-    # 完整拓扑隔离契约由仓库 CI 的 validate_compose.py 门禁强制。
+    # 安装时由候选 init 镜像中的同一 validator 校验 public/internal 渲染结果。
     assert "validate_compose.py" in text
+
+
+def test_windows_candidate_validator_is_offline_shared_and_pre_cutover() -> None:
+    text = _installer()
+
+    validation = text.index('Write-Step "用候选 init 镜像校验 public/internal 安全拓扑"')
+    journal = text.index("New-CutoverJournal", validation)
+    stop = text.index(" stop", journal)
+    assert validation < journal < stop
+    assert text.count("Test-RenderedCandidateTopology `") == 2
+    assert '"--network", "none"' in text
+    assert '"--read-only", "--cap-drop", "ALL"' in text
+    assert '"--security-opt", "no-new-privileges:true"' in text
+    assert '"--user", "65534:65534"' in text
+    assert '"--entrypoint", "python"' in text
+    assert 'if (-not $PublishIngress) { $arguments += "internal" }' in text
+    assert "/var/run/docker.sock" not in text
+    assert "--mount" not in text[text.index("function Test-RenderedCandidateTopology"):text.index("function Restore-ImageEnvironment")]
+
+
+def test_windows_typed_plan_separates_noop_repair_and_upgrade() -> None:
+    text = _installer()
+
+    assert "/usr/local/libexec/memory-platform/plan_install.py" in text
+    assert "function Get-InstallPlan" in text
+    assert "Version = 1" in text
+    assert 'Action = [string] $fields[1]' in text
+    assert 'RepairScope = [string] $fields[3]' in text
+    assert "AcceptMemoryReadiness" in text
+    assert "AcceptModelReadiness" in text
+    assert "AcceptHostReadiness" in text
+    noop = text.index('if ($installPlan.Action -eq "noop")')
+    repair = text.index('if ($installPlan.Action -eq "repair")', noop)
+    snapshot = text.index('Write-Step "保存旧 Compose 快照"', repair)
+    journal = text.index("New-CutoverJournal", snapshot)
+    assert noop < repair < snapshot < journal
+    pre_upgrade = text[noop:snapshot]
+    assert "New-CutoverJournal" not in pre_upgrade
+    assert "New-QuiescedBackup" not in pre_upgrade
+    assert " stop" not in pre_upgrade
+    repair_function = text[
+        text.index("function Invoke-ExistingInstallPlan"):
+        text.index("function Get-FirstLanIp")
+    ]
+    assert "--no-deps --force-recreate model-gateway" in repair_function
+    assert "--no-deps --force-recreate memory-gateway" in repair_function
+    assert "New-QuiescedBackup" not in repair_function
+    assert " stop" not in repair_function
+    planner_function = text[
+        text.index("function Get-InstallPlan"):
+        text.index("function Get-ExistingInstallDirectories")
+    ]
+    assert '"--network", "none"' in planner_function
+    assert '"--read-only", "--cap-drop", "ALL"' in planner_function
+    assert "--mount" not in planner_function
+
+
+def test_windows_host_probe_uses_specific_bind_and_maps_wildcard_to_loopback() -> None:
+    text = _installer()
+
+    helper = text[
+        text.index("function Get-HostProbeAddress"):
+        text.index("function Test-HttpEndpoint")
+    ]
+    assert 'if ($Address -eq "0.0.0.0") { return "127.0.0.1" }' in helper
+    assert "return $Address" in helper
+    assert 'http://${hostProbe}:$port/health' in text
+    assert 'http://${publishProbeHost}:$publishPort/health' in text
 
 
 def test_windows_cutover_journal_is_durable_one_way_and_retry_safe() -> None:

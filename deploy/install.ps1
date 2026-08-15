@@ -262,10 +262,31 @@ function Protect-PrivatePath([string] $Path) {
         }
         [void] $acl.AddAccessRule($rule)
         # Set-Acl on Windows PowerShell 5.1 can request SeSecurityPrivilege
-        # when rewriting an already protected ACL, even though only the DACL
-        # is changing.  FileSystemInfo.SetAccessControl writes the intended
-        # access section directly and keeps repeated installer runs idempotent.
-        $item.SetAccessControl($acl)
+        # when only the DACL is changing. Windows PowerShell exposes the
+        # instance method; PowerShell 7 exposes the equivalent extension
+        # method from System.IO.FileSystem.AccessControl. Select at runtime so
+        # both engines perform the same idempotent DACL-only rewrite.
+        $aclExtensions = "System.IO.FileSystemAclExtensions" -as [type]
+        if ($null -eq $aclExtensions) {
+            $item.SetAccessControl($acl)
+        } else {
+            $setAccessControl = @($aclExtensions.GetMethods() | Where-Object {
+                $_.Name -eq "SetAccessControl" -and
+                $_.GetParameters().Count -eq 2 -and
+                $_.GetParameters()[0].ParameterType.IsAssignableFrom($item.GetType()) -and
+                $_.GetParameters()[1].ParameterType.IsAssignableFrom($acl.GetType())
+            } | Select-Object -First 1)
+            if ($setAccessControl.Count -ne 1) {
+                throw "compatible SetAccessControl method is unavailable"
+            }
+            [void] $setAccessControl[0].Invoke(
+                $null,
+                [object[]] @(
+                    $item.PSObject.BaseObject,
+                    $acl.PSObject.BaseObject
+                )
+            )
+        }
     } catch {
         Stop-Install "无法把私有文件权限限制为当前 Windows 用户；请使用本机 NTFS 目录后重试。"
     }
@@ -363,6 +384,144 @@ function Write-CandidateEnvironment(
         "COMPOSE_FILE", "COMPOSE_PATH_SEPARATOR"
     )
     Protect-PrivatePath $Path
+}
+
+function Get-Sha256Digest([byte[]] $Bytes) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $algorithm.ComputeHash($Bytes)
+    } finally {
+        $algorithm.Dispose()
+    }
+    return "sha256:" + [BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+}
+
+function Get-ManagedConfigDigest(
+    [string] $ComposeFile,
+    [string] $EnvironmentFile,
+    [bool] $EnvironmentExists
+) {
+    if (-not (Test-Path -LiteralPath $ComposeFile -PathType Leaf)) {
+        Stop-Install "无法读取 managed Compose 以生成安装计划。"
+    }
+    $composeDigest = Get-Sha256Digest ([IO.File]::ReadAllBytes($ComposeFile))
+    $builder = New-Object Text.StringBuilder
+    [void] $builder.Append("version=1`n")
+    [void] $builder.Append("compose=$composeDigest`n")
+    $existsValue = if ($EnvironmentExists) { "1" } else { "0" }
+    [void] $builder.Append("environment_exists=$existsValue`n")
+    foreach ($key in @(
+        "MEMORY_CREDENTIAL_DIR", "HOST_UID", "HOST_GID", "MEMORY_HOST",
+        "MEMORY_PORT", "COMPOSE_PROJECT_NAME"
+    )) {
+        $value = Get-ComposeEnvValue $EnvironmentFile $key
+        [void] $builder.Append("$key=$value`n")
+    }
+    foreach ($key in @(
+        "GATEWAY_API_KEY", "MEMORY_CONSOLE_ADMIN_KEY", "COMPOSE_ENV_FILES",
+        "COMPOSE_DISABLE_ENV_FILE", "COMPOSE_PROFILES", "COMPOSE_FILE",
+        "COMPOSE_PATH_SEPARATOR"
+    )) {
+        $present = if (Test-ComposeEnvKey $EnvironmentFile $key) { "1" } else { "0" }
+        [void] $builder.Append("${key}_present=$present`n")
+    }
+    $encoding = New-Object Text.UTF8Encoding($false)
+    return Get-Sha256Digest ($encoding.GetBytes($builder.ToString()))
+}
+
+function ConvertTo-ImageDigest([string] $Image) {
+    if ($Image -match '@(sha256:[0-9a-f]{64})$') { return $Matches[1] }
+    if ($Image -match '^(sha256:[0-9a-f]{64})$') { return $Matches[1] }
+    return "-"
+}
+
+function Get-CurrentServiceDigest(
+    [string] $ComposeFile,
+    [string] $EnvironmentFile,
+    [string] $Service,
+    [string] $EnvironmentKey
+) {
+    $reference = Get-ComposeEnvValue $EnvironmentFile $EnvironmentKey
+    if ($script:Layout -eq "split" -and
+        -not [string]::IsNullOrWhiteSpace($Service)) {
+        $native = Invoke-NativeCapture {
+            & docker compose -p $script:ProjectName -f $ComposeFile ps -aq $Service
+        }
+        $containers = @($native.Output | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ })
+        if ($native.ExitCode -eq 0 -and $containers.Count -eq 1) {
+            $native = Invoke-NativeCapture {
+                & docker inspect ([string] $containers[0]) --format '{{.Config.Image}}'
+            }
+            $references = @($native.Output | ForEach-Object { $_.Trim() } |
+                Where-Object { $_ })
+            if ($native.ExitCode -eq 0 -and $references.Count -eq 1) {
+                $reference = [string] $references[0]
+            }
+        }
+    }
+    return ConvertTo-ImageDigest $reference
+}
+
+function Get-InstallPlan(
+    [string] $CandidateInit,
+    [string] $CandidateModel,
+    [string] $CandidateMemory,
+    [string] $CurrentInit,
+    [string] $CurrentModel,
+    [string] $CurrentMemory,
+    [string] $CandidateConfig,
+    [string] $CurrentConfig,
+    [string] $MemoryReadiness,
+    [string] $ModelReadiness
+) {
+    $arguments = @(
+        "run", "--rm", "--pull", "never", "--network", "none",
+        "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--user", "65534:65534", "--entrypoint", "python",
+        $script:InitImage,
+        "/usr/local/libexec/memory-platform/plan_install.py",
+        $script:Layout,
+        $CandidateInit, $CandidateModel, $CandidateMemory,
+        $CurrentInit, $CurrentModel, $CurrentMemory,
+        $CandidateConfig, $CurrentConfig,
+        $MemoryReadiness, $ModelReadiness, "tsv"
+    )
+    $native = Invoke-NativeCapture { & docker @arguments }
+    $lines = @($native.Output | ForEach-Object { $_.TrimEnd("`r") } |
+        Where-Object { $_ })
+    if ($native.ExitCode -ne 0 -or $lines.Count -ne 1) {
+        Stop-Install "候选 init 镜像无法生成安全安装计划。"
+    }
+    $fields = @(([string] $lines[0]).Split("`t"))
+    if ($fields.Count -ne 7 -or $fields[0] -ne "1") {
+        Stop-Install "候选安装计划字段或版本无效。"
+    }
+    if ($fields[1] -notin @("noop", "repair", "upgrade") -or
+        $fields[2] -notin @(
+            "fresh_install", "image_change", "managed_config_change",
+            "image_and_config_change", "already_current", "service_repair"
+        ) -or
+        $fields[3] -notin @("none", "memory", "model", "both") -or
+        $fields[4] -notin @("0", "1") -or
+        $fields[5] -notin @("0", "1") -or
+        $fields[6] -notin @("0", "1")) {
+        Stop-Install "候选安装计划 typed contract 无效。"
+    }
+    if (($fields[1] -eq "repair" -and $fields[3] -eq "none") -or
+        ($fields[1] -ne "repair" -and $fields[3] -ne "none")) {
+        Stop-Install "候选安装计划 repair scope 无效。"
+    }
+    return [pscustomobject]@{
+        Version = 1
+        Action = [string] $fields[1]
+        Reason = [string] $fields[2]
+        RepairScope = [string] $fields[3]
+        AcceptMemoryReadiness = $fields[4] -eq "1"
+        AcceptModelReadiness = $fields[5] -eq "1"
+        AcceptHostReadiness = $fields[6] -eq "1"
+    }
 }
 
 function Get-ExistingInstallDirectories {
@@ -489,6 +648,11 @@ function Test-HostIp([string] $Address) {
     return $true
 }
 
+function Get-HostProbeAddress([string] $Address) {
+    if ($Address -eq "0.0.0.0") { return "127.0.0.1" }
+    return $Address
+}
+
 function Test-HttpEndpoint([string] $Url) {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri $Url
@@ -545,6 +709,49 @@ function Wait-CandidateContainerHttp(
         Start-Sleep -Seconds 1
     }
     return $false
+}
+
+function Get-ExistingServiceReadiness(
+    [string] $ComposeFile,
+    [string] $Service,
+    [string] $Url
+) {
+    if ($script:Layout -ne "split") { return "absent" }
+    $native = Invoke-NativeCapture {
+        & docker compose -p $script:ProjectName -f $ComposeFile ps -aq $Service
+    }
+    if ($native.ExitCode -ne 0) { return "unknown" }
+    $containers = @($native.Output | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ })
+    if ($containers.Count -eq 0) { return "absent" }
+    if ($containers.Count -ne 1) { return "unknown" }
+    $container = [string] $containers[0]
+    $native = Invoke-NativeCapture {
+        & docker inspect $container --format '{{.State.Running}}'
+    }
+    $runningValues = @($native.Output | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ })
+    if ($native.ExitCode -ne 0 -or $runningValues.Count -ne 1) {
+        return "unknown"
+    }
+    if ($runningValues[0] -eq "false") { return "absent" }
+    if ($runningValues[0] -ne "true") { return "unknown" }
+    $code = @'
+import sys, urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+        raise SystemExit(0 if response.status == 200 else 3)
+except urllib.error.HTTPError:
+    raise SystemExit(3)
+except Exception:
+    raise SystemExit(4)
+'@
+    $exitCode = Invoke-NativeSilently {
+        & docker exec $container python -c $code $Url
+    }
+    if ($exitCode -eq 0) { return "ready" }
+    if ($exitCode -eq 3) { return "not_ready" }
+    return "unknown"
 }
 
 function ConvertTo-NativeQuotedArgument([string] $Value) {
@@ -623,6 +830,202 @@ except Exception:
         'exec', '-T', $Service, 'python', '-c', $code, $Url
     )
     return Invoke-DockerWithInputFile $arguments $CredentialFile
+}
+
+function Test-LiveContainerHttp(
+    [string] $ComposeFile,
+    [string] $EnvironmentFile,
+    [string] $Service,
+    [string] $Url
+) {
+    $code = @'
+import sys, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+        raise SystemExit(0 if response.status == 200 else 1)
+except Exception:
+    raise SystemExit(1)
+'@
+    $exitCode = Invoke-NativeSilently {
+        & docker compose --env-file $EnvironmentFile -p $script:ProjectName `
+            -f $ComposeFile exec -T $Service python -c $code $Url
+    }
+    return $exitCode -eq 0
+}
+
+function Wait-LiveContainerHttp(
+    [string] $ComposeFile,
+    [string] $EnvironmentFile,
+    [string] $Service,
+    [string] $Url,
+    [int] $Attempts
+) {
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        if (Test-LiveContainerHttp `
+            $ComposeFile $EnvironmentFile $Service $Url) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Test-LiveCredential(
+    [string] $ComposeFile,
+    [string] $EnvironmentFile,
+    [string] $Service,
+    [string] $Url,
+    [string] $CredentialFile
+) {
+    $code = @'
+import sys, urllib.request
+token = sys.stdin.read().strip()
+if not token:
+    raise SystemExit(1)
+request = urllib.request.Request(
+    sys.argv[1], headers={"Authorization": "Bearer " + token}
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        raise SystemExit(0 if response.status == 200 else 1)
+except Exception:
+    raise SystemExit(1)
+'@
+    $arguments = @(
+        "compose", "--env-file", $EnvironmentFile,
+        "-p", $script:ProjectName, "-f", $ComposeFile,
+        "exec", "-T", $Service, "python", "-c", $code, $Url
+    )
+    return Invoke-DockerWithInputFile $arguments $CredentialFile
+}
+
+function Test-PrivatePathReadOnly([string] $Path) {
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $rules = @($acl.Access)
+        return $acl.AreAccessRulesProtected -and
+            $rules.Count -eq 1 -and
+            $rules[0].IdentityReference.Value -eq $identity -and
+            $rules[0].AccessControlType -eq `
+                [Security.AccessControl.AccessControlType]::Allow -and
+            (($rules[0].FileSystemRights -band `
+                [Security.AccessControl.FileSystemRights]::FullControl) -eq `
+                [Security.AccessControl.FileSystemRights]::FullControl)
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-ExistingInstallPlan(
+    [object] $Plan,
+    [string] $EnvironmentFile,
+    [string] $CredentialDirectory,
+    [string] $ProbeHost,
+    [int] $Port,
+    [string] $Release
+) {
+    if ($Plan.Action -eq "repair") {
+        if ($Plan.RepairScope -in @("model", "both")) {
+            $exitCode = Invoke-NativeSilently {
+                & docker compose --env-file $EnvironmentFile `
+                    -p $script:ProjectName -f $script:ComposePath `
+                    up -d --no-deps --force-recreate model-gateway
+            }
+            if ($exitCode -ne 0) {
+                Stop-Install "Model Gateway 定向 repair 失败；未停止整栈。"
+            }
+        }
+        if ($Plan.RepairScope -in @("memory", "both")) {
+            $exitCode = Invoke-NativeSilently {
+                & docker compose --env-file $EnvironmentFile `
+                    -p $script:ProjectName -f $script:ComposePath `
+                    up -d --no-deps --force-recreate memory-gateway
+            }
+            if ($exitCode -ne 0) {
+                Stop-Install "Memory Gateway 定向 repair 失败；未停止整栈。"
+            }
+        }
+    }
+    foreach ($check in @(
+        @{ Service = "memory-gateway"; Url = "http://127.0.0.1:2026/health" },
+        @{ Service = "model-gateway"; Url = "http://127.0.0.1:2030/health" }
+    )) {
+        if (-not (Wait-LiveContainerHttp `
+            $script:ComposePath $EnvironmentFile `
+            ([string] $check.Service) ([string] $check.Url) 180)) {
+            Stop-Install "$($Plan.Action) 后内部 liveness 验收失败；未执行全量回滚。"
+        }
+    }
+    if ($Plan.AcceptMemoryReadiness -and -not (Wait-LiveContainerHttp `
+        $script:ComposePath $EnvironmentFile "memory-gateway" `
+        "http://127.0.0.1:2026/readyz" 90)) {
+        Stop-Install "$($Plan.Action) 后 Memory readiness 未满足 typed acceptance。"
+    }
+    if ($Plan.AcceptModelReadiness -and -not (Wait-LiveContainerHttp `
+        $script:ComposePath $EnvironmentFile "model-gateway" `
+        "http://127.0.0.1:2030/readyz" 90)) {
+        Stop-Install "$($Plan.Action) 后 Model readiness 未满足 typed acceptance。"
+    }
+    $gatewayCredential = Resolve-CredentialFile $CredentialDirectory "gateway"
+    $adminCredential = Resolve-CredentialFile $CredentialDirectory "admin"
+    if (-not $gatewayCredential -or -not $adminCredential -or
+        -not (Test-PrivatePathReadOnly $gatewayCredential) -or
+        -not (Test-PrivatePathReadOnly $adminCredential) -or
+        -not (Test-PrivatePathReadOnly $CredentialDirectory)) {
+        Stop-Install "$($Plan.Action) 栈 credentials 缺失或权限不安全；未执行停机或备份。"
+    }
+    if (-not (Test-LiveCredential `
+            $script:ComposePath $EnvironmentFile "memory-gateway" `
+            "http://127.0.0.1:2026/auth/tokens" $gatewayCredential) -or
+        -not (Test-LiveCredential `
+            $script:ComposePath $EnvironmentFile "model-gateway" `
+            "http://127.0.0.1:2030/admin/configuration" $adminCredential)) {
+        Stop-Install "$($Plan.Action) 栈 credentials 实际鉴权失败；未执行全量回滚。"
+    }
+    if (-not (Wait-HttpEndpoint "http://${ProbeHost}:$Port/health" 180) -or
+        ($Plan.AcceptHostReadiness -and
+         -not (Wait-HttpEndpoint "http://${ProbeHost}:$Port/readyz" 90))) {
+        Stop-Install "$($Plan.Action) 栈未通过宿主入口 typed acceptance。"
+    }
+    $native = Invoke-NativeCapture {
+        & docker compose --env-file $EnvironmentFile `
+            -p $script:ProjectName -f $script:ComposePath ps -q memory-gateway
+    }
+    $memoryIds = @($native.Output | Where-Object { $_ })
+    $native = Invoke-NativeCapture {
+        & docker compose --env-file $EnvironmentFile `
+            -p $script:ProjectName -f $script:ComposePath ps -q model-gateway
+    }
+    $modelIds = @($native.Output | Where-Object { $_ })
+    $native = Invoke-NativeCapture {
+        & docker compose --env-file $EnvironmentFile `
+            -p $script:ProjectName -f $script:ComposePath `
+            port memory-gateway 2026
+    }
+    $published = @($native.Output | Where-Object { $_ })
+    $modelPorts = @()
+    if ($modelIds.Count -eq 1) {
+        $native = Invoke-NativeCapture { & docker port ([string] $modelIds[0]) }
+        $modelPorts = @($native.Output | Where-Object { $_ })
+    }
+    if ($memoryIds.Count -ne 1 -or $modelIds.Count -ne 1 -or
+        @($published | Where-Object { $_.Trim() -match ":$Port$" }).Count -eq 0 -or
+        $modelPorts.Count -ne 0) {
+        Stop-Install "$($Plan.Action) 栈宿主端口契约不匹配。"
+    }
+
+    Write-Host ""
+    Write-Host "Memory Platform $Release 已通过 $($Plan.Action) 验收（$($Plan.Reason)）"
+    Write-Host "  Web Console:  http://${ProbeHost}:$Port/ui/"
+    Write-Host "  Client URL:   http://${ProbeHost}:$Port/v1"
+    Write-Host "  Model:        memory-auto"
+    Write-Host "  Console token: $gatewayCredential"
+    Write-Host "  Admin key:    $adminCredential"
+    Write-Host "密钥值没有进入脚本输出、Compose 环境或 Docker 日志。"
+    if ([Environment]::GetEnvironmentVariable("MEMORY_NO_OPEN") -ne "1") {
+        try { Start-Process "http://${ProbeHost}:$Port/ui/" } catch { }
+    }
 }
 
 function Get-FirstLanIp {
@@ -763,78 +1166,75 @@ function Get-JsonPropertyValue([object] $Object, [string] $Name) {
     return $property.Value
 }
 
-function Get-JsonPropertyNames([object] $Object) {
-    if ($null -eq $Object) { return @() }
-    return @($Object.PSObject.Properties | ForEach-Object { $_.Name })
-}
-
-function Test-ExactStringSet([object[]] $Actual, [string[]] $Expected) {
-    $actualValues = @($Actual | ForEach-Object { [string] $_ } | Sort-Object -Unique)
-    $expectedValues = @($Expected | Sort-Object -Unique)
-    if ($actualValues.Count -ne $expectedValues.Count) { return $false }
-    return [string]::Join("`n", $actualValues) -eq [string]::Join("`n", $expectedValues)
-}
-
-function Test-CandidateCompose(
+function Test-CandidateComposeSyntax(
     [string] $ComposeFile,
-    [string] $EnvironmentFile,
-    [hashtable] $ExpectedImages
-) {
-    $native = Invoke-NativeCapture {
-        & docker compose --env-file $EnvironmentFile `
-            -p $script:ProjectName --profile maintenance `
-            -f $ComposeFile config --format json
-    }
-    $jsonLines = @($native.Output)
-    if ($native.ExitCode -ne 0 -or $jsonLines.Count -eq 0) {
-        Stop-Install "候选 Compose 语法无效。"
-    }
-    try {
-        $configuration = ([string]::Join("`n", $jsonLines) | ConvertFrom-Json)
-    } catch {
-        Stop-Install "候选 Compose 无法转换为可审计配置。请升级 Docker Desktop。"
-    }
-    $services = Get-JsonPropertyValue $configuration "services"
-    $expectedServices = @(
-        "stack-init", "model-gateway", "memory-gateway", "stack-maintenance"
-    )
-    if (-not (Test-ExactStringSet `
-        (Get-JsonPropertyNames $services) $expectedServices)) {
-        Stop-Install "候选 Compose 的 split stack 服务集合不安全。"
-    }
-    foreach ($name in $expectedServices) {
-        if ($null -eq (Get-JsonPropertyValue $services $name)) {
-            Stop-Install "候选 Compose 缺少 split stack 服务 $name。"
-        }
-    }
-    foreach ($name in $ExpectedImages.Keys) {
-        $service = Get-JsonPropertyValue $services ([string] $name)
-        $image = [string](Get-JsonPropertyValue $service "image")
-        if ($image -ne [string] $ExpectedImages[$name]) {
-            Stop-Install "候选 Compose 没有使用指定发布镜像。"
-        }
-    }
-    # The full split-topology isolation contract (ports, networks, UID,
-    # volumes) is enforced against the release Compose by
-    # deploy/validate_compose.py in the repository's CI release gates.
-    $rendered = $configuration | ConvertTo-Json -Depth 100 -Compress
-    if ($rendered -match '"(?:GATEWAY_API_KEY|MEMORY_CONSOLE_ADMIN_KEY)"\s*:') {
-        Stop-Install "候选 Compose 仍试图通过环境变量传递访问密钥。"
-    }
-}
-
-function Test-InternalOverrideCompose(
-    [string] $ComposeFile,
-    [string] $OverrideFile,
     [string] $EnvironmentFile
 ) {
     $exitCode = Invoke-NativeSilently {
         & docker compose --env-file $EnvironmentFile `
-            -p $script:ProjectName --profile maintenance `
-            -f $ComposeFile -f $OverrideFile config
+            -p $script:ProjectName -f $ComposeFile config
     }
     if ($exitCode -ne 0) {
-        Stop-Install "本地验收 override 无法生成 Compose 配置。"
+        Stop-Install "候选 Compose 语法无效。"
+    }
+}
+
+function Test-RenderedCandidateTopology(
+    [string] $ComposeFile,
+    [string] $OverrideFile,
+    [string] $EnvironmentFile,
+    [string] $InitImage,
+    [string] $ModelImage,
+    [string] $MemoryImage,
+    [string] $CredentialDirectory,
+    [bool] $PublishIngress
+) {
+    $renderedPath = New-TemporarySibling $script:ComposePath "rendered"
+    try {
+        if ($PublishIngress) {
+            $native = Invoke-NativeCapture {
+                & docker compose --env-file $EnvironmentFile `
+                    -p $script:ProjectName --profile maintenance `
+                    -f $ComposeFile config --format json
+            }
+            $mode = "public"
+        } else {
+            $native = Invoke-NativeCapture {
+                & docker compose --env-file $EnvironmentFile `
+                    -p $script:ProjectName --profile maintenance `
+                    -f $ComposeFile -f $OverrideFile config --format json
+            }
+            $mode = "internal"
+        }
+        $renderedLines = @($native.Output)
+        if ($native.ExitCode -ne 0 -or $renderedLines.Count -eq 0) {
+            Stop-Install "候选 $mode Compose 无法渲染为可审计配置。"
+        }
+        $utf8NoBom = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText(
+            $renderedPath,
+            [string]::Join("`n", $renderedLines) + "`n",
+            $utf8NoBom
+        )
+        $arguments = @(
+            "run", "--rm", "-i", "--pull", "never",
+            "--network", "none", "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true",
+            "--user", "65534:65534", "--entrypoint", "python",
+            $InitImage,
+            "/usr/local/libexec/memory-platform/validate_compose.py",
+            $InitImage, $ModelImage, $MemoryImage,
+            $script:PublishHost, ([string] $script:PublishPort),
+            $CredentialDirectory
+        )
+        if (-not $PublishIngress) { $arguments += "internal" }
+        if (-not (Invoke-DockerWithInputFile $arguments $renderedPath)) {
+            Stop-Install "候选 $mode Compose 未通过安全拓扑校验。"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $renderedPath) {
+            Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -1103,33 +1503,14 @@ function Update-CutoverBackupReference([string] $BackupPath) {
 }
 
 function Test-BackupArchive([string] $BackupPath, [string] $VerifyImage) {
-    # 真实复验：归档内每个成员必须通过 ZIP CRC 校验，且每个 SQLite 库
-    # 必须能重新打开并通过 quick_check=ok。
-    $verifyScript = @'
-import os, shutil, sqlite3, sys, tempfile, zipfile
-archive = zipfile.ZipFile("/backup/verify.zip")
-corrupt = archive.testzip()
-assert corrupt is None, f"CRC mismatch: {corrupt}"
-for member in archive.namelist():
-    if not member.endswith(".db"):
-        continue
-    with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".db", delete=False) as staged:
-        with archive.open(member) as source:
-            shutil.copyfileobj(source, staged)
-        staged_path = staged.name
-    connection = sqlite3.connect(staged_path)
-    try:
-        row = connection.execute("PRAGMA quick_check").fetchone()
-    finally:
-        connection.close()
-        os.unlink(staged_path)
-    assert row and row[0] == "ok", f"quick_check failed: {member}"
-'@
+    # 与 POSIX 安装器和 legacy cutover 共用候选镜像中的权威校验器。
     $arguments = @(
         "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
         "--mount", "type=bind,source=$BackupPath,target=/backup/verify.zip,readonly",
-        "--tmpfs", "/tmp:rw,noexec,nosuid,size=268435456",
-        "--entrypoint", "python", $VerifyImage, "-c", $verifyScript
+        "--mount", "type=volume,target=/tmp,volume-nocopy",
+        "--entrypoint", "python", $VerifyImage,
+        "/usr/local/libexec/memory-platform/verify_backup.py", "/backup/verify.zip"
     )
     return (Invoke-NativeSilently { & docker @arguments }) -eq 0
 }
@@ -1174,7 +1555,9 @@ function New-QuiescedBackup {
     )
     $cleanupImage = $script:RollbackInitImage
     $cleanupVolume = $memoryData
-    $verifyImage = $script:RollbackInitImage
+    # The old runtime creates the snapshot; the candidate release decides
+    # whether that archive is restorable by the version being installed.
+    $verifyImage = $script:InitImage
 
     $backupExitCode = Invoke-NativeSilently { & docker @arguments }
     if ($backupExitCode -ne 0) {
@@ -1345,9 +1728,10 @@ function Restore-InterruptedCutover([string] $EnvironmentPath) {
             & docker compose --env-file $EnvironmentPath -p $project `
                 -f $script:ComposePath up -d
         }
+        $publishProbeHost = Get-HostProbeAddress $publishHost
         if ($publishExitCode -ne 0 -or
-            -not (Wait-HttpEndpoint "http://127.0.0.1:$publishPort/health" 180) -or
-            -not (Wait-HttpEndpoint "http://127.0.0.1:$publishPort/readyz" 90)) {
+            -not (Wait-HttpEndpoint "http://${publishProbeHost}:$publishPort/health" 180) -or
+            -not (Wait-HttpEndpoint "http://${publishProbeHost}:$publishPort/readyz" 90)) {
             Stop-Install "已提交升级尚未完成端口发布；journal 已保留供下次幂等恢复。"
         }
         if (-not (Remove-CutoverJournal)) {
@@ -1809,19 +2193,7 @@ function Invoke-MemoryPlatformInstall {
                 Stop-Install "现有 Compose 没有同 project 的容器或数据卷；拒绝在空 project 上迁移。"
             }
         }
-        Write-Step "保存旧 Compose 快照"
-        $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-$PID"
-        $script:OldComposeBackup = Join-Path $backupDirectory "pre-upgrade-$stamp.compose.yml"
-        [IO.File]::Copy($script:ComposePath, $script:OldComposeBackup, $false)
-        Protect-PrivatePath $script:OldComposeBackup
-
-        # Exactly one data backup is created per upgrade: the quiesced
-        # snapshot taken right after the old stack stops writing.
-        $script:BackupPath = ""
-        Write-Host "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）。"
     }
-
-    Remove-StaleHostBackups $backupDirectory $backupRetention
 
     Write-Step "下载 $release Compose 并校验"
     $script:CandidateCompose = New-TemporarySibling $script:ComposePath "candidate"
@@ -1867,12 +2239,8 @@ function Invoke-MemoryPlatformInstall {
     foreach ($name in $imageEnvironmentNames) {
         $script:OriginalImageEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
     }
-    Test-CandidateCompose $script:CandidateCompose $script:CandidateEnvironment @{
-        "stack-init" = $initTag
-        "model-gateway" = $modelTag
-        "memory-gateway" = $memoryTag
-        "stack-maintenance" = $initTag
-    }
+    Test-CandidateComposeSyntax `
+        $script:CandidateCompose $script:CandidateEnvironment
 
     Write-Step "拉取三枚 semver 发布镜像"
     & docker compose --env-file $script:CandidateEnvironment `
@@ -1893,12 +2261,6 @@ function Invoke-MemoryPlatformInstall {
     }
     Write-CandidateEnvironment `
         $script:CandidateEnvironment $script:InitImage $modelImage $memoryImage
-    Test-CandidateCompose $script:CandidateCompose $script:CandidateEnvironment @{
-        "stack-init" = $script:InitImage
-        "model-gateway" = $modelImage
-        "memory-gateway" = $memoryImage
-        "stack-maintenance" = $script:InitImage
-    }
     $script:CandidateInternalOverride = `
         New-TemporarySibling $script:ComposePath "internal"
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
@@ -1908,9 +2270,95 @@ function Invoke-MemoryPlatformInstall {
         $utf8NoBom
     )
     Protect-PrivatePath $script:CandidateInternalOverride
-    Test-InternalOverrideCompose `
+    Write-Step "用候选 init 镜像校验 public/internal 安全拓扑"
+    Test-RenderedCandidateTopology `
         $script:CandidateCompose $script:CandidateInternalOverride `
-        $script:CandidateEnvironment
+        $script:CandidateEnvironment $script:InitImage $modelImage $memoryImage `
+        $credentialDirectory $true
+    Test-RenderedCandidateTopology `
+        $script:CandidateCompose $script:CandidateInternalOverride `
+        $script:CandidateEnvironment $script:InitImage $modelImage $memoryImage `
+        $credentialDirectory $false
+
+    $oldMemoryReadiness = "absent"
+    $oldModelReadiness = "absent"
+    if ($script:Layout -eq "split") {
+        $oldMemoryReadiness = Get-ExistingServiceReadiness `
+            $script:ComposePath "memory-gateway" `
+            "http://127.0.0.1:2026/readyz"
+        $oldModelReadiness = Get-ExistingServiceReadiness `
+            $script:ComposePath "model-gateway" `
+            "http://127.0.0.1:2030/readyz"
+    }
+    if ($oldMemoryReadiness -eq "unknown" -or
+        $oldModelReadiness -eq "unknown") {
+        Stop-Install ("无法可靠建立旧服务 readiness 基线" +
+            "（Memory=$oldMemoryReadiness, Model=$oldModelReadiness）；旧服务未停机。")
+    }
+
+    $candidateInitDigest = ConvertTo-ImageDigest $script:InitImage
+    $candidateModelDigest = ConvertTo-ImageDigest $modelImage
+    $candidateMemoryDigest = ConvertTo-ImageDigest $memoryImage
+    if (@($candidateInitDigest, $candidateModelDigest, $candidateMemoryDigest) `
+        -contains "-") {
+        Stop-Install "候选镜像 digest triple 无效。"
+    }
+    $candidateConfigDigest = Get-ManagedConfigDigest `
+        $script:CandidateCompose $script:CandidateEnvironment $true
+    $currentInitDigest = "-"
+    $currentModelDigest = "-"
+    $currentMemoryDigest = "-"
+    $currentConfigDigest = "-"
+    if ($script:Layout -eq "split") {
+        $currentInitDigest = Get-CurrentServiceDigest `
+            $script:ComposePath $environmentPath "" `
+            "MEMORY_PLATFORM_INIT_IMAGE"
+        $currentModelDigest = Get-CurrentServiceDigest `
+            $script:ComposePath $environmentPath "model-gateway" `
+            "MEMORY_PLATFORM_MODEL_IMAGE"
+        $currentMemoryDigest = Get-CurrentServiceDigest `
+            $script:ComposePath $environmentPath "memory-gateway" `
+            "MEMORY_PLATFORM_MEMORY_IMAGE"
+        $currentConfigDigest = Get-ManagedConfigDigest `
+            $script:ComposePath $environmentPath `
+            $script:EnvironmentSnapshotExists
+    }
+    Write-Step "生成 typed 安装计划"
+    $installPlan = Get-InstallPlan `
+        $candidateInitDigest $candidateModelDigest $candidateMemoryDigest `
+        $currentInitDigest $currentModelDigest $currentMemoryDigest `
+        $candidateConfigDigest $currentConfigDigest `
+        $oldMemoryReadiness $oldModelReadiness
+    $hostProbe = Get-HostProbeAddress $listenHost
+
+    if ($installPlan.Action -eq "noop") {
+        Write-Step "当前 digest、managed config 与健康状态已满足目标；跳过 cutover"
+        Invoke-ExistingInstallPlan `
+            $installPlan $environmentPath $credentialDirectory `
+            $hostProbe $port $release
+        return
+    }
+    if ($installPlan.Action -eq "repair") {
+        Write-Step ("仅修复退化服务（$($installPlan.RepairScope)），" +
+            "不创建全量备份或停止整栈")
+        Invoke-ExistingInstallPlan `
+            $installPlan $environmentPath $credentialDirectory `
+            $hostProbe $port $release
+        return
+    }
+
+    if ($script:Layout -eq "split") {
+        Write-Step "保存旧 Compose 快照"
+        $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-$PID"
+        $script:OldComposeBackup = `
+            Join-Path $backupDirectory "pre-upgrade-$stamp.compose.yml"
+        [IO.File]::Copy($script:ComposePath, $script:OldComposeBackup, $false)
+        Protect-PrivatePath $script:OldComposeBackup
+        # Exactly one data backup is created per upgrade: the quiesced
+        # snapshot taken right after the old stack stops writing.
+        $script:BackupPath = ""
+        Write-Host "    升级备份将在旧服务停写后创建（每次升级一份一致性备份）。"
+    }
     try {
         New-CutoverJournal
     } catch {
@@ -2021,11 +2469,20 @@ function Invoke-MemoryPlatformInstall {
             Stop-Install "候选内部 liveness 验收失败且自动回滚不完整。"
         }
     }
-    if ($script:Layout -ne "fresh") {
-        foreach ($check in @(
-            @{ Service = "memory-gateway"; Url = "http://127.0.0.1:2026/readyz" },
-            @{ Service = "model-gateway"; Url = "http://127.0.0.1:2030/readyz" }
-        )) {
+    $candidateReadinessChecks = @()
+    if ($installPlan.AcceptMemoryReadiness) {
+        $candidateReadinessChecks += @{
+            Service = "memory-gateway"
+            Url = "http://127.0.0.1:2026/readyz"
+        }
+    }
+    if ($installPlan.AcceptModelReadiness) {
+        $candidateReadinessChecks += @{
+            Service = "model-gateway"
+            Url = "http://127.0.0.1:2030/readyz"
+        }
+    }
+    foreach ($check in $candidateReadinessChecks) {
             if (-not (Wait-CandidateContainerHttp `
                 $script:ComposePath $script:CandidateInternalOverride `
                 $environmentPath ([string] $check.Service) ([string] $check.Url) 90)) {
@@ -2034,7 +2491,6 @@ function Invoke-MemoryPlatformInstall {
                 }
                 Stop-Install "候选内部 readiness 退化且自动回滚不完整。"
             }
-        }
     }
 
     $gatewayCredential = Resolve-CredentialFile $credentialDirectory "gateway"
@@ -2097,9 +2553,9 @@ function Invoke-MemoryPlatformInstall {
     if ($publishExitCode -ne 0) {
         Stop-Install "升级已提交但入口发布失败；不会回滚已接受的新数据，journal 已保留供重试。"
     }
-    if (-not (Wait-HttpEndpoint "http://127.0.0.1:$port/health" 180) -or
-        ($script:Layout -ne "fresh" -and
-         -not (Wait-HttpEndpoint "http://127.0.0.1:$port/readyz" 90))) {
+    if (-not (Wait-HttpEndpoint "http://${hostProbe}:$port/health" 180) -or
+        ($installPlan.AcceptHostReadiness -and
+         -not (Wait-HttpEndpoint "http://${hostProbe}:$port/readyz" 90))) {
         Stop-Install "升级已提交但宿主入口尚未就绪；不会回滚，journal 已保留供重试。"
     }
     $native = Invoke-NativeCapture {
@@ -2117,8 +2573,8 @@ function Invoke-MemoryPlatformInstall {
 
     Write-Host ""
     Write-Host "Memory Platform $release 已启动"
-    Write-Host "  Web Console:  http://127.0.0.1:$port/ui/"
-    Write-Host "  Client URL:   http://127.0.0.1:$port/v1"
+    Write-Host "  Web Console:  http://${hostProbe}:$port/ui/"
+    Write-Host "  Client URL:   http://${hostProbe}:$port/v1"
     Write-Host "  Model:        memory-auto"
     if ($listenHost -ne "127.0.0.1") {
         $lanIp = if ($listenHost -eq "0.0.0.0") { Get-FirstLanIp } else { $listenHost }
@@ -2137,9 +2593,12 @@ function Invoke-MemoryPlatformInstall {
     if (-not [string]::IsNullOrWhiteSpace($script:BackupPath)) {
         Write-Host "升级前备份：$($script:BackupPath)"
     }
+    # Prune only after the new archive exists and the upgrade has committed,
+    # so retention N means exactly N archives rather than N old + 1 new.
+    Remove-StaleHostBackups $backupDirectory $backupRetention
 
     if ([Environment]::GetEnvironmentVariable("MEMORY_NO_OPEN") -ne "1") {
-        try { Start-Process "http://127.0.0.1:$port/ui/" } catch { }
+        try { Start-Process "http://${hostProbe}:$port/ui/" } catch { }
     }
 }
 

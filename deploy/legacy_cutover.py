@@ -234,28 +234,6 @@ def digest_ref(tag: str) -> str:
     raise AssertionError("unreachable")
 
 
-VERIFY_ARCHIVE_SCRIPT = """
-import os, shutil, sqlite3, sys, tempfile, zipfile
-archive = zipfile.ZipFile("/backup/verify.zip")
-corrupt = archive.testzip()
-assert corrupt is None, f"CRC mismatch: {corrupt}"
-for member in archive.namelist():
-    if not member.endswith(".db"):
-        continue
-    with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".db", delete=False) as staged:
-        with archive.open(member) as source:
-            shutil.copyfileobj(source, staged)
-        staged_path = staged.name
-    connection = sqlite3.connect(staged_path)
-    try:
-        row = connection.execute("PRAGMA quick_check").fetchone()
-    finally:
-        connection.close()
-        os.unlink(staged_path)
-    assert row and row[0] == "ok", f"quick_check failed: {member}"
-"""
-
-
 def wait_http(url: str, attempts: int) -> bool:
     for _ in range(attempts):
         try:
@@ -463,12 +441,15 @@ def main() -> int:
             rollback_old_stack()
             fail("无法从只读旧单卷创建完整 v2 备份；旧卷未修改。")
         os.chmod(backup_path, 0o600)
-        # 复验：归档每个成员通过 ZIP CRC，且每个 SQLite 库重新打开后 quick_check=ok。
+        # 与两套安装器共用候选镜像中的权威 manifest/hash/schema/SQLite 校验器。
         verify_result = docker(
             "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true",
             "--mount", f"type=bind,source={backup_path},target=/backup/verify.zip,readonly",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=268435456",
-            "--entrypoint", "python", init_image, "-c", VERIFY_ARCHIVE_SCRIPT,
+            "--mount", "type=volume,target=/tmp,volume-nocopy",
+            "--entrypoint", "python", init_image,
+            "/usr/local/libexec/memory-platform/verify_backup.py",
+            "/backup/verify.zip",
         )
         if verify_result.returncode != 0:
             rollback_old_stack()

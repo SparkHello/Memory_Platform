@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import getpass
-import hmac
 import json
 import os
 from pathlib import Path
@@ -15,7 +14,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 import webbrowser
 
@@ -43,6 +42,15 @@ from app.stack_backup import (
     create_stack_backup,
     recover_interrupted_stack_restore,
     restore_stack_backup,
+)
+from app.stack_install import (
+    StackCredentialSink,
+    StackInstallCommandError,
+    StackInstallDataPaths,
+    apply_stack_install,
+    deliver_private_credential as _deliver_private_credential,
+    read_private_credential as _read_private_credential,
+    validate_stack_install_process_environment,
 )
 
 
@@ -190,11 +198,6 @@ def _add_stack_commands(subparsers: Any) -> None:
         help="首次 Console/admin 凭据的私有文件目录；默认用户配置目录/credentials",
     )
     install.add_argument(
-        "--defer-credential-delivery",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    install.add_argument(
         "--keep-backend-key",
         action="store_true",
         help="保留现有 backend key；默认安全轮换并同步两端",
@@ -335,40 +338,6 @@ def _cmd_init(args: Any, paths: CliPaths, project_root: Path) -> int:
     return 0
 
 
-# 自定义密钥的强度下限。这两枚密钥背后是全部记忆和供应商额度，一旦把服务绑到
-# 0.0.0.0 就直接暴露在网络上，所以用户自己指定的值也要过一道最低门槛。
-MIN_CUSTOM_KEY_LENGTH = 16
-CUSTOM_KEY_VARIABLES = (
-    "GATEWAY_API_KEY",
-    "GATEWAY_SIGNING_SECRET",
-)
-
-
-def _describe_weak_key(name: str, value: str) -> str:
-    """返回非空字符串表示该自定义密钥太弱，字符串本身就是给用户的说明。"""
-    if any(character.isspace() for character in value):
-        return f"{name} 不能包含空格、制表符或换行。"
-    if len(value) < MIN_CUSTOM_KEY_LENGTH:
-        return f"{name} 至少需要 {MIN_CUSTOM_KEY_LENGTH} 个字符，当前只有 {len(value)} 个。"
-    if len(set(value)) < 8:
-        return f"{name} 里不同字符太少，请使用更随机的值。"
-    return ""
-
-
-def _check_custom_keys(environment: dict[str, str]) -> int:
-    """在做任何安装动作之前校验用户自带的密钥，避免装到一半才失败。"""
-    for name in CUSTOM_KEY_VARIABLES:
-        value = environment.get(name, "").strip()
-        if not value or is_placeholder_value(value):
-            continue
-        problem = _describe_weak_key(name, value)
-        if problem:
-            print(problem, file=sys.stderr)
-            print("不设置该变量则自动生成一枚高强度密钥。", file=sys.stderr)
-            return 2
-    return 0
-
-
 def _stack_credential_directory(credential_dir: str, paths: CliPaths) -> Path:
     configured = credential_dir.strip()
     project_config = read_json(paths.project_file)
@@ -400,138 +369,6 @@ def _stack_credential_directory(credential_dir: str, paths: CliPaths) -> Path:
     return selected
 
 
-def _read_private_credential(path: Path) -> str:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise ValueError(f"首次凭据文件缺失：{path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"首次凭据必须是普通文件且不能是符号链接：{path}")
-    if metadata.st_size <= 0 or metadata.st_size > 16 * 1024:
-        raise ValueError(f"首次凭据文件大小无效：{path}")
-    if os.name == "posix" and hasattr(os, "geteuid"):
-        if metadata.st_uid != os.geteuid():
-            raise ValueError(f"首次凭据文件必须由当前用户持有：{path}")
-    try:
-        os.chmod(path, 0o600)
-        value = path.read_text(encoding="ascii").rstrip("\r\n")
-    except (OSError, UnicodeError) as exc:
-        raise ValueError(f"首次凭据文件无法安全读取：{path}") from exc
-    if not value or any(character in value for character in "\r\n\x00"):
-        raise ValueError(f"首次凭据文件内容无效：{path}")
-    return value
-
-
-def _deliver_private_credential(path: Path, value: str) -> None:
-    if (
-        not value
-        or len(value) > 16 * 1024
-        or not value.isascii()
-        or any(character in value for character in "\r\n\x00")
-    ):
-        raise ValueError("拒绝写入格式无效的首次凭据")
-    if path.exists() or path.is_symlink():
-        current = _read_private_credential(path)
-        if not hmac.compare_digest(current.encode("ascii"), value.encode("ascii")):
-            raise ValueError(f"首次凭据文件已存在且内容不同，拒绝覆盖：{path}")
-        return
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except FileExistsError:
-        current = _read_private_credential(path)
-        if not hmac.compare_digest(current.encode("ascii"), value.encode("ascii")):
-            raise ValueError(
-                f"首次凭据文件在写入期间被占用且内容不同，拒绝覆盖：{path}"
-            ) from None
-        return
-    created = True
-    try:
-        with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as handle:
-            descriptor = -1
-            handle.write(value)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            if hasattr(os, "fchmod"):
-                os.fchmod(handle.fileno(), 0o600)
-        created = False
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if created:
-            path.unlink(missing_ok=True)
-
-
-def _validate_first_console_credential(
-    store: AuthTokenStore,
-    credential_path: Path,
-    active_records: list[Any],
-) -> bool:
-    managed = [record for record in active_records if record.name == "first-console"]
-    if not managed:
-        return False
-    if len(managed) != 1:
-        raise ValueError("first-console 凭据状态不唯一，拒绝继续安装")
-    token = _read_private_credential(credential_path)
-    authenticated = store.authenticate(token)
-    if (
-        authenticated is None
-        or authenticated.token_id != managed[0].token_id
-        or authenticated.user_id != "default"
-        or authenticated.role != "console"
-    ):
-        raise ValueError("gateway.key 与 auth.db 中的 first-console 不匹配")
-    return True
-
-
-def _provision_stack_console_credential(
-    *,
-    paths: CliPaths,
-    project_root: Path,
-    credential_path: Path,
-    persisted_settings: dict[str, str],
-) -> tuple[Path | None, bool]:
-    """Provision only genuinely fresh installs; preserve explicit legacy migrations."""
-
-    legacy_value = persisted_settings.get("GATEWAY_API_KEY", "").strip()
-    legacy_flag = persisted_settings.get("GATEWAY_LEGACY_API_KEY_ENABLED", "").strip().lower()
-    legacy_explicitly_disabled = legacy_flag in {"0", "false", "no", "off"}
-    if legacy_value and not is_placeholder_value(legacy_value) and not legacy_explicitly_disabled:
-        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "true")
-        return None, False
-
-    store = _cli_auth_store(paths, project_root)
-    active = [record for record in store.list_tokens() if record.revoked_at is None]
-    if _validate_first_console_credential(store, credential_path, active):
-        update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
-        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
-        return credential_path, False
-
-    if active:
-        # An operator already manages scoped credentials explicitly. Never mint
-        # an extra console credential behind their back.
-        update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
-        update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
-        return None, False
-
-    created = store.create_token(
-        name="first-console",
-        user_id="default",
-        role="console",
-    )
-    try:
-        _deliver_private_credential(credential_path, created.token)
-    except Exception:
-        store.revoke_token(created.record.token_id)
-        raise
-    update_env_value(paths.settings_env, "GATEWAY_API_KEY", None)
-    update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
-    return credential_path, True
-
-
 def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     return _stack_install(
         paths=paths,
@@ -539,9 +376,29 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
         model_gateway_source=args.model_gateway_source,
         model_gateway_home=args.model_gateway_home,
         credential_dir=args.credential_dir,
-        defer_credential_delivery=bool(args.defer_credential_delivery),
         keep_backend_key=bool(args.keep_backend_key),
         start=bool(args.start),
+    )
+
+
+def _source_stack_data_paths(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    environment: Mapping[str, str],
+) -> StackInstallDataPaths:
+    auth_database = environment.get("AUTH_DATABASE_PATH", "").strip() or str(
+        paths.home / "auth.db"
+    )
+    return StackInstallDataPaths(
+        memory_database=environment.get("DATABASE_PATH", "").strip()
+        or "data/memory.db",
+        knowledge_database=environment.get("KNOWLEDGE_DATABASE_PATH", "").strip()
+        or "data/knowledge.db",
+        auth_database=auth_database,
+        auth_store=_resolve_runtime_path(project_root, auth_database),
+        evaluation_directory=environment.get("EVAL_DIR", "").strip() or "eval",
+        ui_directory=environment.get("UI_DIST_DIR", "").strip(),
     )
 
 
@@ -552,244 +409,49 @@ def _stack_install(
     model_gateway_source: str,
     model_gateway_home: str,
     credential_dir: str,
-    defer_credential_delivery: bool,
     keep_backend_key: bool,
     start: bool,
 ) -> int:
-    # 与 scripts/setup.sh 的 SECRET_ENV_NAMES 拒绝清单互为镜像；变更时同步对方。
-    forbidden_environment_secrets = [
-        name
-        for name in (
-            "GATEWAY_API_KEY",
-            "GATEWAY_SIGNING_SECRET",
-            "MODEL_GATEWAY_API_KEY",
-            "MEMORY_CONSOLE_ADMIN_KEY",
-        )
-        if os.environ.get(name, "").strip()
-    ]
-    if forbidden_environment_secrets:
-        print(
-            "拒绝从进程环境读取首次访问凭据："
-            + ", ".join(forbidden_environment_secrets),
-            file=sys.stderr,
-        )
-        print(
-            "请移除这些环境变量；fresh install 会把随机凭据仅写入 0600 文件。",
-            file=sys.stderr,
-        )
-        return 2
+    validate_stack_install_process_environment()
     ensure_initialized(paths, project_root)
     environment = effective_environment(paths, project_root)
-    custom_key_problem = _check_custom_keys(environment)
-    if custom_key_problem:
-        return custom_key_problem
-    persisted_settings = read_env_file(paths.settings_env)
-    defer_credentials = defer_credential_delivery
-    credential_directory = (
-        None if defer_credentials else _stack_credential_directory(credential_dir, paths)
-    )
-    gateway_credential_path = (
-        credential_directory / "gateway.key" if credential_directory else None
-    )
-    admin_credential_path = (
-        credential_directory / "admin.key" if credential_directory else None
-    )
-    persisted_legacy = persisted_settings.get("GATEWAY_API_KEY", "").strip()
-    legacy_flag = persisted_settings.get(
-        "GATEWAY_LEGACY_API_KEY_ENABLED", ""
-    ).strip().lower()
-    legacy_migration = bool(
-        persisted_legacy
-        and not is_placeholder_value(persisted_legacy)
-        and legacy_flag not in {"0", "false", "no", "off"}
-    )
-    active_access_tokens = False
-    if not defer_credentials and not legacy_migration:
-        access_store = _cli_auth_store(paths, project_root)
-        active_records = [
-            record for record in access_store.list_tokens() if record.revoked_at is None
-        ]
-        active_access_tokens = bool(active_records)
-        if gateway_credential_path is not None and _validate_first_console_credential(
-            access_store,
-            gateway_credential_path,
-            active_records,
-        ):
-            if admin_credential_path is None or not admin_credential_path.exists():
-                raise ValueError("安全 scoped 安装缺少 admin.key；拒绝修改现有接线")
-            _read_private_credential(admin_credential_path)
-    fresh_access_install = (
-        not defer_credentials and not legacy_migration and not active_access_tokens
+    credential_directory = _stack_credential_directory(credential_dir, paths)
+    credential_sink = StackCredentialSink(
+        gateway_path=credential_directory / "gateway.key",
+        admin_path=credential_directory / "admin.key",
+        read=_read_private_credential,
+        deliver=_deliver_private_credential,
     )
     modelgw = _ensure_model_gateway_runtime(
         project_root,
         model_gateway_source=model_gateway_source,
     )
     model_home = _resolve_model_gateway_home(model_gateway_home)
-    if _run_modelgw(modelgw, model_home, ["init"]):
-        return 1
-
-    clients = _modelgw_json(modelgw, model_home, ["client", "list"])
-    client_by_id = {
-        str(item.get("id") or ""): item
-        for item in clients
-        if isinstance(item, dict) and item.get("id")
-    }
-    backend = client_by_id.get("memory-gateway")
-    backend_routes = (
-        set(str(item) for item in backend.get("allowed_routes") or [])
-        if isinstance(backend, dict)
-        else set()
-    )
-    required_backend_routes = list(
-        dict.fromkeys(
-            environment.get(name, default).strip() or default
-            for name, default in (
-                ("MODEL_GATEWAY_CHAT_MODEL", "memory.chat"),
-                ("MODEL_GATEWAY_MEMORY_EXTRACT_MODEL", "memory.extract"),
-                ("MODEL_GATEWAY_MEMORY_COMPACT_MODEL", "memory.compact"),
-                ("MODEL_GATEWAY_MEMORY_CORE_MODEL", "memory.core"),
-                ("MODEL_GATEWAY_MEMORY_REVIEW_MODEL", "memory.review"),
-                ("MODEL_GATEWAY_KNOWLEDGE_FAST_MODEL", "knowledge.fast"),
-                ("MODEL_GATEWAY_KNOWLEDGE_PRO_MODEL", "knowledge.pro"),
-                ("MODEL_GATEWAY_EMBEDDING_MODEL", "memory.embedding"),
-            )
-        )
-    )
-    if (
-        not isinstance(backend, dict)
-        or backend.get("kind") != "backend"
-        or not backend.get("enabled", True)
-        or backend_routes != set(required_backend_routes)
-        or backend.get("allow_direct_deployments", False)
-    ):
-        client_arguments = [
-            "client",
-            "add",
-            "memory-gateway",
-            "--kind",
-            "backend",
-        ]
-        for route_id in required_backend_routes:
-            client_arguments.extend(["--route", route_id])
-        client_arguments.append("--replace")
-        result = _run_modelgw(
-            modelgw,
-            model_home,
-            client_arguments,
-        )
-        if result:
-            return result
-
-    admin = client_by_id.get("memory-console-admin")
-    admin_needs_secret = (
-        not isinstance(admin, dict)
-        or not admin.get("secret_configured")
-        or (
-            fresh_access_install
-            and admin_credential_path is not None
-            and not admin_credential_path.exists()
-        )
-    )
-    if (
-        not isinstance(admin, dict)
-        or admin.get("kind") != "admin"
-        or not admin.get("enabled", True)
-    ):
-        result = _run_modelgw(
-            modelgw,
-            model_home,
-            [
-                "client",
-                "add",
-                "memory-console-admin",
-                "--kind",
-                "admin",
-                "--route",
-                "*",
-                "--replace",
-            ],
-        )
-        if result:
-            return result
-        admin_needs_secret = True
-
-    environment = effective_environment(paths, project_root)
-    backend_key = environment.get("MODEL_GATEWAY_API_KEY", "").strip()
-    if not keep_backend_key or not backend_key or is_placeholder_value(backend_key):
-        backend_key = secrets.token_urlsafe(48)
-    result = _run_modelgw(
-        modelgw,
-        model_home,
-        ["secret", "set", "memory-gateway", "--stdin", "--no-check"],
-        input_text=backend_key + "\n",
-        quiet=True,
-    )
-    if result:
-        return result
-
-    # Model 管理密钥与 Memory 的 scoped Console token 独立生成。明文仅交付到
-    # 用户指定的 0600 文件；命令输出、项目目录和服务进程环境都不得包含它。
-    admin_key = ""
-    if admin_needs_secret:
-        admin_key = secrets.token_urlsafe(48)
-        if admin_credential_path is not None and (
-            admin_credential_path.exists() or admin_credential_path.is_symlink()
-        ):
-            existing_admin = _read_private_credential(admin_credential_path)
-            if not hmac.compare_digest(
-                existing_admin.encode("ascii"),
-                admin_key.encode("ascii"),
-            ):
-                raise ValueError(
-                    "admin.key 已存在且无法与待配置密钥匹配，拒绝轮换或覆盖"
-                )
-        result = _run_modelgw(
-            modelgw,
-            model_home,
-            ["secret", "set", "memory-console-admin", "--stdin", "--no-check"],
-            input_text=admin_key + "\n",
-            quiet=True,
-        )
-        if result:
-            return result
-        if admin_credential_path is not None:
-            _deliver_private_credential(admin_credential_path, admin_key)
-
-    config = _read_model_gateway_config(model_home)
+    config = _read_model_gateway_config(model_home) if (model_home / "config.json").is_file() else {}
     server = config.get("server") if isinstance(config.get("server"), dict) else {}
     port = int(server.get("port") or 2030)
-    update_env_value(paths.settings_env, "MODEL_GATEWAY_BASE_URL", f"http://127.0.0.1:{port}/v1")
-    update_env_value(paths.settings_env, "MODEL_GATEWAY_API_KEY", backend_key)
-    embedding_space = _model_gateway_embedding_space(config)
-    if embedding_space:
-        update_env_value(
-            paths.settings_env,
-            "MODEL_GATEWAY_EMBEDDING_SPACE_ID",
-            embedding_space,
-        )
-
-    console_credential_path: Path | None = None
-    console_credential_generated = False
-    if gateway_credential_path is not None:
-        console_credential_path, console_credential_generated = (
-            _provision_stack_console_credential(
+    try:
+        result = apply_stack_install(
+            layout="source",
+            paths=paths,
+            project_root=project_root,
+            modelgw=modelgw,
+            model_gateway_home=model_home,
+            model_gateway_base_url=f"http://127.0.0.1:{port}/v1",
+            data_paths=_source_stack_data_paths(
                 paths=paths,
                 project_root=project_root,
-                credential_path=gateway_credential_path,
-                persisted_settings=persisted_settings,
-            )
+                environment=environment,
+            ),
+            credential_sink=credential_sink,
+            keep_backend_key=keep_backend_key,
         )
-    if (
-        console_credential_path is not None
-        and admin_credential_path is not None
-        and not admin_credential_path.exists()
-    ):
-        raise ValueError(
-            "安全 scoped 安装缺少 admin.key；拒绝报告安装完成"
+    except StackInstallCommandError as exc:
+        print(
+            f"Model Gateway 安装命令失败（exit={exc.returncode}）。",
+            file=sys.stderr,
         )
-    if admin_credential_path is not None and admin_credential_path.exists():
-        _read_private_credential(admin_credential_path)
+        return exc.returncode
 
     memory_port = int(read_json(paths.project_file).get("port") or 2026)
     # 在容器里 uvicorn 固定绑 2026，宿主机映射到哪个端口只有 compose 知道。用户
@@ -800,7 +462,7 @@ def _stack_install(
     if declared_public.isdigit():
         public_port = declared_public
     print("双服务运行栈已经安装并安全接线。")
-    print(f"Model Gateway 配置：{model_home}")
+    print(f"Model Gateway 配置：{result.model_gateway_home}")
     print("backend key 已在两端同步，值未显示，也未写入项目 .env。")
     print("")
     print("接入信息")
@@ -808,24 +470,24 @@ def _stack_install(
     print(f"Web Console            http://127.0.0.1:{public_port}/ui/")
     print(f"OpenAI 兼容 base URL   http://127.0.0.1:{public_port}/v1")
     print(f"MCP                    http://127.0.0.1:{public_port}/mcp")
-    print(f"Model Gateway base URL http://127.0.0.1:{port}/v1")
+    print(f"Model Gateway base URL {result.model_gateway_base_url}")
     print("                       ↑ 内部接线地址，不要填进客户端")
-    if console_credential_path is not None:
+    if result.console_credential_path is not None:
         print("")
-        action = "已生成" if console_credential_generated else "已校验"
+        action = "已生成" if result.console_credential_generated else "已校验"
         print(f"{action} scoped Console token；明文未显示：")
-        print(f"  {console_credential_path}")
+        print(f"  {result.console_credential_path}")
         print("聊天/MCP 客户端请分别用 `memgw token create --role chat|mcp` 创建。")
-    elif legacy_migration:
+    elif result.legacy_migration:
         print("")
         print("检测到旧版 GATEWAY_API_KEY，已保留一个版本的 legacy 兼容；值未显示。")
         print("建议为设备创建 scoped token 后禁用 legacy 兼容。")
-    elif not defer_credentials:
+    elif result.existing_scoped_tokens:
         print("")
         print("已有用户管理的 scoped token，安装未额外生成 Console token。")
-    if admin_credential_path is not None and admin_credential_path.exists():
+    if result.admin_credential_path is not None:
         print("Model Gateway admin key 明文未显示：")
-        print(f"  {admin_credential_path}")
+        print(f"  {result.admin_credential_path}")
     if start:
         return _stack_restart(
             paths=paths,
@@ -1100,7 +762,6 @@ def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
         model_gateway_source=args.model_gateway_source,
         model_gateway_home=args.model_gateway_home,
         credential_dir="",
-        defer_credential_delivery=False,
         keep_backend_key=False,
         start=False,
     )
@@ -1897,44 +1558,11 @@ def _run_modelgw(
     return int(result.returncode)
 
 
-def _modelgw_json(modelgw: Path, home: Path, arguments: list[str]) -> list[Any]:
-    result = subprocess.run(
-        [*_modelgw_base_command(modelgw, home), "--json", *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode:
-        raise ValueError((result.stderr or result.stdout or "Model Gateway 命令失败").strip())
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Model Gateway 返回了无效 JSON") from exc
-    if not isinstance(payload, list):
-        raise ValueError("Model Gateway JSON 响应格式无效")
-    return payload
-
-
 def _read_model_gateway_config(home: Path) -> dict[str, Any]:
     config_path = home / "config.json"
     if not config_path.is_file():
         raise ValueError(f"Model Gateway 配置不存在：{config_path}")
     return read_json(config_path)
-
-
-def _model_gateway_embedding_space(config: dict[str, Any]) -> str:
-    routes = config.get("routes")
-    deployments = config.get("deployments")
-    if not isinstance(routes, dict) or not isinstance(deployments, dict):
-        return ""
-    route = routes.get("memory.embedding")
-    if not isinstance(route, dict):
-        return ""
-    targets = route.get("targets")
-    if not isinstance(targets, list) or not targets:
-        return ""
-    deployment = deployments.get(str(targets[0]))
-    return str(deployment.get("embedding_space") or "") if isinstance(deployment, dict) else ""
 
 
 def _model_gateway_health_ok(home: Path) -> bool:

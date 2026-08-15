@@ -7,17 +7,22 @@ are delivered as mode-0600 host files instead.
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import hmac
 import secrets
 import stat
-import subprocess
 import sys
 
-from app.cli_config import cli_paths, read_env_file, update_env_value
-from app.auth.tokens import AuthTokenStore
-from model_gateway.config_store import gateway_paths, load_config, read_secrets
+from app.stack_install import (
+    StackCredentialSink,
+    StackInstallCommandError,
+    StackInstallDataPaths,
+    apply_stack_install,
+)
+from app.cli_config import cli_paths
 
 
 MEMORY_UID = 10001
@@ -33,6 +38,8 @@ MODEL_MARKER = MODEL_DATA / ".stack-installed-v2"
 # (UTI com.apple.iwork.keynote.sffkey). Legacy .key remains accepted for upgrades.
 GATEWAY_CREDENTIAL_NAMES = ("gateway.txt", "gateway.key")
 ADMIN_CREDENTIAL_NAMES = ("admin.txt", "admin.key")
+MODELGW = Path("/usr/local/bin/modelgw")
+PROJECT_ROOT = Path("/app/services/memory-gateway")
 
 
 def main() -> int:
@@ -61,8 +68,10 @@ def main() -> int:
         _secure_tree(MEMORY_SECRETS, MEMORY_UID)
         _secure_tree(MODEL_DATA, MODEL_UID)
         _secure_tree(MODEL_SECRETS, MODEL_UID)
-        _secure_credentials()
-        _validate_published_credentials()
+        missing = _secure_credentials(require_complete=False)
+        missing.extend(_validate_published_credentials(require_complete=False))
+        if missing:
+            _warn_missing_published_credentials(sorted(set(missing)))
         return 0
 
     for directory in (
@@ -75,90 +84,43 @@ def main() -> int:
         directory.mkdir(parents=True, exist_ok=True)
         directory.chmod(0o700)
 
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "MEMGW_HOME": str(MEMORY_DATA / "config"),
-            "MEMGW_SETTINGS_PATH": str(MEMORY_SECRETS / "settings.env"),
-            "MEMGW_PROJECT_ROOT": "/app/services/memory-gateway",
-            "MODEL_GATEWAY_HOME": str(MODEL_DATA),
-            "MODEL_GATEWAY_SECRETS_PATH": str(MODEL_SECRETS / "secrets.env"),
-        }
+    paths = replace(
+        cli_paths(MEMORY_DATA / "config"),
+        settings_env=MEMORY_SECRETS / "settings.env",
     )
-    # Generated values must not enter container logs even temporarily.  The
-    # command writes them straight into the two private stores; output is
-    # discarded and errors are reported only by return code.
-    result = subprocess.run(
-        [
-            "memgw",
-            "--home",
-            str(MEMORY_DATA / "config"),
-            "--project-root",
-            "/app/services/memory-gateway",
-            "stack",
-            "install",
-            "--model-gateway-home",
-            str(MODEL_DATA),
-            # This one-shot initializer provisions the final auth.db and
-            # host-mounted credential files after rewriting container paths.
-            # Avoid minting a second source-layout token in config/auth.db.
-            "--defer-credential-delivery",
-        ],
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+    credential_sink = StackCredentialSink(
+        gateway_path=_credential_write_path(GATEWAY_CREDENTIAL_NAMES),
+        admin_path=_credential_write_path(ADMIN_CREDENTIAL_NAMES),
+        read=_read_credential_path,
+        deliver=_deliver_once,
     )
-    if result.returncode:
+    try:
+        apply_stack_install(
+            layout="docker",
+            paths=paths,
+            project_root=PROJECT_ROOT,
+            modelgw=MODELGW,
+            model_gateway_home=MODEL_DATA,
+            model_gateway_base_url="http://model-gateway:2030/v1",
+            data_paths=StackInstallDataPaths(
+                memory_database="/data/memory.db",
+                knowledge_database="/data/knowledge.db",
+                auth_database="/data/auth.db",
+                auth_store=MEMORY_DATA / "auth.db",
+                evaluation_directory="/data/eval",
+                ui_directory="/app/ui/dist",
+                model_gateway_secrets=MODEL_SECRETS / "secrets.env",
+            ),
+            credential_sink=credential_sink,
+            keep_backend_key=False,
+        )
+    except StackInstallCommandError as exc:
         print(
-            f"离线初始化失败（exit={result.returncode}）；未输出任何密钥。",
+            f"离线初始化失败（exit={exc.returncode}）；未输出任何密钥。",
             file=sys.stderr,
         )
-        return result.returncode
+        return exc.returncode
 
-    paths = cli_paths(MEMORY_DATA / "config")
-    runtime_settings = {
-        "MODEL_GATEWAY_BASE_URL": "http://model-gateway:2030/v1",
-        "MODEL_GATEWAY_ALLOW_PRIVATE_HTTP": "true",
-        # These values are consumed by the long-lived Memory container, where
-        # its private data volume is mounted at /data (not /memory-data, the
-        # initializer's cross-volume mount point).
-        "DATABASE_PATH": "/data/memory.db",
-        "KNOWLEDGE_DATABASE_PATH": "/data/knowledge.db",
-        "AUTH_DATABASE_PATH": "/data/auth.db",
-        "EVAL_DIR": "/data/eval",
-        "UI_DIST_DIR": "/app/ui/dist",
-    }
-    for name, value in runtime_settings.items():
-        update_env_value(paths.settings_env, name, value)
-    current = read_env_file(paths.settings_env)
-    if not current.get("GATEWAY_SIGNING_SECRET", "").strip():
-        update_env_value(
-            paths.settings_env,
-            "GATEWAY_SIGNING_SECRET",
-            secrets.token_urlsafe(48),
-        )
-
-    _provision_first_console_token(
-        settings_path=paths.settings_env,
-        auth_database_path=MEMORY_DATA / "auth.db",
-        credential_path=_credential_write_path(GATEWAY_CREDENTIAL_NAMES),
-    )
-    model_paths = gateway_paths(MODEL_DATA)
-    config = load_config(model_paths.config)
-    admin_client = config.clients.get("memory-console-admin")
-    model_secrets = read_secrets(model_paths.secrets)
-    admin_key = (
-        model_secrets.get(admin_client.secret_ref, "").strip()
-        if admin_client is not None
-        else ""
-    )
-    if not admin_key:
-        print("初始化未生成完整凭据；拒绝发布半成品标记。", file=sys.stderr)
-        return 3
-
-    _deliver_once(_credential_write_path(ADMIN_CREDENTIAL_NAMES), admin_key)
     # settings.env.bak can contain live backend/gateway material and is not a
     # supported recovery mechanism; the portable backup intentionally excludes
     # secrets.  Remove this convenience copy before publishing the volumes.
@@ -166,14 +128,15 @@ def main() -> int:
         missing_ok=True
     )
 
-    transaction_id = secrets.token_hex(16)
-    _write_marker(MEMORY_MARKER, transaction_id)
-    _write_marker(MODEL_MARKER, transaction_id)
     _secure_tree(MEMORY_DATA, MEMORY_UID)
     _secure_tree(MEMORY_SECRETS, MEMORY_UID)
     _secure_tree(MODEL_DATA, MODEL_UID)
     _secure_tree(MODEL_SECRETS, MODEL_UID)
     _secure_credentials()
+    _validate_published_credentials()
+    transaction_id = secrets.token_hex(16)
+    _write_marker(MEMORY_MARKER, transaction_id)
+    _write_marker(MODEL_MARKER, transaction_id)
     print(
         "离线初始化完成；访问凭据已写入 Compose 工作目录下的 "
         "credentials/gateway.txt 与 credentials/admin.txt。"
@@ -207,53 +170,14 @@ def _deliver_once(path: Path, value: str) -> None:
     _fsync_directory_no_follow(path.parent)
 
 
-def _provision_first_console_token(
-    *,
-    settings_path: Path,
-    auth_database_path: Path,
-    credential_path: Path,
-) -> None:
-    """Provision the sole fresh-install console credential.
-
-    Legacy volumes use ``migrate_legacy.py`` and intentionally retain their
-    one-version all-scope key. This initializer handles only a fresh volume.
-    """
-
-    store = AuthTokenStore(auth_database_path)
-    store.init_db()
-    active = [record for record in store.list_tokens() if record.revoked_at is None]
+def _read_credential_path(path: Path) -> str:
+    descriptor = _open_regular_no_follow(path, os.O_RDONLY)
     try:
-        descriptor = _open_regular_no_follow(credential_path, os.O_RDONLY)
-    except FileNotFoundError:
-        descriptor = None
-    if descriptor is not None:
-        try:
-            token = _read_credential_descriptor(descriptor)
-            os.fchmod(descriptor, 0o600)
-        finally:
-            os.close(descriptor)
-        record = store.authenticate(token)
-        if (
-            record is None
-            or record.name != "first-console"
-            or record.user_id != "default"
-            or record.role != "console"
-            or len(active) != 1
-            or active[0].token_id != record.token_id
-        ):
-            raise RuntimeError("initial console credential does not match auth database")
-    else:
-        if active:
-            raise RuntimeError("fresh auth database already contains active tokens")
-        created = store.create_token(
-            name="first-console",
-            user_id="default",
-            role="console",
-        )
-        _deliver_once(credential_path, created.token)
-
-    update_env_value(settings_path, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
-    update_env_value(settings_path, "GATEWAY_API_KEY", None)
+        value = _read_credential_descriptor(descriptor)
+        os.fchmod(descriptor, 0o600)
+        return value
+    finally:
+        os.close(descriptor)
 
 
 def _secure_tree(root: Path, owner: int) -> None:
@@ -282,19 +206,21 @@ def _resolve_credential_path(names: tuple[str, ...]) -> Path | None:
     """First non-empty regular file among preferred and legacy names."""
     for name in names:
         path = CREDENTIALS / name
-        if _is_nonempty_regular_no_follow(path):
-            return path
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        descriptor = _open_regular_no_follow(path, os.O_RDONLY)
+        try:
+            if os.fstat(descriptor).st_size <= 0:
+                raise RuntimeError("credential file has invalid format")
+        finally:
+            os.close(descriptor)
+        return path
     return None
 
 
-def _require_credential_path(names: tuple[str, ...], *, label: str) -> Path:
-    path = _resolve_credential_path(names)
-    if path is None:
-        raise RuntimeError(_missing_credential_message(label))
-    return path
-
-
-def _secure_credentials() -> None:
+def _secure_credentials(*, require_complete: bool = True) -> list[str]:
     uid = _bounded_id(os.getenv("HOST_UID", ""))
     gid = _bounded_id(os.getenv("HOST_GID", ""))
     directory = CREDENTIALS.lstat()
@@ -303,24 +229,35 @@ def _secure_credentials() -> None:
     CREDENTIALS.chmod(0o700)
     if uid is not None and gid is not None:
         os.chown(CREDENTIALS, uid, gid)
+    missing: list[str] = []
     for names, label in (
         (GATEWAY_CREDENTIAL_NAMES, "gateway"),
         (ADMIN_CREDENTIAL_NAMES, "admin"),
     ):
-        path = _require_credential_path(names, label=label)
+        path = _resolve_credential_path(names)
+        if path is None:
+            if require_complete:
+                raise RuntimeError(_missing_credential_message(label))
+            missing.append(label)
+            continue
         # Harden every present alias (.txt and legacy .key) so neither stays world-readable.
         for name in names:
             candidate = CREDENTIALS / name
-            if not _is_nonempty_regular_no_follow(candidate):
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
                 continue
             descriptor = _open_regular_no_follow(candidate, os.O_RDONLY)
             try:
+                if os.fstat(descriptor).st_size <= 0:
+                    raise RuntimeError("credential file has invalid format")
                 os.fchmod(descriptor, 0o600)
                 if uid is not None and gid is not None:
                     os.fchown(descriptor, uid, gid)
             finally:
                 os.close(descriptor)
         _ = path  # ensure resolve succeeded
+    return missing
 
 
 def _missing_credential_message(label: str) -> str:
@@ -333,7 +270,7 @@ def _missing_credential_message(label: str) -> str:
     )
 
 
-def _validate_published_credentials() -> None:
+def _validate_published_credentials(*, require_complete: bool = True) -> list[str]:
     uid = _bounded_id(os.getenv("HOST_UID", ""))
     gid = _bounded_id(os.getenv("HOST_GID", ""))
     directory = CREDENTIALS.lstat()
@@ -343,11 +280,17 @@ def _validate_published_credentials() -> None:
         directory.st_uid != uid or directory.st_gid != gid
     ):
         raise RuntimeError("published credential directory ownership is invalid")
+    missing: list[str] = []
     for names, label in (
         (GATEWAY_CREDENTIAL_NAMES, "gateway"),
         (ADMIN_CREDENTIAL_NAMES, "admin"),
     ):
-        path = _require_credential_path(names, label=label)
+        path = _resolve_credential_path(names)
+        if path is None:
+            if require_complete:
+                raise RuntimeError(_missing_credential_message(label))
+            missing.append(label)
+            continue
         descriptor = _open_regular_no_follow(path, os.O_RDONLY)
         try:
             metadata = os.fstat(descriptor)
@@ -359,6 +302,25 @@ def _validate_published_credentials() -> None:
                 raise RuntimeError("published credential ownership is invalid")
         finally:
             os.close(descriptor)
+    return missing
+
+
+def _warn_missing_published_credentials(missing: list[str]) -> None:
+    warning = {
+        "level": "warning",
+        "code": "host_credential_delivery_missing",
+        "missing": [f"{label}.txt" for label in missing],
+        "message": "初始化 marker 已完成；内部凭据保持有效，服务将继续启动。",
+        "reset_hint": (
+            "参见 docs/stack-operations.md 的“安装目录丢失但数据卷仍在”："
+            "Console 用 stack-maintenance token create --role console 重建，"
+            "admin 用 modelgw secret set memory-console-admin --stdin 重设。"
+        ),
+    }
+    print(
+        json.dumps(warning, ensure_ascii=False, separators=(",", ":")),
+        file=sys.stderr,
+    )
 
 
 def _bounded_id(value: str) -> int | None:
@@ -374,12 +336,7 @@ def _installation_complete() -> bool:
         MODEL_DATA / "config.json",
         MODEL_SECRETS / "secrets.env",
     )
-    if not all(_is_nonempty_regular_no_follow(path) for path in required_paths):
-        return False
-    return (
-        _resolve_credential_path(GATEWAY_CREDENTIAL_NAMES) is not None
-        and _resolve_credential_path(ADMIN_CREDENTIAL_NAMES) is not None
-    )
+    return all(_is_nonempty_regular_no_follow(path) for path in required_paths)
 
 
 _MAX_CREDENTIAL_BYTES = 512

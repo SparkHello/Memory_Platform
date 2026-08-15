@@ -93,4 +93,6 @@ COPY deploy/migrate_legacy.py /usr/local/libexec/memory-platform/migrate_legacy.
 COPY deploy/backup_legacy.py /usr/local/libexec/memory-platform/backup_legacy.py
 COPY deploy/restore_split.py /usr/local/libexec/memory-platform/restore_split.py
 COPY deploy/validate_compose.py /usr/local/libexec/memory-platform/validate_compose.py
+COPY deploy/plan_install.py /usr/local/libexec/memory-platform/plan_install.py
+COPY deploy/verify_backup.py /usr/local/libexec/memory-platform/verify_backup.py
 ENTRYPOINT ["python", "/usr/local/libexec/memory-platform/init_stack.py"]
