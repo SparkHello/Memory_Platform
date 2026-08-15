@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
-import hashlib
 import json
 import math
 from pathlib import Path
 import sqlite3
-import shutil
-import sys
-from urllib.parse import quote
 
-from app.memory.redaction import redact_memory_payload
+from app.memory import evaluation_workspace as workspace
 from app.memory.search import (
     EmbeddingClient,
     MemorySearchService,
@@ -21,18 +15,19 @@ from app.memory.search import (
     RECALL_CANDIDATE_POOL,
     _memory_is_locally_sensitive,
 )
-from app.memory.store import MemoryStore, ClosingSQLiteConnection
 
+
+EMBEDDING_RESULT_NAME = workspace.EMBEDDING_RESULT_NAME
+KEYWORD_RESULT_NAME = workspace.KEYWORD_RESULT_NAME
+LABELS_NAME = workspace.LABELS_NAME
+PREVIEW_NAME = workspace.PREVIEW_NAME
+SNAPSHOT_NAME = workspace.SNAPSHOT_NAME
+SNAPSHOT_POINTER_NAME = workspace.SNAPSHOT_POINTER_NAME
+SNAPSHOT_PREFIX = workspace.SNAPSHOT_PREFIX
+delete_user_eval_workspace = workspace.delete_user_eval_workspace
+_user_eval_dir = workspace.user_eval_dir
 
 DEFAULT_EVAL_DIR = "eval"
-SNAPSHOT_NAME = "eval_snapshot.db"
-SNAPSHOT_PREFIX = "eval_snapshot_"
-SNAPSHOT_POINTER_NAME = "current_snapshot.txt"
-PREVIEW_NAME = "memories_preview.tsv"
-LABELS_NAME = "labels.jsonl"
-KEYWORD_RESULT_NAME = "last_keyword_result.json"
-EMBEDDING_RESULT_NAME = "last_embedding_result.json"
-USER_WORKSPACES_NAME = "users"
 
 LABEL_JUDGMENTS = {"unlabeled", "relevant", "no_answer"}
 BLOCKING_LABEL_ISSUE_CODES = {
@@ -77,67 +72,6 @@ class Verdict:
 
 class EvaluationError(ValueError):
     pass
-
-
-class _EvaluationMemoryStore(MemoryStore):
-    """Read-only store whose context-managed connections actually close."""
-
-    def _connect(self) -> sqlite3.Connection:
-        resolved = Path(self.database_path).resolve()
-        uri_path = quote(resolved.as_posix(), safe="/:")
-        connection = sqlite3.connect(
-            f"file:{uri_path}?mode=ro",
-            uri=True,
-            factory=ClosingSQLiteConnection,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        return connection
-
-
-def delete_user_eval_workspace(
-    eval_dir: str | Path,
-    *,
-    user_id: str,
-) -> dict[str, int | bool]:
-    """Remove snapshots and labels that may retain a permanently deleted memory."""
-    eval_path = Path(eval_dir)
-    user_path = _user_eval_dir(eval_path, user_id=user_id)
-    workspace_removed = user_path.exists()
-    if workspace_removed:
-        shutil.rmtree(user_path)
-
-    legacy_names = {
-        SNAPSHOT_POINTER_NAME,
-        PREVIEW_NAME,
-        LABELS_NAME,
-        KEYWORD_RESULT_NAME,
-        EMBEDDING_RESULT_NAME,
-    }
-    legacy_removed = 0
-    for path in (eval_path / name for name in legacy_names):
-        if not path.is_file():
-            continue
-        path.unlink()
-        legacy_removed += 1
-
-    legacy_databases = {eval_path / SNAPSHOT_NAME}
-    for path in eval_path.glob(f"{SNAPSHOT_PREFIX}*.db*"):
-        raw_path = str(path)
-        for suffix in ("-wal", "-shm", "-journal"):
-            if raw_path.endswith(suffix):
-                raw_path = raw_path[: -len(suffix)]
-                break
-        legacy_databases.add(Path(raw_path))
-    for database_path in legacy_databases:
-        legacy_removed += _unlink_sqlite_database(
-            database_path,
-            ignore_permission_error=False,
-        )
-    return {
-        "workspace_removed": workspace_removed,
-        "legacy_artifacts_removed": legacy_removed,
-    }
 
 
 def run_diagnosis(
@@ -224,63 +158,28 @@ def init_eval(
     user_id: str = "default",
 ) -> dict[str, object]:
     """创建只包含单个用户数据的快照，并生成该用户独立的评测工作区。"""
-    source_path = Path(source_db)
-    if not source_path.exists():
-        return {"error": f"Source database does not exist: {source_path}"}
-
-    out_dir = _user_eval_dir(eval_dir, user_id=user_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = _new_snapshot_path(out_dir)
-    preview_path = out_dir / PREVIEW_NAME
-    labels_path = out_dir / LABELS_NAME
-
-    _snapshot_readonly(source_path, snapshot_path, user_id=user_id)
-
-    user_counts, preview_rows = _read_snapshot_overview(
-        snapshot_path,
-        user_id=user_id,
-    )
-    _write_preview(preview_path, preview_rows)
-    _write_current_snapshot_pointer(out_dir, snapshot_path)
-    _cleanup_old_snapshots(out_dir, current_snapshot=snapshot_path)
-    _invalidate_eval_results(out_dir)
-
-    labels_created = False
-    if not labels_path.exists():
-        labels_path.write_text(LABELS_TEMPLATE, encoding="utf-8")
-        labels_created = True
-
-    return {
-        "snapshot": str(snapshot_path),
-        "preview": str(preview_path),
-        "labels": str(labels_path),
-        "labels_created": labels_created,
-        "memory_count": len(preview_rows),
-        "user_counts": user_counts,
-        "user_id": user_id,
-    }
+    with workspace.evaluation_workspace_lock(eval_dir):
+        workspace.prepare_evaluation_workspace_mutation(
+            eval_dir,
+            database_path=source_db,
+        )
+        return workspace.initialize_eval_workspace(
+            source_db=source_db,
+            eval_dir=eval_dir,
+            user_id=user_id,
+            labels_template=LABELS_TEMPLATE,
+            candidate_pool=RECALL_CANDIDATE_POOL,
+            is_locally_sensitive=_memory_is_locally_sensitive,
+            filter_snapshot=_filter_snapshot_to_user,
+        )
 
 
 def load_labels(labels_path: str | Path) -> list[dict[str, object]]:
-    path = Path(labels_path)
-    labels: list[dict[str, object]] = []
-    try:
-        raw_text = path.read_text(encoding="utf-8")
-    except UnicodeError as exc:
-        raise EvaluationError(f"Labels file is not valid UTF-8: {path}: {exc}") from exc
-    for index, raw_line in enumerate(raw_text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise EvaluationError(f"Invalid label JSON on line {index}: {exc}") from exc
-        try:
-            labels.append(_normalize_label_entry(entry, index=index))
-        except EvaluationError as exc:
-            raise EvaluationError(f"Invalid label on line {index}: {exc}") from exc
-    return labels
+    return workspace.load_labels_file(
+        labels_path,
+        normalize_entry=_normalize_label_entry,
+        error_type=EvaluationError,
+    )
 
 
 def save_labels(
@@ -289,17 +188,22 @@ def save_labels(
     labels: list[dict[str, object]],
     user_id: str,
 ) -> dict[str, object]:
-    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
-    snapshot_path = _current_snapshot_path(eval_path)
-    labels_path = eval_path / LABELS_NAME
-    valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
-    normalized = _validate_labels(labels, valid_ids=valid_ids)
-    _write_labels_atomic(labels_path, normalized)
-    return {
-        "labels": normalized,
-        "summary": _label_summary(normalized),
-        "validation_issues": _label_validation_issues(normalized, valid_ids=valid_ids),
-    }
+    with workspace.evaluation_workspace_lock(eval_dir):
+        _, snapshot_path, labels_path = workspace.eval_workspace_paths(
+            eval_dir,
+            user_id=user_id,
+        )
+        valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
+        normalized = _validate_labels(labels, valid_ids=valid_ids)
+        workspace.write_labels_atomic(labels_path, normalized)
+        return {
+            "labels": normalized,
+            "summary": _label_summary(normalized),
+            "validation_issues": _label_validation_issues(
+                normalized,
+                valid_ids=valid_ids,
+            ),
+        }
 
 
 def build_recall_workbench(
@@ -308,29 +212,31 @@ def build_recall_workbench(
     user_id: str,
     redact_sensitive: bool = True,
 ) -> dict[str, object]:
-    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
-    snapshot_path = _current_snapshot_path(eval_path)
-    labels_path = eval_path / LABELS_NAME
-    if not snapshot_path.exists():
-        raise FileNotFoundError(f"Snapshot not found: {snapshot_path}. Run recall init first.")
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Labels not found: {labels_path}. Run recall init first.")
+    with workspace.evaluation_workspace_lock(eval_dir):
+        eval_path, snapshot_path, labels_path = workspace.require_eval_workspace(
+            eval_dir,
+            user_id=user_id,
+        )
 
-    memories = _snapshot_memories(snapshot_path, user_id=user_id, redact_sensitive=redact_sensitive)
-    labels = load_labels(labels_path)
-    valid_ids = {str(memory["id"]) for memory in memories}
-    return {
-        "snapshot": str(snapshot_path),
-        "labels_path": str(labels_path),
-        "user_id": user_id,
-        "target_label_min": TARGET_LABEL_MIN,
-        "target_label_max": TARGET_LABEL_MAX,
-        "labels": labels,
-        "summary": _label_summary(labels),
-        "validation_issues": _label_validation_issues(labels, valid_ids=valid_ids),
-        "candidates": memories,
-        "last_results": load_last_results(eval_path, snapshot_path=snapshot_path),
-    }
+        memories = _snapshot_memories(
+            snapshot_path,
+            user_id=user_id,
+            redact_sensitive=redact_sensitive,
+        )
+        labels = load_labels(labels_path)
+        valid_ids = {str(memory["id"]) for memory in memories}
+        return {
+            "snapshot": str(snapshot_path),
+            "labels_path": str(labels_path),
+            "user_id": user_id,
+            "target_label_min": TARGET_LABEL_MIN,
+            "target_label_max": TARGET_LABEL_MAX,
+            "labels": labels,
+            "summary": _label_summary(labels),
+            "validation_issues": _label_validation_issues(labels, valid_ids=valid_ids),
+            "candidates": memories,
+            "last_results": load_last_results(eval_path, snapshot_path=snapshot_path),
+        }
 
 
 class _TrackingEmbeddingClient(EmbeddingClient):
@@ -373,7 +279,7 @@ def run_eval(
     relevant_labels = [label for label in normalized_labels if label["judgment"] == "relevant"]
     no_answer_labels = [label for label in normalized_labels if label["judgment"] == "no_answer"]
     graded_count = len(relevant_labels) + len(no_answer_labels)
-    store = _EvaluationMemoryStore(str(snapshot_db))
+    store = workspace.EvaluationMemoryStore(str(snapshot_db))
     tracking_embedding_client = _TrackingEmbeddingClient(embedding_client or NullEmbeddingClient())
     service = MemorySearchService(
         store=store,
@@ -449,37 +355,45 @@ def run_recall_eval(
     k: int = 8,
     embedding_client: EmbeddingClient | None = None,
 ) -> dict[str, object]:
-    eval_path = _user_eval_dir(eval_dir, user_id=user_id)
-    snapshot_path = _current_snapshot_path(eval_path)
-    labels_path = eval_path / LABELS_NAME
-    if not snapshot_path.exists():
-        raise FileNotFoundError(f"Snapshot not found: {snapshot_path}. Run recall init first.")
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Labels not found: {labels_path}. Run recall init first.")
-    if mode not in {"keyword", "embedding"}:
-        raise EvaluationError("mode must be keyword or embedding")
+    with workspace.evaluation_workspace_lock(eval_dir):
+        eval_path, snapshot_path, labels_path = workspace.require_eval_workspace(
+            eval_dir,
+            user_id=user_id,
+        )
+        if mode not in {"keyword", "embedding"}:
+            raise EvaluationError("mode must be keyword or embedding")
 
-    labels = load_labels(labels_path)
-    valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
-    issues = _label_validation_issues(labels, valid_ids=valid_ids)
-    blocking = [issue for issue in issues if issue["code"] in BLOCKING_LABEL_ISSUE_CODES]
-    if blocking:
-        raise EvaluationError("; ".join(str(issue["message"]) for issue in blocking))
+        labels = load_labels(labels_path)
+        valid_ids = _snapshot_memory_ids(snapshot_path, user_id=user_id)
+        issues = _label_validation_issues(labels, valid_ids=valid_ids)
+        blocking = [
+            issue
+            for issue in issues
+            if issue["code"] in BLOCKING_LABEL_ISSUE_CODES
+        ]
+        if blocking:
+            raise EvaluationError(
+                "; ".join(str(issue["message"]) for issue in blocking)
+            )
 
-    result = run_eval(
-        snapshot_db=snapshot_path,
-        labels=labels,
-        user_id=user_id,
-        k=k,
-        embedding_client=embedding_client if mode == "embedding" else NullEmbeddingClient(),
-        requested_mode=mode,
-    )
-    result["mode"] = mode
-    result["user_id"] = user_id
-    result["snapshot"] = str(snapshot_path)
-    result["validation_issues"] = issues
-    save_eval_result(eval_path, mode=mode, result=result)
-    return result
+        result = run_eval(
+            snapshot_db=snapshot_path,
+            labels=labels,
+            user_id=user_id,
+            k=k,
+            embedding_client=(
+                embedding_client
+                if mode == "embedding"
+                else NullEmbeddingClient()
+            ),
+            requested_mode=mode,
+        )
+        result["mode"] = mode
+        result["user_id"] = user_id
+        result["snapshot"] = str(snapshot_path)
+        result["validation_issues"] = issues
+        save_eval_result(eval_path, mode=mode, result=result)
+        return result
 
 
 async def _search_all(
@@ -618,10 +532,11 @@ def _score_query(
 
 
 def save_eval_result(eval_dir: str | Path, *, mode: str, result: dict[str, object]) -> Path:
-    path = Path(eval_dir) / _result_name(mode)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(path, result)
-    return path
+    return workspace.save_eval_result_file(
+        eval_dir,
+        result_name=_result_name(mode),
+        result=result,
+    )
 
 
 def load_last_results(
@@ -629,26 +544,14 @@ def load_last_results(
     *,
     snapshot_path: str | Path | None = None,
 ) -> dict[str, object]:
-    eval_path = Path(eval_dir)
-    expected_snapshot = str(Path(snapshot_path)) if snapshot_path is not None else None
-    results: dict[str, object] = {}
-    for mode in ("keyword", "embedding"):
-        path = eval_path / _result_name(mode)
-        if not path.exists():
-            results[mode] = None
-            continue
-        try:
-            result = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            results[mode] = None
-            continue
-        if not isinstance(result, dict) or (
-            expected_snapshot is not None and result.get("snapshot") != expected_snapshot
-        ):
-            results[mode] = None
-            continue
-        results[mode] = result
-    return results
+    return workspace.load_eval_results(
+        eval_dir,
+        result_names={
+            "keyword": _result_name("keyword"),
+            "embedding": _result_name("embedding"),
+        },
+        snapshot_path=snapshot_path,
+    )
 
 
 def format_text_report(result: dict[str, object]) -> str:
@@ -1319,10 +1222,7 @@ def _active_memory_scope(user_id: str | None) -> tuple[str, tuple[object, ...]]:
     return "COALESCE(archived, 0) = 0 AND COALESCE(user_id, 'default') = ?", (user_id,)
 
 
-def _connect_readonly(database_path: Path) -> sqlite3.Connection:
-    resolved = database_path.resolve()
-    uri_path = quote(resolved.as_posix(), safe="/:")
-    return sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
+_connect_readonly = workspace.connect_readonly_database
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
@@ -1342,157 +1242,28 @@ def _count(connection: sqlite3.Connection, sql: str, params: tuple[object, ...] 
     return int(row[0] or 0)
 
 
-def _new_snapshot_path(eval_dir: Path) -> Path:
-    while True:
-        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
-        path = eval_dir / f"{SNAPSHOT_PREFIX}{stamp}.db"
-        if not path.exists():
-            return path
-
-
-def _user_eval_dir(eval_dir: str | Path, *, user_id: str) -> Path:
-    normalized_user_id = user_id or "default"
-    digest = hashlib.sha256(normalized_user_id.encode("utf-8")).hexdigest()
-    return Path(eval_dir) / USER_WORKSPACES_NAME / digest
-
-
-def _current_snapshot_path(eval_dir: str | Path) -> Path:
-    eval_path = Path(eval_dir)
-    pointer_path = eval_path / SNAPSHOT_POINTER_NAME
-    try:
-        pointed_name = pointer_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        pointed_name = ""
-
-    if pointed_name:
-        pointed_path = eval_path / pointed_name
-        if pointed_path.exists():
-            return pointed_path
-
-    legacy_path = eval_path / SNAPSHOT_NAME
-    if legacy_path.exists():
-        return legacy_path
-
-    snapshots = sorted(
-        eval_path.glob(f"{SNAPSHOT_PREFIX}*.db"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    return snapshots[0] if snapshots else legacy_path
-
-
-def _write_current_snapshot_pointer(eval_dir: Path, snapshot_path: Path) -> None:
-    pointer_path = eval_dir / SNAPSHOT_POINTER_NAME
-    tmp_path = pointer_path.with_name(pointer_path.name + ".tmp")
-    tmp_path.write_text(snapshot_path.name, encoding="utf-8")
-    tmp_path.replace(pointer_path)
-
-
-def _cleanup_old_snapshots(eval_dir: Path, *, current_snapshot: Path, keep: int = 3) -> None:
-    snapshots = [
-        path
-        for path in eval_dir.glob(f"{SNAPSHOT_PREFIX}*.db")
-        if path.resolve() != current_snapshot.resolve()
-    ]
-    legacy_path = eval_dir / SNAPSHOT_NAME
-    if legacy_path.exists() and legacy_path.resolve() != current_snapshot.resolve():
-        snapshots.append(legacy_path)
-
-    snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for snapshot_path in snapshots[keep:]:
-        _unlink_sqlite_database(snapshot_path)
-
-
-def _invalidate_eval_results(eval_dir: Path) -> None:
-    for name in (KEYWORD_RESULT_NAME, EMBEDDING_RESULT_NAME):
-        (eval_dir / name).unlink(missing_ok=True)
-
-
-def _unlink_sqlite_database(
-    path: Path,
-    *,
-    ignore_permission_error: bool = True,
-) -> int:
-    removed = 0
-    for target in (
-        path,
-        Path(str(path) + "-wal"),
-        Path(str(path) + "-shm"),
-        Path(str(path) + "-journal"),
-    ):
-        try:
-            if target.is_file():
-                target.unlink()
-                removed += 1
-        except PermissionError:
-            if ignore_permission_error:
-                continue
-            raise
-    return removed
+_new_snapshot_path = workspace.new_snapshot_path
+_current_snapshot_path = workspace.current_snapshot_path
+_write_current_snapshot_pointer = workspace.write_current_snapshot_pointer
+_cleanup_old_snapshots = workspace.cleanup_old_snapshots
+_invalidate_eval_results = workspace.invalidate_eval_results
+_unlink_sqlite_database = workspace.unlink_sqlite_database
 
 
 def _snapshot_readonly(source_path: Path, snapshot_path: Path, *, user_id: str) -> None:
-    """用 backup API 建立临时副本，过滤完成后再原子发布单用户快照。"""
-    resolved = source_path.resolve()
-    uri_path = quote(resolved.as_posix(), safe="/:")
-    temp_path = snapshot_path.with_name(f".{snapshot_path.name}.tmp")
-    _unlink_sqlite_database(temp_path)
-    source = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
-    try:
-        dest = sqlite3.connect(str(temp_path))
-        try:
-            source.backup(dest)
-            dest.execute("PRAGMA journal_mode = DELETE")
-            _filter_snapshot_to_user(dest, user_id=user_id)
-        finally:
-            dest.close()
-        # Filtering is committed into the main temp file before publication. Any
-        # empty/stale sidecars must keep the temporary name and never accompany
-        # the atomically replaced snapshot.
-        for sidecar in (
-            Path(str(temp_path) + "-wal"),
-            Path(str(temp_path) + "-shm"),
-            Path(str(temp_path) + "-journal"),
-        ):
-            sidecar.unlink(missing_ok=True)
-        temp_path.replace(snapshot_path)
-    except Exception:
-        _unlink_sqlite_database(temp_path)
-        raise
-    finally:
-        source.close()
+    parent = snapshot_path.parent
+    eval_root = parent.parent.parent if parent.parent.name == "users" else parent
+    workspace.snapshot_readonly(
+        source_path,
+        snapshot_path,
+        eval_root=eval_root,
+        user_id=user_id,
+        filter_snapshot=_filter_snapshot_to_user,
+    )
 
 
-def _filter_snapshot_to_user(connection: sqlite3.Connection, *, user_id: str) -> None:
-    connection.execute("PRAGMA secure_delete = ON")
-    table_rows = connection.execute(
-        "SELECT name FROM sqlite_master "
-        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    ).fetchall()
-    for row in table_rows:
-        table_name = str(row[0])
-        quoted_table = _quote_identifier(table_name)
-        columns = {
-            str(column[1])
-            for column in connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
-        }
-        if "user_id" in columns:
-            connection.execute(
-                f"DELETE FROM {quoted_table} WHERE COALESCE(user_id, 'default') <> ?",
-                (user_id,),
-            )
-            connection.execute(
-                f"UPDATE {quoted_table} SET user_id = 'default' WHERE user_id IS NULL"
-            )
-        else:
-            # 未声明用户边界的辅助表不能安全带入用户快照；保留 schema，清空其数据。
-            connection.execute(f"DELETE FROM {quoted_table}")
-    connection.commit()
-    connection.execute("VACUUM")
-
-
-def _quote_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
+_filter_snapshot_to_user = workspace.filter_snapshot_to_user
+_quote_identifier = workspace.quote_identifier
 
 
 def _read_snapshot_overview(
@@ -1500,28 +1271,15 @@ def _read_snapshot_overview(
     *,
     user_id: str,
 ) -> tuple[dict[str, int], list[tuple[str, str, str]]]:
-    connection = sqlite3.connect(str(snapshot_path))
-    try:
-        connection.row_factory = sqlite3.Row
-        user_rows = connection.execute(
-            "SELECT COALESCE(user_id, 'default') AS user_id, COUNT(*) AS count "
-            "FROM memories WHERE COALESCE(archived, 0) = 0 GROUP BY user_id ORDER BY count DESC"
-        ).fetchall()
-        user_counts = {str(row["user_id"]): int(row["count"]) for row in user_rows}
-    finally:
-        connection.close()
-    memories = _eligible_snapshot_memories(snapshot_path, user_id=user_id)
-    preview = [
-        (memory.id, memory.type, _one_line(memory.content))
-        for memory in memories
-    ]
-    return user_counts, preview
+    return workspace.read_snapshot_overview(
+        snapshot_path,
+        user_id=user_id,
+        candidate_pool=RECALL_CANDIDATE_POOL,
+        is_locally_sensitive=_memory_is_locally_sensitive,
+    )
 
 
-def _write_preview(preview_path: Path, rows: list[tuple[str, str, str]]) -> None:
-    lines = ["id\ttype\tcontent_preview"]
-    lines.extend(f"{memory_id}\t{memory_type}\t{content}" for memory_id, memory_type, content in rows)
-    preview_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+_write_preview = workspace.write_preview
 
 
 def _snapshot_memories(
@@ -1530,34 +1288,31 @@ def _snapshot_memories(
     user_id: str,
     redact_sensitive: bool,
 ) -> list[dict[str, object]]:
-    memories = _eligible_snapshot_memories(snapshot_path, user_id=user_id)
-    payloads: list[dict[str, object]] = []
-    for memory in memories:
-        payload = memory.model_dump(exclude={"embedding_json"})
-        payloads.append(redact_memory_payload(payload, redact_sensitive=redact_sensitive))
-    return payloads
+    return workspace.snapshot_memories(
+        snapshot_path,
+        user_id=user_id,
+        redact_sensitive=redact_sensitive,
+        candidate_pool=RECALL_CANDIDATE_POOL,
+        is_locally_sensitive=_memory_is_locally_sensitive,
+    )
 
 
 def _eligible_snapshot_memories(snapshot_path: Path, *, user_id: str):
-    """Mirror the default search candidate pool before scoring."""
-    store = _EvaluationMemoryStore(str(snapshot_path))
-    memories = store.list_memories(
+    return workspace.eligible_snapshot_memories(
+        snapshot_path,
         user_id=user_id,
-        limit=RECALL_CANDIDATE_POOL,
-        include_lifecycle_archived=False,
+        candidate_pool=RECALL_CANDIDATE_POOL,
+        is_locally_sensitive=_memory_is_locally_sensitive,
     )
-    return [
-        memory
-        for memory in memories
-        if memory.origin == "user_asserted"
-        and not _memory_is_locally_sensitive(memory)
-    ]
 
 
 def _snapshot_memory_ids(snapshot_path: Path, *, user_id: str) -> set[str]:
-    if not snapshot_path.exists():
-        raise FileNotFoundError(f"Snapshot not found: {snapshot_path}. Run recall init first.")
-    return {str(memory["id"]) for memory in _snapshot_memories(snapshot_path, user_id=user_id, redact_sensitive=False)}
+    return workspace.snapshot_memory_ids(
+        snapshot_path,
+        user_id=user_id,
+        candidate_pool=RECALL_CANDIDATE_POOL,
+        is_locally_sensitive=_memory_is_locally_sensitive,
+    )
 
 
 def _normalize_label_entry(entry: object, *, index: int) -> dict[str, object]:
@@ -1720,21 +1475,8 @@ def _deduplicate_identical_queries(
     return unique
 
 
-def _write_labels_atomic(labels_path: Path, labels: list[dict[str, object]]) -> None:
-    labels_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        json.dumps(label, ensure_ascii=False, sort_keys=True)
-        for label in labels
-    ]
-    tmp_path = labels_path.with_suffix(labels_path.suffix + ".tmp")
-    tmp_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    tmp_path.replace(labels_path)
-
-
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+_write_labels_atomic = workspace.write_labels_atomic
+_write_json_atomic = workspace.write_json_atomic
 
 
 def _result_name(mode: str) -> str:
@@ -1749,94 +1491,3 @@ def _one_line(text: str, limit: int = 120) -> str:
 def _mean(values) -> float:
     items = list(values)
     return sum(items) / len(items) if items else 0.0
-
-
-def _build_embedding_client() -> EmbeddingClient:
-    from app.api.deps import get_embedding_client
-    from app.config import get_settings
-
-    return get_embedding_client(get_settings())
-
-
-def recall_cli_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Micro recall evaluation for memory-gateway search.")
-    parser.add_argument("--init", action="store_true", help="Snapshot the real DB and scaffold labels.")
-    parser.add_argument("--run", action="store_true", help="Run the evaluation against the snapshot.")
-    parser.add_argument("--database", default="data/memory.db", help="Real SQLite database path (read-only).")
-    parser.add_argument("--eval-dir", default=DEFAULT_EVAL_DIR, help="Directory for snapshot/preview/labels.")
-    parser.add_argument("--user-id", default="default", help="X-User-Id scope to evaluate.")
-    parser.add_argument(
-        "--k",
-        type=int,
-        default=8,
-        help=f"Top-k cutoff (1-{MAX_RECALL_EVAL_K}).",
-    )
-    parser.add_argument("--use-embedding", action="store_true", help="Use the real embedding provider for queries.")
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
-    args = parser.parse_args(argv)
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):
-        pass
-
-    if not args.init and not args.run:
-        parser.error("Specify --init or --run.")
-
-    eval_dir = Path(args.eval_dir)
-
-    if args.init:
-        result = init_eval(source_db=args.database, eval_dir=eval_dir, user_id=args.user_id)
-        if result.get("error"):
-            print(result["error"])
-            return 1
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-        else:
-            print(f"Snapshot: {result['snapshot']} ({result['memory_count']} active memories)")
-            print(f"Preview:  {result['preview']}")
-            print(f"Labels:   {result['labels']} ({'created template' if result['labels_created'] else 'kept existing'})")
-            print(f"User scopes: {json.dumps(result['user_counts'], ensure_ascii=False)}")
-            print("\nNext: edit labels.jsonl to fill relevant_ids, then run --run.")
-        if not args.run:
-            return 0
-
-    mode = "embedding" if args.use_embedding else "keyword"
-    try:
-        result = run_recall_eval(
-            eval_dir=eval_dir,
-            user_id=args.user_id,
-            mode=mode,
-            k=args.k,
-            embedding_client=_build_embedding_client() if args.use_embedding else NullEmbeddingClient(),
-        )
-    except (FileNotFoundError, EvaluationError) as exc:
-        print(str(exc))
-        return 1
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_text_report(result))
-    return 0
-
-
-def diagnosis_cli_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Read-only diagnosis of whether memory mechanisms are activated by real data."
-    )
-    parser.add_argument("--database", default="data/memory.db", help="SQLite database path.")
-    parser.add_argument("--user-id", default=None, help="Optional user scope.")
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
-    args = parser.parse_args(argv)
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):
-        pass
-
-    result = run_diagnosis(args.database, user_id=args.user_id)
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_diagnosis_text_report(result))
-    return 1 if result.get("error") else 0

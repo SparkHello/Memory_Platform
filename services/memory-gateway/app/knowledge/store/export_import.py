@@ -8,7 +8,9 @@ from typing import Any
 from app.knowledge.models import KnowledgeDocument, KnowledgeVersion
 from app.knowledge.store.errors import KnowledgeValidationError
 from app.knowledge.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
+    DocumentSizeProvider,
+    KnowledgeWriteProvider,
     _document_id,
     _get_document_row,
     _load_document_model,
@@ -37,7 +39,7 @@ from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK
 
 
 def list_versions(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -68,7 +70,7 @@ def list_versions(
     ]
 
 
-def export_user(store: _ConnectableStore, user_id: str) -> dict[str, Any]:
+def export_user(store: ConnectionProvider, user_id: str) -> dict[str, Any]:
     """Export canonical knowledge data, never derived chunks or FTS rows."""
     user_id = _required_text(user_id, "user_id", 256)
     documents: list[dict[str, Any]] = []
@@ -144,7 +146,7 @@ def export_user(store: _ConnectableStore, user_id: str) -> dict[str, Any]:
 
 
 def restore_export(
-    store: _ConnectableStore, user_id: str, export_data: dict[str, Any]
+    store: KnowledgeWriteProvider, user_id: str, export_data: dict[str, Any]
 ) -> dict[str, Any]:
     """Restore an export under ``user_id`` and rebuild every derived index."""
     user_id = _required_text(user_id, "user_id", 256)
@@ -301,7 +303,7 @@ def restore_export(
 
 
 def _validate_import_document(
-    store: _ConnectableStore, value: Any
+    store: DocumentSizeProvider, value: Any
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise KnowledgeValidationError("each exported knowledge document must be an object")

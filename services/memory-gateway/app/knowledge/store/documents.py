@@ -17,7 +17,8 @@ from app.knowledge.store.errors import (
     KnowledgeValidationError,
 )
 from app.knowledge.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
+    VersionIndexProvider,
     _document_from_row,
     _document_id,
     _document_ids,
@@ -49,7 +50,7 @@ from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK
 
 
 def list_documents(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     query: str = "",
     status: str = "active",
@@ -89,7 +90,7 @@ def list_documents(
 
 
 def resolve_document_refs(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     *,
     document_refs: Sequence[str] | None = None,
@@ -138,7 +139,7 @@ def resolve_document_refs(
 
 
 def get_document_detail(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -169,7 +170,7 @@ def get_document_detail(
 
 
 def get_version(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     version_id: str,
     *,
@@ -190,7 +191,7 @@ def get_version(
 
 
 def update_document(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -293,7 +294,7 @@ def update_document(
 
 
 def soft_delete_document(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -329,7 +330,7 @@ def soft_delete_document(
 
 
 def restore_document(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -363,7 +364,7 @@ def restore_document(
 
 
 def purge_document(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_id: str = "",
     *,
@@ -403,7 +404,7 @@ def purge_document(
 
 
 def restore_version(
-    store: _ConnectableStore,
+    store: VersionIndexProvider,
     user_id: str,
     document_id: str = "",
     version_id: str = "",
@@ -520,7 +521,7 @@ def restore_version(
 
 
 def reindex_version(
-    store: _ConnectableStore,
+    store: VersionIndexProvider,
     user_id: str,
     version_id: str = "",
     *,

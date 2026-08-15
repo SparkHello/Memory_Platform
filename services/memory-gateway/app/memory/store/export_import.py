@@ -28,7 +28,7 @@ from app.memory.classification import (
 )
 from app.memory.store.constants import _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _bounded_float,
     _coerce_float,
     _coerce_float_or_none,
@@ -55,7 +55,7 @@ from app.memory.store.temporal import _rebuild_temporal_key
 from app.memory.utils import _parse_iso_datetime
 
 def list_all_memories_for_export(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     archived: bool,
@@ -88,7 +88,7 @@ def list_all_memories_for_export(
         )
 
 def read_memory_export_snapshot(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     include_deleted: bool = True,
@@ -203,7 +203,7 @@ def read_memory_export_snapshot(
         }
 
 def read_memory_selection_export_snapshot(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -274,7 +274,7 @@ def read_memory_selection_export_snapshot(
         }
 
 def prepare_memory_space_import(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     data: dict,
 ) -> dict[str, object] | None:
@@ -307,7 +307,7 @@ def prepare_memory_space_import(
     }
 
 def import_memory_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     data: dict,
@@ -426,7 +426,7 @@ def import_memory_space(
     return "created", space, old_id or space_id
 
 def plan_memory_import_ids(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     source_ids: list[str],
@@ -490,7 +490,7 @@ def _plan_memory_import_ids_on_connection(
     return result
 
 def filter_existing_memory_ids(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -530,7 +530,7 @@ def _filter_existing_memory_ids_on_connection(
     return existing
 
 def prune_dangling_memory_references(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     memory_ids: list[str],
@@ -624,7 +624,7 @@ def _prune_dangling_memory_references_on_connection(
     return changed_references
 
 def restore_prepared_export(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     prepared_spaces: list[dict[str, object]],
@@ -1098,7 +1098,7 @@ def _restore_branch_node_on_connection(
     return "created" if existing is None else "updated"
 
 def prepare_memory_import_record(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     data: dict,
@@ -1190,7 +1190,7 @@ def prepare_memory_import_record(
     return memory
 
 def import_memory_record(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     data: dict,

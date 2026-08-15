@@ -25,14 +25,18 @@ from app.memory.redaction import sensitivity_floor
 from app.memory.utils import _ordered_unique, _parse_iso_datetime
 
 
-class _ConnectableStore(Protocol):
-    """store 领域子模块对 MemoryStore 的最小能力要求。
+class ConnectionProvider(Protocol):
+    """Memory repository functions' explicit persistence dependency.
 
-    打破子模块与 MemoryStore 之间的类型层环形依赖：运行时仍传入
-    MemoryStore 实例，类型上只要求能打开 SQLite 连接（外加个别公共读方法）。
+    Repository functions accept this structural contract instead of importing
+    the composed ``MemoryStore`` and creating a type-level cycle.
     """
 
     def _connect(self) -> sqlite3.Connection: ...
+
+
+class MemoryLookupProvider(ConnectionProvider, Protocol):
+    """Connection provider that can resolve a materialized memory record."""
 
     def get_memory(self, *, memory_id: str, user_id: str) -> MemoryRecord | None: ...
 
@@ -280,7 +284,7 @@ def _space_ids_for_memory_ids_on_connection(
 
 
 def _rows_to_memories(
-    store: _ConnectableStore, rows: list[sqlite3.Row]
+    store: ConnectionProvider, rows: list[sqlite3.Row]
 ) -> list[MemoryRecord]:
     if not rows:
         return []

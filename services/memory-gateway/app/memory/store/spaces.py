@@ -10,7 +10,7 @@ from app.memory.classification import normalize_classification_name
 from app.memory.models import MemoryRecord, MemorySpace, new_memory_id, utc_now_iso
 from app.memory.store.errors import RevisionConflictError
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _ordered_unique,
     _row_to_memory,
     _row_to_memory_space,
@@ -50,7 +50,7 @@ def normalize_space_sort_order(value: int | None) -> int:
         raise ValueError(f"sort_order 须在 0..{_SPACE_SORT_ORDER_MAX}")
     return order
 
-def upsert_memory_space(store: _ConnectableStore, *, user_id: str, name: str) -> MemorySpace:
+def upsert_memory_space(store: ConnectionProvider, *, user_id: str, name: str) -> MemorySpace:
     display_name = normalize_classification_name(name, field_name="space")
     with store._connect() as connection:
         return _upsert_memory_space_on_connection(
@@ -125,7 +125,7 @@ def _upsert_memory_space_on_connection(
     return space
 
 def create_memory_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     name: str,
@@ -184,7 +184,7 @@ def create_memory_space(
         return space
 
 def update_memory_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     space_id: str,
@@ -264,7 +264,7 @@ def update_memory_space(
         return _row_to_memory_space(updated) if updated else None
 
 def set_memory_space_archived(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     space_id: str,
@@ -296,7 +296,7 @@ def set_memory_space_archived(
         return _row_to_memory_space(updated) if updated else None
 
 def delete_memory_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     space_id: str,
@@ -328,7 +328,7 @@ def delete_memory_space(
         return "deleted"
 
 def list_memory_spaces(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     include_archived: bool = False,
@@ -343,7 +343,7 @@ def list_memory_spaces(
     return [_row_to_memory_space(row) for row in rows]
 
 def list_memory_space_summaries(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     include_archived: bool = False,
@@ -379,7 +379,7 @@ def list_memory_space_summaries(
     return summaries
 
 def get_memory_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     space_id: str,
@@ -405,7 +405,7 @@ def get_memory_space(
     return _row_to_memory_space(row) if row else None
 
 def list_memories_for_space(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     space_id: str,
@@ -429,7 +429,7 @@ def list_memories_for_space(
     return _rows_to_memories(store, rows)
 
 def replace_memory_spaces(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,

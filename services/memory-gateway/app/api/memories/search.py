@@ -1,8 +1,58 @@
 """/memories routes: search."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from functools import partial
+import json
+from typing import Annotated
+
+import anyio
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import PlainTextResponse
+
+from app.api.deps import (
+    get_embedding_client,
+    get_llm_client,
+    get_memory_search_service,
+    get_memory_store,
+    get_user_id,
+)
+from app.api.memories.common import (
+    MemoryContextExplainRequest,
+    MemoryContextRequest,
+    MemoryIngestRequest,
+    MemoryMergeRequest,
+    MemoryReEmbedRequest,
+    MemorySearchFeedbackRequest,
+    MemorySearchRequest,
+    _derive_context_search_query,
+    _find_memories_needing_embedding,
+    _recent_context_payload,
+    _safe_core_sections,
+    _search_hit_to_dict,
+)
+from app.config import Settings, get_settings
+from app.llm.client import OpenAICompatibleClient
+from app.llm.prompts import (
+    render_core_memory_context,
+    render_memory_context,
+    render_recent_context_summary_context,
+)
 from app.llm.runtime import resolve_model_runtime
+from app.memory.health import MemoryHealthChecker
+from app.memory.ingest import MemoryIngestService
+from app.memory.models import RecentContextSummary
+from app.memory.search import (
+    EmbeddingClient,
+    MemorySearchService,
+    NullEmbeddingClient,
+    embedding_space_id_for,
+    search_cache_stats,
+)
+from app.memory.store import MemoryStore
+from app.usage.context import model_usage_scope
+
+
+router = APIRouter()
 
 @router.get("/cache-stats")
 def memory_search_cache_stats(

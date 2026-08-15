@@ -1,7 +1,26 @@
 """/memories routes: graph."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.api.deps import get_memory_search_service, get_memory_store, get_user_id
+from app.api.memories.common import (
+    MemoryNetworkRequest,
+    MemoryNetworkTraverseRequest,
+    MemorySurfaceRequest,
+    _memory_to_response,
+    _surface_hit_to_dict,
+    _traversal_edge_to_dict,
+)
+from app.memory.graph_traverse import traverse_memory_network
+from app.memory.network import build_memory_network
+from app.memory.search import MemorySearchService
+from app.memory.store import MemoryStore
+
+
+router = APIRouter()
 
 @router.post("/surface")
 def surface_memories(

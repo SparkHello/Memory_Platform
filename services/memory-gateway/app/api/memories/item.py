@@ -1,7 +1,32 @@
 """/memories routes for individual memory items (/{memory_id})."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
+
+from app.api.deps import get_memory_store, get_user_id
+from app.api.memories.common import (
+    MemorySpacesUpdateRequest,
+    MemoryUpdateRequest,
+    _classification_payload,
+    _memory_to_response,
+    _raise_revision_conflict,
+    _revision_etag,
+    _write_classification_log,
+)
+from app.memory.classification import classify_memory
+from app.memory.models import (
+    CandidateMemory,
+    normalize_iso_text,
+    normalize_optional_text,
+)
+from app.memory.redaction import redact_memory_payload
+from app.memory.store import MemoryStore, RevisionConflictError
+
+
+router = APIRouter()
 
 @router.patch("/{memory_id}/spaces")
 def update_memory_spaces(
@@ -318,4 +343,3 @@ def delete_memory(
             detail="记忆不存在或已删除",
         )
     return {"id": memory_id, "archived": True}
-

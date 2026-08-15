@@ -16,14 +16,14 @@ from app.memory.models import (
 )
 from app.memory.store.constants import _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _json_string_list,
     _row_to_conversation_branch_node,
     _row_to_recent_context_summary,
 )
 
 def get_recent_context_summary(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     conversation_id: str | None = None,
@@ -47,7 +47,7 @@ def get_recent_context_summary(
     return _row_to_recent_context_summary(row) if row else None
 
 def get_recent_context_summary_for_conversation(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -73,7 +73,7 @@ def get_recent_context_summary_for_conversation(
     return _row_to_recent_context_summary(row) if row else None
 
 def list_recent_context_summaries(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     limit: int | None = 20,
@@ -93,7 +93,7 @@ def list_recent_context_summaries(
     return [_row_to_recent_context_summary(row) for row in rows]
 
 def upsert_recent_context_summary(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -110,7 +110,7 @@ def upsert_recent_context_summary(
     )
 
 def upsert_recent_context_state(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     conversation_id: str | None,
@@ -206,7 +206,7 @@ def upsert_recent_context_state(
         )
 
 def get_conversation_branch_node(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     history_fingerprint: str,
@@ -226,7 +226,7 @@ def get_conversation_branch_node(
     return _row_to_conversation_branch_node(row) if row else None
 
 def list_conversation_branch_nodes(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     limit: int = 5000,
@@ -249,7 +249,7 @@ def list_conversation_branch_nodes(
     return [_row_to_conversation_branch_node(row) for row in rows]
 
 def count_conversation_branch_nodes(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     archived: bool = False,
@@ -266,7 +266,7 @@ def count_conversation_branch_nodes(
     return int(row["count"]) if row else 0
 
 def archive_conversation_branch_subtree(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     node_id: str,
     user_id: str,
@@ -303,7 +303,7 @@ def archive_conversation_branch_subtree(
         return connection.total_changes - before
 
 def restore_conversation_branch_subtree(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     node_id: str,
     user_id: str,
@@ -340,7 +340,7 @@ def restore_conversation_branch_subtree(
         return connection.total_changes - before
 
 def upsert_conversation_branch_node(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     conversation_id: str | None,

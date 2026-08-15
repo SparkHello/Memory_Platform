@@ -34,6 +34,7 @@ from app.llm.runtime import (
 )
 from app.mcp_server.auth import MCPAuthMiddleware
 from app.mcp_server.server import create_mcp_server
+from app.memory.evaluation_workspace import cleanup_abandoned_eval_trash
 from app.memory.store import MemoryStore
 from app.request_limits import (
     RequestTargetLimitMiddleware,
@@ -122,6 +123,13 @@ def create_app() -> FastAPI:
         initialize_request_spool_directories(settings)
         AuthTokenStore(settings.auth_database_path).init_db()
         MemoryStore(settings.database_path).init_db()
+        try:
+            cleanup_abandoned_eval_trash(
+                settings.eval_dir,
+                database_path=settings.database_path,
+            )
+        except OSError:
+            logger.exception("清理遗留评测 trash 失败；服务继续启动。")
         app.state.knowledge_init_error = ""
         try:
             KnowledgeStore(

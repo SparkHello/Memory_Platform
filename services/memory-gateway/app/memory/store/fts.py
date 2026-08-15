@@ -21,7 +21,7 @@ import sqlite3
 
 from app.memory.models import MemoryRecord
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _rows_to_memories_on_connection,
 )
 from app.memory.utils import _terms
@@ -149,16 +149,12 @@ def _refresh_user_index(connection: sqlite3.Connection, user_id: str) -> None:
         _rebuild_user_index(connection, user_id)
 
 def keyword_candidate_memories(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     terms: list[str],
-    limit: int | None = None,
-    min_corpus_rows: int | None = None,
 ) -> list[MemoryRecord] | None:
     """返回共享至少一个查询词的候选记忆；返回 None 表示走全表扫描。"""
-    bounded_limit = FTS_CANDIDATE_LIMIT if limit is None else limit
-    threshold = FTS_MIN_CORPUS_ROWS if min_corpus_rows is None else min_corpus_rows
     safe_terms = [term for term in terms if term and '"' not in term]
     if not safe_terms:
         return None
@@ -171,7 +167,7 @@ def keyword_candidate_memories(
             f"SELECT COUNT(*) FROM memories WHERE user_id = ? AND {_ACTIVE_WHERE}",
             (user_id,),
         ).fetchone()
-        if int(active_count_row[0] or 0) < max(1, int(threshold)):
+        if int(active_count_row[0] or 0) < max(1, int(FTS_MIN_CORPUS_ROWS)):
             return None
         _refresh_user_index(connection, user_id)
         candidate_rows = connection.execute(
@@ -180,7 +176,7 @@ def keyword_candidate_memories(
             WHERE memories_fts MATCH ? AND user_id = ?
             ORDER BY rank LIMIT ?
             """,
-            (match_expression, user_id, max(1, int(bounded_limit))),
+            (match_expression, user_id, max(1, int(FTS_CANDIDATE_LIMIT))),
         ).fetchall()
         rowids = [int(row[0]) for row in candidate_rows]
         memories: list[MemoryRecord] = []

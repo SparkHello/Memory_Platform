@@ -15,7 +15,7 @@ from app.knowledge.store.errors import (
     KnowledgeValidationError,
 )
 from app.knowledge.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _chunk_from_row,
     _chunk_id,
     _document_ids,
@@ -38,7 +38,7 @@ from app.vector_util import try_cosine_similarity
 
 
 def search_chunks(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     query: str,
     limit: int = 5,
@@ -91,7 +91,7 @@ def search_chunks(
 
 
 def egress_override_confirmed(
-    store: _ConnectableStore, user_id: str, version_ref: str
+    store: ConnectionProvider, user_id: str, version_ref: str
 ) -> bool:
     """Whether the owner explicitly cleared this version's document for egress.
 
@@ -121,7 +121,7 @@ def egress_override_confirmed(
 
 
 def list_chunks_for_embedding(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     version_ref: str,
     *,
@@ -151,7 +151,7 @@ def list_chunks_for_embedding(
 
 
 def set_version_embedding_status(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     version_ref: str,
     *,
@@ -198,7 +198,7 @@ def set_version_embedding_status(
 
 
 def replace_chunk_embeddings(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     version_ref: str,
     *,
@@ -303,7 +303,7 @@ def replace_chunk_embeddings(
 
 
 def search_chunks_by_embedding(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     query_vector: Sequence[float],
     *,
@@ -387,7 +387,7 @@ def search_chunks_by_embedding(
 
 
 def get_chunks_by_refs(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     chunk_refs: Sequence[str],
     include_sensitive: bool = False,
@@ -436,7 +436,7 @@ def get_chunks_by_refs(
 
 
 def _search_with_fts(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     query: str,
@@ -490,7 +490,7 @@ def _search_with_fts(
 
 
 def _search_with_instr(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     query: str,
@@ -544,7 +544,7 @@ def _search_with_instr(
 
 
 def _all_documents_visible(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     document_ids: list[str],
     *,

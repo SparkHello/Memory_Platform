@@ -3,12 +3,29 @@ from __future__ import annotations
 
 import uuid
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from app.api.deps import (
+    get_embedding_client,
+    get_llm_client,
+    get_memory_store,
+    get_user_id,
+)
+from app.config import Settings, get_settings
+from app.llm.client import OpenAICompatibleClient
 from app.memory.conversation_import import (
     MAX_TURNS,
     parse_conversation_import,
 )
 from app.memory.ingest import MemoryIngestService
+from app.memory.search import EmbeddingClient
+from app.memory.store import MemoryStore
+
+
+router = APIRouter()
 
 
 class ConversationImportRequest(BaseModel):

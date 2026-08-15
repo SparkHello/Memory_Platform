@@ -4,6 +4,7 @@ from pathlib import Path
 import zipfile
 
 import app.api.memories as memories_api_module
+import pytest
 from app.memory.models import RecentContextTurn
 from app.memory.report import build_memory_export
 from app.memory.store import MemoryStore
@@ -646,12 +647,12 @@ def test_deleted_memory_purge_reports_eval_cleanup_failure_after_commit(
     )
     assert memory_store.archive_memory(memory_id=memory.id, user_id="default")
 
-    def fail_cleanup(*args, **kwargs):
-        raise PermissionError("forced cleanup failure")
+    def fail_cleanup(staged):
+        return staged.result(cleanup_failed=True)
 
     monkeypatch.setattr(
         memories_api_module.common,
-        "delete_user_eval_workspace",
+        "discard_staged_eval_workspace",
         fail_cleanup,
     )
     response = client.request(
@@ -668,6 +669,55 @@ def test_deleted_memory_purge_reports_eval_cleanup_failure_after_commit(
     assert payload["warnings"]
     assert memory_store.get_memory(memory_id=memory.id, user_id="default") is None
     assert memory_store.list_archived_memories(user_id="default") == []
+
+
+def test_deleted_memory_purge_restores_eval_workspace_when_database_fails(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+    monkeypatch,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="Memory whose database purge will fail.",
+    )
+    assert memory_store.archive_memory(memory_id=memory.id, user_id="default")
+    initialized = client.post(
+        "/memories/evaluation/recall/init",
+        headers=auth_headers,
+    )
+    assert initialized.status_code == 200, initialized.text
+    snapshot = Path(initialized.json()["snapshot"])
+    assert snapshot.exists()
+
+    def fail_purge(*args, **kwargs):
+        del args, kwargs
+        assert not snapshot.exists(), "workspace must move before the DB purge"
+        raise RuntimeError("injected database purge failure")
+
+    monkeypatch.setattr(
+        type(memory_store),
+        "purge_archived_memory",
+        fail_purge,
+    )
+
+    with pytest.raises(RuntimeError, match="injected database purge failure"):
+        client.request(
+            "DELETE",
+            f"/memories/deleted/{memory.id}/purge",
+            headers=auth_headers,
+            json={"confirm_memory_id": memory.id},
+        )
+
+    assert snapshot.exists()
+    assert memory.id in {
+        item.id for item in memory_store.list_archived_memories(user_id="default")
+    }
+    trash_root = snapshot.parents[2] / ".trash"
+    assert trash_root.is_dir()
+    assert {path.name for path in trash_root.iterdir()} == {
+        ".memory-platform-evaluation-trash-v1"
+    }
 
 
 def test_deleted_memory_rest_purge_rejects_unsafe_requests(

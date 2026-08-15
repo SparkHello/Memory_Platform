@@ -17,7 +17,7 @@ from app.memory.models import (
     utc_now_iso,
 )
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _average_float,
     _casefold_set,
     _earliest_datetime_text,
@@ -37,7 +37,7 @@ from app.memory.store.spaces import (
 from app.memory.utils import _parse_iso_datetime
 
 def merge_memories(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     memory_ids: list[str],

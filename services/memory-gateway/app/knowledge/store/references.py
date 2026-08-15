@@ -12,7 +12,7 @@ from app.knowledge.store.constants import (
 )
 from app.knowledge.store.errors import KnowledgeValidationError
 from app.knowledge.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _chunk_id,
     _get_chunk_row,
     _get_version_row,
@@ -31,7 +31,7 @@ from app.knowledge.store.utils import (
 
 
 def read_reference(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     reference: str,
     cursor: str = "",

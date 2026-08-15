@@ -16,7 +16,7 @@ from app.memory.models import (
 )
 from app.memory.store.errors import RevisionConflictError
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _json_string_list,
     _ordered_unique,
     _row_to_core_memory_section,
@@ -24,7 +24,7 @@ from app.memory.store.helpers import (
 )
 
 def list_core_memory_sections(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
 ) -> list[CoreMemorySection]:
@@ -50,7 +50,7 @@ def list_core_memory_sections(
     return [_row_to_core_memory_section(row) for row in rows]
 
 def get_core_memory_section(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -68,7 +68,7 @@ def get_core_memory_section(
     return _row_to_core_memory_section(row) if row else None
 
 def upsert_core_memory_section(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -183,7 +183,7 @@ def upsert_core_memory_section(
         return "update", _row_to_core_memory_section(updated_row)
 
 def archive_core_memory_section(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     section: CoreMemorySectionName,
@@ -224,7 +224,7 @@ def archive_core_memory_section(
     return cursor.rowcount > 0
 
 def list_core_memory_section_history(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     section: CoreMemorySectionName | None = None,
@@ -247,7 +247,7 @@ def list_core_memory_section_history(
     return [_row_to_core_memory_section_history(row) for row in rows]
 
 def _create_core_memory_section_history(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     connection: sqlite3.Connection | None,
     section: CoreMemorySection,

@@ -16,7 +16,7 @@ from app.memory.models import (
 from app.memory.purge_preview import purge_memory_ids_digest
 from app.memory.store.decision_logs import _insert_decision_log
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _json_string_list,
     _merge_core_section_audit_summaries,
     _ordered_unique,
@@ -33,7 +33,7 @@ from app.memory.store.purge_ops import (
 )
 
 def preview_archived_memory_purge(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -58,7 +58,7 @@ def preview_archived_memory_purge(
     }
 
 def commit_archived_memory_purge(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -116,7 +116,7 @@ def commit_archived_memory_purge(
     )
 
 def purge_archived_memory(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -207,7 +207,7 @@ def purge_archived_memory(
     return memory, log
 
 def list_purge_affected_core_sections(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,

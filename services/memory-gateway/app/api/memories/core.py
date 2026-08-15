@@ -1,7 +1,25 @@
 """/memories routes: core."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
+
+from app.api.deps import get_llm_client, get_memory_store, get_user_id
+from app.api.memories.common import (
+    CoreMemoryUpdateRequest,
+    _core_memory_collection_etag,
+    _raise_revision_conflict,
+    _revision_etag,
+)
+from app.llm.client import OpenAICompatibleClient
+from app.memory.core import CoreMemoryConsolidator
+from app.memory.models import CoreMemorySectionName
+from app.memory.store import MemoryStore, RevisionConflictError
+
+
+router = APIRouter()
 
 @router.get("/core")
 def list_core_memory(

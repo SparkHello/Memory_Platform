@@ -1,7 +1,16 @@
 """/memories routes: conversation."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from app.api.deps import get_memory_store, get_user_id
+from app.api.memories.common import RecentContextUpsertRequest
+from app.memory.store import MemoryStore
+
+
+router = APIRouter()
 
 @router.get("/recent-context")
 def list_recent_context_summaries(

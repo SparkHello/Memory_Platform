@@ -1,9 +1,4 @@
-"""Shared row mapping and connection-level primitives for the knowledge store.
-
-子模块首参只依赖 ``_ConnectableStore`` Protocol（``_connect`` 等最小能力），
-不反向类型引用 KnowledgeStore；row→model 映射与 connection 级原语是本模块里
-的自由函数。
-"""
+"""Shared row mapping and connection-level primitives for the knowledge store."""
 
 from __future__ import annotations
 
@@ -46,17 +41,24 @@ from app.knowledge.store.utils import (
 )
 
 
-class _ConnectableStore(Protocol):
-    """knowledge store 领域子模块对 KnowledgeStore 的最小能力要求。
+class ConnectionProvider(Protocol):
+    """Knowledge repository dependency that can open SQLite connections.
 
-    打破子模块与 KnowledgeStore 之间的类型层环形依赖：运行时仍传入
-    KnowledgeStore 实例，类型上只要求能打开 SQLite 连接并暴露索引重建入口。
+    The structural contract avoids importing the composed ``KnowledgeStore``
+    from domain modules and creating a type-level cycle.
     """
 
-    database_path: str
+    def _connect(self) -> sqlite3.Connection: ...
+
+
+class DocumentSizeProvider(ConnectionProvider, Protocol):
+    """Connection provider carrying the configured document size boundary."""
+
     max_document_bytes: int
 
-    def _connect(self) -> sqlite3.Connection: ...
+
+class VersionIndexProvider(ConnectionProvider, Protocol):
+    """Connection provider that can rebuild one knowledge version index."""
 
     def _index_version_in_connection(
         self,
@@ -67,6 +69,14 @@ class _ConnectableStore(Protocol):
         version_id: str,
         make_current: bool,
     ) -> None: ...
+
+
+class KnowledgeWriteProvider(
+    DocumentSizeProvider,
+    VersionIndexProvider,
+    Protocol,
+):
+    """Explicit dependency for writes that enforce size and rebuild indexes."""
 
 
 def _plain_id(value: str, label: str) -> str:

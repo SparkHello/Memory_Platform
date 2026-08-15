@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from app.knowledge.store.helpers import _ConnectableStore
+from app.knowledge.store.helpers import ConnectionProvider
 from app.knowledge.store.utils import _required_text, _utc_now
 
 # Explicit status → count-key mappings.  Unknown enum values no longer create
@@ -30,7 +30,7 @@ _EMBEDDING_STATUS_KEYS = {
 }
 
 
-def counts(store: _ConnectableStore, user_id: str) -> dict[str, int]:
+def counts(store: ConnectionProvider, user_id: str) -> dict[str, int]:
     user_id = _required_text(user_id, "user_id", 256)
     with store._connect() as connection:
         document_rows = connection.execute(
@@ -117,7 +117,7 @@ def counts(store: _ConnectableStore, user_id: str) -> dict[str, int]:
     return result
 
 
-def status(store: _ConnectableStore, user_id: str) -> dict[str, Any]:
+def status(store: ConnectionProvider, user_id: str) -> dict[str, Any]:
     try:
         counts_result = counts(store, user_id)
     except sqlite3.Error as exc:

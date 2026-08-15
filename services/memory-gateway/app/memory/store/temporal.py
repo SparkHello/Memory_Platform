@@ -8,7 +8,8 @@ import sqlite3
 from app.memory.models import MemoryRecord, new_memory_id, normalize_optional_text, utc_now_iso
 from app.memory.store.decision_logs import _insert_decision_log
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
+    MemoryLookupProvider,
     _insert_memory_row,
     _row_to_memory,
     _space_ids_for_memory_ids_on_connection,
@@ -18,7 +19,7 @@ from app.memory.store.spaces import _replace_memory_space_links
 from app.memory.utils import _parse_iso_datetime
 
 def restore_temporal_memory(
-    store: _ConnectableStore,
+    store: MemoryLookupProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -110,7 +111,7 @@ def restore_temporal_memory(
     return store.get_memory(memory_id=restored.id, user_id=user_id)
 
 def get_next_temporal_boundary(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     after: datetime,

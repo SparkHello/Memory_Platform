@@ -6,21 +6,41 @@ from functools import partial
 import os
 from pathlib import Path
 import tempfile
+from typing import Annotated, Literal
 import zipfile
 
 import anyio.to_thread
 import httpx
-from fastapi import File, Header, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from starlette.background import BackgroundTask
 
-from app.api.memories.common import *  # noqa: F403
+from app.api.deps import get_memory_store, get_user_id
+from app.api.memories.common import (
+    MemoryRestoreExportRequest,
+    MemorySelectionExportRequest,
+    _safe_download_filename_part,
+)
 from app.cli_config import cli_paths, default_model_gateway_home
+from app.config import Settings, get_settings
 from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
+from app.memory.report import (
+    MemorySelectionConflict,
+    build_memory_export,
+    build_memory_report,
+    build_memory_selection_export,
+    build_obsidian_markdown_zip,
+    format_memory_export,
+    restore_memory_export,
+)
+from app.memory.store import MemoryStore
 from app.stack_backup import (
     create_stack_backup,
     validate_stack_backup,
 )
+
+
+router = APIRouter()
 
 @router.get("/report", response_model=None)
 def get_memory_report(

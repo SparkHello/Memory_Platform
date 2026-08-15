@@ -1,7 +1,4 @@
-"""微型召回评测脚手架。
-
-真实实现位于 app.memory.evaluation，REST/Web 与 CLI 共用同一套评测逻辑。
-"""
+"""微型召回评测兼容入口。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,10 +17,10 @@ from app.memory.evaluation import (  # noqa: E402,F401
     format_text_report,
     init_eval,
     load_labels,
-    recall_cli_main,
     run_eval,
     _score_query,
 )
+from app.memory.evaluation_cli import recall_cli_main  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

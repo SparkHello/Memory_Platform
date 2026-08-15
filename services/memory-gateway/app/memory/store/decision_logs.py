@@ -8,7 +8,7 @@ from typing import Any
 
 from app.memory.models import DecisionLog, DecisionLogAction, new_memory_id, utc_now_iso
 from app.memory.store.constants import _DECISION_LOG_RETENTION_LIMIT
-from app.memory.store.helpers import _ConnectableStore
+from app.memory.store.helpers import ConnectionProvider
 
 def _insert_decision_log(
     *,
@@ -68,7 +68,7 @@ def _insert_decision_log(
     return log
 
 def create_decision_log(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str = "default",
     conversation_id: str | None,
@@ -166,7 +166,7 @@ def _decision_log_references_memory_ids(raw_json: str, memory_ids: set[str]) -> 
     return bool(_decision_log_referenced_memory_ids(payload) & memory_ids)
 
 def list_decision_logs(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str | None = None,
     conversation_id: str | None = None,

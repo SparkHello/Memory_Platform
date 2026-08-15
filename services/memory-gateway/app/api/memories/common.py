@@ -1,51 +1,20 @@
-"""Shared router, models, and helpers for /memories routes."""
-from datetime import UTC, datetime, timedelta
-from functools import partial
+"""Shared request models and helpers for ``/memories`` route modules."""
 import hashlib
 import json
 from typing import Annotated, Literal
 
-import anyio
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import PlainTextResponse, Response
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from fastapi import HTTPException, status
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.config import Settings, get_settings
-from app.api.deps import (
-    get_embedding_client,
-    get_llm_client,
-    get_memory_search_service,
-    get_memory_store,
-    get_signing_secret,
-    get_user_id,
-    require_api_key,
+from app.memory.core import safe_core_memory_sections
+from app.memory.evaluation import MAX_RECALL_EVAL_K
+from app.memory.evaluation_workspace import (
+    StagedEvaluationWorkspace,
+    discard_staged_eval_workspace,
+    mark_staged_eval_workspace_committed,
 )
-from app.llm.client import OpenAICompatibleClient
-from app.llm.prompts import (
-    render_core_memory_context,
-    render_memory_context,
-    render_recent_context_summary_context,
-)
-from app.memory.classification import classify_memory
-from app.memory.core import CoreMemoryConsolidator, safe_core_memory_sections
-from app.memory.evaluation import (
-    EvaluationError,
-    MAX_RECALL_EVAL_K,
-    build_recall_workbench,
-    delete_user_eval_workspace,
-    init_eval,
-    run_diagnosis,
-    run_recall_eval,
-    save_labels,
-)
-from app.memory.extractor import validate_candidate_for_save
-from app.memory.graph_traverse import traverse_memory_network
-from app.memory.health import MemoryHealthChecker
-from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
-    CandidateMemory,
     CoreMemorySection,
-    CoreMemorySectionName,
     MemoryRecord,
     MemoryRelation,
     MemoryReviewRiskTag,
@@ -56,44 +25,10 @@ from app.memory.models import (
     MemorySurfaceMode,
     MemoryStability,
     MemoryType,
-    RecentContextSummary,
-    normalize_iso_text,
-    normalize_optional_text,
-)
-from app.memory.network import build_memory_network
-from app.memory.resolver import MemoryResolver
-from app.memory.purge_preview import (
-    PurgePreviewTokenError,
-    sign_purge_preview,
-    verify_purge_preview,
-)
-from app.memory.review import MemoryReviewer
-from app.memory.review_revision import (
-    ReviewRevisionError,
-    apply_review_revision,
-    find_related_review_revision_memories,
-    preview_review_revision,
-)
-from app.memory.report import (
-    MemorySelectionConflict,
-    build_obsidian_markdown_zip,
-    build_memory_export,
-    build_memory_selection_export,
-    build_memory_report,
-    format_memory_export,
-    restore_memory_export,
 )
 from app.memory.redaction import (
     detect_text_sensitivity,
     redact_memory_payload,
-    sensitivity_floor,
-)
-from app.memory.search import (
-    EmbeddingClient,
-    MemorySearchService,
-    NullEmbeddingClient,
-    embedding_space_id_for,
-    search_cache_stats,
 )
 from app.memory.store import (
     MemoryStore,
@@ -101,13 +36,6 @@ from app.memory.store import (
     RevisionConflictError,
 )
 from app.memory.utils import _ordered_unique, parse_embedding_vector
-from app.usage.context import model_usage_scope
-
-router = APIRouter(
-    prefix="/memories",
-    tags=["memories"],
-    dependencies=[Depends(require_api_key)],
-)
 
 QUERY_MAX_CHARS = 4096
 MEMORY_TEXT_MAX_CHARS = 65_536
@@ -406,25 +334,28 @@ def _purge_preview_http_conflict(exc: PurgePreviewConflictError) -> HTTPExceptio
 
 def _cleanup_eval_after_purge(
     *,
-    settings: Settings,
-    user_id: str,
+    staged: StagedEvaluationWorkspace,
 ) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
     try:
-        return delete_user_eval_workspace(settings.eval_dir, user_id=user_id), []
-    except Exception:
-        # SQLite has already committed. Report the irreversible database result
-        # truthfully and surface the independent filesystem cleanup failure.
-        return (
-            {
-                "workspace_removed": False,
-                "legacy_artifacts_removed": 0,
-                "cleanup_failed": True,
-            },
-            [
-                "记忆已永久删除，但本地评测工作区清理失败；"
-                "请检查 EVAL_DIR 权限并手动清理残留评测文件。"
-            ],
+        mark_staged_eval_workspace_committed(staged)
+    except OSError:
+        # The SQLite commit is already authoritative. Recovery can still
+        # inspect target IDs in the durable staged manifest on next startup.
+        warnings.append(
+            "记忆已永久删除，但评测清理事务的完成标记写入失败；"
+            "服务下次启动会按数据库状态恢复清理。"
         )
+    result = discard_staged_eval_workspace(staged)
+    if not result.get("cleanup_failed"):
+        return result, warnings
+    # SQLite has committed. The staged copy remains under EVAL_DIR/.trash and
+    # startup cleanup will retry without blocking the truthful purge result.
+    warnings.append(
+        "记忆已永久删除，但本地评测 trash 清理失败；"
+        "服务下次启动会重试清理 EVAL_DIR/.trash。"
+    )
+    return result, warnings
 
 def _memory_to_response(memory: MemoryRecord, *, redact_sensitive: bool = False) -> dict:
     payload = memory.model_dump(exclude={"embedding_json"})
@@ -689,7 +620,3 @@ def _find_memories_needing_embedding(
             memory_ids.append(row["id"])
             continue
     return memory_ids
-
-# Domain route modules use ``from .common import *``. Include private helpers
-# (``_memory_to_response`` etc.) so star-import does not hide them.
-__all__ = [name for name in globals() if not name.startswith("__")]

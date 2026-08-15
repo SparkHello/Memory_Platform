@@ -9,7 +9,7 @@ from typing import Any
 from app.memory.models import MemoryRecord, MemoryType, new_memory_id, utc_now_iso
 from app.memory.store.constants import _SENSITIVITY_RANK
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _average_float,
     _insert_memory_row,
     _json_string_list,
@@ -20,7 +20,7 @@ from app.memory.store.helpers import (
 from app.memory.utils import _parse_iso_datetime
 
 def list_undigested_memories(
-    store: _ConnectableStore, *, user_id: str, limit: int = 10, include_sensitive: bool = False
+    store: ConnectionProvider, *, user_id: str, limit: int = 10, include_sensitive: bool = False
 ) -> list[MemoryRecord]:
     """返回近期未消化的记忆，供 digest_memories 使用。"""
     with store._connect() as connection:
@@ -51,7 +51,7 @@ def list_undigested_memories(
     return memories[: max(0, limit)]
 
 def get_digest_source_memories(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -73,7 +73,7 @@ def get_digest_source_memories(
     return _rows_to_memories(store, rows)
 
 def apply_memory_digest(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     source_ids: list[str],

@@ -2,6 +2,8 @@
 
 独立的本地模型连接与路由服务。它把“模型是谁”和“从哪里调用、用哪个账号付费”分开管理，再向 My_Memory 或其他应用提供稳定的 OpenAI-compatible `/v1` 接口。
 
+跨版本保留的 HTTP、CLI、Python、配置与错误契约集中记录在仓库根目录的 [兼容契约 v2](../../docs/compatibility-contract-v2.md)。
+
 项目默认只监听 `127.0.0.1:2030`。上游密钥保存在项目目录外，代理不记录 prompt、回复、工具参数、embedding 输入或知识正文。
 
 ## 核心设计
@@ -10,7 +12,7 @@
 
 - `server`：本地监听地址、端口、请求体上限和磁盘软/硬保留量；
 - `client`：调用网关的本地应用身份、Bearer key 与 route 权限；
-- `connection`：真实渠道账号、Base URL、上游密钥引用、套餐范围和 adapter；
+- `connection`：真实渠道账号、Base URL、上游密钥引用、展示用套餐元数据、运行时 `usage_scope` 和 adapter；
 - `deployment`：该 connection 上的精确上游模型 ID、能力、推理默认值和可选渠道 profile；
 - `route`：业务功能名与有序 fallback deployments；
 - `pricing`：绑定 deployment 的官方价格快照，不用相似模型或第三方聚合价代替。

@@ -1,5 +1,7 @@
 # memory-gateway
 
+跨版本保留的 HTTP、MCP、Python、数据库和错误契约集中记录在仓库根目录的 [兼容契约 v2](../../docs/compatibility-contract-v2.md)。
+
 `memory-gateway` 是一个本地优先的长期记忆与长文本知识服务，可接入支持远程 Streamable HTTP MCP 或 OpenAI Chat Completions 的 AI 客户端，并提供 REST 管理接口和 Web 控制台；它不依赖某个特定客户端。长期记忆与知识文档分别保存在物理隔离的 SQLite 数据库中：记忆支持提取、浮现和衰减，知识库只在显式调用时做可引用的全文检索。
 
 OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat Plus）这类 Chat Completions 客户端。代理会在服务端完成安全记忆召回和上下文注入，并在完整最终回答后提取、去重和嵌入新记忆；支持 SSE 流式、工具调用、多模态消息和推理字段透明转发。MCP 入口仍保留，适合希望由模型显式控制记忆工具的客户端。
@@ -373,7 +375,7 @@ FLIT（原 LastChat Plus）使用下面的 Provider 配置：
 
 FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当前 OpenAI-compatible Provider → 编辑 `memory-auto` 模型”，把输入模态设为“文本 + 图片”、输出模态设为“文本”，并开启“工具”和“推理”两项能力。`/v1/models` 的标准响应不能声明这些 FLIT 私有能力；不手动开启时 FLIT 不会发送 tools/reasoning，图片也可能先被客户端 OCR 改写。
 
-在 FLIT 的自定义 Header 中可设置 `X-User-Id: default`。不要额外设置 `Authorization`，FLIT 会用 API Key 自动生成 Bearer Header。FLIT 当前不能把每个聊天的动态会话 ID 发给网关，因此不要给所有聊天配置同一个静态 `X-Conversation-Id`。缺省时网关会对客户端回传的可见用户/助手历史计算指纹，并在本地保存每个完整回答后的分支节点：正常续聊命中父节点，修改旧消息或重新生成回答会形成独立分支，不会把两条路线的滚动摘要混合。
+在 FLIT 的自定义 Header 中可设置 `X-User-Id: default`。不要额外设置 `Authorization`，FLIT 会用 API Key 自动生成 Bearer Header。FLIT 当前不能把每个聊天的动态会话 ID 发给网关，因此不要给所有聊天配置同一个静态 `X-Conversation-Id`。缺省时网关会对客户端回传的可见用户/助手历史计算指纹，并在本地保存每个完整回答后的分支节点：正常续聊命中父节点，修改旧消息或重新生成回答会形成独立分支。无 conversation ID 的节点通常不生成滚动摘要，也不会用指纹猜测客户端已经截断的上下文。
 
 ### 记忆模式与写入时机
 
@@ -402,7 +404,7 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 
 ### 对话分支、编辑与重新生成
 
-网关只用客户端可稳定回传的可见 user/assistant 文本计算历史指纹；system、工具调用、工具结果和 reasoning 不参与分支匹配。每个完整回答会保存一个本地分支节点，节点包含不可逆历史指纹、滚动压缩摘要和最近原始轮次，不保存一份额外的完整逐字聊天副本。
+网关只用客户端可稳定回传的可见 user/assistant 文本计算历史指纹；system、工具调用、工具结果和 reasoning 不参与分支匹配。每个完整回答会保存一个本地分支节点，节点包含不可逆历史指纹和最近原始轮次，不保存一份额外的完整逐字聊天副本。只有真实 conversation ID 在客户端没有可见父历史时，才会通过 `conversation-fallback` 使用并更新滚动摘要；无 ID 节点的 `compressed_summary` 通常为空。
 
 - 正常续聊：请求历史命中上一个完整回答，接续该节点。
 - 重新生成回答：同一个父节点产生多个兄弟分支；之后继续哪份回答，就接续哪条路线。
@@ -410,7 +412,7 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 - 动态 `X-Conversation-Id`/`conversation_id`：供只发送增量消息的客户端后备匹配；最多 200 个字符，超长请求会返回 400；不要给所有 FLIT 对话配置同一个静态值。
 - 历史被截断：客户端既不发送动态 ID、又没有带回足够历史时，网关不会猜测其他对话，而是从本次请求自带上下文重新开始。
 
-较早普通轮次达到 8 轮或 6000 字符后在后台压缩，默认保留最近两轮逐字内容。压缩摘要只能辅助理解，不能作为 `context_quote` 或独立授权保存事实。每用户最多保留最近 5000 个分支节点，超出后从最旧节点开始裁剪。分支写入属于最终响应后的后台任务；如果客户端在前一响应刚结束时立即并发发送下一轮，极短时间内可能尚未命中刚生成的节点。
+`conversation-fallback` 的较早普通轮次达到 8 轮或 6000 字符后可在后台压缩，默认保留最近两轮逐字内容。压缩摘要只能辅助理解，不能作为 `context_quote` 或独立授权保存事实。完整历史已由客户端带回的 `matched` 请求和无 conversation ID 的请求都不会额外调用 compactor。每用户最多保留最近 5000 个分支节点，超出后从最旧节点开始裁剪。分支写入属于最终响应后的后台任务；如果客户端在前一响应刚结束时立即并发发送下一轮，极短时间内可能尚未命中刚生成的节点。
 
 成功响应中的 `X-Memory-Branch-State` 用于诊断本轮输入：
 
@@ -781,8 +783,8 @@ Windows 服务辅助脚本：
 
 - 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
 - OpenAI-compatible 入口只实现 `/v1/models` 与 `/v1/chat/completions`；不提供 Responses API、文件、音频或图片生成等其他 OpenAI API。
-- `/v1` 的记忆激活和近期上下文通过 SQLite TTL claim 跨 worker/重启去重；长期 ingest 先写入 durable outbox，`done` 为终态，崩溃后由 drainer 重放。工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
-- FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点并持久化滚动摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。
+- `/v1` 的记忆激活和近期上下文通过 SQLite TTL claim 跨 worker/重启去重；长期 ingest 先写入带 lease 的 durable outbox，`done`/`failed` 都是清空正文的终态，崩溃或 lease 过期后由 drainer 以 at-least-once 语义重放。工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
+- FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点；无 ID 节点通常不生成摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。
 - 分支节点和长期记忆提取在完整最终回答后的后台任务中完成，属于最终一致；极快的并发下一轮可能暂时看不到刚结束的一轮。
 - 没有动态 conversation ID 时，短 TTL 内“完全相同的消息历史 + 完全相同的最终回答”无法与 HTTP 重试区分，会按重试去重；不同最终回答仍可独立 ingest。
 - 图遍历和 Time Ripple 保留为实验/兼容能力，不是默认产品路径。

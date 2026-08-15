@@ -30,7 +30,7 @@ from app.memory.models import (
 from app.memory.store.constants import _UNSET
 from app.memory.store.errors import RevisionConflictError
 from app.memory.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
     _bounded_float,
     _coerce_float,
     _coerce_float_or_none,
@@ -60,7 +60,7 @@ from app.memory.store.temporal import (
 from app.memory.utils import _parse_iso_datetime
 
 def create_memory(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     content: str,
@@ -177,7 +177,7 @@ def create_memory(
     return memory
 
 def update_memory(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -484,7 +484,7 @@ def update_memory(
             raise RuntimeError("Memory update did not persist.")
         return _row_to_memory(updated_row, space_ids=existing_space_ids)
 
-def get_memory(store: _ConnectableStore, *, memory_id: str, user_id: str) -> MemoryRecord | None:
+def get_memory(store: ConnectionProvider, *, memory_id: str, user_id: str) -> MemoryRecord | None:
     with store._connect() as connection:
         row = connection.execute(
             """
@@ -503,7 +503,7 @@ def get_memory(store: _ConnectableStore, *, memory_id: str, user_id: str) -> Mem
     return _row_to_memory(row, space_ids=space_ids)
 
 def list_memory_timeline(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     subject: str,
@@ -537,7 +537,7 @@ def list_memory_timeline(
     return _rows_to_memories(store, rows)
 
 def list_memories(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     limit: int = 200,
@@ -567,7 +567,7 @@ def list_memories(
         rows = connection.execute(sql, params).fetchall()
     return _rows_to_memories(store, rows)
 
-def list_memories_for_resolution(store: _ConnectableStore, *, user_id: str) -> list[MemoryRecord]:
+def list_memories_for_resolution(store: ConnectionProvider, *, user_id: str) -> list[MemoryRecord]:
     """Return the complete active candidate set used for write deduplication.
 
     Resolver correctness must not depend on importance ordering: an exact
@@ -587,7 +587,7 @@ def list_memories_for_resolution(store: _ConnectableStore, *, user_id: str) -> l
 
 @contextmanager
 def memory_recall_snapshot(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     page_size: int = 500,
@@ -640,7 +640,7 @@ def memory_recall_snapshot(
 
         yield read_pages
 
-def get_memories_max_updated_at(store: _ConnectableStore, *, user_id: str) -> str | None:
+def get_memories_max_updated_at(store: ConnectionProvider, *, user_id: str) -> str | None:
     """返回该用户所有活跃记忆的最新 updated_at，用于缓存失效比对。"""
     with store._connect() as connection:
         row = connection.execute(
@@ -653,7 +653,7 @@ def get_memories_max_updated_at(store: _ConnectableStore, *, user_id: str) -> st
         ).fetchone()
     return row[0] if row and row[0] else None
 
-def get_active_memory_count(store: _ConnectableStore, *, user_id: str) -> int:
+def get_active_memory_count(store: ConnectionProvider, *, user_id: str) -> int:
     """返回该用户活跃记忆的数量，用于缓存失效比对。"""
     with store._connect() as connection:
         row = connection.execute(
@@ -667,7 +667,7 @@ def get_active_memory_count(store: _ConnectableStore, *, user_id: str) -> int:
     return int(row[0]) if row else 0
 
 def list_archived_memories(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     user_id: str,
     limit: int = 200,
@@ -685,7 +685,7 @@ def list_archived_memories(
     return _rows_to_memories(store, rows)
 
 def explain_memory_source(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -712,7 +712,7 @@ def explain_memory_source(
     )
 
 def archive_memory(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -763,7 +763,7 @@ def archive_memory(
             )
         return current_revision + 1 if return_revision else True
 
-def restore_memory(store: _ConnectableStore, *, memory_id: str, user_id: str) -> MemoryRecord | None:
+def restore_memory(store: ConnectionProvider, *, memory_id: str, user_id: str) -> MemoryRecord | None:
     with store._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -818,7 +818,7 @@ def restore_memory(store: _ConnectableStore, *, memory_id: str, user_id: str) ->
         return _row_to_memory(restored_row, space_ids=space_ids)
 
 def update_memory_embedding(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_id: str,
     user_id: str,
@@ -843,7 +843,7 @@ def update_memory_embedding(
         )
     return cursor.rowcount > 0
 
-def archive_expired_memories(store: _ConnectableStore, *, user_id: str) -> int:
+def archive_expired_memories(store: ConnectionProvider, *, user_id: str) -> int:
     """Archive expired temporary memories without erasing version history."""
     now_iso = utc_now_iso()
     now = _parse_iso_datetime(now_iso)
@@ -882,7 +882,7 @@ def archive_expired_memories(store: _ConnectableStore, *, user_id: str) -> int:
     return int(cursor.rowcount)
 
 def mark_memories_used(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_ids: list[str],
     user_id: str,
@@ -905,7 +905,7 @@ def mark_memories_used(
     return now
 
 def update_memory_statuses(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     memory_ids: list[str],
     user_id: str,

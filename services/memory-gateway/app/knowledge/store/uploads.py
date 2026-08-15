@@ -25,7 +25,9 @@ from app.knowledge.store.errors import (
     KnowledgeValidationError,
 )
 from app.knowledge.store.helpers import (
-    _ConnectableStore,
+    ConnectionProvider,
+    DocumentSizeProvider,
+    KnowledgeWriteProvider,
     _document_id,
     _get_document_row,
     _load_document_model,
@@ -57,7 +59,7 @@ from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK
 
 
 def begin_upload(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     user_id: str,
     title: str,
     *,
@@ -139,7 +141,7 @@ def begin_upload(
 
 
 def append_upload(
-    store: _ConnectableStore,
+    store: DocumentSizeProvider,
     user_id: str,
     upload_id: str,
     sequence: int,
@@ -220,7 +222,7 @@ def append_upload(
 
 
 def commit_upload(
-    store: _ConnectableStore,
+    store: KnowledgeWriteProvider,
     user_id: str,
     upload_id: str,
     expected_parts: int,
@@ -545,7 +547,7 @@ def commit_upload(
     )
 
 
-def cancel_upload(store: _ConnectableStore, user_id: str, upload_id: str) -> bool:
+def cancel_upload(store: ConnectionProvider, user_id: str, upload_id: str) -> bool:
     user_id = _required_text(user_id, "user_id", 256)
     upload_id = _plain_id(upload_id, "upload")
     with store._connect() as connection:

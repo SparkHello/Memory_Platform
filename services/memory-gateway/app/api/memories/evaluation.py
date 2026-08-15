@@ -1,7 +1,25 @@
 """/memories routes: evaluation."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from app.api.deps import get_embedding_client, get_user_id
+from app.api.memories.common import RecallEvalLabelsRequest, RecallEvalRunRequest
+from app.config import Settings, get_settings
+from app.memory.evaluation import (
+    EvaluationError,
+    build_recall_workbench,
+    init_eval,
+    run_diagnosis,
+    run_recall_eval,
+    save_labels,
+)
+from app.memory.search import EmbeddingClient, NullEmbeddingClient
+
+
+router = APIRouter()
 
 @router.get("/evaluation/diagnosis")
 def memory_evaluation_diagnosis(

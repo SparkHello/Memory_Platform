@@ -14,7 +14,7 @@ import json
 import sqlite3
 from uuid import uuid4
 
-from app.memory.store.helpers import _ConnectableStore
+from app.memory.store.helpers import ConnectionProvider
 
 
 CHAT_FINALIZE_LEASE_SECONDS = 300.0
@@ -29,7 +29,7 @@ class ChatFinalizeQueueFullError(RuntimeError):
 
 
 def claim_chat_side_effect(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     kind: str,
     key: str,
@@ -72,7 +72,7 @@ def claim_chat_side_effect(
 
 
 def release_chat_side_effect_claim(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     kind: str,
     key: str,
@@ -175,7 +175,7 @@ def _cap_nonterminal_jobs(
 
 
 def enqueue_chat_finalize_job(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     job_id: str,
     user_id: str,
@@ -243,7 +243,7 @@ def enqueue_chat_finalize_job(
 
 
 def claim_chat_finalize_job(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     job_id: str | None = None,
     lease_seconds: float = CHAT_FINALIZE_LEASE_SECONDS,
@@ -348,7 +348,7 @@ def claim_chat_finalize_job(
 
 
 def mark_chat_finalize_job(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     job_id: str,
     lease_token: str,
@@ -387,7 +387,7 @@ def mark_chat_finalize_job(
 
 
 def prune_chat_finalize_jobs(
-    store: _ConnectableStore,
+    store: ConnectionProvider,
     *,
     keep_per_user: int = 5000,
 ) -> int:

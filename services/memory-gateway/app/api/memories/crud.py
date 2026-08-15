@@ -1,7 +1,28 @@
 """/memories routes: crud."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import ValidationError
+
+from app.api.deps import get_embedding_client, get_memory_store, get_user_id
+from app.api.memories.common import (
+    PUBLIC_ID_MAX_CHARS,
+    MemorySaveRequest,
+    MemorySpaceCreateRequest,
+    MemorySpaceUpdateRequest,
+    _memory_to_response,
+)
+from app.memory.extractor import validate_candidate_for_save
+from app.memory.models import CandidateMemory, MemoryStatus, normalize_optional_text
+from app.memory.redaction import sensitivity_floor
+from app.memory.resolver import MemoryResolver
+from app.memory.search import EmbeddingClient
+from app.memory.store import MemoryStore
+
+
+router = APIRouter()
 
 
 @router.get("")
@@ -289,4 +310,3 @@ async def save_memory(
         "reason": result.reason,
         "memory_id": result.memory.id if result.memory else None,
     }
-

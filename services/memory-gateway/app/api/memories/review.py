@@ -1,7 +1,47 @@
 """/memories routes: review."""
 from __future__ import annotations
 
-from app.api.memories.common import *  # noqa: F403
+from datetime import UTC, datetime, timedelta
+import json
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from app.api.deps import (
+    get_llm_client,
+    get_memory_search_service,
+    get_memory_store,
+    get_signing_secret,
+    get_user_id,
+)
+from app.api.memories.common import (
+    MemoryBatchPurgePreviewRequest,
+    MemoryReviewActionRequest,
+    MemoryReviewRevisionApplyRequest,
+    MemoryReviewRevisionPreviewRequest,
+    MemoryReviewRevisionRelatedRequest,
+    _affected_core_sections_for_memory_ids,
+    _load_review_action_memories,
+    _memory_audit_payload,
+    _purge_preview_http_conflict,
+    _review_action_after_payload,
+)
+from app.config import Settings, get_settings
+from app.llm.client import OpenAICompatibleClient
+from app.memory.purge_preview import sign_purge_preview
+from app.memory.redaction import detect_text_sensitivity
+from app.memory.review import MemoryReviewer
+from app.memory.review_revision import (
+    ReviewRevisionError,
+    apply_review_revision,
+    find_related_review_revision_memories,
+    preview_review_revision,
+)
+from app.memory.search import MemorySearchService
+from app.memory.store import MemoryStore, PurgePreviewConflictError
+
+
+router = APIRouter()
 
 @router.post("/review")
 def review_memories(
