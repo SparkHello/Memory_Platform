@@ -10,11 +10,7 @@ import httpx
 from model_gateway.discovery import (
     fetch_model_listing,
     parse_model_listing,
-    probe_client,
-    read_bounded_response,
-    upstream_auth_headers,
 )
-from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     ConnectionConfig,
     DeploymentConfig,
@@ -22,6 +18,11 @@ from model_gateway.models import (
 )
 from model_gateway.proxy import prepare_payload
 from model_gateway.routing import RouteTarget
+from model_gateway.upstream_executor import (
+    UpstreamExecutor,
+    UsageLedgerPreflightError,
+)
+from model_gateway.usage import UsageMetadata, UsageStore
 
 
 HealthLevel = Literal["ok", "warning", "error", "skipped"]
@@ -64,6 +65,7 @@ class DeploymentHealth:
     level: HealthLevel
     detail: str
     http_status: int | None = None
+    usage_ledger_status: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -76,6 +78,8 @@ class DeploymentHealth:
         }
         if self.http_status is not None:
             result["http_status"] = self.http_status
+        if self.usage_ledger_status:
+            result["usage_ledger_status"] = self.usage_ledger_status
         return result
 
 
@@ -155,6 +159,9 @@ async def check_health(
     client_kind: str = "backend",
     timeout_seconds: float = 10.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    usage_store: UsageStore | None = None,
+    usage_client_id: str = "modelgw-health-check",
+    storage_monitor: object | None = None,
 ) -> HealthReport:
     """Check configured connections without exposing credentials or provider bodies.
 
@@ -169,20 +176,29 @@ async def check_health(
 
     selected = _select_connections(config, connection_id)
     timeout = max(0.1, float(timeout_seconds))
-    checks = [
-        _check_connection(
-            config=config,
-            secrets=secrets,
-            connection_id=item_id,
-            connection=connection,
-            live=live,
-            client_kind=client_kind,
-            timeout_seconds=timeout,
-            transport=transport,
-        )
-        for item_id, connection in selected
-    ]
-    results = await asyncio.gather(*checks)
+    executor = UpstreamExecutor(transport=transport) if live else None
+    try:
+        checks = [
+            _check_connection(
+                config=config,
+                secrets=secrets,
+                connection_id=item_id,
+                connection=connection,
+                live=live,
+                client_kind=client_kind,
+                timeout_seconds=timeout,
+                transport=transport,
+                executor=executor,
+                usage_store=usage_store,
+                usage_client_id=usage_client_id,
+                storage_monitor=storage_monitor,
+            )
+            for item_id, connection in selected
+        ]
+        results = await asyncio.gather(*checks)
+    finally:
+        if executor is not None:
+            await executor.aclose()
     return HealthReport(
         mode="live" if live else "discovery",
         connections=tuple(results),
@@ -212,6 +228,10 @@ async def _check_connection(
     client_kind: str,
     timeout_seconds: float,
     transport: httpx.AsyncBaseTransport | None,
+    executor: UpstreamExecutor | None,
+    usage_store: UsageStore | None,
+    usage_client_id: str,
+    storage_monitor: object | None,
 ) -> ConnectionHealth:
     deployments = [
         (deployment_id, deployment)
@@ -251,13 +271,18 @@ async def _check_connection(
         )
 
     if live:
+        assert executor is not None
         return await _check_live(
+            config=config,
             connection_id=connection_id,
             connection=connection,
             deployments=deployments,
             secret=secret,
             timeout_seconds=timeout_seconds,
-            transport=transport,
+            executor=executor,
+            usage_store=usage_store,
+            usage_client_id=usage_client_id,
+            storage_monitor=storage_monitor,
         )
     return await _check_discovery(
         connection_id=connection_id,
@@ -406,12 +431,16 @@ async def _check_discovery(
 
 async def _check_live(
     *,
+    config: GatewayConfig,
     connection_id: str,
     connection: ConnectionConfig,
     deployments: list[tuple[str, DeploymentConfig]],
     secret: str,
     timeout_seconds: float,
-    transport: httpx.AsyncBaseTransport | None,
+    executor: UpstreamExecutor,
+    usage_store: UsageStore | None,
+    usage_client_id: str,
+    storage_monitor: object | None,
 ) -> ConnectionHealth:
     enabled = [item for item in deployments if item[1].enabled]
     disabled = [item for item in deployments if not item[1].enabled]
@@ -425,20 +454,23 @@ async def _check_live(
             detail="connection 没有已启用的 deployment",
         )
 
-    async with probe_client(connection, timeout_seconds, transport) as client:
-        checked = await asyncio.gather(
-            *[
-                _check_live_deployment(
-                    client=client,
-                    connection=connection,
-                    deployment_id=deployment_id,
-                    deployment=deployment,
-                    secret=secret,
-                    validate_destination=transport is None,
-                )
-                for deployment_id, deployment in enabled
-            ]
-        )
+    checked = await asyncio.gather(
+        *[
+            _check_live_deployment(
+                config=config,
+                executor=executor,
+                connection=connection,
+                deployment_id=deployment_id,
+                deployment=deployment,
+                secret=secret,
+                timeout_seconds=timeout_seconds,
+                usage_store=usage_store,
+                usage_client_id=usage_client_id,
+                storage_monitor=storage_monitor,
+            )
+            for deployment_id, deployment in enabled
+        ]
+    )
     checked.extend(
         _deployment_result(
             deployment_id,
@@ -464,124 +496,147 @@ async def _check_live(
 
 async def _check_live_deployment(
     *,
-    client: httpx.AsyncClient,
+    config: GatewayConfig,
+    executor: UpstreamExecutor,
     connection: ConnectionConfig,
     deployment_id: str,
     deployment: DeploymentConfig,
     secret: str,
-    validate_destination: bool,
+    timeout_seconds: float,
+    usage_store: UsageStore | None,
+    usage_client_id: str,
+    storage_monitor: object | None,
 ) -> DeploymentHealth:
-    endpoint = (
-        connection.chat_endpoint
-        if deployment.kind == "chat"
-        else connection.embeddings_endpoint
-    )
     # The live probe must send exactly what the data plane would send for this
     # deployment: adapter quirks, request_transform and the authoritative
     # embedding dimensions all come from the shared payload builder.
-    payload = prepare_payload(
-        _minimal_payload(deployment),
-        RouteTarget(
-            route_id="health.check",
-            deployment_id=deployment_id,
-            deployment=deployment,
-            connection_id=deployment.connection,
-            connection=connection,
-        ),
+    target = RouteTarget(
+        route_id="health.live",
+        deployment_id=deployment_id,
+        deployment=deployment,
+        connection_id=deployment.connection,
+        connection=connection,
     )
+    payload = prepare_payload(_minimal_payload(deployment), target)
     try:
-        url = upstream_url(
-            connection.base_url,
-            endpoint,
-            allowed_private_networks=connection.allowed_private_networks,
-        )
-        if validate_destination:
-            await require_safe_destination(
-                url,
-                allowed_private_networks=connection.allowed_private_networks,
+        if usage_store is None:
+            result = await executor.post_json(
+                target=target,
+                payload=payload,
+                secret=secret,
+                timeout_seconds=timeout_seconds,
             )
-        async with client.stream(
-            "POST",
-            url,
-            headers=upstream_auth_headers(connection, secret),
-            json=payload,
-        ) as response:
-            content = (
-                await read_bounded_response(
-                    response,
-                    connection.response_limit_bytes,
-                )
-                if response.is_success
-                else b""
+        else:
+            result = await executor.post_json_accounted(
+                target=target,
+                payload=payload,
+                secret=secret,
+                timeout_seconds=timeout_seconds,
+                usage_store=usage_store,
+                server=config.server,
+                pricing_catalog=config.pricing,
+                client_id=usage_client_id,
+                route_id="health.live",
+                metadata=UsageMetadata(operation="health.live"),
+                storage_monitor=storage_monitor,
             )
-    except (httpx.HTTPError, OSError):
-        return _deployment_result(
-            deployment_id,
-            deployment,
-            status="network_error",
-            level="error",
-            detail="最小真实请求无法连接 provider",
-        )
-    except ValueError:
+    except UsageLedgerPreflightError:
         return _deployment_result(
             deployment_id,
             deployment,
             status="invalid_response",
             level="error",
-            detail="真实请求响应超过安全上限或 URL 无效",
+            detail="usage ledger 预检失败；未发起真实请求",
         )
 
-    if not response.is_success:
-        status, level, detail = _http_failure(response.status_code, discovery=False)
+    def finish(
+        *,
+        status: str,
+        level: HealthLevel,
+        detail: str,
+        http_status: int | None = None,
+    ) -> DeploymentHealth:
+        ledger_status = result.usage_ledger_status
+        if ledger_status == "incomplete":
+            detail += "；usage ledger 写入失败，检查结果仍保留"
+            if level == "ok":
+                level = "warning"
         return _deployment_result(
             deployment_id,
             deployment,
             status=status,
             level=level,
             detail=detail,
-            http_status=response.status_code,
+            http_status=http_status,
+            usage_ledger_status=ledger_status,
         )
 
+    if result.trace is None:
+        return finish(
+            status="invalid_response",
+            level="error",
+            detail=result.error_detail or "真实请求 URL 或 Header 无效",
+        )
+    if result.error_type:
+        status = (
+            "invalid_response"
+            if result.trace.failure_class == "response_too_large"
+            else "network_error"
+        )
+        detail = (
+            "真实请求响应超过安全上限"
+            if status == "invalid_response"
+            else "最小真实请求无法连接 provider"
+        )
+        return finish(
+            status=status,
+            level="error",
+            detail=detail,
+            http_status=result.status_code,
+        )
+    assert result.status_code is not None
+    if not result.is_success:
+        status, level, detail = _http_failure(result.status_code, discovery=False)
+        return finish(
+            status=status,
+            level=level,
+            detail=detail,
+            http_status=result.status_code,
+        )
+
+    content = result.content
     if deployment.kind == "chat":
         if not _is_chat_completion_response(content):
-            return _deployment_result(
-                deployment_id,
-                deployment,
+            return finish(
                 status="invalid_response",
                 level="error",
                 detail="真实请求成功，但响应不是可识别的 chat completion",
-                http_status=response.status_code,
+                http_status=result.status_code,
             )
     else:
         dimensions = _extract_embedding_dimensions(content)
         if dimensions is None:
-            return _deployment_result(
-                deployment_id,
-                deployment,
+            return finish(
                 status="invalid_response",
                 level="error",
                 detail="真实请求成功，但响应中没有可验证的 embedding 向量",
-                http_status=response.status_code,
+                http_status=result.status_code,
             )
         if any(dimension != deployment.dimensions for dimension in dimensions):
-            return _deployment_result(
-                deployment_id,
-                deployment,
+            return finish(
                 status="dimension_mismatch",
                 level="error",
                 detail=(
                     f"真实请求含非 {deployment.dimensions} 维向量，与配置的 "
                     f"{deployment.dimensions} 维不一致"
                 ),
-                http_status=response.status_code,
+                http_status=result.status_code,
             )
-    return _deployment_result(
-        deployment_id,
-        deployment,
+    return finish(
         status="live_ok",
         level="ok",
         detail="最小真实请求成功",
-        http_status=response.status_code,
+        http_status=result.status_code,
     )
 
 
@@ -688,6 +743,7 @@ def _deployment_result(
     level: HealthLevel,
     detail: str,
     http_status: int | None = None,
+    usage_ledger_status: str = "",
 ) -> DeploymentHealth:
     return DeploymentHealth(
         deployment_id=deployment_id,
@@ -697,6 +753,7 @@ def _deployment_result(
         level=level,
         detail=detail,
         http_status=http_status,
+        usage_ledger_status=usage_ledger_status,
     )
 
 
@@ -708,6 +765,12 @@ def _aggregate_live(
         return "disabled", "skipped", "没有已启用的 deployment"
     successes = sum(item.status == "live_ok" for item in active)
     if successes == len(active):
+        if any(item.level == "warning" for item in active):
+            return (
+                "live_ok",
+                "warning",
+                "所有最小真实请求均成功，但部分 usage ledger 写入不完整",
+            )
         return "live_ok", "ok", "所有已启用 deployment 的最小真实请求均成功"
     if successes:
         level: HealthLevel = (

@@ -199,6 +199,138 @@ def test_v1_paid_request_preflight_returns_507_with_zero_provider_calls(
         assert connection.execute("SELECT count(*) FROM attempt_events").fetchone()[0] == 0
 
 
+def test_v1_ledger_writability_preflight_returns_507_with_zero_provider_calls(
+    gateway_home,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+
+    def unavailable() -> None:
+        raise sqlite3.OperationalError("private ledger path")
+
+    monkeypatch.setattr(app.state.usage_store, "probe_writable", unavailable)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": []},
+        )
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == (
+        "model_gateway_insufficient_storage"
+    )
+    assert response.json()["error"]["attempts"] == 0
+    assert provider_calls == 0
+    assert "private ledger path" not in response.text
+    with sqlite3.connect(gateway_home.usage_db) as connection:
+        assert connection.execute("SELECT count(*) FROM usage_events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM attempt_events").fetchone()[0] == 0
+
+
+def test_capability_probe_preflight_returns_507_with_zero_provider_calls(
+    gateway_home,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+
+    def unavailable() -> None:
+        raise sqlite3.OperationalError("private ledger path")
+
+    monkeypatch.setattr(app.state.usage_store, "probe_writable", unavailable)
+    with TestClient(app) as client:
+        response = client.post(
+            "/admin/channels/probe-capabilities",
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
+            json={
+                "revision": configuration_revision(gateway_home.config),
+                "candidate_key": "candidate-provider-secret",
+                "channel_operator": "official-vendor",
+                "base_url": "https://official.example/v1",
+                "adapter": "generic",
+                "auth_type": "bearer",
+                "allowed_private_networks": [],
+                "upstream_model": "author/chat-v1",
+                "probes": ["chat"],
+            },
+        )
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == (
+        "model_gateway_insufficient_storage"
+    )
+    assert response.json()["error"]["attempts"] == 0
+    assert provider_calls == 0
+    assert "private ledger path" not in response.text
+
+
+def test_capability_probe_ledger_failure_keeps_result_and_latches_not_ready(
+    gateway_home,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+
+    def fail_record(**_kwargs) -> str:
+        raise sqlite3.OperationalError("private ledger path")
+
+    monkeypatch.setattr(app.state.usage_store, "record", fail_record)
+    with TestClient(app) as client:
+        response = client.post(
+            "/admin/channels/probe-capabilities",
+            headers={"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"},
+            json={
+                "revision": configuration_revision(gateway_home.config),
+                "candidate_key": "candidate-provider-secret",
+                "channel_operator": "official-vendor",
+                "base_url": "https://official.example/v1",
+                "adapter": "generic",
+                "auth_type": "bearer",
+                "allowed_private_networks": [],
+                "upstream_model": "author/chat-v1",
+                "probes": ["chat"],
+            },
+        )
+        first_ready = client.get("/readyz")
+        second_ready = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["usage_ledger_status"] == "incomplete"
+    assert response.json()["warnings"]
+    assert provider_calls == 1
+    assert "private ledger path" not in response.text
+    assert first_ready.status_code == 503
+    assert first_ready.json() == {
+        "status": "not_ready",
+        "reason": "disk_unavailable",
+    }
+    assert second_ready.status_code == 200
+
+
 def test_post_provider_sqlite_full_keeps_upstream_result_and_latches_not_ready(
     gateway_home,
     monkeypatch: pytest.MonkeyPatch,
@@ -241,6 +373,57 @@ def test_post_provider_sqlite_full_keeps_upstream_result_and_latches_not_ready(
     assert response.headers["x-model-gateway-usage-ledger-status"] == "incomplete"
     assert "x-model-gateway-usage-event-id" not in response.headers
     assert "SECRET-BODY" not in response.text
+    assert first_ready.status_code == 503
+    assert first_ready.json() == {
+        "status": "not_ready",
+        "reason": "disk_unavailable",
+    }
+    assert second_ready.status_code == 200
+
+
+def test_stream_runtime_ledger_failure_latches_not_ready(
+    gateway_home,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_body = (
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    class OneChunkStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield upstream_body
+
+        async def aclose(self) -> None:
+            return None
+
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                stream=OneChunkStream(),
+                headers={"content-type": "text/event-stream"},
+            )
+        ),
+    )
+
+    def fail_record(**_kwargs) -> str:
+        raise RuntimeError("non-storage ledger callback failure")
+
+    monkeypatch.setattr(app.state.usage_store, "record", fail_record)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": [], "stream": True},
+        )
+        first_ready = client.get("/readyz")
+        second_ready = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.content == upstream_body
+    assert response.headers["x-model-gateway-usage-ledger-status"] == "deferred"
     assert first_ready.status_code == 503
     assert first_ready.json() == {
         "status": "not_ready",

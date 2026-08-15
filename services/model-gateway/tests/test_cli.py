@@ -13,7 +13,12 @@ import pytest
 from model_gateway import cli as cli_module
 from model_gateway import process as process_module
 from model_gateway.cli import main
-from model_gateway.config_store import gateway_paths, load_config, read_secrets
+from model_gateway.config_store import (
+    configuration_revision,
+    gateway_paths,
+    load_config,
+    read_secrets,
+)
 
 
 STRONG_LOCAL_TOKEN = "local_sensitive_token_0123456789_ABCDEFG"
@@ -421,6 +426,50 @@ def test_client_secret_set_rejects_weak_v2_value(tmp_path: Path, capsys) -> None
     captured = capsys.readouterr()
     assert "short-password" not in (captured.out + captured.err)
     assert read_secrets(gateway_paths(home).secrets) == {}
+
+
+def test_client_add_with_invalid_secret_is_one_atomic_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    paths = gateway_paths(home)
+    config_before = paths.config.read_bytes()
+    secrets_before = paths.secrets.read_bytes()
+    revision_before = configuration_revision(paths.config)
+    monkeypatch.setattr(cli_module.getpass, "getpass", lambda prompt="": "weak")
+
+    assert run_cli(home, "client", "add", "new-client", "--set-secret") == 2
+
+    assert paths.config.read_bytes() == config_before
+    assert paths.secrets.read_bytes() == secrets_before
+    assert configuration_revision(paths.config) == revision_before
+    assert "new-client" not in load_config(paths.config).clients
+    captured = capsys.readouterr()
+    assert "weak" not in (captured.out + captured.err)
+
+
+def test_client_add_with_secret_commits_the_pair_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    paths = gateway_paths(home)
+    monkeypatch.setattr(
+        cli_module.getpass,
+        "getpass",
+        lambda prompt="": STRONG_LOCAL_TOKEN,
+    )
+
+    assert run_cli(home, "client", "add", "atomic-client", "--set-secret") == 0
+
+    config = load_config(paths.config)
+    client = config.clients["atomic-client"]
+    assert read_secrets(paths.secrets)[client.secret_ref] == STRONG_LOCAL_TOKEN
+    assert not paths.journal.exists()
 
 
 def test_doctor_warns_for_migrated_weak_client_and_rotation_clears_override(

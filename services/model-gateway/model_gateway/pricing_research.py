@@ -9,14 +9,12 @@ import ipaddress
 import json
 import re
 import socket
-import time
 from typing import Any, Literal, Mapping
 from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     ConnectionConfig,
     DeploymentConfig,
@@ -24,32 +22,20 @@ from model_gateway.models import (
     PricingConfig,
     PricingTier,
 )
-from model_gateway.proxy import (
-    classify_network_failure,
-    http_failure_class,
-    prepare_payload,
-    upstream_async_client,
-    upstream_headers,
-)
+from model_gateway.proxy import prepare_payload
 from model_gateway.routing import RouteTarget
-from model_gateway.usage import metadata_only_usage, safe_metadata_id
+from model_gateway.upstream_executor import (
+    BufferedUpstreamResult,
+    UpstreamExecutor,
+    UsageLedgerPreflightError,
+    http_failure_class,
+)
+from model_gateway.usage import UsageMetadata, UsageStore, metadata_only_usage
 
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_VISIBLE_CHARACTERS = 80_000
 MAX_RESEARCH_RESPONSE_BYTES = 512 * 1024
-_MULTI_LABEL_PUBLIC_SUFFIXES = {
-    "co.jp",
-    "co.uk",
-    "com.au",
-    "com.br",
-    "com.cn",
-    "com.hk",
-    "com.sg",
-    "com.tw",
-    "net.cn",
-    "org.cn",
-}
 _INJECTION_PATTERNS = (
     re.compile(r"\bignore\s+(?:all\s+|any\s+)?(?:previous|prior|above)\s+instructions?\b", re.I),
     re.compile(r"\bdisregard\s+(?:all\s+|any\s+)?(?:previous|prior|above)\b", re.I),
@@ -82,6 +68,7 @@ class ResearchCallMetadata:
     failure_class: str = ""
     request_sent: bool = True
     response_complete: bool | None = None
+    usage_ledger_status: str = ""
 
     def __post_init__(self) -> None:
         if not self.outcome:
@@ -108,7 +95,7 @@ class ResearchCallMetadata:
             )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "status_code": self.status_code,
             "latency_ms": self.latency_ms,
             "usage": dict(self.usage) if self.usage is not None else None,
@@ -119,6 +106,9 @@ class ResearchCallMetadata:
             "request_sent": self.request_sent,
             "response_complete": self.response_complete,
         }
+        if self.usage_ledger_status:
+            result["usage_ledger_status"] = self.usage_ledger_status
+        return result
 
 
 class _ResearchTier(BaseModel):
@@ -236,6 +226,9 @@ async def research_pricing(
     confirmed_official_host: str = "",
     source_transport: httpx.AsyncBaseTransport | None = None,
     research_transport: httpx.AsyncBaseTransport | None = None,
+    usage_store: UsageStore | None = None,
+    usage_client_id: str = "modelgw-pricing-research",
+    storage_monitor: object | None = None,
 ) -> PricingResearchOutcome:
     """Extract an evidence-bound price candidate without mutating config or usage data."""
 
@@ -285,6 +278,9 @@ async def research_pricing(
         source_sha256=digest,
         visible_text=visible_text,
         transport=research_transport,
+        usage_store=usage_store,
+        usage_client_id=usage_client_id,
+        storage_monitor=storage_monitor,
     )
     try:
         parsed = _ResearchAnswer.model_validate(_strict_json_object(raw_answer))
@@ -365,9 +361,9 @@ def validate_official_source(
     if confirmed:
         if "://" in confirmed or "/" in confirmed or confirmed != source_host:
             raise PricingResearchError("--official-host 必须与 --source-url 的 hostname 完全一致")
-    elif not _same_organization_domain(source_host, connection_host):
+    elif source_host != connection_host:
         raise PricingResearchError(
-            "来源域名与目标 connection 不属于同一站点；核对它确为该渠道官方页面后，"
+            "来源 hostname 与目标 connection 不一致；核对它确为该渠道官方页面后，"
             "用 --official-host 明确确认该 hostname"
         )
     return normalized, source_host
@@ -452,6 +448,9 @@ async def _call_research_deployment(
     source_sha256: str,
     visible_text: str,
     transport: httpx.AsyncBaseTransport | None,
+    usage_store: UsageStore | None,
+    usage_client_id: str,
+    storage_monitor: object | None,
 ) -> tuple[str, ResearchCallMetadata]:
     deployment = config.deployments[research_deployment_id]
     connection = config.connections[deployment.connection]
@@ -526,80 +525,55 @@ async def _call_research_deployment(
         payload["response_format"] = {"type": "json_object"}
     forwarded = prepare_payload(payload, route_target)
     secret = secrets[connection.auth.secret_ref]
-    headers = upstream_headers(route_target, secret, {})
-    url = upstream_url(
-        connection.base_url,
-        connection.chat_endpoint,
-        allowed_private_networks=connection.allowed_private_networks,
-    )
-    if transport is None:
-        await require_safe_destination(
-            url,
-            allowed_private_networks=connection.allowed_private_networks,
-        )
-    started = time.monotonic()
     try:
-        async with upstream_async_client(connection, transport=transport) as client:
-            async with client.stream(
-                "POST",
-                url,
-                headers=headers,
-                json=forwarded,
-            ) as response:
-                if response.is_redirect:
-                    raise PricingResearchCallError(
-                        "research deployment 返回重定向；不会携带密钥跟随",
-                        ResearchCallMetadata(
-                            status_code=response.status_code,
-                            latency_ms=_elapsed_ms(started),
-                            failure_class="http_redirect",
-                        ),
-                    )
-                if not response.is_success:
-                    error_body = await _bounded_error_body(response)
-                    raise PricingResearchCallError(
-                        f"research deployment 调用失败（HTTP {response.status_code}）",
-                        ResearchCallMetadata(
-                            status_code=response.status_code,
-                            latency_ms=_elapsed_ms(started),
-                            failure_class=http_failure_class(
-                                response.status_code,
-                                error_body,
-                            ),
-                        ),
-                    )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_RESEARCH_RESPONSE_BYTES:
-                        raise PricingResearchCallError(
-                            "research deployment 响应超过安全上限",
-                            ResearchCallMetadata(
-                                status_code=response.status_code,
-                                latency_ms=_elapsed_ms(started),
-                                outcome="ambiguous_failure",
-                                failure_class="response_too_large",
-                                response_complete=False,
-                            ),
-                        )
-                    chunks.append(chunk)
-                raw = b"".join(chunks)
-    except PricingResearchCallError:
-        raise
-    except httpx.HTTPError as exc:
-        request_sent, outcome, failure_class = classify_network_failure(exc)
-        raise PricingResearchCallError(
-            f"research deployment 网络调用失败：{type(exc).__name__}",
-            ResearchCallMetadata(
-                status_code=502,
-                latency_ms=_elapsed_ms(started),
-                outcome=outcome,
-                failure_class=failure_class,
-                request_sent=request_sent,
-            ),
+        async with UpstreamExecutor(transport=transport) as executor:
+            if usage_store is None:
+                result = await executor.post_json(
+                    target=route_target,
+                    payload=forwarded,
+                    secret=secret,
+                    response_limit_bytes=MAX_RESEARCH_RESPONSE_BYTES,
+                )
+            else:
+                result = await executor.post_json_accounted(
+                    target=route_target,
+                    payload=forwarded,
+                    secret=secret,
+                    response_limit_bytes=MAX_RESEARCH_RESPONSE_BYTES,
+                    usage_store=usage_store,
+                    server=config.server,
+                    pricing_catalog=config.pricing,
+                    client_id=usage_client_id,
+                    route_id="pricing.research",
+                    metadata=UsageMetadata(operation="pricing.research"),
+                    storage_monitor=storage_monitor,
+                )
+    except UsageLedgerPreflightError as exc:
+        raise PricingResearchError(
+            "usage ledger 预检失败；未发起 research deployment 请求"
         ) from exc
-    metadata = _research_metadata(raw, response.status_code, _elapsed_ms(started))
+    if result.trace is None:
+        raise PricingResearchError(
+            result.error_detail or "research deployment URL 或 Header 未通过安全校验"
+        )
+    metadata = _research_metadata(result)
+    if result.error_type:
+        if result.trace.failure_class == "response_too_large":
+            message = "research deployment 响应超过安全上限"
+        else:
+            message = f"research deployment 网络调用失败：{result.error_type}"
+        raise PricingResearchCallError(message, metadata)
+    if result.is_redirect:
+        raise PricingResearchCallError(
+            "research deployment 返回重定向；不会携带密钥跟随",
+            metadata,
+        )
+    if not result.is_success:
+        raise PricingResearchCallError(
+            f"research deployment 调用失败（HTTP {result.status_code}）",
+            metadata,
+        )
+    raw = result.content
     try:
         response_payload = json.loads(raw)
         choices = response_payload["choices"]
@@ -753,80 +727,26 @@ def _unknown(
 
 
 def _research_metadata(
-    raw_response: bytes,
-    status_code: int,
-    latency_ms: int,
+    result: BufferedUpstreamResult,
 ) -> ResearchCallMetadata:
-    usage: dict[str, Any] | None = None
-    response_model = ""
-    request_id = ""
-    try:
-        payload = json.loads(raw_response)
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
-        payload = None
-    if isinstance(payload, dict):
-        raw_usage = payload.get("usage")
-        if isinstance(raw_usage, dict):
-            usage = metadata_only_usage(raw_usage)
-        raw_model = payload.get("model")
-        if isinstance(raw_model, str):
-            response_model = safe_metadata_id(
-                raw_model,
-                max_length=300,
-                allow_slash=True,
-            )
-        raw_request_id = payload.get("request_id") or payload.get("id")
-        if isinstance(raw_request_id, str):
-            request_id = safe_metadata_id(
-                raw_request_id, max_length=300, allow_slash=False
-            )
+    trace = result.trace
+    assert trace is not None
     return ResearchCallMetadata(
-        status_code=status_code,
-        latency_ms=latency_ms,
-        usage=usage,
-        response_model=response_model,
-        request_id=request_id,
-        outcome="success",
-        failure_class="none",
-        request_sent=True,
-        response_complete=True,
+        status_code=result.status_code if result.status_code is not None else 502,
+        latency_ms=trace.latency_ms,
+        usage=(
+            metadata_only_usage(trace.capture.usage)
+            if trace.capture.usage is not None
+            else None
+        ),
+        response_model=trace.capture.response_model,
+        request_id=trace.capture.request_id,
+        outcome=trace.outcome,
+        failure_class=trace.failure_class,
+        request_sent=trace.request_sent,
+        response_complete=trace.response_complete,
+        usage_ledger_status=result.usage_ledger_status,
     )
-
-
-async def _bounded_error_body(response: httpx.Response) -> bytes:
-    """Drain a small error body so HTTP failures classify like the data plane."""
-
-    content = b""
-    async for chunk in response.aiter_bytes():
-        content += chunk
-        if len(content) > 64 * 1024:
-            return content[: 64 * 1024]
-    return content
-
-
-def _elapsed_ms(started: float) -> int:
-    return max(0, int((time.monotonic() - started) * 1000))
-
-
-def _same_organization_domain(left: str, right: str) -> bool:
-    if not left or not right:
-        return False
-    if left == right or left.endswith("." + right) or right.endswith("." + left):
-        return True
-    return _registrable_domain(left) == _registrable_domain(right)
-
-
-def _registrable_domain(host: str) -> str:
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        pass
-    parts = host.split(".")
-    if len(parts) <= 2:
-        return host
-    suffix = ".".join(parts[-2:])
-    return ".".join(parts[-3:]) if suffix in _MULTI_LABEL_PUBLIC_SUFFIXES else suffix
 
 
 async def _require_public_dns(hostname: str, port: int) -> None:

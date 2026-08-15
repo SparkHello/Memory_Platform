@@ -10,15 +10,13 @@ from pydantic import Field, StrictBool, ValidationError, field_validator
 
 from model_gateway.auth import (
     provider_secret_header_value,
-    validate_secret_domains,
 )
 from model_gateway.config_store import (
     GatewayPaths,
-    commit_control_plane,
     load_config,
     read_secrets,
-    source_revision,
 )
+from model_gateway.control_plane import ControlPlaneService
 from model_gateway.discovery import fetch_model_listing_sync, parse_model_listing
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.memory_client import (
@@ -37,7 +35,6 @@ from model_gateway.models import (
     ConnectionConfig,
     DeploymentConfig,
     derive_embedding_space,
-    GatewayConfig,
     RequestTransform,
     RouteConfig,
     StrictModel,
@@ -404,20 +401,15 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         request_transform=RequestTransform(),
     )
 
-    payload = config.model_dump(mode="python")
-    payload["connections"] = {
-        **payload["connections"],
-        connection_id: connection.model_dump(mode="python"),
-    }
-    deployments = dict(payload["deployments"])
-    deployments[chat_deployment_id] = chat_deployment.model_dump(mode="python")
-    routes = dict(payload["routes"])
-    for route_id in CHAT_ROUTES:
-        routes[route_id] = RouteConfig(
+    deployments = {chat_deployment_id: chat_deployment}
+    routes = {
+        route_id: RouteConfig(
             kind="chat",
             targets=[chat_deployment_id],
             max_attempts=1,
-        ).model_dump(mode="python")
+        )
+        for route_id in CHAT_ROUTES
+    }
 
     embedding_deployment_id = ""
     resolved_embedding_space = ""
@@ -441,43 +433,42 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
             dimensions=spec.embedding_dimensions,
             embedding_space=resolved_embedding_space,
         )
-        deployments[embedding_deployment_id] = embedding_deployment.model_dump(mode="python")
+        deployments[embedding_deployment_id] = embedding_deployment
         routes[EMBEDDING_ROUTE] = RouteConfig(
             kind="embedding",
             targets=[embedding_deployment_id],
             max_attempts=1,
-        ).model_dump(mode="python")
-
-    payload["deployments"] = deployments
-    payload["routes"] = routes
+        )
 
     # Memory Gateway owns the desired permissions for its managed client. A
     # standalone quickstart may bootstrap the client with the exact eight
     # defaults, but it must never rewrite an existing client's policy.
     memory_client = provision_memory_gateway_client(config, existing_secrets)
-    if memory_client.created:
-        clients = dict(payload["clients"])
-        clients["memory-gateway"] = memory_client.client.model_dump(mode="python")
-        payload["clients"] = clients
 
     client_secret_ref = memory_client.client.secret_ref
     memory_client_key = memory_client.key
 
-    # Single validation of the whole relationship graph before the sole write.
-    validated = GatewayConfig.model_validate(payload)
-    candidate_secrets = dict(existing_secrets)
-    candidate_secrets[connection_secret_ref] = spec.api_key.strip()
-    candidate_secrets[client_secret_ref] = memory_client_key
-    validate_secret_domains(config=validated, secrets=candidate_secrets)
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=validated,
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=existing_secrets,
+    )
+    candidate = control_plane.upsert_graph(
+        snapshot,
+        clients=(
+            {"memory-gateway": memory_client.client}
+            if memory_client.created
+            else None
+        ),
+        connections={connection_id: connection},
+        deployments=deployments,
+        routes=routes,
         secret_updates={
             connection_secret_ref: spec.api_key.strip(),
             client_secret_ref: memory_client_key,
         },
     )
+    control_plane.commit(candidate)
 
     return QuickstartResult(
         connection_id=connection_id,

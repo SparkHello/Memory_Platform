@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from model_gateway.config_store import (
+    configuration_revision,
     gateway_paths,
     initialize,
     load_config,
@@ -59,7 +60,6 @@ def test_user_console_adds_channel_model_and_friendly_routes(
             "1",  # add a channel and model
             "deepseek",
             "https://api.deepseek.example/v1",
-            "",  # pay as you go
             "3",  # DeepSeek compatibility
             "deepseek-chat",
             "",  # chat model
@@ -83,6 +83,9 @@ def test_user_console_adds_channel_model_and_friendly_routes(
     paths = gateway_paths(home)
     config = load_config(paths.config)
     assert len(config.connections) == 1
+    connection = next(iter(config.connections.values()))
+    assert connection.billing_plan == BillingPlan(type="payg", name="default")
+    assert connection.usage_scope == "backend_allowed"
     deployment = next(iter(config.deployments.values()))
     assert deployment.upstream_model == "deepseek-chat"
     assert deployment.capabilities.tools is True
@@ -96,7 +99,46 @@ def test_user_console_adds_channel_model_and_friendly_routes(
     output = capsys.readouterr().out
     assert "本地模型服务" in output
     assert "添加渠道和模型" in output
+    assert "你的套餐" not in output
     assert "upstream-sensitive-key" not in output
+
+
+def test_user_console_invalid_provider_secret_changes_nothing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "gateway-home"
+    paths = gateway_paths(home)
+    initialize(paths)
+    config_before = paths.config.read_bytes()
+    secrets_before = paths.secrets.read_bytes()
+    revision_before = configuration_revision(paths.config)
+    answers = iter(
+        [
+            "1",
+            "deepseek",
+            "https://api.deepseek.example/v1",
+            "3",
+            "deepseek-chat",
+            "",
+            "",
+            "",
+            "",
+            "0",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.setattr(
+        user_console.getpass,
+        "getpass",
+        lambda prompt="": "invalid provider secret",
+    )
+
+    assert user_console.run_user_console(_args(home)) == 0
+
+    assert paths.config.read_bytes() == config_before
+    assert paths.secrets.read_bytes() == secrets_before
+    assert configuration_revision(paths.config) == revision_before
 
 
 def test_user_console_connects_memory_service_without_showing_client_key(

@@ -275,10 +275,10 @@ def commit_control_plane(
         candidate_config = (
             current_config
             if config is None
-            else (
-                config
+            else GatewayConfig.model_validate(
+                config.model_dump(mode="python", exclude_none=False)
                 if isinstance(config, GatewayConfig)
-                else GatewayConfig.model_validate(config)
+                else config
             )
         )
         current_secrets = read_secrets(paths.secrets)
@@ -289,24 +289,16 @@ def commit_control_plane(
                 candidate_secrets.pop(name, None)
             else:
                 candidate_secrets[name] = value
-        _validate_request_transform_transition(
-            current=current_config,
-            candidate=candidate_config,
+        # This validation is intentionally repeated by the higher-level
+        # ControlPlaneService before any optional discovery/probe and here,
+        # under the authoritative cross-process lock.  The second pass closes
+        # races with concurrent secret-only writers while this function stays
+        # the crash-safe persistence primitive.
+        validate_control_plane_snapshot(
+            current_config=current_config,
+            candidate_config=candidate_config,
+            candidate_secrets=candidate_secrets,
         )
-
-        # Validate the complete referenced credential snapshot inside the
-        # lock. A concurrent writer must not be able to race individually valid
-        # updates into an unsafe provider header or an ambiguous client domain.
-        try:
-            validate_secret_snapshot(
-                config=candidate_config,
-                secrets=candidate_secrets,
-            )
-        except SecretSnapshotError as exc:
-            raise ControlPlaneValidationError(
-                str(exc),
-                reason=exc.reason,
-            ) from exc
 
         # The transaction needs room for durable before-images, candidate
         # temporary files and its journal.  Refuse before creating any of them
@@ -390,6 +382,35 @@ def _validate_request_transform_transition(
             + ", ".join(protected_fields),
             reason="request_transform_invalid",
         )
+
+
+def validate_control_plane_snapshot(
+    *,
+    current_config: GatewayConfig,
+    candidate_config: GatewayConfig,
+    candidate_secrets: Mapping[str, str],
+) -> None:
+    """Validate one complete candidate graph without writing it.
+
+    The low-level commit calls this again while holding its file lock.  It is
+    public so adapters can reject an invalid combined config/secret candidate
+    before performing network discovery, without duplicating security rules.
+    """
+
+    _validate_request_transform_transition(
+        current=current_config,
+        candidate=candidate_config,
+    )
+    try:
+        validate_secret_snapshot(
+            config=candidate_config,
+            secrets=dict(candidate_secrets),
+        )
+    except SecretSnapshotError as exc:
+        raise ControlPlaneValidationError(
+            str(exc),
+            reason=exc.reason,
+        ) from exc
 
 
 def _control_plane_expected_write_bytes(

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from model_gateway.service import create_app
 from model_gateway.config_store import (
+    configuration_revision,
     load_config,
     read_secrets,
     write_config,
@@ -226,6 +227,9 @@ def test_admin_secret_write_is_one_way_and_connection_check_is_discovery_only(
 
 
 def test_admin_cannot_reuse_local_client_key_as_provider_key(gateway_home) -> None:
+    config_before = gateway_home.config.read_bytes()
+    secrets_before = gateway_home.secrets.read_bytes()
+    revision_before = configuration_revision(gateway_home.config)
     app = create_app(paths=gateway_home, transport=httpx.MockTransport(lambda request: None))
     with TestClient(app) as client:
         response = client.put(
@@ -236,6 +240,9 @@ def test_admin_cannot_reuse_local_client_key_as_provider_key(gateway_home) -> No
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "model_gateway_secret_domain_conflict"
+    assert gateway_home.config.read_bytes() == config_before
+    assert gateway_home.secrets.read_bytes() == secrets_before
+    assert configuration_revision(gateway_home.config) == revision_before
     assert read_secrets(gateway_home.secrets)["UPSTREAM_OFFICIAL"] == "official-secret"
 
 
@@ -766,7 +773,7 @@ def test_usage_storage_failure_never_changes_successful_upstream_response(
     app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
 
     def fail_record(**kwargs) -> None:
-        raise sqlite3.OperationalError("disk unavailable")
+        raise RuntimeError("non-storage ledger callback failure")
 
     monkeypatch.setattr(app.state.usage_store, "record", fail_record)
     with TestClient(app) as client:
@@ -775,9 +782,18 @@ def test_usage_storage_failure_never_changes_successful_upstream_response(
             headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
             json={"model": "memory.chat", "messages": []},
         )
+        first_ready = client.get("/readyz")
+        second_ready = client.get("/readyz")
 
     assert response.status_code == 200
     assert response.content == raw
+    assert response.headers["x-model-gateway-usage-ledger-status"] == "incomplete"
+    assert first_ready.status_code == 503
+    assert first_ready.json() == {
+        "status": "not_ready",
+        "reason": "disk_unavailable",
+    }
+    assert second_ready.status_code == 200
 
 
 def test_chat_stream_control_must_be_boolean(gateway_home) -> None:

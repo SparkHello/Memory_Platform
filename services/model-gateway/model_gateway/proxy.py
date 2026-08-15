@@ -13,11 +13,6 @@ from model_gateway.adapters import (
     strip_reasoning_from_assistant_messages,
 )
 from model_gateway.auth import provider_secret_header_value
-from model_gateway.http_safety import require_safe_destination, upstream_url
-from model_gateway.models import (
-    FORBIDDEN_UPSTREAM_FORWARD_HEADERS,
-    ConnectionConfig,
-)
 from model_gateway.routing import (
     RequestRequirements,
     ResolvedRoute,
@@ -27,7 +22,11 @@ from model_gateway.routing import (
     should_fail_over,
     structured_error_code,
 )
-from model_gateway.usage import AttemptTrace, UsageCapture
+from model_gateway.usage import AttemptTrace
+from model_gateway.upstream_executor import (
+    UpstreamExecutor,
+    UpstreamStreamLease,
+)
 
 
 PASSTHROUGH_RESPONSE_HEADERS = {
@@ -43,10 +42,6 @@ PASSTHROUGH_RESPONSE_HEADERS = {
 
 
 class ProxyNetworkError(RuntimeError):
-    pass
-
-
-class ProxyResponseTooLarge(httpx.ReadError):
     pass
 
 
@@ -74,60 +69,31 @@ class ProxyUpstreamStream:
     def __init__(
         self,
         *,
-        client: httpx.AsyncClient,
-        response: httpx.Response,
-        iterator: AsyncIterator[bytes],
-        first_chunk: bytes | None,
+        lease: UpstreamStreamLease,
         target: RouteTarget,
         attempts: int,
         headers: dict[str, str],
         attempt_traces: tuple[AttemptTrace, ...],
-        active_trace: AttemptTrace,
-        response_limit_bytes: int,
-        attempt_started_monotonic: float,
     ) -> None:
-        self.client = client
-        self.response = response
-        self.iterator = iterator
-        self.first_chunk = first_chunk
+        self._lease = lease
+        self.client = lease.client
+        self.response = lease.response
+        self.iterator = lease.iterator
+        self.first_chunk = lease.first_chunk
         self.target = target
         self.attempts = attempts
         self.headers = headers
         self.attempt_traces = attempt_traces
-        self.active_trace = active_trace
-        self.response_limit_bytes = response_limit_bytes
-        self.attempt_started_monotonic = attempt_started_monotonic
-        self._closed = False
+        self.active_trace = lease.trace
+        self.response_limit_bytes = lease.response_limit_bytes
+        self.attempt_started_monotonic = lease.attempt_started_monotonic
 
     async def aiter_raw(self) -> AsyncIterator[bytes]:
-        total = 0
-        try:
-            if self.first_chunk:
-                total += len(self.first_chunk)
-                _enforce_response_limit(
-                    total,
-                    self.response_limit_bytes,
-                    self.response,
-                )
-                yield self.first_chunk
-            async for chunk in self.iterator:
-                if chunk:
-                    total += len(chunk)
-                    _enforce_response_limit(total, self.response_limit_bytes, self.response)
-                    yield chunk
-            self.active_trace.response_complete = True
-        except httpx.HTTPError as exc:
-            self.active_trace.outcome = "ambiguous_failure"
-            self.active_trace.failure_class = _network_failure_class(exc)
-            self.active_trace.billable_unknown = True
-            self.active_trace.response_complete = False
-            raise
+        async for chunk in self._lease.aiter_raw():
+            yield chunk
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await self.response.aclose()
+        await self._lease.aclose()
 
 
 class RawOpenAIProxy:
@@ -141,7 +107,9 @@ class RawOpenAIProxy:
         self.router = router
         self.transport = transport
         self._wall_clock = wall_clock
-        self._clients: dict[tuple[float, float, float, float], httpx.AsyncClient] = {}
+        self.executor = UpstreamExecutor(transport=transport)
+        # Compatibility for lifecycle diagnostics; the executor owns the map.
+        self._clients = self.executor._clients
 
     async def complete(
         self,
@@ -165,79 +133,58 @@ class RawOpenAIProxy:
                 break
             if not self.router.runtime_health.available(target):
                 continue
-            url = self._url(target)
-            if self.transport is None:
-                try:
-                    await require_safe_destination(
-                        url,
-                        allowed_private_networks=(
-                            target.connection.allowed_private_networks
-                        ),
-                    )
-                except (OSError, ValueError) as exc:
-                    last_network_error = httpx.ConnectError(
-                        _destination_validation_message(exc)
-                    )
-                    continue
+            forwarded = (
+                prepared_payloads[target.deployment_id]
+                if prepared_payloads is not None
+                else prepare_payload(
+                    payload,
+                    target,
+                    reasoning_origin_deployment=reasoning_origin_deployment,
+                )
+            )
+            execution = await self.executor.post_json(
+                target=target,
+                payload=forwarded,
+                secret=secret,
+                request_headers=request_headers,
+                attempt_index=attempts + 1,
+            )
+            trace = execution.trace
+            if trace is None:
+                last_network_error = httpx.ConnectError(
+                    execution.error_detail or execution.error_type
+                )
+                continue
             attempts += 1
-            attempt_started = time.monotonic()
-            response: httpx.Response | None = None
-            try:
-                client = self._client(target)
-                request = client.build_request(
-                    "POST",
-                    url,
-                    headers=upstream_headers(target, secret, request_headers),
-                    json=(
-                        prepared_payloads[target.deployment_id]
-                        if prepared_payloads is not None
-                        else prepare_payload(
-                            payload,
-                            target,
-                            reasoning_origin_deployment=reasoning_origin_deployment,
-                        )
-                    ),
-                )
-                response = await client.send(request, stream=True)
-                try:
-                    content = await _read_raw_content(
-                        response,
-                        limit=target.connection.response_limit_bytes,
+            attempt_traces.append(trace)
+            if execution.error_type:
+                last_network_error = httpx.ConnectError(execution.error_type)
+                if execution.status_code is not None:
+                    self._record_health(
+                        target,
+                        status_code=execution.status_code,
+                        headers=execution.headers,
+                        content=b"",
                     )
-                finally:
-                    await response.aclose()
-            except httpx.HTTPError as exc:
-                last_network_error = exc
-                trace = _network_attempt_trace(
-                    target=target,
-                    attempt_index=attempts,
-                    exc=exc,
-                    latency_ms=int((time.monotonic() - attempt_started) * 1000),
-                )
-                attempt_traces.append(trace)
-                if response is not None:
-                    trace.status_code = response.status_code
-                    self._record_health(target, response, b"")
-                if _network_error_can_fail_over(exc):
+                if trace.outcome == "connect_failure":
                     continue
                 return _network_error_result(
-                    exc,
+                    execution.error_type,
                     route=route,
                     target=target,
                     attempts=attempts,
                     attempt_traces=tuple(attempt_traces),
                 )
-            trace = _response_attempt_trace(
-                target=target,
-                attempt_index=attempts,
-                response=response,
+            assert execution.status_code is not None
+            content = execution.content
+            self._record_health(
+                target,
+                status_code=execution.status_code,
+                headers=execution.headers,
                 content=content,
-                latency_ms=int((time.monotonic() - attempt_started) * 1000),
             )
-            attempt_traces.append(trace)
-            self._record_health(target, response, content)
             if (
-                response.is_success
+                execution.is_success
                 and target.deployment.kind == "embedding"
                 and not _valid_embedding_response(
                     content,
@@ -254,9 +201,9 @@ class RawOpenAIProxy:
                 )
             result = ProxyHTTPResult(
                 content=content,
-                status_code=response.status_code,
-                headers=response_headers(
-                    response,
+                status_code=execution.status_code,
+                headers=buffered_response_headers(
+                    execution.headers,
                     route=route,
                     target=target,
                     attempts=attempts,
@@ -265,11 +212,11 @@ class RawOpenAIProxy:
                 attempts=attempts,
                 attempt_traces=tuple(attempt_traces),
             )
-            if response.is_redirect:
+            if execution.is_redirect:
                 result = _unsafe_redirect_result(result)
-            if response.is_success:
+            if execution.is_success:
                 return result
-            if not should_fail_over(response.status_code, content):
+            if not should_fail_over(execution.status_code, content):
                 return result
             last_result = result
 
@@ -304,107 +251,62 @@ class RawOpenAIProxy:
                 break
             if not self.router.runtime_health.available(target):
                 continue
-            url = self._url(target)
-            if self.transport is None:
-                try:
-                    await require_safe_destination(
-                        url,
-                        allowed_private_networks=(
-                            target.connection.allowed_private_networks
-                        ),
-                    )
-                except (OSError, ValueError) as exc:
-                    last_network_error = httpx.ConnectError(
-                        _destination_validation_message(exc)
-                    )
-                    continue
+            forwarded = (
+                prepared_payloads[target.deployment_id]
+                if prepared_payloads is not None
+                else prepare_payload(
+                    payload,
+                    target,
+                    reasoning_origin_deployment=reasoning_origin_deployment,
+                )
+            )
+            execution = await self.executor.open_json_stream(
+                target=target,
+                payload=forwarded,
+                secret=secret,
+                request_headers=request_headers,
+                attempt_index=attempts + 1,
+            )
+            trace = execution.trace
+            if trace is None:
+                last_network_error = httpx.ConnectError(
+                    execution.error_detail or execution.error_type
+                )
+                continue
+
             attempts += 1
-            attempt_started = time.monotonic()
-            client = self._client(target)
-            response: httpx.Response | None = None
-            try:
-                request = client.build_request(
-                    "POST",
-                    url,
-                    headers=upstream_headers(target, secret, request_headers),
-                    json=(
-                        prepared_payloads[target.deployment_id]
-                        if prepared_payloads is not None
-                        else prepare_payload(
-                            payload,
-                            target,
-                            reasoning_origin_deployment=reasoning_origin_deployment,
-                        )
+            attempt_traces.append(trace)
+            if execution.status_code is not None:
+                self._record_health(
+                    target,
+                    status_code=execution.status_code,
+                    headers=execution.headers,
+                    content=(
+                        execution.content if not execution.error_type else b""
                     ),
                 )
-                response = await client.send(request, stream=True)
-            except httpx.HTTPError as exc:
-                last_network_error = exc
-                attempt_traces.append(
-                    _network_attempt_trace(
-                        target=target,
-                        attempt_index=attempts,
-                        exc=exc,
-                        latency_ms=int(
-                            (time.monotonic() - attempt_started) * 1000
-                        ),
-                    )
-                )
-                if _network_error_can_fail_over(exc):
+
+            if execution.error_type:
+                error = execution.error or httpx.ReadError(execution.error_type)
+                last_network_error = error
+                if trace.outcome == "connect_failure":
                     continue
                 return _network_error_result(
-                    exc,
+                    error,
                     route=route,
                     target=target,
                     attempts=attempts,
                     streaming=True,
                     attempt_traces=tuple(attempt_traces),
                 )
-            if not response.is_success:
-                try:
-                    content = await _read_raw_content(
-                        response,
-                        limit=target.connection.response_limit_bytes,
-                    )
-                except httpx.HTTPError as exc:
-                    last_network_error = exc
-                    trace = _network_attempt_trace(
-                        target=target,
-                        attempt_index=attempts,
-                        exc=exc,
-                        latency_ms=int(
-                            (time.monotonic() - attempt_started) * 1000
-                        ),
-                    )
-                    trace.request_sent = True
-                    trace.billable_unknown = True
-                    trace.outcome = "ambiguous_failure"
-                    trace.status_code = response.status_code
-                    attempt_traces.append(trace)
-                    self._record_health(target, response, b"")
-                    await response.aclose()
-                    return _network_error_result(
-                        exc,
-                        route=route,
-                        target=target,
-                        attempts=attempts,
-                        streaming=True,
-                        attempt_traces=tuple(attempt_traces),
-                    )
-                trace = _response_attempt_trace(
-                    target=target,
-                    attempt_index=attempts,
-                    response=response,
-                    content=content,
-                    latency_ms=int((time.monotonic() - attempt_started) * 1000),
-                )
-                attempt_traces.append(trace)
-                self._record_health(target, response, content)
+
+            if execution.lease is None:
+                assert execution.status_code is not None
                 result = ProxyHTTPResult(
-                    content=content,
-                    status_code=response.status_code,
-                    headers=response_headers(
-                        response,
+                    content=execution.content,
+                    status_code=execution.status_code,
+                    headers=buffered_response_headers(
+                        execution.headers,
                         route=route,
                         target=target,
                         attempts=attempts,
@@ -413,87 +315,23 @@ class RawOpenAIProxy:
                     attempts=attempts,
                     attempt_traces=tuple(attempt_traces),
                 )
-                if response.is_redirect:
+                if execution.is_redirect:
                     result = _unsafe_redirect_result(result)
-                await response.aclose()
-                if not should_fail_over(response.status_code, content):
+                if not should_fail_over(
+                    execution.status_code,
+                    execution.content,
+                ):
                     return result
                 last_result = result
                 continue
-            iterator = response.aiter_raw().__aiter__()
-            trace = _response_attempt_trace(
-                target=target,
-                attempt_index=attempts,
-                response=response,
-                content=None,
-                latency_ms=int((time.monotonic() - attempt_started) * 1000),
-            )
-            attempt_traces.append(trace)
-            self._record_health(target, response, b"")
-            try:
-                first_chunk = await _first_non_empty_chunk(iterator)
-            except httpx.HTTPError as exc:
-                last_network_error = exc
-                trace.outcome = "ambiguous_failure"
-                trace.failure_class = _network_failure_class(exc)
-                trace.billable_unknown = True
-                await response.aclose()
-                return _network_error_result(
-                    exc,
-                    route=route,
-                    target=target,
-                    attempts=attempts,
-                    streaming=True,
-                    attempt_traces=tuple(attempt_traces),
-                )
-            if first_chunk is None:
-                last_network_error = httpx.ReadError(
-                    "upstream stream ended before first byte"
-                )
-                trace.outcome = "ambiguous_failure"
-                trace.failure_class = "empty_stream"
-                trace.billable_unknown = True
-                await response.aclose()
-                return _network_error_result(
-                    last_network_error,
-                    route=route,
-                    target=target,
-                    attempts=attempts,
-                    streaming=True,
-                    attempt_traces=tuple(attempt_traces),
-                )
-            try:
-                _enforce_response_limit(
-                    len(first_chunk),
-                    target.connection.response_limit_bytes,
-                    response,
-                )
-            except ProxyResponseTooLarge as exc:
-                trace.outcome = "ambiguous_failure"
-                trace.failure_class = "response_too_large"
-                trace.billable_unknown = True
-                await response.aclose()
-                return _network_error_result(
-                    exc,
-                    route=route,
-                    target=target,
-                    attempts=attempts,
-                    streaming=True,
-                    attempt_traces=tuple(attempt_traces),
-                )
+
             return ProxyUpstreamStream(
-                client=client,
-                response=response,
-                iterator=iterator,
-                first_chunk=first_chunk,
+                lease=execution.lease,
                 target=target,
                 attempts=attempts,
                 attempt_traces=tuple(attempt_traces),
-                active_trace=trace,
-                response_limit_bytes=target.connection.response_limit_bytes,
-                attempt_started_monotonic=attempt_started,
-                headers=response_headers(
-                    response,
+                headers=buffered_response_headers(
+                    execution.headers,
                     route=route,
                     target=target,
                     attempts=attempts,
@@ -509,114 +347,26 @@ class RawOpenAIProxy:
             phase_label="上游流连接失败",
         )
 
-    def _client(self, target: RouteTarget) -> httpx.AsyncClient:
-        connection = target.connection
-        key = (
-            float(connection.connect_timeout_seconds),
-            float(connection.read_timeout_seconds),
-            float(connection.write_timeout_seconds),
-            float(connection.pool_timeout_seconds),
-        )
-        existing = self._clients.get(key)
-        if existing is not None and not existing.is_closed:
-            return existing
-        client = upstream_async_client(connection, transport=self.transport)
-        self._clients[key] = client
-        return client
-
     async def aclose(self) -> None:
-        clients = tuple(self._clients.values())
-        self._clients.clear()
-        for client in clients:
-            await client.aclose()
-
-    @staticmethod
-    def _url(target: RouteTarget) -> str:
-        endpoint = (
-            target.connection.chat_endpoint
-            if target.deployment.kind == "chat"
-            else target.connection.embeddings_endpoint
-        )
-        return upstream_url(
-            target.connection.base_url,
-            endpoint,
-            allowed_private_networks=target.connection.allowed_private_networks,
-        )
+        await self.executor.aclose()
 
     def _record_health(
         self,
         target: RouteTarget,
-        response: httpx.Response,
+        *,
+        status_code: int,
+        headers: Mapping[str, str],
         content: bytes,
     ) -> None:
         self.router.runtime_health.record_http(
             target,
-            status_code=response.status_code,
+            status_code=status_code,
             error_code=structured_error_code(content),
             retry_after=retry_after_seconds(
-                response.headers.get("Retry-After", ""),
+                headers.get("Retry-After", headers.get("retry-after", "")),
                 wall_time=self._wall_clock(),
             ),
         )
-
-
-def _destination_validation_message(exc: BaseException) -> str:
-    detail = str(exc).strip() or type(exc).__name__
-    return f"上游地址安全校验失败：{detail}"
-
-
-def upstream_async_client(
-    connection: ConnectionConfig,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> httpx.AsyncClient:
-    """One upstream client honoring the connection's timeout policy.
-
-    Never follows redirects (a credential must not cross a redirect boundary)
-    and never inherits ambient ``HTTP(S)_PROXY`` environment settings.
-    """
-
-    kwargs: dict[str, Any] = {
-        "timeout": httpx.Timeout(
-            connect=connection.connect_timeout_seconds,
-            read=connection.read_timeout_seconds,
-            write=connection.write_timeout_seconds,
-            pool=connection.pool_timeout_seconds,
-        ),
-        "follow_redirects": False,
-        "trust_env": False,
-    }
-    if transport is not None:
-        kwargs["transport"] = transport
-    return httpx.AsyncClient(**kwargs)
-
-
-def upstream_headers(
-    target: RouteTarget,
-    secret: str,
-    request_headers: Mapping[str, str],
-) -> dict[str, str]:
-    provider_secret_header_value(secret)
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": request_headers.get("accept", "application/json"),
-        "Accept-Encoding": "identity",
-    }
-    if target.connection.auth.type == "bearer":
-        headers["Authorization"] = f"Bearer {secret}"
-    else:
-        headers["X-Api-Key"] = secret
-    allowed = {name.lower() for name in target.connection.forward_headers}
-    for name, value in request_headers.items():
-        normalized = name.lower()
-        if (
-            normalized in allowed
-            and normalized not in FORBIDDEN_UPSTREAM_FORWARD_HEADERS
-            and not normalized.startswith("x-model-gateway-")
-        ):
-            headers[name] = value
-    return headers
-
 
 def _finalize_attempts(
     *,
@@ -676,124 +426,8 @@ def _network_failure_detail(
     return f"{phase_label}：{type(exc).__name__}"
 
 
-def _network_error_can_fail_over(exc: httpx.HTTPError) -> bool:
-    """Only retry failures that happen before an HTTP request can be sent."""
-
-    return isinstance(
-        exc,
-        (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
-    )
-
-
-def _network_failure_class(exc: httpx.HTTPError) -> str:
-    if isinstance(exc, ProxyResponseTooLarge):
-        return "response_too_large"
-    if isinstance(exc, httpx.ConnectTimeout):
-        return "connect_timeout"
-    if isinstance(exc, httpx.ConnectError):
-        return "connect_error"
-    if isinstance(exc, httpx.PoolTimeout):
-        return "pool_timeout"
-    if isinstance(exc, httpx.ReadTimeout):
-        return "read_timeout"
-    if isinstance(exc, httpx.WriteTimeout):
-        return "write_timeout"
-    if isinstance(exc, httpx.ReadError):
-        return "read_error"
-    if isinstance(exc, httpx.WriteError):
-        return "write_error"
-    if isinstance(exc, httpx.ProtocolError):
-        return "protocol_error"
-    return "other_network"
-
-
-def _network_attempt_trace(
-    *,
-    target: RouteTarget,
-    attempt_index: int,
-    exc: httpx.HTTPError,
-    latency_ms: int,
-) -> AttemptTrace:
-    request_sent, outcome, failure_class = classify_network_failure(exc)
-    return AttemptTrace(
-        attempt_index=attempt_index,
-        target=target,
-        latency_ms=max(0, latency_ms),
-        outcome=outcome,
-        failure_class=failure_class,
-        request_sent=request_sent,
-        billable_unknown=request_sent,
-        response_complete=False,
-    )
-
-
-def classify_network_failure(exc: httpx.HTTPError) -> tuple[bool, str, str]:
-    """Classify a transport failure as (request_sent, outcome, failure_class).
-
-    Shared by the data-plane attempt ledger and the pricing-research caller so
-    both record the same finite labels for the same failure.
-    """
-
-    request_sent = not _network_error_can_fail_over(exc)
-    return (
-        request_sent,
-        "ambiguous_failure" if request_sent else "connect_failure",
-        _network_failure_class(exc),
-    )
-
-
-def http_failure_class(status_code: int, content: bytes) -> str:
-    if status_code == 401:
-        return "http_auth"
-    if status_code == 402:
-        return "http_billing"
-    if structured_error_code(content) in {
-        "deployment_not_found",
-        "invalid_model",
-        "invalid_model_name",
-        "model_not_found",
-        "model_not_found_error",
-    }:
-        return "http_model_not_found"
-    if status_code == 429:
-        return "http_rate_limit"
-    if status_code >= 500:
-        return "http_server"
-    if 300 <= status_code < 400:
-        return "http_redirect"
-    return "http_other"
-
-
-def _response_attempt_trace(
-    *,
-    target: RouteTarget,
-    attempt_index: int,
-    response: httpx.Response,
-    content: bytes | None,
-    latency_ms: int,
-) -> AttemptTrace:
-    capture = UsageCapture()
-    if content is not None:
-        capture.from_non_stream(content)
-    return AttemptTrace(
-        attempt_index=attempt_index,
-        target=target,
-        status_code=response.status_code,
-        latency_ms=max(0, latency_ms),
-        outcome="success" if response.is_success else "http_error",
-        failure_class=(
-            "none"
-            if response.is_success
-            else http_failure_class(response.status_code, content or b"")
-        ),
-        request_sent=True,
-        response_complete=content is not None,
-        capture=capture,
-    )
-
-
 def _network_error_result(
-    exc: httpx.HTTPError,
+    exc: httpx.HTTPError | str,
     *,
     route: ResolvedRoute,
     target: RouteTarget,
@@ -802,12 +436,13 @@ def _network_error_result(
     attempt_traces: tuple[AttemptTrace, ...] = (),
 ) -> ProxyHTTPResult:
     phase = "流响应" if streaming else "响应"
+    error_type = exc if isinstance(exc, str) else type(exc).__name__
     return ProxyHTTPResult(
         content=json.dumps(
             {
                 "error": {
                     "message": (
-                        f"上游{phase}中断：{type(exc).__name__}；"
+                        f"上游{phase}中断：{error_type}；"
                         "为避免请求可能已计费，不自动切换 deployment"
                     ),
                     "type": "model_gateway_ambiguous_upstream_error",
@@ -962,49 +597,6 @@ def _invalid_embedding_result(
     )
 
 
-async def _read_raw_content(response: httpx.Response, *, limit: int) -> bytes:
-    """Collect an HTTP response without applying content decoding.
-
-    ``httpx.Response.content`` is decoded according to ``Content-Encoding``.
-    Passing those decoded bytes downstream together with the original encoding
-    header corrupts the response, so the transparent path must consume the raw
-    stream.  ``MockTransport`` may construct an already-buffered response; that
-    case is only a compatibility fallback for in-process transports.
-    """
-
-    if response.is_stream_consumed:
-        content = response.content
-        _enforce_response_limit(len(content), limit, response)
-        return content
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in response.aiter_raw():
-        total += len(chunk)
-        _enforce_response_limit(total, limit, response)
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def _enforce_response_limit(
-    size: int,
-    limit: int,
-    response: httpx.Response,
-) -> None:
-    if size <= limit:
-        return
-    raise ProxyResponseTooLarge(
-        "upstream response exceeded configured byte limit",
-        request=response.request,
-    )
-
-
-async def _first_non_empty_chunk(iterator: AsyncIterator[bytes]) -> bytes | None:
-    while True:
-        chunk = await anext(iterator, None)
-        if chunk is None or chunk:
-            return chunk
-
-
 def response_headers(
     response: httpx.Response,
     *,
@@ -1012,9 +604,24 @@ def response_headers(
     target: RouteTarget,
     attempts: int,
 ) -> dict[str, str]:
+    return buffered_response_headers(
+        response.headers,
+        route=route,
+        target=target,
+        attempts=attempts,
+    )
+
+
+def buffered_response_headers(
+    response_headers: Mapping[str, str],
+    *,
+    route: ResolvedRoute,
+    target: RouteTarget,
+    attempts: int,
+) -> dict[str, str]:
     headers = {
         name.lower(): value
-        for name, value in response.headers.items()
+        for name, value in response_headers.items()
         if name.lower() in PASSTHROUGH_RESPONSE_HEADERS
     }
     headers.update(

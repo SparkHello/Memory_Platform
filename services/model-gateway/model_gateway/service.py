@@ -14,20 +14,12 @@ import httpx
 from pydantic import ValidationError
 
 from model_gateway.admin import (
-    BundleApplyRequest,
     CandidateDiscoverRequest,
     CapabilityProbeRequest,
-    ConnectionCreateRequest,
-    DeploymentApplyRequest,
     EnabledUpdateRequest,
     RevisionRequest,
-    RouteUpdateRequest,
     SecretUpdateRequest,
-    bundle_candidate,
-    connection_candidate,
-    deployment_candidate,
     public_configuration,
-    route_candidate,
 )
 from model_gateway.capability_probe import (
     build_probe_connection,
@@ -37,12 +29,10 @@ from model_gateway.capability_probe import (
 from model_gateway.auth import (
     AuthenticationError,
     AuthenticatedClient,
-    SecretSnapshotError,
     authenticate_client,
     client_token_bytes,
     provider_secret_header_value,
     validate_secret_domains,
-    validate_secret_snapshot,
 )
 from model_gateway.config_store import (
     ConfigConflict,
@@ -50,9 +40,16 @@ from model_gateway.config_store import (
     ConfigManager,
     ControlPlaneValidationError,
     GatewayPaths,
-    commit_control_plane,
-    configuration_revision,
     initialize,
+    source_revision,
+)
+from model_gateway.control_plane import (
+    BundleApplyRequest,
+    ConnectionCreateRequest,
+    ControlPlaneCandidate,
+    ControlPlaneService,
+    DeploymentApplyRequest,
+    RouteUpdateRequest,
 )
 from model_gateway.health import HealthCheckError, check_health
 from model_gateway.models import AuthConfig, ConnectionConfig, GatewayConfig, PricingConfig
@@ -78,13 +75,13 @@ from model_gateway.usage import (
     UsageMetadata,
     UsageStore,
 )
+from model_gateway.upstream_executor import (
+    UsageLedgerPreflightError,
+    preflight_usage_ledger,
+)
 from model_gateway.storage import (
-    StorageCapacityError,
     StorageErrorMiddleware,
     StorageFaultMonitor,
-    ensure_write_capacity,
-    estimated_ledger_write_bytes,
-    is_storage_exhausted,
     storage_readiness_reason,
 )
 
@@ -99,6 +96,7 @@ def create_app(
 ) -> FastAPI:
     initialize(paths)
     manager = ConfigManager(paths)
+    control_plane = ControlPlaneService(paths, manager=manager)
     router = Router()
     proxy = RawOpenAIProxy(router=router, transport=transport)
     usage_store = UsageStore(paths.usage_db)
@@ -130,20 +128,14 @@ def create_app(
             return forbidden
         return config, secrets, client
 
-    def _commit_admin_change(expected_revision, *, config=None, secret_updates=None):
+    def _commit_admin_change(candidate: ControlPlaneCandidate):
         """Commit + reload, mapping ConfigConflict to the stale error."""
         try:
-            commit = commit_control_plane(
-                paths,
-                expected_revision=expected_revision,
-                config=config,
-                secret_updates=secret_updates,
-            )
+            commit = control_plane.commit(candidate)
         except ConfigConflict:
             return _config_stale_error()
         except ControlPlaneValidationError as exc:
             return _candidate_validation_error(exc)
-        manager.force_reload()
         return commit
 
     # OpenAPI is off by default; Model port is internal but still avoid free recon.
@@ -274,7 +266,7 @@ def create_app(
                 config=config,
                 secrets=secrets,
                 client=client,
-                revision=configuration_revision(paths.config),
+                revision=source_revision(config, paths.config),
             )
         )
 
@@ -314,15 +306,17 @@ def create_app(
         )
         if isinstance(payload, Response):
             return payload
-        current_revision = configuration_revision(paths.config)
-        if payload.revision != current_revision:
+        snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+        if payload.revision != snapshot.revision:
             return _error(
                 409,
                 "配置已经被其他操作修改；请重新读取当前 revision 后重试",
                 error_type="model_gateway_config_stale",
             )
         try:
-            _, changed, warnings = route_candidate(config, payload)
+            _, changed, warnings = control_plane.route_update(snapshot, payload)
+        except ControlPlaneValidationError as exc:
+            return _candidate_validation_error(exc)
         except (ValueError, ValidationError) as exc:
             return _error(
                 400,
@@ -332,7 +326,7 @@ def create_app(
         return JSONResponse(
             {
                 "valid": True,
-                "revision": current_revision,
+                "revision": snapshot.revision,
                 "changed_routes": changed,
                 "warnings": warnings,
             }
@@ -353,8 +347,13 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
             try:
-                candidate, changed, warnings = route_candidate(config, payload)
+                candidate, changed, warnings = control_plane.route_update(
+                    snapshot, payload
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
             except (ValueError, ValidationError) as exc:
                 return _error(
                     400,
@@ -363,7 +362,7 @@ def create_app(
                 )
             # The commit-time revision CAS is authoritative; no separate
             # preflight revision read on the apply path.
-            commit = _commit_admin_change(payload.revision, config=candidate)
+            commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
                 return commit
             return JSONResponse(
@@ -391,8 +390,13 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
             try:
-                candidate, connection_id = connection_candidate(config, payload)
+                candidate, connection_id = control_plane.connection_create(
+                    snapshot, payload
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
             except (ValueError, ValidationError) as exc:
                 return _error(
                     400,
@@ -402,10 +406,10 @@ def create_app(
             if payload.dry_run:
                 # A dry run never reaches the commit CAS, so it keeps its own
                 # revision check.
-                if payload.revision != configuration_revision(paths.config):
+                if payload.revision != snapshot.revision:
                     return _config_stale_error()
             else:
-                commit = _commit_admin_change(payload.revision, config=candidate)
+                commit = _commit_admin_change(candidate)
                 if isinstance(commit, JSONResponse):
                     return commit
             return JSONResponse(
@@ -416,7 +420,7 @@ def create_app(
                     "revision": (
                         commit.revision
                         if not payload.dry_run
-                        else configuration_revision(paths.config)
+                        else snapshot.revision
                     ),
                 }
             )
@@ -436,10 +440,13 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
             try:
-                candidate, deployment_ids, changed, warnings = deployment_candidate(
-                    config, payload
+                candidate, deployment_ids, changed, warnings = (
+                    control_plane.deployment_apply(snapshot, payload)
                 )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
             except (ValueError, ValidationError) as exc:
                 return _error(
                     400,
@@ -449,10 +456,10 @@ def create_app(
             if payload.dry_run:
                 # A dry run never reaches the commit CAS, so it keeps its own
                 # revision check.
-                if payload.revision != configuration_revision(paths.config):
+                if payload.revision != snapshot.revision:
                     return _config_stale_error()
             else:
-                commit = _commit_admin_change(payload.revision, config=candidate)
+                commit = _commit_admin_change(candidate)
                 if isinstance(commit, JSONResponse):
                     return commit
             return JSONResponse(
@@ -474,7 +481,7 @@ def create_app(
                     "revision": (
                         commit.revision
                         if not payload.dry_run
-                        else configuration_revision(paths.config)
+                        else snapshot.revision
                     ),
                 }
             )
@@ -501,19 +508,21 @@ def create_app(
             )
             if isinstance(payload, Response):
                 return payload
-            candidate_secrets = dict(secrets)
-            candidate_secrets[connection.auth.secret_ref] = payload.value
-            try:
-                validate_secret_snapshot(config=config, secrets=candidate_secrets)
-            except SecretSnapshotError as exc:
-                return _candidate_validation_error(exc)
-            revision = configuration_revision(paths.config)
-            if payload.revision and payload.revision != revision:
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+            revision = payload.revision or snapshot.revision
+            if payload.revision and payload.revision != snapshot.revision:
                 return _config_stale_error()
-            revision = payload.revision or revision
+            try:
+                candidate = control_plane.prepare(
+                    snapshot,
+                    expected_revision=revision,
+                    secret_updates={connection.auth.secret_ref: payload.value},
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
             report = await check_health(
-                config=config,
-                secrets=candidate_secrets,
+                config=candidate.effective_config,
+                secrets=candidate.effective_secrets,
                 connection_id=connection_id,
                 live=False,
                 client_kind="interactive",
@@ -526,10 +535,7 @@ def create_app(
                     "候选渠道密钥未通过只读 models discovery；原密钥保持不变",
                     error_type="model_gateway_candidate_key_rejected",
                 )
-            result = _commit_admin_change(
-                revision,
-                secret_updates={connection.auth.secret_ref: payload.value},
-            )
+            result = _commit_admin_change(candidate)
             if isinstance(result, JSONResponse):
                 return result
             router.runtime_health.clear_connection(
@@ -565,7 +571,8 @@ def create_app(
         )
         if isinstance(payload, Response):
             return payload
-        if payload.revision != configuration_revision(paths.config):
+        snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+        if payload.revision != snapshot.revision:
             return _config_stale_error()
         candidate_config = config
         connection_id = payload.connection
@@ -608,18 +615,18 @@ def create_app(
                     + _safe_validation_message(exc),
                     error_type="model_gateway_config_invalid",
                 )
-        candidate_secrets = dict(secrets)
-        candidate_secrets[connection.auth.secret_ref] = payload.secret_value
         try:
-            validate_secret_snapshot(
+            candidate = control_plane.prepare(
+                snapshot,
+                expected_revision=payload.revision,
                 config=candidate_config,
-                secrets=candidate_secrets,
+                secret_updates={connection.auth.secret_ref: payload.secret_value},
             )
-        except SecretSnapshotError as exc:
+        except ControlPlaneValidationError as exc:
             return _candidate_validation_error(exc)
         report = await check_health(
-            config=candidate_config,
-            secrets=candidate_secrets,
+            config=candidate.effective_config,
+            secrets=candidate.effective_secrets,
             connection_id=connection_id,
             live=False,
             client_kind="interactive",
@@ -672,7 +679,8 @@ def create_app(
         )
         if isinstance(payload, Response):
             return payload
-        if payload.revision != configuration_revision(paths.config):
+        snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+        if payload.revision != snapshot.revision:
             return _config_stale_error()
         try:
             connection = build_probe_connection(
@@ -694,10 +702,13 @@ def create_app(
                 ),
             }
             probe_config = GatewayConfig.model_validate(graph)
-            probe_secrets = dict(secrets)
-            probe_secrets[connection.auth.secret_ref] = payload.candidate_key
-            validate_secret_snapshot(config=probe_config, secrets=probe_secrets)
-        except SecretSnapshotError as exc:
+            candidate = control_plane.prepare(
+                snapshot,
+                expected_revision=payload.revision,
+                config=probe_config,
+                secret_updates={connection.auth.secret_ref: payload.candidate_key},
+            )
+        except ControlPlaneValidationError as exc:
             return _candidate_validation_error(exc)
         except (ValueError, ValidationError) as exc:
             return _error(
@@ -705,14 +716,21 @@ def create_app(
                 "能力探测草稿未通过安全校验：" + _safe_validation_message(exc),
                 error_type="model_gateway_config_invalid",
             )
-        result = await probe_chat_capabilities(
-            connection=connection,
-            deployment=deployment,
-            secret=payload.candidate_key,
-            probes=tuple(payload.probes),  # type: ignore[arg-type]
-            timeout_seconds=25.0,
-            transport=transport,
-        )
+        try:
+            result = await probe_chat_capabilities(
+                connection=connection,
+                deployment=deployment,
+                secret=payload.candidate_key,
+                probes=tuple(payload.probes),  # type: ignore[arg-type]
+                timeout_seconds=25.0,
+                transport=transport,
+                usage_store=usage_store,
+                usage_server=candidate.effective_config.server,
+                pricing_catalog=candidate.effective_config.pricing,
+                storage_monitor=storage_monitor,
+            )
+        except UsageLedgerPreflightError:
+            return _insufficient_storage_error()
         return JSONResponse(
             {
                 "persisted": False,
@@ -747,7 +765,8 @@ def create_app(
         )
         if isinstance(payload, Response):
             return payload
-        if not apply and payload.revision != configuration_revision(paths.config):
+        snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+        if not apply and payload.revision != snapshot.revision:
             # The validate-only path never reaches the commit CAS.
             return _config_stale_error()
         try:
@@ -758,11 +777,8 @@ def create_app(
                 deployment_ids,
                 changed_routes,
                 embedding_connection_id,
-            ) = bundle_candidate(config, payload)
-            candidate_secrets = dict(secrets)
-            candidate_secrets[secret_ref] = payload.connection.secret
-            validate_secret_snapshot(config=candidate, secrets=candidate_secrets)
-        except SecretSnapshotError as exc:
+            ) = control_plane.bundle_apply(snapshot, payload)
+        except ControlPlaneValidationError as exc:
             return _candidate_validation_error(exc)
         except (ValueError, ValidationError) as exc:
             return _error(
@@ -771,8 +787,8 @@ def create_app(
                 error_type="model_gateway_config_invalid",
             )
         report = await check_health(
-            config=candidate,
-            secrets=candidate_secrets,
+            config=candidate.effective_config,
+            secrets=candidate.effective_secrets,
             connection_id=connection_id,
             live=False,
             client_kind="interactive",
@@ -787,11 +803,7 @@ def create_app(
             )
         revision = payload.revision
         if apply:
-            commit = _commit_admin_change(
-                revision,
-                config=candidate,
-                secret_updates={secret_ref: payload.connection.secret},
-            )
+            commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
                 return commit
             revision = commit.revision
@@ -846,19 +858,24 @@ def create_app(
             records = getattr(config, collection)
             if item_id not in records:
                 return _error(404, "找不到指定对象")
-            payload = config.model_dump(mode="python", exclude_none=False)
-            record = dict(payload[collection][item_id])
-            record["enabled"] = body.enabled
-            payload[collection][item_id] = record
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
             try:
-                candidate = type(config).model_validate(payload)
+                candidate = control_plane.set_enabled(
+                    snapshot,
+                    collection=collection,
+                    item_id=item_id,
+                    enabled=body.enabled,
+                    expected_revision=body.revision,
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
             except (ValueError, ValidationError) as exc:
                 return _error(
                     400,
                     f"对象修改未通过完整配置校验：{_safe_validation_message(exc)}",
                     error_type="model_gateway_config_invalid",
                 )
-            commit = _commit_admin_change(body.revision, config=candidate)
+            commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
                 return commit
             return JSONResponse(
@@ -899,17 +916,24 @@ def create_app(
                     "对象仍被引用：" + ", ".join(blockers),
                     error_type="model_gateway_object_referenced",
                 )
-            payload = config.model_dump(mode="python", exclude_none=False)
-            del payload[collection][item_id]
-            candidate = type(config).model_validate(payload)
-            secret_updates: dict[str, None] = {}
-            if collection == "connections":
-                secret_updates[config.connections[item_id].auth.secret_ref] = None
-            commit = _commit_admin_change(
-                body.revision,
-                config=candidate,
-                secret_updates=secret_updates,
-            )
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+            try:
+                candidate = control_plane.remove_item(
+                    snapshot,
+                    collection=collection,
+                    item_id=item_id,
+                    expected_revision=body.revision,
+                    delete_secret=collection == "connections",
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
+            except (ValueError, ValidationError) as exc:
+                return _error(
+                    400,
+                    f"对象删除未通过完整配置校验：{_safe_validation_message(exc)}",
+                    error_type="model_gateway_config_invalid",
+                )
+            commit = _commit_admin_change(candidate)
             if isinstance(commit, JSONResponse):
                 return commit
             return JSONResponse(
@@ -1161,27 +1185,22 @@ async def _proxy_request(
     resolved = prepared.route
 
     # Authentication, JSON validation and route/capability resolution have all
-    # succeeded, but no provider HTTP request has been built or sent yet.  Keep
-    # enough durable room for this logical request and every allowed attempt.
-    # The ledger's SQLite-level health is probed by readyz/startup, not here:
-    # the 507 contract is a pre-write capacity estimate, and an unexpected
-    # ledger write failure still latches readiness after the response.
+    # succeeded, but no provider HTTP request has been built or sent yet. Keep
+    # enough durable room for this logical request and every allowed attempt,
+    # and prove that SQLite can acquire a writer before any provider can bill.
     route_attempts = min(
         len(resolved.targets),
         resolved.route.max_attempts if resolved.route is not None else 1,
     )
     try:
-        await asyncio.to_thread(
-            ensure_write_capacity,
-            (usage_store.path,),
-            config.server,
-            expected_write_bytes=estimated_ledger_write_bytes(
-                body_bytes=len(raw_body),
-                attempts=route_attempts,
-            ),
+        await preflight_usage_ledger(
+            usage_store,
+            server=config.server,
+            body_bytes=len(raw_body),
+            attempts=route_attempts,
+            storage_monitor=storage_monitor,
         )
-    except StorageCapacityError:
-        storage_monitor.mark_unavailable()
+    except UsageLedgerPreflightError:
         return _insufficient_storage_error()
 
     started = time.monotonic()
@@ -1333,8 +1352,7 @@ def _streaming_response(
                 metadata=metadata,
             )
         except Exception as exc:
-            if is_storage_exhausted(exc) or isinstance(exc, StorageCapacityError):
-                storage_monitor.mark_unavailable()
+            storage_monitor.mark_unavailable()
             _LOGGER.warning(
                 "usage recording failed after stream (%s)",
                 type(exc).__name__,
@@ -1404,8 +1422,7 @@ async def _record_non_stream(
         )
         return event_id, True
     except Exception as exc:
-        if is_storage_exhausted(exc) or isinstance(exc, StorageCapacityError):
-            storage_monitor.mark_unavailable()
+        storage_monitor.mark_unavailable()
         _LOGGER.warning(
             "usage recording failed after non-stream response (%s)",
             type(exc).__name__,
@@ -1613,7 +1630,7 @@ def _config_stale_error() -> JSONResponse:
 
 
 def _candidate_validation_error(
-    exc: ControlPlaneValidationError | SecretSnapshotError,
+    exc: ControlPlaneValidationError,
 ) -> JSONResponse:
     if exc.reason in {"provider_secret_invalid", "client_secret_invalid"}:
         return _error(

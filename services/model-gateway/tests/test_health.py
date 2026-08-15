@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sqlite3
 
 import httpx
 import pytest
@@ -8,6 +10,8 @@ import pytest
 from conftest import config_payload
 from model_gateway.health import check_health
 from model_gateway.models import GatewayConfig
+from model_gateway.storage import StorageFaultMonitor
+from model_gateway.usage import UsageStore
 
 
 @pytest.mark.asyncio
@@ -277,3 +281,93 @@ async def test_discovery_response_size_is_bounded(
     assert connection.status == "invalid_response"
     assert connection.level == "error"
     assert "安全上限" in connection.detail
+
+
+@pytest.mark.asyncio
+async def test_live_health_records_one_exact_operation_per_provider_post(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+) -> None:
+    gateway_config.deployments = {
+        "chat-official": gateway_config.deployments["chat-official"]
+    }
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        live=True,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            )
+        ),
+        usage_store=store,
+    )
+
+    deployment = report.connections[0].deployments[0]
+    assert deployment.status == "live_ok"
+    assert deployment.usage_ledger_status == "complete"
+    with sqlite3.connect(store.path) as connection:
+        usage = connection.execute(
+            "SELECT route_id, operation, client_id, attempts FROM usage_events"
+        ).fetchall()
+        attempts = connection.execute(
+            "SELECT route_id, client_id FROM attempt_events"
+        ).fetchall()
+    assert usage == [
+        ("health.live", "health.live", "modelgw-health-check", 1)
+    ]
+    assert attempts == [("health.live", "modelgw-health-check")]
+
+
+@pytest.mark.asyncio
+async def test_live_health_keeps_success_as_warning_when_ledger_record_fails(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway_config.deployments = {
+        "chat-official": gateway_config.deployments["chat-official"]
+    }
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    monitor = StorageFaultMonitor()
+
+    def fail_record(**_kwargs: object) -> str:
+        raise sqlite3.OperationalError("ledger unavailable")
+
+    monkeypatch.setattr(store, "record", fail_record)
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        live=True,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ok"}}]},
+            )
+        ),
+        usage_store=store,
+        storage_monitor=monitor,
+    )
+
+    connection = report.connections[0]
+    deployment = connection.deployments[0]
+    assert deployment.status == "live_ok"
+    assert deployment.level == "warning"
+    assert deployment.usage_ledger_status == "incomplete"
+    assert "结果仍保留" in deployment.detail
+    assert connection.level == "warning"
+    assert monitor.consume_after_successful_probe() == "disk_unavailable"

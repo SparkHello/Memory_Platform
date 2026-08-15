@@ -21,6 +21,7 @@ from model_gateway.pricing_research import (
     research_pricing,
     validate_official_source,
 )
+from model_gateway.usage import UsageStore
 
 from conftest import config_payload
 
@@ -102,6 +103,7 @@ async def test_research_returns_evidence_bound_candidate_without_usage_write(
         target_deployment_id="chat-official",
         research_deployment_id="chat-official",
         source_url="https://docs.official.example/pricing",
+        confirmed_official_host="docs.official.example",
         source_transport=httpx.MockTransport(source_handler),
         research_transport=httpx.MockTransport(research_handler),
     )
@@ -124,6 +126,95 @@ async def test_research_returns_evidence_bound_candidate_without_usage_write(
         "completion_tokens": 20,
         "total_tokens": 120,
     }
+
+
+@pytest.mark.asyncio
+async def test_accounted_research_records_exactly_one_pricing_operation(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+) -> None:
+    digest = sha256(VISIBLE_PRICE.encode("utf-8")).hexdigest()
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+
+    outcome = await research_pricing(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "research-secret"},
+        target_deployment_id="chat-official",
+        research_deployment_id="chat-official",
+        source_url="https://official.example/pricing",
+        source_transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text=VISIBLE_PRICE,
+            )
+        ),
+        research_transport=httpx.MockTransport(
+            lambda request: _chat_completion(_answer(digest=digest))
+        ),
+        usage_store=store,
+    )
+
+    assert outcome.status == "candidate"
+    assert outcome.research_call is not None
+    assert outcome.research_call.usage_ledger_status == "complete"
+    with sqlite3.connect(store.path) as database:
+        usage = database.execute(
+            "SELECT route_id, operation, client_id, attempts FROM usage_events"
+        ).fetchall()
+        attempts = database.execute(
+            "SELECT route_id, client_id FROM attempt_events"
+        ).fetchall()
+    assert usage == [
+        (
+            "pricing.research",
+            "pricing.research",
+            "modelgw-pricing-research",
+            1,
+        )
+    ]
+    assert attempts == [("pricing.research", "modelgw-pricing-research")]
+
+
+@pytest.mark.asyncio
+async def test_research_ledger_preflight_failure_makes_zero_provider_calls(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    research_calls = 0
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+
+    def unavailable() -> None:
+        raise sqlite3.OperationalError("private ledger path")
+
+    def research_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal research_calls
+        research_calls += 1
+        return httpx.Response(500)
+
+    monkeypatch.setattr(store, "probe_writable", unavailable)
+    with pytest.raises(PricingResearchError, match="预检失败"):
+        await research_pricing(
+            config=gateway_config,
+            secrets={"UPSTREAM_OFFICIAL": "research-secret"},
+            target_deployment_id="chat-official",
+            research_deployment_id="chat-official",
+            source_url="https://official.example/pricing",
+            source_transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "text/plain"},
+                    text=VISIBLE_PRICE,
+                )
+            ),
+            research_transport=httpx.MockTransport(research_handler),
+            usage_store=store,
+        )
+
+    assert research_calls == 0
 
 
 @pytest.mark.asyncio
@@ -255,11 +346,20 @@ def test_official_source_requires_https_and_channel_provenance() -> None:
             "http://official.example/pricing",
             target_connection_base_url="https://api.official.example/v1",
         )
-    with pytest.raises(PricingResearchError, match="不属于同一站点"):
+    with pytest.raises(PricingResearchError, match="hostname 与目标 connection 不一致"):
         validate_official_source(
             "https://third-party.example/prices",
             target_connection_base_url="https://api.official.example/v1",
         )
+    with pytest.raises(PricingResearchError, match="hostname 与目标 connection 不一致"):
+        validate_official_source(
+            "https://docs.official.example/pricing",
+            target_connection_base_url="https://official.example/v1",
+        )
+    assert validate_official_source(
+        "https://official.example/pricing",
+        target_connection_base_url="https://official.example/v1",
+    )[1] == "official.example"
     assert validate_official_source(
         "https://help.vendor-docs.example/pricing",
         target_connection_base_url="https://api.official.example/v1",

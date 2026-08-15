@@ -84,13 +84,9 @@ schema v1 升级时，原有短 client key 会以显式 `allow_legacy_weak_secre
 
 运行时熔断按故障作用域处理：401/402/429 暂停整个 connection；结构化 `model_not_found` 只暂停对应 deployment；连续三次 5xx 才短暂暂停该 deployment。每次真正发送前都会重新检查，渠道密钥轮换成功后会立即清除该 connection 的旧熔断。
 
-套餐类型为 `payg`、`subscription`、`free_tier`、`token_plan`、`coding_plan` 或 `custom`。其中 `token_plan` 和 `coding_plan` 不能配置为 `backend_allowed`，CLI 默认把它们设为 `interactive_only`。这条限制同时存在于：
+`billing_plan` 类型可为 `payg`、`subscription`、`free_tier`、`token_plan`、`coding_plan` 或 `custom`。它只保存供界面展示和人工审计的套餐元数据，不参与路由、client 授权或健康检查。运行时唯一的 workload 策略是 `usage_scope`：`backend_allowed` 允许 backend，`interactive_only` 只允许显式 interactive workload，`disabled` 禁用该连接。若供应商条款限制用途，请把限制明确编码为 `usage_scope`，不要依赖套餐名称推断。
 
-1. 配置模型校验；
-2. 运行时 client 路由；
-3. 默认按 backend 用途执行的健康检查。
-
-`--as-interactive` 只对当次检查生效，绝不会修改 connection，也不会让 My_Memory 使用交互套餐。
+`--as-interactive` 只改变当次检查的 workload 身份，不会修改 connection，也不会让 My_Memory 绕过 `usage_scope`。
 
 ### deployment
 
@@ -197,8 +193,8 @@ modelgw pricing research TARGET_DEPLOYMENT \
 安全约束如下：
 
 - `TARGET_DEPLOYMENT` 是精确 deployment；候选证据必须逐字包含它的 `upstream_model`，不能拿相似模型替代；
-- 研究 deployment 必须是已启用的 `chat`，且 connection 为 `backend_allowed`；`token_plan`、`coding_plan`、`direct_tool_only` 和 `interactive_only` 均不可用；
-- 页面必须是该目标 connection/channel 的官方 HTTPS 页面；默认要求与 API 属于同一组织域，跨域官方文档需用 `--official-host` 明确确认最终 hostname；不得用它认可第三方聚合站；
+- 研究 deployment 必须是已启用的 `chat`，且 connection 的 `usage_scope` 为 `backend_allowed`；`direct_tool_only` 和 `interactive_only` 均不可用；`billing_plan` 不参与判定；
+- 页面必须是该目标 connection/channel 的官方 HTTPS 页面；默认只接受与 connection API 完全相同的 hostname，任何其他 hostname 都需用 `--official-host` 精确确认来源 hostname；不得用它认可第三方聚合站；
 - 页面抓取不携带任何 API Key，不跟随 redirect，拒绝本机/私网 DNS、非 HTML/纯文本、隐藏脚本和疑似提示注入内容；
 - 页面被当作不可信资料。研究模型只能返回严格 JSON；本地还会逐项核对页面摘要、精确模型、原文 evidence、币种、Token 单位、分档上限和每个单价；任一项不足即为 `unknown`；
 - 默认不写 pricing 或 deployment。`--apply` 需要完整交互确认；非交互自动化必须同时显式使用 `--yes`；
@@ -231,7 +227,8 @@ adapter 是少量、显式的 OpenAI-compatible 参数兼容规则，不是完�
 
 Kimi adapter 会区分官方开放平台模型与 Kimi Code 套餐模型：`k3` / `k3-256k` 使用
 原生 `reasoning_effort`（Code 端点默认 `high`），`kimi-for-coding*` 按 K2.7 Code 的
-thinking 形状处理。不要把这些套餐模型开放给 backend client。
+thinking 形状处理。若对应渠道条款限制为交互用途，应将 connection 的
+`usage_scope` 显式设为 `interactive_only`。
 
 示例只展示结构，不代表任何真实模型当前可用：
 

@@ -10,6 +10,7 @@ import pytest
 
 from model_gateway.cli import main
 from model_gateway.config_store import (
+    configuration_revision,
     gateway_paths,
     initialize,
     load_config,
@@ -77,6 +78,21 @@ def test_apply_quickstart_stores_secrets_without_leaking_into_config(tmp_path: P
     config_text = paths.config.read_text(encoding="utf-8")
     assert "upstream-sensitive-token" not in config_text
     assert result.memory_client_key not in config_text
+
+
+def test_quickstart_invalid_provider_secret_changes_nothing(tmp_path: Path) -> None:
+    paths = gateway_paths(tmp_path / "gateway-home")
+    initialize(paths)
+    config_before = paths.config.read_bytes()
+    secrets_before = paths.secrets.read_bytes()
+    revision_before = configuration_revision(paths.config)
+
+    with pytest.raises(QuickstartError):
+        apply_quickstart(paths, _base_spec(api_key="invalid provider secret"))
+
+    assert paths.config.read_bytes() == config_before
+    assert paths.secrets.read_bytes() == secrets_before
+    assert configuration_revision(paths.config) == revision_before
 
 
 def test_apply_quickstart_configures_embedding_route_when_requested(tmp_path: Path) -> None:

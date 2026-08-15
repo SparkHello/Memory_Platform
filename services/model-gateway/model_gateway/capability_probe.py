@@ -8,24 +8,23 @@ console mean the router will not send that feature to this deployment.
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import httpx
 
-from model_gateway.adapters import apply_connection_adapter
 from model_gateway.auth import provider_secret_header_value
-from model_gateway.discovery import (
-    probe_client,
-    read_bounded_response,
-    upstream_auth_headers,
-)
-from model_gateway.http_safety import require_safe_destination, upstream_url
 from model_gateway.models import (
     AuthConfig,
     Capabilities,
     ConnectionConfig,
     DeploymentConfig,
+    PricingConfig,
+    ServerConfig,
 )
+from model_gateway.proxy import prepare_payload
+from model_gateway.routing import RouteTarget
+from model_gateway.upstream_executor import UpstreamExecutor
+from model_gateway.usage import UsageMetadata, UsageStore
 
 
 ProbeName = Literal[
@@ -89,6 +88,11 @@ async def probe_chat_capabilities(
     probes: tuple[ProbeName, ...] = DEFAULT_PROBES,
     timeout_seconds: float = _PROBE_TIMEOUT,
     transport: httpx.AsyncBaseTransport | None = None,
+    usage_store: UsageStore | None = None,
+    usage_server: ServerConfig | None = None,
+    pricing_catalog: Mapping[str, PricingConfig] | None = None,
+    usage_client_id: str = "modelgw-capability-probe",
+    storage_monitor: object | None = None,
 ) -> dict[str, Any]:
     """Run selected probes and return declared capability map + per-probe notes."""
 
@@ -108,15 +112,26 @@ async def probe_chat_capabilities(
         "json_schema": False,
     }
 
-    async with probe_client(connection, timeout_seconds, transport) as client:
+    target = RouteTarget(
+        route_id="capability.probe",
+        deployment_id="capability-probe",
+        deployment=deployment,
+        connection_id=deployment.connection,
+        connection=connection,
+    )
+    async with UpstreamExecutor(transport=transport) as executor:
         for name in ordered:
             result = await _run_one_probe(
-                client=client,
-                connection=connection,
-                deployment=deployment,
+                executor=executor,
+                target=target,
                 secret=secret,
                 probe=name,
-                validate_destination=transport is None,
+                timeout_seconds=timeout_seconds,
+                usage_store=usage_store,
+                usage_server=usage_server,
+                pricing_catalog=pricing_catalog or {},
+                usage_client_id=usage_client_id,
+                storage_monitor=storage_monitor,
             )
             details[name] = result
             if name == "chat" and not result["ok"]:
@@ -138,7 +153,7 @@ async def probe_chat_capabilities(
             capabilities["streaming"] = True
         # Chat itself does not set tools/reasoning.
 
-    return {
+    response: dict[str, Any] = {
         "ok": bool(details.get("chat", {}).get("ok")),
         "capabilities": capabilities,
         "details": details,
@@ -147,104 +162,147 @@ async def probe_chat_capabilities(
             "未勾选视为不支持，客户端若使用该能力会被网关拒绝。"
         ),
     }
+    ledger_statuses = {
+        str(item.get("usage_ledger_status", ""))
+        for item in details.values()
+        if item.get("usage_ledger_status")
+    }
+    if ledger_statuses:
+        response["usage_ledger_status"] = (
+            "incomplete" if "incomplete" in ledger_statuses else "complete"
+        )
+    if "incomplete" in ledger_statuses:
+        response["warnings"] = [
+            "部分真实探测已完成，但 usage ledger 写入失败；探测结果仍保留"
+        ]
+    return response
 
 
 async def _run_one_probe(
     *,
-    client: httpx.AsyncClient,
-    connection: ConnectionConfig,
-    deployment: DeploymentConfig,
+    executor: UpstreamExecutor,
+    target: RouteTarget,
     secret: str,
     probe: ProbeName,
-    validate_destination: bool,
+    timeout_seconds: float,
+    usage_store: UsageStore | None,
+    usage_server: ServerConfig | None,
+    pricing_catalog: Mapping[str, PricingConfig],
+    usage_client_id: str,
+    storage_monitor: object | None,
 ) -> dict[str, Any]:
-    payload = _probe_payload(deployment.upstream_model, probe)
-    apply_connection_adapter(
-        payload,
-        connection=connection,
-        deployment=deployment,
+    operation = f"capability.probe.{probe}"
+    probe_target = RouteTarget(
+        route_id=operation,
+        deployment_id=target.deployment_id,
+        deployment=target.deployment,
+        connection_id=target.connection_id,
+        connection=target.connection,
     )
-    try:
-        url = upstream_url(
-            connection.base_url,
-            connection.chat_endpoint,
-            allowed_private_networks=connection.allowed_private_networks,
+    payload = prepare_payload(
+        _probe_payload(probe_target.deployment.upstream_model, probe),
+        probe_target,
+    )
+    if usage_store is not None:
+        if usage_server is None:
+            raise ValueError("usage_server is required with usage_store")
+        result = await executor.post_json_accounted(
+            target=probe_target,
+            payload=payload,
+            secret=secret,
+            timeout_seconds=timeout_seconds,
+            response_limit_bytes=min(
+                target.connection.response_limit_bytes,
+                256 * 1024,
+            ),
+            usage_store=usage_store,
+            server=usage_server,
+            pricing_catalog=pricing_catalog,
+            client_id=usage_client_id,
+            route_id=operation,
+            metadata=UsageMetadata(operation=operation),
+            storage_monitor=storage_monitor,
         )
-        if validate_destination:
-            await require_safe_destination(
-                url,
-                allowed_private_networks=connection.allowed_private_networks,
+    else:
+        result = await executor.post_json(
+            target=probe_target,
+            payload=payload,
+            secret=secret,
+            timeout_seconds=timeout_seconds,
+            response_limit_bytes=min(
+                target.connection.response_limit_bytes,
+                256 * 1024,
+            ),
+        )
+
+    def finish(payload: dict[str, Any]) -> dict[str, Any]:
+        if result.usage_ledger_status:
+            payload["usage_ledger_status"] = result.usage_ledger_status
+        if result.usage_ledger_status == "incomplete":
+            payload["warning"] = (
+                "真实探测已完成，但 usage ledger 写入失败；探测结果仍保留"
             )
-        async with client.stream(
-            "POST",
-            url,
-            headers=upstream_auth_headers(connection, secret),
-            json=payload,
-        ) as response:
-            if response.is_success:
-                content = await read_bounded_response(
-                    response,
-                    min(connection.response_limit_bytes, 256 * 1024),
-                )
-            else:
-                content = b""
-                # Drain a small error body for classification.
-                async for chunk in response.aiter_bytes():
-                    content += chunk
-                    if len(content) > 2048:
-                        break
-                status = response.status_code
-                detail = _error_snippet(content) or f"HTTP {status}"
-                return {
-                    "ok": False,
-                    "http_status": status,
-                    "detail": detail[:300],
-                }
-            status = response.status_code
-    except (httpx.HTTPError, OSError) as exc:
-        return {
+        return payload
+
+    if result.trace is None:
+        return finish({
             "ok": False,
             "http_status": None,
-            "detail": f"网络错误：{type(exc).__name__}",
-        }
-    except ValueError as exc:
-        return {
+            "detail": result.error_detail or "URL/响应未通过安全校验",
+        })
+    if result.error_type:
+        detail = (
+            "响应超过安全上限"
+            if result.trace.failure_class == "response_too_large"
+            else f"网络错误：{result.error_type}"
+        )
+        return finish({
             "ok": False,
-            "http_status": None,
-            "detail": str(exc)[:300] or "URL/响应未通过安全校验",
-        }
+            "http_status": result.status_code,
+            "detail": detail,
+        })
+    assert result.status_code is not None
+    status = result.status_code
+    content = result.content
+    if not result.is_success:
+        detail = _error_snippet(content) or f"HTTP {status}"
+        return finish({
+            "ok": False,
+            "http_status": status,
+            "detail": detail[:300],
+        })
 
     # Streaming success may be empty SSE with only done; treat 200 as ok.
     if probe == "streaming":
-        return {
+        return finish({
             "ok": True,
             "http_status": status,
             "detail": "流式请求被接受",
-        }
+        })
     if probe == "tools":
         # Accept any 2xx; some models answer in text without tool_calls.
-        return {
+        return finish({
             "ok": True,
             "http_status": status,
             "detail": "带 tools 的请求被接受",
-        }
+        })
     if probe == "json_object":
-        return {
+        return finish({
             "ok": True,
             "http_status": status,
             "detail": "json_object 请求被接受",
-        }
+        })
     if probe == "reasoning":
-        return {
+        return finish({
             "ok": True,
             "http_status": status,
             "detail": "带推理字段的请求被接受",
-        }
-    return {
+        })
+    return finish({
         "ok": True,
         "http_status": status,
         "detail": "基础聊天请求成功",
-    }
+    })
 
 
 def _probe_payload(model: str, probe: ProbeName) -> dict[str, Any]:

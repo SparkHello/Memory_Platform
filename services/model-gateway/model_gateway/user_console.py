@@ -14,19 +14,17 @@ from pydantic import ValidationError
 from model_gateway.config_store import (
     ConfigError,
     GatewayPaths,
-    commit_control_plane,
     initialize,
     load_config,
     read_secrets,
-    source_revision,
 )
+from model_gateway.control_plane import ControlPlaneService
 from model_gateway.health import HEALTH_STATUS_LABELS
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
 from model_gateway.memory_client import provision_memory_gateway_client
 from model_gateway.models import (
     ADAPTER_NAMES,
     AuthConfig,
-    BillingPlan,
     Capabilities,
     ConnectionConfig,
     DeploymentConfig,
@@ -197,34 +195,28 @@ def _add_channel_and_model(paths: GatewayPaths) -> None:
         dimensions=dimensions,
         embedding_space=embedding_space,
     )
-    payload = config.model_dump(mode="python")
-    if new_connection:
-        payload["connections"] = {
-            **payload["connections"],
-            connection_id: connection.model_dump(mode="python"),
-        }
-    payload["deployments"] = {
-        **payload["deployments"],
-        deployment_id: deployment.model_dump(mode="python"),
-    }
-    updated = GatewayConfig.model_validate(payload)
-
     print("\n准备保存：")
     print(f"  渠道：{connection.channel_operator}  {connection.base_url}")
     print(f"  模型：{upstream_model}（{'聊天' if kind == 'chat' else '向量'}）")
     if not _confirm("确认保存？", True):
         print("已取消，没有修改设置。")
         return
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=updated,
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    candidate = control_plane.upsert_graph(
+        snapshot,
+        connections={connection_id: connection} if new_connection else None,
+        deployments={deployment_id: deployment},
         secret_updates=(
             {connection.auth.secret_ref: secret_value}
             if secret_value is not None
             else {}
         ),
     )
+    control_plane.commit(candidate)
     print("已保存渠道和模型，API Key 不会显示在列表或日志中。")
 
     if kind == "chat":
@@ -283,13 +275,6 @@ def _choose_connection(
     print("渠道是你实际购买或领取 API Key 的地方，不一定是模型作者。")
     operator = _required("渠道英文简称（例如 deepseek、siliconflow、dashscope）：").lower()
     base_url = _required("官方 OpenAI-compatible API 地址（必须是 HTTPS）：")
-    plan_choice = _prompt(
-        "你的套餐：1=按量付费，2=订阅，3=免费额度，4=其他 [1]：",
-        "1",
-    )
-    plan_types = {"1": "payg", "2": "subscription", "3": "free_tier", "4": "custom"}
-    if plan_choice not in plan_types:
-        raise ValueError("套餐只能选择 1、2、3 或 4")
     print("接口兼容方式：1=标准 OpenAI，2=Kimi，3=DeepSeek，4=MiMo，5=百炼 Qwen")
     adapter_choice = _prompt("选择 [1]：", "1")
     adapters = {
@@ -306,7 +291,6 @@ def _choose_connection(
         adapter=adapters[adapter_choice],
         base_url=base_url,
         auth=AuthConfig(type="bearer", secret_ref=secret_ref),
-        billing_plan=BillingPlan(type=plan_types[plan_choice], name="default"),
         usage_scope="backend_allowed",
     )
     secret_value = getpass.getpass("该渠道的 API Key（输入时不会显示）：").strip()
@@ -397,39 +381,39 @@ def _assign_deployment_to_routes(
         if not _confirm(f"这会替换已有安排：{labels}。继续？", False):
             print("模型已经保存，原有用途安排保持不变。")
             return
-    payload = config.model_dump(mode="python")
-    routes = dict(payload["routes"])
     kind = config.deployments[deployment_id].kind
-    for route_id in selected:
-        routes[route_id] = RouteConfig(
+    routes = {
+        route_id: RouteConfig(
             kind=kind,
             targets=[deployment_id],
             max_attempts=1,
-        ).model_dump(mode="python")
-    payload["routes"] = routes
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=GatewayConfig.model_validate(payload),
+        )
+        for route_id in selected
+    }
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
     )
+    control_plane.commit(control_plane.upsert_graph(snapshot, routes=routes))
     print("已安排用途：" + "、".join(PURPOSE_LABELS[item] for item in selected))
 
 
 def _write_route(paths: GatewayPaths, route_id: str, targets: list[str]) -> None:
     config = load_config(paths.config)
-    payload = config.model_dump(mode="python")
-    routes = dict(payload["routes"])
-    routes[route_id] = RouteConfig(
+    route = RouteConfig(
         kind=config.deployments[targets[0]].kind,
         targets=targets,
         max_attempts=min(3, len(targets)),
         fallback_scope="any_channel" if len(targets) > 1 else "none",
-    ).model_dump(mode="python")
-    payload["routes"] = routes
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=GatewayConfig.model_validate(payload),
+    )
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    control_plane.commit(
+        control_plane.upsert_graph(snapshot, routes={route_id: route})
     )
 
 
@@ -457,19 +441,18 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
 
     secret_values = read_secrets(paths.secrets)
     memory_client = provision_memory_gateway_client(config, secret_values)
-    updated = config
-    if memory_client.created:
-        payload = config.model_dump(mode="python")
-        clients = dict(payload["clients"])
-        clients["memory-gateway"] = memory_client.client.model_dump(mode="python")
-        payload["clients"] = clients
-        updated = GatewayConfig.model_validate(payload)
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=updated,
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(config=config, secrets=secret_values)
+    candidate = control_plane.upsert_graph(
+        snapshot,
+        clients=(
+            {"memory-gateway": memory_client.client}
+            if memory_client.created
+            else None
+        ),
         secret_updates={memory_client.client.secret_ref: memory_client.key},
     )
+    updated = control_plane.commit(candidate).config
 
     if not _gateway_healthy(paths, updated):
         print("正在启动模型服务……")
@@ -652,20 +635,18 @@ def _record_price(paths: GatewayPaths) -> None:
     if not _confirm("已亲自核对官方页面，确认保存？", False):
         print("已取消。")
         return
-    payload = config.model_dump(mode="python")
-    payload["pricing"] = {
-        **payload["pricing"],
-        pricing_id: pricing.model_dump(mode="python"),
-    }
-    deployments = dict(payload["deployments"])
-    updated_deployment = dict(deployments[deployment_id])
-    updated_deployment["pricing"] = pricing_id
-    deployments[deployment_id] = updated_deployment
-    payload["deployments"] = deployments
-    commit_control_plane(
-        paths,
-        expected_revision=source_revision(config, paths.config),
-        config=GatewayConfig.model_validate(payload),
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    control_plane.commit(
+        control_plane.upsert_pricing(
+            snapshot,
+            pricing_id=pricing_id,
+            pricing=pricing,
+            deployment_ids=[deployment_id],
+        )
     )
     print("官方价格已经保存；过去的用量价格快照不会被改写。")
 

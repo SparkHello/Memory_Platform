@@ -115,7 +115,7 @@ modelgw connection check CONNECTION_ID
 - `connected_unverified`：连接正常，但响应形状无法识别；
 - `check_unsupported`：未配置 models endpoint，或 provider 不支持；
 - `not_configured`：缺少 secret；
-- `policy_blocked`：本次检查用途不允许访问该套餐；
+- `policy_blocked`：本次检查的 workload 身份不符合 connection 的 `usage_scope`；
 - `auth_failed`、`network_error`、`provider_error`：相应的鉴权、网络或 provider 失败。
 
 保存 connection 的 API Key 后也会自动运行同样的免费检查：
@@ -137,9 +137,9 @@ modelgw connection check CONNECTION_ID --live
 
 Embedding live check 还会对比实际向量维度和配置的 `dimensions`，不一致时报告 `dimension_mismatch`。
 
-## 交互套餐检查
+## interactive workload 检查
 
-`token_plan`、`coding_plan` 和显式 `interactive_only` connection 默认按 backend 用途检查，因此在任何网络请求前返回 `policy_blocked`。需要核对用户交互用途时，必须显式写：
+`billing_plan` 仅用于展示和审计，不参与检查策略。显式设置为 `interactive_only` 的 connection 默认按 backend workload 检查，因此会在任何网络请求前返回 `policy_blocked`。需要核对用户交互用途时，必须显式写：
 
 ```bash
 modelgw check --connection INTERACTIVE_CONNECTION_ID --as-interactive

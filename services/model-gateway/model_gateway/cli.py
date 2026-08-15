@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -25,19 +26,17 @@ from model_gateway.auth import (
     client_token_bytes,
     provider_secret_header_value,
     validate_secret_domains,
-    validate_secret_snapshot,
 )
 from model_gateway.config_store import (
     ConfigConflict,
     ConfigError,
     GatewayPaths,
-    commit_control_plane,
     gateway_paths,
     initialize,
     load_config,
     read_secrets,
-    source_revision,
 )
+from model_gateway.control_plane import ControlPlaneCandidate, ControlPlaneService
 from model_gateway.ids import default_secret_ref
 from model_gateway.models import (
     ADAPTER_NAMES,
@@ -72,6 +71,7 @@ from model_gateway.process import (
     _write_state,
 )
 from model_gateway.routing import RouteTarget
+from model_gateway.storage import StorageFaultMonitor
 from model_gateway.usage import AttemptTrace, UsageCapture, UsageStore
 
 
@@ -313,7 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     secret_set.add_argument(
         "--as-interactive",
         action="store_true",
-        help="仅用于交互式客户端套餐检查；不会把连接开放给 backend",
+        help="以 interactive workload 检查；不会修改 connection 的 usage_scope",
     )
     secret_set.set_defaults(handler=_cmd_secret_set)
     secret_list = secret_commands.add_parser("list", help="只列出密钥名称和引用，不显示值")
@@ -381,8 +381,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="billing_type",
         default="payg",
         choices=list(BILLING_PLAN_TYPES),
+        help="仅保存展示/审计元数据；运行时授权只由 --scope 决定",
     )
-    connection_add.add_argument("--plan-name", default="default")
+    connection_add.add_argument(
+        "--plan-name",
+        default="default",
+        help="展示用套餐名称，不参与路由",
+    )
     connection_add.add_argument(
         "--scope",
         choices=["backend_allowed", "interactive_only", "disabled"],
@@ -433,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     connection_check.add_argument(
         "--as-interactive",
         action="store_true",
-        help="以 interactive 用途检查受限套餐；不会改变 connection 配置",
+        help="以 interactive workload 检查 usage_scope；不会改变 connection 配置",
     )
     connection_check.set_defaults(handler=_cmd_connection_check)
 
@@ -653,7 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument(
         "--as-interactive",
         action="store_true",
-        help="以 interactive 用途检查受限套餐；不会改变 connection 配置",
+        help="以 interactive workload 检查 usage_scope；不会改变 connection 配置",
     )
     check_parser.set_defaults(handler=_cmd_connection_check)
 
@@ -1498,6 +1503,11 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
     paths = _paths(args)
     initialize(paths)
     config = load_config(paths.config)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
     secret_ref = _resolve_secret_ref(config, args.name)
     if args.value is not None:
         value = args.value
@@ -1507,8 +1517,6 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
         value = getpass.getpass(f"{secret_ref} API Key：")
     if not value:
         raise CLIError("密钥不能为空")
-    candidate_secrets = read_secrets(paths.secrets)
-    candidate_secrets[secret_ref] = value
     referenced_clients = [
         client_id
         for client_id, client in config.clients.items()
@@ -1536,10 +1544,11 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
             provider_secret_header_value(value)
         except ValueError as exc:
             raise CLIError(str(exc)) from exc
-    try:
-        validate_secret_snapshot(config=candidate_config, secrets=candidate_secrets)
-    except ValueError as exc:
-        raise CLIError(str(exc)) from exc
+    candidate = control_plane.prepare(
+        snapshot,
+        config=candidate_config if candidate_config is not config else None,
+        secret_updates={secret_ref: value},
+    )
     payload: dict[str, Any] = {"saved": True, "secret_ref": secret_ref, "checks": []}
     connections = [
         connection_id
@@ -1557,23 +1566,21 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
     if not args.no_check and connections:
         results = asyncio.run(
             _run_probes(
-                config=config,
-                secret_values=candidate_secrets,
+                config=candidate.effective_config,
+                secret_values=candidate.effective_secrets,
                 connection_ids=connections,
                 live=args.live,
                 client_kind="interactive" if args.as_interactive else "backend",
+                usage_store=(
+                    _open_usage_store(paths) if args.live else None
+                ),
             )
         )
         payload["checks"] = [_probe_dict(result) for result in results]
         if _probe_summary(results)["failed"]:
             raise CLIError("候选渠道密钥检查失败；原密钥保持不变")
     try:
-        commit_control_plane(
-            paths,
-            expected_revision=source_revision(config, paths.config),
-            config=candidate_config if candidate_config is not config else None,
-            secret_updates={secret_ref: value},
-        )
+        control_plane.commit(candidate)
     except ConfigConflict as exc:
         raise CLIError("配置已被其他进程修改，请重试") from exc
     if args.json:
@@ -1623,12 +1630,16 @@ def _cmd_secret_delete(args: argparse.Namespace) -> int:
     paths = _paths(args)
     initialize(paths)
     config = load_config(paths.config)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
     secret_ref = _resolve_secret_ref(config, args.name)
-    existed = secret_ref in read_secrets(paths.secrets)
+    existed = secret_ref in snapshot.secrets
     try:
-        commit_control_plane(
-            paths,
-            expected_revision=source_revision(config, paths.config),
+        control_plane.apply(
+            snapshot,
             secret_updates={secret_ref: None},
         )
     except ConfigConflict as exc:
@@ -1648,6 +1659,11 @@ def _cmd_secret_delete(args: argparse.Namespace) -> int:
 def _cmd_client_add(args: argparse.Namespace) -> int:
     paths = _paths(args)
     config = _load_initialized(paths)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
     client_id = validate_id(args.client_id, "client")
     if client_id in config.clients and not args.replace:
         raise CLIError(f"client 已存在：{client_id}；如需替换请加 --replace")
@@ -1662,31 +1678,26 @@ def _cmd_client_add(args: argparse.Namespace) -> int:
         allow_direct_deployments=args.allow_direct_deployments,
         enabled=not args.disabled,
     )
-    config = _replace_config_item(paths, config, "clients", client_id, client)
+    secret_value: str | None = None
     if args.set_secret:
         value = getpass.getpass(f"{secret_ref} 本地客户端 API Key：")
         if not value:
-            raise CLIError("客户端密钥不能为空；client 配置已保存，可稍后运行 secret set")
-        try:
-            client_token_bytes(value)
-            candidate_secrets = read_secrets(paths.secrets)
-            candidate_secrets[secret_ref] = value
-            validate_secret_snapshot(config=config, secrets=candidate_secrets)
-        except ValueError as exc:
-            raise CLIError(str(exc)) from exc
-        refreshed = load_config(paths.config)
-        try:
-            commit_control_plane(
-                paths,
-                expected_revision=source_revision(refreshed, paths.config),
-                secret_updates={secret_ref: value},
-            )
-        except ConfigConflict as exc:
-            raise CLIError("配置已被其他进程修改，请重试") from exc
+            raise CLIError("客户端密钥不能为空；没有修改 client 或密钥")
+        secret_value = value
+    candidate = control_plane.upsert_client(
+        snapshot,
+        client_id=client_id,
+        client=client,
+        secret_value=secret_value,
+    )
+    try:
+        committed = control_plane.commit(candidate)
+    except ConfigConflict as exc:
+        raise CLIError("配置已被其他进程修改，请重试") from exc
     payload = {
         "client_id": client_id,
         "secret_ref": secret_ref,
-        "secret_configured": bool(read_secrets(paths.secrets).get(secret_ref)),
+        "secret_configured": bool(committed.secrets.get(secret_ref)),
     }
     if args.json:
         _json(payload)
@@ -1903,6 +1914,7 @@ def _cmd_connection_check(args: argparse.Namespace) -> int:
             client_kind=(
                 "interactive" if getattr(args, "as_interactive", False) else "backend"
             ),
+            usage_store=_open_usage_store(paths) if live else None,
         )
     )
     summary = _probe_summary(results)
@@ -2162,19 +2174,18 @@ def _cmd_pricing_set(args: argparse.Namespace) -> int:
     if unknown:
         raise CLIError("未知 deployment：" + ", ".join(unknown))
 
-    payload = config.model_dump(mode="python")
-    pricing_records = dict(payload["pricing"])
-    pricing_records[pricing_id] = pricing.model_dump(mode="python")
-    payload["pricing"] = pricing_records
-    if deployment_ids:
-        deployments = dict(payload["deployments"])
-        for deployment_id in deployment_ids:
-            deployment = dict(deployments[deployment_id])
-            deployment["pricing"] = pricing_id
-            deployments[deployment_id] = deployment
-        payload["deployments"] = deployments
-    validated = GatewayConfig.model_validate(payload)
-    _commit_config(paths, config, validated)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    candidate = control_plane.upsert_pricing(
+        snapshot,
+        pricing_id=pricing_id,
+        pricing=pricing,
+        deployment_ids=deployment_ids,
+    )
+    _commit_candidate(control_plane, candidate)
 
     record = {"pricing_id": pricing_id, **pricing.model_dump(mode="json")}
     record["bound_deployments"] = deployment_ids
@@ -2208,6 +2219,7 @@ def _cmd_pricing_research(args: argparse.Namespace) -> int:
     config = _load_initialized(paths)
     target_id = validate_id(args.target_deployment, "deployment")
     research_id = validate_id(args.research_deployment, "deployment")
+    research_usage_store = _open_usage_store(paths)
     try:
         outcome = asyncio.run(
             research_pricing(
@@ -2217,17 +2229,22 @@ def _cmd_pricing_research(args: argparse.Namespace) -> int:
                 research_deployment_id=research_id,
                 source_url=args.source_url,
                 confirmed_official_host=args.official_host,
+                usage_store=research_usage_store,
             )
         )
     except PricingResearchCallError as exc:
-        _record_pricing_research_usage(
-            paths=paths,
-            config=config,
-            research_deployment_id=research_id,
-            metadata=exc.metadata,
-        )
+        if not exc.metadata.usage_ledger_status:
+            _record_pricing_research_usage(
+                paths=paths,
+                config=config,
+                research_deployment_id=research_id,
+                metadata=exc.metadata,
+            )
         raise
-    if outcome.research_call is not None:
+    if (
+        outcome.research_call is not None
+        and not outcome.research_call.usage_ledger_status
+    ):
         _record_pricing_research_usage(
             paths=paths,
             config=config,
@@ -2296,20 +2313,19 @@ def _apply_researched_pricing(
 ) -> None:
     if outcome.pricing is None:
         raise CLIError("研究结果没有 PricingConfig 候选")
-    # Validate the exact candidate again together with the entire relationship
-    # graph immediately before the sole mutating operation.
     pricing = PricingConfig.model_validate(outcome.pricing.model_dump(mode="python"))
-    payload = config.model_dump(mode="python")
-    pricing_records = dict(payload["pricing"])
-    pricing_records[pricing_id] = pricing.model_dump(mode="python")
-    payload["pricing"] = pricing_records
-    deployments = dict(payload["deployments"])
-    target = dict(deployments[target_deployment_id])
-    target["pricing"] = pricing_id
-    deployments[target_deployment_id] = target
-    payload["deployments"] = deployments
-    validated = GatewayConfig.model_validate(payload)
-    _commit_config(paths, config, validated)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    candidate = control_plane.upsert_pricing(
+        snapshot,
+        pricing_id=pricing_id,
+        pricing=pricing,
+        deployment_ids=[target_deployment_id],
+    )
+    _commit_candidate(control_plane, candidate)
 
 
 def _record_pricing_research_usage(
@@ -2405,6 +2421,12 @@ def _print_pricing_research(record: Mapping[str, Any]) -> None:
             print(f"证据：{quote}")
     elif record.get("reason"):
         print(f"原因：{record['reason']}")
+    research_call = record.get("research_call")
+    if (
+        isinstance(research_call, Mapping)
+        and research_call.get("usage_ledger_status") == "incomplete"
+    ):
+        print("警告：研究请求已完成，但 usage ledger 写入失败；结果仍保留。")
     if record.get("applied"):
         print(
             f"已保存 pricing：{record['pricing_id']}，并绑定到 "
@@ -2611,6 +2633,15 @@ def _load_initialized(paths: GatewayPaths) -> GatewayConfig:
     return load_config(paths.config)
 
 
+def _open_usage_store(paths: GatewayPaths) -> UsageStore:
+    store = UsageStore(paths.usage_db)
+    try:
+        store.init_db()
+    except (OSError, sqlite3.Error) as exc:
+        raise CLIError("usage ledger 无法初始化；未发起可能计费的请求") from exc
+    return store
+
+
 def _replace_config_item(
     paths: GatewayPaths,
     config: GatewayConfig,
@@ -2618,12 +2649,18 @@ def _replace_config_item(
     item_id: str,
     item: Any,
 ) -> GatewayConfig:
-    payload = config.model_dump(mode="python")
-    collection = dict(payload[collection_name])
-    collection[item_id] = item.model_dump(mode="python")
-    payload[collection_name] = collection
-    validated = GatewayConfig.model_validate(payload)
-    return _commit_config(paths, config, validated)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    candidate = control_plane.replace_item(
+        snapshot,
+        collection=collection_name,
+        item_id=item_id,
+        item=item,
+    )
+    return _commit_candidate(control_plane, candidate)
 
 
 def _remove_config_item(
@@ -2632,27 +2669,28 @@ def _remove_config_item(
     collection_name: str,
     item_id: str,
 ) -> GatewayConfig:
-    payload = config.model_dump(mode="python")
-    collection = dict(payload[collection_name])
-    if item_id not in collection:
-        raise CLIError(f"{collection_name} 中不存在：{item_id}")
-    del collection[item_id]
-    payload[collection_name] = collection
-    validated = GatewayConfig.model_validate(payload)
-    return _commit_config(paths, config, validated)
+    control_plane = ControlPlaneService(paths)
+    snapshot = control_plane.from_loaded(
+        config=config,
+        secrets=read_secrets(paths.secrets),
+    )
+    try:
+        candidate = control_plane.remove_item(
+            snapshot,
+            collection=collection_name,
+            item_id=item_id,
+        )
+    except ValueError as exc:
+        raise CLIError(str(exc)) from exc
+    return _commit_candidate(control_plane, candidate)
 
 
-def _commit_config(
-    paths: GatewayPaths,
-    base: GatewayConfig,
-    candidate: GatewayConfig,
+def _commit_candidate(
+    control_plane: ControlPlaneService,
+    candidate: ControlPlaneCandidate,
 ) -> GatewayConfig:
     try:
-        return commit_control_plane(
-            paths,
-            expected_revision=source_revision(base, paths.config),
-            config=candidate,
-        ).config
+        return control_plane.commit(candidate).config
     except ConfigConflict as exc:
         raise CLIError("配置已被其他进程修改，请重试") from exc
 
@@ -2693,10 +2731,14 @@ async def _run_probes(
     connection_ids: Iterable[str],
     live: bool,
     client_kind: str = "backend",
+    usage_store: UsageStore | None = None,
 ) -> list[ProbeResult]:
     """Run the bundled, policy-aware health checker."""
     from model_gateway.health import check_health
 
+    if live and usage_store is None:
+        raise CLIError("真实检查必须先初始化 usage ledger")
+    storage_monitor = StorageFaultMonitor()
     reports = await asyncio.gather(
         *[
             check_health(
@@ -2705,6 +2747,8 @@ async def _run_probes(
                 connection_id=connection_id,
                 live=live,
                 client_kind=client_kind,
+                usage_store=usage_store,
+                storage_monitor=storage_monitor,
             )
             for connection_id in connection_ids
         ]

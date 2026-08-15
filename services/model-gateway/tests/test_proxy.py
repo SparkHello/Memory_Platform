@@ -509,6 +509,170 @@ async def test_sse_chunks_are_forwarded_byte_for_byte(
 
 
 @pytest.mark.asyncio
+async def test_stream_connect_failure_can_fallback_before_request_is_sent(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "official.example":
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        return httpx.Response(
+            200,
+            stream=ChunkStream([b"data: fallback\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert not isinstance(result, ProxyHTTPResult)
+    try:
+        assert b"".join([chunk async for chunk in result.aiter_raw()]) == (
+            b"data: fallback\n\n"
+        )
+        assert calls == ["official.example", "reseller.example"]
+        assert result.attempts == 2
+        assert result.attempt_traces[0].failure_class == "connect_timeout"
+        assert result.attempt_traces[0].request_sent is False
+        assert result.headers["x-model-gateway-deployment"] == "chat-reseller"
+    finally:
+        await result.aclose()
+        await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_http_failure_can_fallback_before_successful_stream(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "official.example":
+            return httpx.Response(
+                429,
+                content=b'{"error":"limited"}',
+                headers={"retry-after": "600"},
+            )
+        return httpx.Response(
+            200,
+            stream=ChunkStream([b"data: fallback\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert not isinstance(result, ProxyHTTPResult)
+    try:
+        assert b"".join([chunk async for chunk in result.aiter_raw()]) == (
+            b"data: fallback\n\n"
+        )
+        assert calls == ["official.example", "reseller.example"]
+        assert result.attempts == 2
+        assert result.attempt_traces[0].failure_class == "http_rate_limit"
+        assert result.attempt_traces[0].request_sent is True
+        assert router.runtime_health.remaining("official") > 599
+        assert result.headers["x-model-gateway-channel-operator"] == (
+            "reseller-vendor"
+        )
+    finally:
+        await result.aclose()
+        await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_compressed_response_preserves_raw_bytes_and_encoding(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    compressed = gzip.compress(b"data: compressed\n\n")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=ChunkStream([compressed]),
+            headers={
+                "content-type": "text/event-stream",
+                "content-encoding": "gzip",
+            },
+        )
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert not isinstance(result, ProxyHTTPResult)
+    try:
+        assert b"".join([chunk async for chunk in result.aiter_raw()]) == compressed
+        assert result.headers["content-encoding"] == "gzip"
+    finally:
+        await result.aclose()
+        await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_real_transport_runs_destination_validation_before_send(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validated: list[str] = []
+
+    async def reject_destination(
+        url: str,
+        *,
+        allowed_private_networks: list[str],
+    ) -> None:
+        del allowed_private_networks
+        validated.append(url)
+        raise ValueError("unsafe destination")
+
+    monkeypatch.setattr(
+        "model_gateway.upstream_executor.require_safe_destination",
+        reject_destination,
+    )
+    router = Router()
+    proxy = RawOpenAIProxy(router=router)
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+    await proxy.aclose()
+
+    assert isinstance(result, ProxyHTTPResult)
+    assert result.attempts == 0
+    assert validated == [
+        "https://official.example/v1/chat/completions",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stream_does_not_failover_after_first_byte(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,
