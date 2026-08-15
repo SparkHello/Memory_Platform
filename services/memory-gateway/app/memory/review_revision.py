@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 from datetime import UTC, datetime, timedelta
 import hashlib
-import hmac
 import json
 from typing import Any
 
@@ -20,16 +18,21 @@ from app.memory.models import (
     MemoryReviewRevisionOperation,
     MemoryReviewRevisionPreview,
 )
+from app.memory.preview_token import (
+    PreviewTokenError,
+    _unb64,  # noqa: F401  # 测试直接复用该解码器检查 token payload
+    sign_preview_token,
+    verify_preview_token,
+)
 from app.memory.redaction import detect_text_sensitivity
+from app.memory.review import _core_evidence_section_map
 from app.memory.review_policy import build_review_policy
 from app.memory.search import MemorySearchService
 from app.memory.store import MemoryStore
 from app.memory.utils import (
-    _char_overlap,
-    _has_negation,
-    _normalize,
+    _ordered_unique,
     _parse_json_object,
-    _term_jaccard,
+    pair_relation,
 )
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.context import model_usage_scope
@@ -826,21 +829,20 @@ def _related_query(
 def _rule_relation(left: MemoryRecord, right: MemoryRecord) -> tuple[MemoryRelation, float, str]:
     if left.type != right.type:
         return "none", 0.0, ""
-    left_normalized = _normalize(left.content)
-    right_normalized = _normalize(right.content)
-    if not left_normalized or not right_normalized:
-        return "none", 0.0, ""
-    if left_normalized == right_normalized:
-        return "same", 1.0, "同类型记忆内容重复"
-    if left_normalized in right_normalized or right_normalized in left_normalized:
-        return "supplement", 0.92, "同类型记忆存在包含或补充关系"
-
-    score = max(_term_jaccard(left.content, right.content), _char_overlap(left.content, right.content))
-    if score < 0.45:
-        return "none", 0.0, ""
-    if _has_negation(left.content) != _has_negation(right.content):
-        return "conflict", score, "同类型记忆相似但否定关系不同，可能冲突"
-    return "supersede", score, "同类型记忆高度相似，可能存在替代关系"
+    # 规则关联候选需要召回更多关联记忆供 AI 修改预览参考：阈值 0.45
+    # （见 utils.pair_relation）。
+    relation, score = pair_relation(
+        left.content,
+        right.content,
+        similarity_threshold=0.45,
+    )
+    reason = {
+        "same": "同类型记忆内容重复",
+        "supplement": "同类型记忆存在包含或补充关系",
+        "conflict": "同类型记忆相似但否定关系不同，可能冲突",
+        "supersede": "同类型记忆高度相似，可能存在替代关系",
+    }.get(relation, "")
+    return relation, score, reason
 
 
 def _upsert_related_candidate(
@@ -884,12 +886,12 @@ def _core_evidence_map(
     store: MemoryStore,
     user_id: str,
 ) -> dict[str, list[dict]]:
-    result: dict[str, list[dict]] = {}
-    for section in store.list_core_memory_sections(user_id=user_id):
-        section_payload = section.model_dump()
-        for memory_id in section.evidence_memory_ids:
-            result.setdefault(memory_id, []).append(section_payload)
-    return result
+    return {
+        memory_id: [section.model_dump() for section in sections]
+        for memory_id, sections in _core_evidence_section_map(
+            store, user_id=user_id
+        ).items()
+    }
 
 
 def _affected_operation_memory_ids(operations: list[MemoryReviewRevisionOperation]) -> list[str]:
@@ -981,17 +983,6 @@ def _assert_operation_coverage(
         raise ReviewRevisionError(422, f"AI 修改预览没有覆盖本次已选记忆：{missing}")
 
 
-def _ordered_unique(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
-
-
 def _token_payload(
     *,
     user_id: str,
@@ -1028,60 +1019,21 @@ def _operation_payload(operation: MemoryReviewRevisionOperation) -> dict:
 
 
 def _sign_preview(*, secret: str, payload: dict) -> str:
-    payload_json = _canonical_json(payload).encode("utf-8")
-    signature = hmac.new(_secret_bytes(secret), payload_json, hashlib.sha256).digest()
-    return f"{_b64(payload_json)}.{_b64(signature)}"
+    try:
+        return sign_preview_token(secret=secret, payload=payload)
+    except PreviewTokenError as exc:  # 仅在签名密钥未配置时 fail closed
+        raise ReviewRevisionError(503, "GATEWAY_SIGNING_SECRET 未配置") from exc
 
 
 def _verify_preview(*, secret: str, token: str) -> dict:
     try:
-        payload_part, signature_part = token.split(".", 1)
-        payload_json = _unb64(payload_part)
-        expected = hmac.new(_secret_bytes(secret), payload_json, hashlib.sha256).digest()
-        actual = _unb64(signature_part)
-    except ReviewRevisionError:
-        raise
-    except Exception as exc:
+        return verify_preview_token(secret=secret, token=token, expected_version=2)
+    except PreviewTokenError as exc:
+        if exc.reason == "unconfigured":
+            raise ReviewRevisionError(503, "GATEWAY_SIGNING_SECRET 未配置") from exc
+        if exc.reason == "expired":
+            raise ReviewRevisionError(409, "修改预览 token 已过期") from exc
         raise ReviewRevisionError(409, "修改预览 token 无效") from exc
-    if not hmac.compare_digest(expected, actual):
-        raise ReviewRevisionError(409, "修改预览 token 无效")
-    try:
-        payload = json.loads(payload_json.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ReviewRevisionError(409, "修改预览 token 无效") from exc
-    if not isinstance(payload, dict) or payload.get("version") != 2:
-        raise ReviewRevisionError(409, "修改预览 token 无效")
-    try:
-        expires_at = datetime.fromisoformat(str(payload["expires_at"]))
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ReviewRevisionError(409, "修改预览 token 无效") from exc
-    if expires_at <= datetime.now(UTC):
-        raise ReviewRevisionError(409, "修改预览 token 已过期")
-    return payload
-
-
-def _canonical_json(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _b64(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _unb64(text: str) -> bytes:
-    padding = "=" * (-len(text) % 4)
-    return base64.urlsafe_b64decode((text + padding).encode("ascii"))
-
-
-def _secret_bytes(secret: str) -> bytes:
-    # Fail closed: never sign or verify with a well-known fallback key.  The
-    # REST layer already returns 503 for an unset GATEWAY_SIGNING_SECRET; this
-    # guard keeps any direct caller from silently using a forgeable constant.
-    if not secret:
-        raise ReviewRevisionError(503, "GATEWAY_SIGNING_SECRET 未配置")
-    return secret.encode("utf-8")
 
 
 def _decision_log_json(

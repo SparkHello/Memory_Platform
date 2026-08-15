@@ -95,3 +95,22 @@ def parse_bare_age_answer(source_quote: str) -> int | None:
         return None
     age = int(match.group(1))
     return age if 0 < age < 130 else None
+
+
+def contextual_age_answer(
+    *,
+    source_quote: str,
+    context_quote: str,
+    context_text: str | None = None,
+) -> int | None:
+    """Interpret a bare numeric answer using a verified age-question context.
+
+    review_policy 会额外要求 context_quote 逐字出现在 context_text 中；
+    extractor 的 context_quote 由独立的 context_quote gate 校验，因此不传
+    context_text。两条路径此前各有一份同名不同签名的实现，已收敛于此。
+    """
+    if context_text is not None and context_quote not in context_text:
+        return None
+    if not AGE_CONTEXT_PATTERN.search(context_quote):
+        return None
+    return parse_bare_age_answer(source_quote)

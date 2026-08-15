@@ -7,7 +7,7 @@ from app.memory.extractor import (
     LLMMemoryExtractor,
 )
 from app.memory.models import MemoryIngestItemResult, MemoryIngestResult
-from app.memory.redaction import detect_text_sensitivity
+from app.memory.redaction import detect_text_sensitivity, higher_sensitivity
 from app.memory.resolver import MemoryResolver
 from app.memory.search import EmbeddingClient
 from app.memory.store import MemoryStore
@@ -294,7 +294,7 @@ def _candidate_audit_payload(outcome: ExtractionOutcome) -> dict:
             payload.pop("topics", None)
             if memory:
                 payload.update(_text_audit_fields("memory", memory))
-            payload["sensitivity"] = _higher_sensitivity(declared, detected)
+            payload["sensitivity"] = higher_sensitivity(declared, detected)
             payload["redacted"] = True
         return payload
 
@@ -318,7 +318,7 @@ def _candidate_audit_payload(outcome: ExtractionOutcome) -> dict:
     payload.pop("entities", None)
     payload.pop("topics", None)
     payload.update(_text_audit_fields("memory", memory))
-    payload["sensitivity"] = _higher_sensitivity(candidate.sensitivity, detected)
+    payload["sensitivity"] = higher_sensitivity(candidate.sensitivity, detected)
     payload["redacted"] = True
     return payload
 
@@ -343,10 +343,3 @@ def _text_audit_fields(prefix: str, text: str) -> dict[str, int | str]:
         f"{prefix}_length": len(text),
         f"{prefix}_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
-
-
-def _higher_sensitivity(left: str, right: str) -> str:
-    rank = {"normal": 0, "private": 1, "sensitive": 2}
-    normalized_left = left if left in rank else "sensitive"
-    normalized_right = right if right in rank else "sensitive"
-    return max((normalized_left, normalized_right), key=rank.__getitem__)

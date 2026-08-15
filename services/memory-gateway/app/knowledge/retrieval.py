@@ -8,6 +8,7 @@ import anyio
 
 from app.knowledge.models import KnowledgeSearchHit
 from app.knowledge.store import KnowledgeStore
+from app.knowledge.store.utils import _safe_error
 from app.memory.search import (
     EmbeddingClient,
     NullEmbeddingClient,
@@ -169,7 +170,7 @@ class KnowledgeEmbeddingIndexer:
                     status="failed",
                     model=model,
                     embedding_space_id=embedding_space_id,
-                    error=_safe_embedding_error(exc),
+                    error=_safe_error(exc, max_length=1000),
                 )
             )
             return {"status": "failed", "stored": len(vectors), "total": len(chunks)}
@@ -311,8 +312,3 @@ def _weighted_rrf(
             )
         )
     return result
-
-
-def _safe_embedding_error(exc: Exception) -> str:
-    message = str(exc).strip().replace("\x00", "")
-    return (message or exc.__class__.__name__)[:1000]

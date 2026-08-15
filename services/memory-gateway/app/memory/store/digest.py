@@ -246,19 +246,3 @@ def _validated_digest_source_rows(
         raise ValueError("source_ids contain missing or inaccessible memories")
     return [rows_by_id[memory_id] for memory_id in source_ids]
 
-def mark_digested(store: _ConnectableStore, *, memory_ids: list[str], user_id: str) -> None:
-    """标记记忆为已消化。"""
-    if not memory_ids:
-        return
-    placeholders = ", ".join("?" for _ in memory_ids)
-    now = utc_now_iso()
-    with store._connect() as connection:
-        connection.execute(
-            f"""
-            UPDATE memories
-            SET digested = 1, updated_at = ?
-            WHERE id IN ({placeholders}) AND user_id = ? AND archived = 0
-            """,
-            (now, *memory_ids, user_id),
-        )
-

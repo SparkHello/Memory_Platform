@@ -1,6 +1,6 @@
 """聊天 finalize outbox 状态机测试。
 
-覆盖：崩溃恢复（持久 claim 残留）、重复投递（done 不回翻）、retryable
+覆盖：崩溃恢复（stale-running 重放）、重复投递（done 不回翻）、retryable
 重试、done 时 payload 清理，以及终态行数裁剪。
 """
 from __future__ import annotations
@@ -83,8 +83,6 @@ async def _run_job(
     store: MemoryStore,
     job_id: str,
     key: str,
-    *,
-    force_reclaim: bool = False,
 ) -> bool:
     return await chat_gateway._run_ingest_finalize_job(
         store=store,
@@ -99,7 +97,6 @@ async def _run_job(
         conversation_id=None,
         extraction_context=None,
         context_quote_source=None,
-        force_reclaim=force_reclaim,
     )
 
 
@@ -132,14 +129,11 @@ async def test_done_job_clears_payload_and_never_flips_back(
 
 
 @pytest.mark.asyncio
-async def test_crash_recovery_bypasses_stale_persistent_claim(
+async def test_crash_recovery_replays_stale_running_job(
     memory_store: MemoryStore, stub_ingest
 ) -> None:
-    job_id, key = _enqueue(memory_store)
-    # 模拟崩溃现场：worker 已拿到持久 claim 并置 running，然后进程死亡。
-    assert memory_store.claim_chat_side_effect(
-        kind="ingest", key=key, user_id="default", ttl_seconds=3600.0
-    )
+    job_id, _key = _enqueue(memory_store)
+    # 模拟崩溃现场：job 已置 running 后进程死亡，进程内 claim 随进程消失。
     memory_store.mark_chat_finalize_job(job_id=job_id, status="running")
     stale = (datetime.now(UTC) - timedelta(seconds=600)).isoformat()
     with sqlite3.connect(memory_store.database_path) as connection:
@@ -147,6 +141,7 @@ async def test_crash_recovery_bypasses_stale_persistent_claim(
             "UPDATE chat_finalize_jobs SET updated_at = ? WHERE id = ?",
             (stale, job_id),
         )
+    chat_gateway.clear_chat_gateway_state()
 
     recovered = await chat_gateway.recover_pending_chat_finalize_jobs(
         store=memory_store,
@@ -164,19 +159,19 @@ async def test_crash_recovery_bypasses_stale_persistent_claim(
 async def test_recovered_counts_only_actually_executed_jobs(
     memory_store: MemoryStore, stub_ingest
 ) -> None:
-    _, _ = _enqueue(memory_store)  # 该 pending job 的 claim 被"另一 worker"占用
+    _, _ = _enqueue(memory_store)  # 该 pending job 的同轮副作用正在本进程内执行
     jobs = memory_store.list_recoverable_chat_finalize_jobs(limit=10)
     key = str(jobs[0]["claim_key"])
-    assert memory_store.claim_chat_side_effect(
-        kind="ingest", key=key, user_id="default", ttl_seconds=3600.0
-    )
-
-    recovered = await chat_gateway.recover_pending_chat_finalize_jobs(
-        store=memory_store,
-        embedding_client=NullEmbeddingClient(),
-        llm_client=None,
-        settings=_settings(),
-    )
+    assert chat_gateway._INGESTED_TURNS.claim(key, 3600.0)
+    try:
+        recovered = await chat_gateway.recover_pending_chat_finalize_jobs(
+            store=memory_store,
+            embedding_client=NullEmbeddingClient(),
+            llm_client=None,
+            settings=_settings(),
+        )
+    finally:
+        chat_gateway._INGESTED_TURNS.release(key)
 
     assert recovered == 0
     assert stub_ingest.calls == 0

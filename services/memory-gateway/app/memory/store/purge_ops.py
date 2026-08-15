@@ -3,14 +3,17 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime
 import hashlib
 import json
 import sqlite3
 from typing import Any
 
-from app.memory.models import DecisionLog, MemoryRecord, new_memory_id
+from app.memory.models import DecisionLog, MemoryRecord
 from app.memory.purge_preview import purge_memory_ids_digest
+from app.memory.store.decision_logs import (
+    _decision_log_references_memory_ids,
+    _insert_decision_log,
+)
 from app.memory.store.helpers import (
     _core_section_audit_summaries,
     _json_like_safe,
@@ -18,8 +21,6 @@ from app.memory.store.helpers import (
     _like_escape,
     _ordered_unique,
 )
-
-from app.memory.store.constants import _DECISION_LOG_RETENTION_LIMIT
 
 
 class PurgePreviewConflictError(RuntimeError):
@@ -504,8 +505,9 @@ def _insert_batch_purge_audit(
     purged_at: str,
     call_source: str,
 ) -> DecisionLog:
-    log = DecisionLog(
-        id=new_memory_id(),
+    # 统一走 _insert_decision_log：批量 purge 审计同样按用户裁剪保留条数。
+    return _insert_decision_log(
+        connection=connection,
         user_id=user_id,
         conversation_id=None,
         candidate_json=json.dumps(
@@ -525,36 +527,6 @@ def _insert_batch_purge_audit(
         reason="批量永久删除回收站记忆",
         created_at=purged_at,
     )
-    connection.execute(
-        """
-        INSERT INTO memory_decision_logs (
-            id, user_id, conversation_id, candidate_json, decision, reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            log.id,
-            log.user_id,
-            log.conversation_id,
-            log.candidate_json,
-            log.decision,
-            log.reason,
-            log.created_at,
-        ),
-    )
-    connection.execute(
-        """
-        DELETE FROM memory_decision_logs
-        WHERE user_id = ?
-          AND id NOT IN (
-              SELECT id FROM memory_decision_logs
-              WHERE user_id = ?
-              ORDER BY created_at DESC, rowid DESC
-              LIMIT ?
-          )
-        """,
-        (user_id, user_id, _DECISION_LOG_RETENTION_LIMIT),
-    )
-    return log
 
 
 def _derived_memory_dependency_closure(
@@ -847,24 +819,6 @@ def _scrub_purged_memory_artifacts(
     }
 
 
-_DECISION_LOG_MEMORY_REFERENCE_KEYS = {
-    "allowed_memory_ids",
-    "archived_memory_ids",
-    "evidence_memory_ids",
-    "memory_id",
-    "memory_ids",
-    "new_memory_id",
-    "previous_superseded_by",
-    "primary_superseded_id",
-    "resolved_ids",
-    "source_ids",
-    "superseded_by",
-    "superseded_memory_ids",
-    "supersedes",
-    "target_memory_id",
-}
-
-
 def _decision_log_scrub_prefilter(
     *,
     affected_conversation_ids: set[str],
@@ -902,54 +856,6 @@ def _decision_log_scrub_prefilter(
     if not clauses:
         return None
     return " OR ".join(f"({clause})" for clause in clauses), params
-
-
-def _decision_log_references_memory_ids(raw_json: str, memory_ids: set[str]) -> bool:
-    try:
-        payload = json.loads(raw_json)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return _payload_references_memory_ids(payload, memory_ids=memory_ids)
-
-
-def _payload_references_memory_ids(
-    value: object,
-    *,
-    memory_ids: set[str],
-    reference_context: bool = False,
-) -> bool:
-    if reference_context:
-        if isinstance(value, str):
-            return value in memory_ids
-        if isinstance(value, list):
-            return any(
-                _payload_references_memory_ids(
-                    item,
-                    memory_ids=memory_ids,
-                    reference_context=True,
-                )
-                for item in value
-            )
-    if isinstance(value, dict):
-        for raw_key, item in value.items():
-            key = str(raw_key).casefold()
-            is_reference = (
-                key in _DECISION_LOG_MEMORY_REFERENCE_KEYS
-                or key.endswith("_memory_id")
-                or key.endswith("_memory_ids")
-            )
-            if _payload_references_memory_ids(
-                item,
-                memory_ids=memory_ids,
-                reference_context=is_reference,
-            ):
-                return True
-    elif isinstance(value, list):
-        return any(
-            _payload_references_memory_ids(item, memory_ids=memory_ids)
-            for item in value
-        )
-    return False
 
 
 def _decision_log_contains_fragments(

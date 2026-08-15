@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 import re
 
 from app.memory.models import (
@@ -9,10 +9,10 @@ from app.memory.models import (
     MemoryType,
 )
 from app.memory.review_signals import (
-    AGE_CONTEXT_PATTERN,
+    contextual_age_answer,
     is_time_variable_memory,
-    parse_bare_age_answer,
 )
+from app.memory.utils import _utc_now
 
 
 def review_after_for_days(days: int, *, now: datetime | None = None) -> str:
@@ -55,7 +55,7 @@ def normalize_time_uncertain_candidate(
     # the age, either explicitly or as a bare answer to a verified age question.
     age = _unanchored_age(candidate.source_quote)
     if age is None and source_text and candidate.context_quote:
-        age = _contextual_age_answer(
+        age = contextual_age_answer(
             source_quote=candidate.source_quote,
             context_quote=candidate.context_quote,
             context_text=source_text,
@@ -123,24 +123,3 @@ def _has_time_or_birth_anchor(text: str) -> bool:
         "birthday",
     )
     return any(marker in lowered for marker in markers)
-
-
-def _contextual_age_answer(
-    *,
-    source_quote: str,
-    context_quote: str,
-    context_text: str,
-) -> int | None:
-    if context_quote not in context_text:
-        return None
-    if not AGE_CONTEXT_PATTERN.search(context_quote):
-        return None
-    return parse_bare_age_answer(source_quote)
-
-
-def _utc_now(now: datetime | None) -> datetime:
-    if now is None:
-        return datetime.now(UTC)
-    if now.tzinfo is None:
-        return now.replace(tzinfo=UTC)
-    return now.astimezone(UTC)

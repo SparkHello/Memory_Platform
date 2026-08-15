@@ -21,9 +21,8 @@ from app.memory.models import (
     normalize_memory_type,
     normalize_optional_text,
 )
-from app.memory.redaction import detect_text_sensitivity
-from app.memory.store.constants import _SENSITIVITY_RANK
-from app.memory.utils import _parse_iso_datetime
+from app.memory.redaction import sensitivity_floor
+from app.memory.utils import _ordered_unique, _parse_iso_datetime
 
 
 class _ConnectableStore(Protocol):
@@ -102,17 +101,6 @@ def _average_float(values: list[float], *, default: float) -> float:
     if not values:
         return default
     return round(sum(values) / len(values), 3)
-
-
-def _ordered_unique(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    unique: list[str] = []
-    for value in values:
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        unique.append(value)
-    return unique
 
 
 def _core_section_audit_summaries(sections: list[dict]) -> list[dict]:
@@ -197,14 +185,9 @@ def _sensitivity_with_floor(
     source_message: str | None = None,
     entities: list[str] | None = None,
 ) -> MemorySensitivity:
-    detected = detect_text_sensitivity(
-        "\n".join(
-            part
-            for part in (content, source_message or "", *(entities or []))
-            if part
-        )
-    )
-    return max((declared, detected), key=_SENSITIVITY_RANK.__getitem__)
+    # store 边界统一直接委托 redaction.sensitivity_floor（fail closed：
+    # 未知级别按 sensitive 处理），不再保留本地实现。
+    return sensitivity_floor(declared, content, source_message, *(entities or []))
 
 
 def _insert_memory_row(

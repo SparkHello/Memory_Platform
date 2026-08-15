@@ -202,7 +202,7 @@ PDF 必须自带可提取文本层，扫描件需先 OCR。导入时可填写标
 
 默认 `read-write` 会自动检索/注入安全记忆，并在完整最终回复后提取、去重和嵌入新长期记忆。提取时以最后一条用户文本为唯一事实来源，同时附带最近两轮可见对话消歧；system、工具内容和 reasoning 不会进入提取上下文。依赖上下文的候选必须同时通过本轮 `source_quote` 和较早 `context_quote` 校验，所以“前文问年龄、本轮回答 18”可保存，孤立的“18”会忽略。每个完整回答会保存本地分支节点；较早对话在后台压缩成滚动摘要，节点保留“摘要 + 最近两轮”。压缩摘要只能辅助理解，不能作为 `context_quote` 授权保存。如果客户端既没有动态 `conversation_id` 又截断了用于指纹匹配的旧历史，本轮会从请求自带上下文保守重建，而不会猜测其他分支。
 
-可用静态或按请求 Header `X-Memory-Mode: read` 关闭自动写入，或用 `off` 作为纯代理。多模态、tools、上游 reasoning 响应和 SSE 会透明转发；图片与音频数据不会送入记忆 embedding。网关会按实际上游处理 BigModel/Mistral 的 `stream_options` 差异，并在进程内短暂缓存、恢复 FLIT 使用 `memory-auto` 时省略的工具推理状态；历史 reasoning 无法证明属于当前 provider 时会在转发上游前清除，避免故障切换时跨 provider 泄露。`ALLOW_SENSITIVE_EGRESS=false` 时，敏感历史只保存在本地，不会发送给记忆提取或上下文压缩 provider。
+可用静态或按请求 Header `X-Memory-Mode: read` 关闭自动写入，或用 `off` 作为纯代理。多模态、tools、上游 reasoning 响应和 SSE 会透明转发，`stream_options` 也原样保留（上游兼容性由 Model Gateway 渠道适配层负责）；图片与音频数据不会送入记忆 embedding。在进程内短暂缓存、恢复 FLIT 使用 `memory-auto` 时省略的工具推理状态；历史 reasoning 无法证明属于当前 provider 时会在转发上游前清除，避免故障切换时跨 provider 泄露。`ALLOW_SENSITIVE_EGRESS=false` 时，敏感历史只保存在本地，不会发送给记忆提取或上下文压缩 provider。
 
 ## 4. 终端命令速查
 

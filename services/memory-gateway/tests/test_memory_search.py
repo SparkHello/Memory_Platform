@@ -1,4 +1,4 @@
-﻿from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import json
 
@@ -222,7 +222,7 @@ def test_concurrent_expired_cache_reads_do_not_raise(memory_store: MemoryStore) 
         store=memory_store,
         embedding_client=NullEmbeddingClient(),
     )
-    key = ("default", "咖啡", 8, False)
+    key = ("default", "咖啡", 8, False, "")
     SEARCH_CACHE[key] = (0.0, "unused", 0, [])
 
     def read(_: int):

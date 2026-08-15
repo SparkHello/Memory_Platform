@@ -29,12 +29,12 @@ def test_ui_entrypoints_redirect_or_fall_back_to_index(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
     with TestClient(main.create_app()) as client:
-        for path in ["/", "/dashboard", "/studio", "/memory-studio", "/记忆工作室", "/ui"]:
+        for path in ["/", "/ui"]:
             response = client.get(path, follow_redirects=False)
             assert response.status_code == 307
             assert response.headers["location"] == "/ui/"
 
-        for path in ["/ui/", "/ui/dashboard", "/ui/记忆工作室"]:
+        for path in ["/ui/"]:
             response = client.get(path)
             assert response.status_code == 200
             assert "text/html" in response.headers["content-type"]

@@ -1,7 +1,10 @@
-"""Chat side-effect claim and finalize outbox persistence.
+"""Chat side-effect claims and finalize outbox persistence.
 
 Kept out of the MemoryStore facade so the claim/finalize machinery lives beside
-its own tables instead of in the orchestration shell.
+its own tables instead of in the orchestration shell. Activation and recent
+context use durable TTL claims; ingest uses the finalize outbox itself as its
+cross-process idempotency authority so crash recovery is never blocked by a
+stale generic claim.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from app.memory.store.helpers import _ConnectableStore
+
 
 def claim_chat_side_effect(
     store: _ConnectableStore,
@@ -21,9 +25,11 @@ def claim_chat_side_effect(
 ) -> bool:
     """Atomically claim a retry-sensitive chat side effect.
 
-    Only a hash of the turn key is persisted.  The unique constraint makes
-    the guard effective across workers and process restarts; expired claims
-    are removed while holding the same SQLite write lock used for insert.
+    Only a hash of the turn key is persisted. The unique constraint makes the
+    guard effective across workers and process restarts; expired claims are
+    removed while holding the same SQLite write lock used for the insert.
+    Ingest intentionally does not call this helper: its durable outbox row is
+    the authority for crash-safe replay.
     """
     normalized_kind = str(kind).strip().lower()
     if normalized_kind not in {"activate", "recent_context", "ingest"}:
@@ -58,6 +64,7 @@ def claim_chat_side_effect(
         )
         return cursor.rowcount == 1
 
+
 def release_chat_side_effect_claim(
     store: _ConnectableStore,
     *,
@@ -76,6 +83,7 @@ def release_chat_side_effect_claim(
             """,
             (normalized_kind, key_hash, normalized_user[:200]),
         )
+
 
 def enqueue_chat_finalize_job(
     store: _ConnectableStore,

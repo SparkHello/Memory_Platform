@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import anyio
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
@@ -95,15 +95,7 @@ class GatewayTurnContext:
 @dataclass(slots=True)
 class _ProviderReasoningState:
     reasoning: str
-    provider_code: str
-    provider_model: str
-    deployment_id: str = ""
-    connection_id: str = ""
-    vendor: str = ""
-
-    @property
-    def affinity_key(self) -> str:
-        return self.deployment_id or self.provider_code
+    deployment_id: str
 
 
 class _ExpiringState:
@@ -167,8 +159,9 @@ class _ExpiringState:
 
 _TURN_SIDE_EFFECT_CACHE_MAX = 4096
 
-# FLIT 会在每个工具步骤用新 HTTP 请求重复同一轮前缀。这里需要短期幂等，
-# 但不能让任意 user/turn key 在长生命周期进程里无界增长。
+# FLIT 会在每个工具步骤用新 HTTP 请求重复同一轮前缀。进程缓存提供快速
+# 路径并限制 key 数量；激活/近期上下文另有 SQLite TTL claim 跨进程去重，
+# ingest 则由 durable outbox 的终态负责跨重启幂等。
 _ACTIVATED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
 _RECENT_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
 _INGESTED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
@@ -194,8 +187,7 @@ def _claim_turn_side_effect(
     user_id: str,
     ttl_seconds: float,
 ) -> bool:
-    """Use the in-process cache as a fast path and SQLite as the authority."""
-
+    """Use the in-process cache as a fast path and SQLite as authority."""
     if not cache.claim(key, ttl_seconds):
         return False
     try:
@@ -213,8 +205,8 @@ def _claim_turn_side_effect(
         )
         return False
     if not claimed:
-        # Keep the cheap local negative cache until its TTL expires.  The
-        # persisted row remains the source of truth across other workers.
+        # Keep the cheap local negative cache until its TTL expires. SQLite
+        # remains the authority for retries from other workers or restarts.
         return False
     return True
 
@@ -421,32 +413,20 @@ async def chat_completions(
             try:
                 async for chunk in upstream_stream.aiter_bytes():
                     capture.feed(chunk)
-                    if capture.tool_call_trace_ready and not reasoning_cached:
-                        _cache_tool_reasoning(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                            turn_fingerprint=turn_fingerprint,
-                            tool_call_ids=capture.tool_call_ids,
-                            reasoning=capture.assistant_reasoning,
-                            provider=upstream_stream.provider,
-                            ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
-                        )
-                        reasoning_cached = True
-                    if (
-                        capture.final_text_trace_ready
-                        and current_turn_has_tool_calls
-                        and not turn_reasoning_cached
-                    ):
-                        _cache_turn_reasoning(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                            turn_fingerprint=turn_fingerprint,
-                            tool_call_ids=current_turn_tool_call_ids,
-                            reasoning=capture.assistant_reasoning,
-                            provider=upstream_stream.provider,
-                            ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
-                        )
-                        turn_reasoning_cached = True
+                    reasoning_cached, turn_reasoning_cached = _maybe_cache_reasoning(
+                        capture,
+                        tool_trace_ready=capture.tool_call_trace_ready,
+                        final_text_ready=capture.final_text_trace_ready,
+                        tool_reasoning_cached=reasoning_cached,
+                        turn_reasoning_cached=turn_reasoning_cached,
+                        current_turn_has_tool_calls=current_turn_has_tool_calls,
+                        current_turn_tool_call_ids=current_turn_tool_call_ids,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        turn_fingerprint=turn_fingerprint,
+                        provider=upstream_stream.provider,
+                        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
+                    )
                     yield chunk
                 completed = True
             finally:
@@ -454,31 +434,20 @@ async def chat_completions(
                 # Treat that protocol marker as completion even if downstream
                 # cancellation happens before the upstream iterator reaches EOF.
                 capture.finish(clean=completed or capture.saw_done)
-                if capture.is_complete_tool_call_response and not reasoning_cached:
-                    _cache_tool_reasoning(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        turn_fingerprint=turn_fingerprint,
-                        tool_call_ids=capture.tool_call_ids,
-                        reasoning=capture.assistant_reasoning,
-                        provider=upstream_stream.provider,
-                        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
-                    )
-                if (
-                    capture.is_final_text_response
-                    and current_turn_has_tool_calls
-                    and not turn_reasoning_cached
-                ):
-                    _cache_turn_reasoning(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        turn_fingerprint=turn_fingerprint,
-                        tool_call_ids=current_turn_tool_call_ids,
-                        reasoning=capture.assistant_reasoning,
-                        provider=upstream_stream.provider,
-                        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
-                    )
-                    turn_reasoning_cached = True
+                _maybe_cache_reasoning(
+                    capture,
+                    tool_trace_ready=capture.is_complete_tool_call_response,
+                    final_text_ready=capture.is_final_text_response,
+                    tool_reasoning_cached=reasoning_cached,
+                    turn_reasoning_cached=turn_reasoning_cached,
+                    current_turn_has_tool_calls=current_turn_has_tool_calls,
+                    current_turn_tool_call_ids=current_turn_tool_call_ids,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    turn_fingerprint=turn_fingerprint,
+                    provider=upstream_stream.provider,
+                    ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
+                )
                 await upstream_stream.aclose()
 
         headers = _gateway_response_headers(
@@ -520,7 +489,9 @@ async def chat_completions(
         if isinstance(upstream_json, dict):
             assistant_text, is_final = extract_non_stream_result(upstream_json)
             if is_final and current_turn_has_tool_calls:
-                _cache_turn_reasoning(
+                _cache_reasoning(
+                    _TURN_REASONING,
+                    _turn_reasoning_keys,
                     user_id=user_id,
                     conversation_id=conversation_id,
                     turn_fingerprint=turn_fingerprint,
@@ -533,7 +504,9 @@ async def chat_completions(
                 extract_non_stream_tool_trace(upstream_json)
             )
             if complete_tool_call:
-                _cache_tool_reasoning(
+                _cache_reasoning(
+                    _TOOL_REASONING,
+                    _tool_reasoning_keys,
                     user_id=user_id,
                     conversation_id=conversation_id,
                     turn_fingerprint=turn_fingerprint,
@@ -841,6 +814,23 @@ def _restore_tool_reasoning(
     cached_messages: list[
         tuple[int, dict[str, Any], _ProviderReasoningState | None]
     ] = []
+    # A turn fingerprint only depends on the message prefix up to a user
+    # position, and nothing below mutates messages before every fingerprint is
+    # taken. Hash each user position at most once per request instead of
+    # re-hashing the full prefix for every assistant tool message and turn.
+    fingerprint_by_user_index: dict[int, str] = {}
+
+    def fingerprint_at(user_index: int) -> str:
+        fingerprint = fingerprint_by_user_index.get(user_index)
+        if fingerprint is None:
+            fingerprint = _turn_fingerprint(
+                user_id=user_id,
+                messages=messages,
+                latest_user_index=user_index,
+            )
+            fingerprint_by_user_index[user_index] = fingerprint
+        return fingerprint
+
     latest_user_index = -1
     for index, message in enumerate(messages):
         if isinstance(message, dict) and message.get("role") == "user":
@@ -853,11 +843,7 @@ def _restore_tool_reasoning(
             continue
         if latest_user_index < 0:
             continue
-        origin_fingerprint = _turn_fingerprint(
-            user_id=user_id,
-            messages=messages,
-            latest_user_index=latest_user_index,
-        )
+        origin_fingerprint = fingerprint_at(latest_user_index)
         state = None
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
@@ -911,11 +897,7 @@ def _restore_tool_reasoning(
         )
         if final_assistant is None:
             continue
-        origin_fingerprint = _turn_fingerprint(
-            user_id=user_id,
-            messages=messages,
-            latest_user_index=user_index,
-        )
+        origin_fingerprint = fingerprint_at(user_index)
         turn_tool_call_ids = _turn_tool_call_ids(
             messages,
             start_index=turn_start,
@@ -938,7 +920,7 @@ def _restore_tool_reasoning(
     known_states = [
         state for _, _, state in cached_messages if state is not None
     ]
-    preferred_provider_code = known_states[-1].affinity_key if known_states else None
+    preferred_provider_code = known_states[-1].deployment_id if known_states else None
     proven_messages: set[int] = set()
     for _, message, state in cached_messages:
         if state is None:
@@ -946,9 +928,9 @@ def _restore_tool_reasoning(
                 message.pop("reasoning_content", None)
                 message.pop("reasoning", None)
             continue
-        if state.affinity_key != preferred_provider_code:
+        if state.deployment_id != preferred_provider_code:
             # A memory-auto history can contain tool turns produced by several
-            # providers. Never replay one provider's hidden state to another.
+            # deployments. Never replay one deployment's hidden state to another.
             message.pop("reasoning_content", None)
             message.pop("reasoning", None)
             continue
@@ -977,88 +959,133 @@ def _strip_unproven_assistant_reasoning(
             continue
         # With an alias model the client cannot prove which upstream produced
         # a historical reasoning field. Normal turns do not need hidden state
-        # replay, so only process-local, provider-tagged tool traces survive.
+        # replay, so only process-local, deployment-tagged tool traces survive.
         message.pop("reasoning_content", None)
         message.pop("reasoning", None)
 
 
-def _cache_tool_reasoning(
+def _tool_reasoning_keys(
     *,
     user_id: str,
     conversation_id: str | None,
     turn_fingerprint: str,
     tool_call_ids: list[str],
-    reasoning: str,
-    provider: Any,
-    ttl_seconds: float,
-) -> None:
-    provider_code = str(getattr(provider, "code", "") or "")
-    provider_model = str(getattr(provider, "model", "") or "")
-    deployment_id = str(getattr(provider, "deployment_id", "") or "")
-    connection_id = str(getattr(provider, "connection_id", "") or "")
-    vendor = str(getattr(provider, "vendor", "") or "")
-    if not deployment_id and provider_code not in {"M", "K", "D"}:
-        return
-    state = _ProviderReasoningState(
-        reasoning=reasoning,
-        provider_code=provider_code,
-        provider_model=provider_model,
-        deployment_id=deployment_id,
-        connection_id=connection_id,
-        vendor=vendor,
-    )
-    for tool_call_id in tool_call_ids:
-        if not tool_call_id:
-            continue
-        _TOOL_REASONING.put(
-            _tool_reasoning_key(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                turn_fingerprint=turn_fingerprint,
-                tool_call_id=tool_call_id,
-            ),
-            state,
-            ttl_seconds,
+) -> list[str]:
+    return [
+        _tool_reasoning_key(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            turn_fingerprint=turn_fingerprint,
+            tool_call_id=tool_call_id,
         )
+        for tool_call_id in tool_call_ids
+        if tool_call_id
+    ]
 
 
-def _cache_turn_reasoning(
+def _turn_reasoning_keys(
     *,
     user_id: str,
     conversation_id: str | None,
     turn_fingerprint: str,
     tool_call_ids: list[str],
-    reasoning: str,
-    provider: Any,
-    ttl_seconds: float,
-) -> None:
-    provider_code = str(getattr(provider, "code", "") or "")
-    provider_model = str(getattr(provider, "model", "") or "")
-    deployment_id = str(getattr(provider, "deployment_id", "") or "")
-    connection_id = str(getattr(provider, "connection_id", "") or "")
-    vendor = str(getattr(provider, "vendor", "") or "")
-    if (
-        (not deployment_id and provider_code not in {"M", "K", "D"})
-        or not tool_call_ids
-    ):
-        return
-    _TURN_REASONING.put(
+) -> list[str]:
+    if not tool_call_ids:
+        return []
+    return [
         _turn_reasoning_key(
             user_id=user_id,
             conversation_id=conversation_id,
             turn_fingerprint=turn_fingerprint,
             tool_call_ids=tool_call_ids,
-        ),
-        _ProviderReasoningState(
-            reasoning=reasoning,
-            provider_code=provider_code,
-            provider_model=provider_model,
-            deployment_id=deployment_id,
-            connection_id=connection_id,
-            vendor=vendor,
-        ),
-        ttl_seconds,
+        )
+    ]
+
+
+def _cache_reasoning(
+    cache: _ExpiringState,
+    keys_fn: Callable[..., list[str]],
+    *,
+    user_id: str,
+    conversation_id: str | None,
+    turn_fingerprint: str,
+    tool_call_ids: list[str],
+    reasoning: str,
+    provider: Any,
+    ttl_seconds: float,
+) -> None:
+    deployment_id = provider.deployment_id
+    if not deployment_id:
+        return
+    keys = keys_fn(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        turn_fingerprint=turn_fingerprint,
+        tool_call_ids=tool_call_ids,
     )
+    if not keys:
+        return
+    state = _ProviderReasoningState(
+        reasoning=reasoning,
+        deployment_id=deployment_id,
+    )
+    for key in keys:
+        cache.put(key, state, ttl_seconds)
+
+
+def _maybe_cache_reasoning(
+    capture: ChatStreamCapture,
+    *,
+    tool_trace_ready: bool,
+    final_text_ready: bool,
+    tool_reasoning_cached: bool,
+    turn_reasoning_cached: bool,
+    current_turn_has_tool_calls: bool,
+    current_turn_tool_call_ids: list[str],
+    user_id: str,
+    conversation_id: str | None,
+    turn_fingerprint: str,
+    provider: Any,
+    ttl_seconds: float,
+) -> tuple[bool, bool]:
+    """Cache stream-captured reasoning at most once per leg.
+
+    FLIT closes its EventSource as soon as `[DONE]` arrives, so the streaming
+    path invokes this both inside the forward loop (incremental traces) and
+    from the finally fallback (completed response); the readiness flags tell
+    the two sights apart while the cached flags keep each write idempotent.
+    """
+    if tool_trace_ready and not tool_reasoning_cached:
+        _cache_reasoning(
+            _TOOL_REASONING,
+            _tool_reasoning_keys,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            turn_fingerprint=turn_fingerprint,
+            tool_call_ids=capture.tool_call_ids,
+            reasoning=capture.assistant_reasoning,
+            provider=provider,
+            ttl_seconds=ttl_seconds,
+        )
+        tool_reasoning_cached = True
+    if (
+        final_text_ready
+        and current_turn_has_tool_calls
+        and not turn_reasoning_cached
+    ):
+        _cache_reasoning(
+            _TURN_REASONING,
+            _turn_reasoning_keys,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            turn_fingerprint=turn_fingerprint,
+            tool_call_ids=current_turn_tool_call_ids,
+            reasoning=capture.assistant_reasoning,
+            provider=provider,
+            ttl_seconds=ttl_seconds,
+        )
+        turn_reasoning_cached = True
+    return tool_reasoning_cached, turn_reasoning_cached
 
 
 def _finalization_key(
@@ -1566,31 +1593,10 @@ async def _run_ingest_finalize_job(
     conversation_id: str | None,
     extraction_context: str | None,
     context_quote_source: str | None,
-    force_reclaim: bool = False,
 ) -> bool:
     """Run one durable ingest job. Returns True when the job actually ran."""
-    if force_reclaim:
-        # Crash recovery: the previous worker died between claim and
-        # completion, leaving a persistent claim that would otherwise block
-        # this replay until its TTL expires.
-        _release_turn_side_effect(
-            cache=_INGESTED_TURNS,
-            store=store,
-            kind="ingest",
-            key=ingest_key,
-            user_id=user_id,
-        )
-
-    if not _claim_turn_side_effect(
-        cache=_INGESTED_TURNS,
-        store=store,
-        kind="ingest",
-        key=ingest_key,
-        user_id=user_id,
-        ttl_seconds=settings.chat_gateway_turn_ttl_seconds,
-    ):
-        # Another worker is handling the same turn; leave job for recovery only
-        # if still pending after claim TTL.
+    if not _INGESTED_TURNS.claim(ingest_key, settings.chat_gateway_turn_ttl_seconds):
+        # 本轮正在本进程内执行；保持 job 现状，由崩溃恢复兜底。
         return False
     try:
         # Mark running only after winning the claim so a losing duplicate
@@ -1602,8 +1608,8 @@ async def _run_ingest_finalize_job(
             bump_attempts=True,
         )
         if not marked:
-            # Job already completed elsewhere; keep the claim so the turn is
-            # not re-ingested.
+            # Job 已由早前的执行为 done（终态，崩溃重启后也不会回翻）；
+            # 保留 claim，本轮不再重复提取。
             return False
     except Exception:
         logger.exception("聊天网关无法标记 finalize job 为 running")
@@ -1623,13 +1629,7 @@ async def _run_ingest_finalize_job(
             source="chat_gateway",
         )
         if result.retryable:
-            _release_turn_side_effect(
-                cache=_INGESTED_TURNS,
-                store=store,
-                kind="ingest",
-                key=ingest_key,
-                user_id=user_id,
-            )
+            _INGESTED_TURNS.release(ingest_key)
             store.mark_chat_finalize_job(
                 job_id=job_id,
                 status="pending",
@@ -1639,13 +1639,7 @@ async def _run_ingest_finalize_job(
         store.mark_chat_finalize_job(job_id=job_id, status="done")
         return True
     except Exception as exc:
-        _release_turn_side_effect(
-            cache=_INGESTED_TURNS,
-            store=store,
-            kind="ingest",
-            key=ingest_key,
-            user_id=user_id,
-        )
+        _INGESTED_TURNS.release(ingest_key)
         try:
             store.mark_chat_finalize_job(
                 job_id=job_id,
@@ -1718,9 +1712,6 @@ async def recover_pending_chat_finalize_jobs(
                 if payload.get("context_quote_source") is not None
                 else None
             ),
-            # A stale-running job means the previous worker crashed after
-            # claiming; its persistent claim must not block the replay.
-            force_reclaim=str(job.get("status") or "") == "running",
         )
         if executed:
             recovered += 1

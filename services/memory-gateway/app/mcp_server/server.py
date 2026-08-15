@@ -27,6 +27,7 @@ from app.knowledge.store import (
     KnowledgeStore,
     KnowledgeValidationError,
 )
+from app.memory.affect import _digest_affect
 from app.memory.core import safe_core_memory_sections
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import (
@@ -123,37 +124,10 @@ def _search_service(store: MemoryStore, embedding_client: EmbeddingClient) -> Me
 
 
 def _memory_to_dict(memory: MemoryRecord) -> dict:
-    return {
-        "id": memory.id,
-        "content": memory.content,
-        "type": memory.type,
-        "importance": memory.importance,
-        "confidence": memory.confidence,
-        "valence": memory.valence,
-        "arousal": memory.arousal,
-        "origin": memory.origin,
-        "usage_count": memory.usage_count,
-        "last_used_at": memory.last_used_at,
-        "stability": memory.stability,
-        "valid_from": memory.valid_from,
-        "valid_until": memory.valid_until,
-        "review_after": memory.review_after,
-        "sensitivity": memory.sensitivity,
-        "evidence_memory_ids": memory.evidence_memory_ids,
-        "topics": memory.topics,
-        "entities": memory.entities,
-        "space_ids": memory.space_ids,
-        "temporal_subject": memory.temporal_subject,
-        "temporal_predicate": memory.temporal_predicate,
-        "status": memory.status,
-        "digested": memory.digested,
-        "decay_lambda": memory.decay_lambda,
-        "supersedes": memory.supersedes,
-        "superseded_by": memory.superseded_by,
-        "created_at": memory.created_at,
-        "updated_at": memory.updated_at,
-        "archived_at": memory.archived_at,
-    }
+    # Derived from the model so new memory fields automatically keep MCP
+    # aligned with the REST response (app/api/memories/common.py); only the
+    # embedding payload stays excluded on both sides.
+    return memory.model_dump(exclude={"embedding_json"})
 
 
 def _search_hit_to_dict(hit) -> dict:
@@ -228,20 +202,12 @@ def _knowledge_model_dump(value: object) -> dict:
     raise TypeError("knowledge result is not serializable")
 
 
-def _knowledge_document_to_dict(value: object) -> dict:
-    return _knowledge_model_dump(value)
-
-
-def _knowledge_version_to_dict(value: object) -> dict:
-    return _knowledge_model_dump(value)
-
-
 def _knowledge_commit_to_dict(value: object) -> dict:
     payload = _knowledge_model_dump(value)
     if "document" in payload:
-        payload["document"] = _knowledge_document_to_dict(payload["document"])
+        payload["document"] = _knowledge_model_dump(payload["document"])
     if "version" in payload:
-        payload["version"] = _knowledge_version_to_dict(payload["version"])
+        payload["version"] = _knowledge_model_dump(payload["version"])
     return payload
 
 
@@ -336,78 +302,6 @@ def _knowledge_error(exc: Exception, *, operation: str) -> str:
     )
 
 
-def _digest_affect(
-    *,
-    text: str,
-    source_memories: list[MemoryRecord],
-    default_valence: float = 0.5,
-    default_arousal: float = 0.3,
-) -> tuple[float, float]:
-    if source_memories:
-        valence = sum(memory.valence for memory in source_memories) / len(source_memories)
-        arousal = sum(memory.arousal for memory in source_memories) / len(source_memories)
-    else:
-        valence = default_valence
-        arousal = default_arousal
-
-    lowered = text.lower()
-    positive_markers = (
-        "安心",
-        "稳定",
-        "期待",
-        "满意",
-        "顺畅",
-        "有信心",
-        "踏实",
-        "喜欢",
-        "relief",
-        "confident",
-        "good",
-    )
-    negative_markers = (
-        "焦虑",
-        "压力",
-        "担心",
-        "讨厌",
-        "难受",
-        "挫败",
-        "烦",
-        "害怕",
-        "anxious",
-        "pressure",
-        "frustrated",
-        "worried",
-    )
-    high_arousal_markers = (
-        "强烈",
-        "压力",
-        "焦虑",
-        "兴奋",
-        "紧张",
-        "冲突",
-        "痛点",
-        "urgent",
-        "intense",
-    )
-    calm_markers = ("稳定", "平静", "安心", "踏实", "settled", "calm")
-
-    if any(marker in lowered for marker in positive_markers):
-        valence += 0.15
-    if any(marker in lowered for marker in negative_markers):
-        valence -= 0.20
-        arousal += 0.15
-    if any(marker in lowered for marker in high_arousal_markers):
-        arousal += 0.15
-    if any(marker in lowered for marker in calm_markers):
-        arousal -= 0.05
-
-    return _clamp01(valence), _clamp01(arousal)
-
-
-def _clamp01(value: float) -> float:
-    return max(0.0, min(1.0, round(float(value), 3)))
-
-
 def _register_tools(mcp: FastMCP) -> None:
     mcp.tool()(search_memory)
     mcp.tool()(surface_memories)
@@ -459,7 +353,7 @@ async def list_knowledge_documents(
                 include_sensitive=include_sensitive,
             )
         )
-        items = [_knowledge_document_to_dict(item) for item in documents]
+        items = [_knowledge_model_dump(item) for item in documents]
         return _dump({"ok": True, "documents": items, "count": len(items)})
     except Exception as exc:
         return _knowledge_error(exc, operation="list_knowledge_documents")
@@ -740,7 +634,7 @@ async def commit_knowledge_upload(
             )
         )
         payload = _knowledge_commit_to_dict(result)
-        payload["version"] = _knowledge_version_to_dict(refreshed)
+        payload["version"] = _knowledge_model_dump(refreshed)
         return _dump({"ok": True, **payload, "embedding": embedding})
     except Exception as exc:
         return _knowledge_error(exc, operation="commit_knowledge_upload")
@@ -824,7 +718,7 @@ async def manage_knowledge_document(
                 )
             )
             return _dump(
-                {"ok": True, "action": action, "document": _knowledge_document_to_dict(document)}
+                {"ok": True, "action": action, "document": _knowledge_model_dump(document)}
             )
         if action == "soft_delete":
             document = await anyio.to_thread.run_sync(
@@ -835,7 +729,7 @@ async def manage_knowledge_document(
                 )
             )
             payload = (
-                _knowledge_document_to_dict(document)
+                _knowledge_model_dump(document)
                 if document is not None
                 else {"document_ref": document_ref}
             )
@@ -849,7 +743,7 @@ async def manage_knowledge_document(
                 )
             )
             return _dump(
-                {"ok": True, "action": action, "document": _knowledge_document_to_dict(document)}
+                {"ok": True, "action": action, "document": _knowledge_model_dump(document)}
             )
         if action == "restore_version":
             result = await anyio.to_thread.run_sync(
@@ -881,7 +775,7 @@ async def manage_knowledge_document(
             )
         )
         payload = _knowledge_commit_to_dict(result)
-        payload["version"] = _knowledge_version_to_dict(refreshed)
+        payload["version"] = _knowledge_model_dump(refreshed)
         return _dump(
             {
                 "ok": True,

@@ -3,7 +3,7 @@ import re
 from typing import Literal
 
 from app.memory.models import MemoryRecord
-from app.memory.utils import _parse_iso_datetime
+from app.memory.utils import _parse_iso_datetime, _utc_now
 
 
 TemporalQueryMode = Literal["current", "history", "future"]
@@ -282,10 +282,3 @@ def _is_point_event(memory: MemoryRecord) -> bool:
         and not memory.supersedes
         and not memory.superseded_by
     )
-
-
-def _utc_now(now: datetime | None) -> datetime:
-    current = now or datetime.now(UTC)
-    if current.tzinfo is None:
-        return current.replace(tzinfo=UTC)
-    return current.astimezone(UTC)

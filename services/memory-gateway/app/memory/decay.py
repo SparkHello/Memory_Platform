@@ -1,37 +1,17 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 import json
 import math
 
 from app.config import get_settings
 from app.memory.models import MemoryRecord
-from app.memory.utils import _parse_iso_datetime
-
-
-SECTOR_LAMBDA_MAP: dict[str, float] = {}
+from app.memory.utils import _parse_iso_datetime, _utc_now
 
 
 def _load_sector_lambda_map() -> dict[str, float]:
-    """从 Settings 解析扇区 -> lambda 映射，按需 lazy-load。"""
-    global SECTOR_LAMBDA_MAP
-    if SECTOR_LAMBDA_MAP:
-        return SECTOR_LAMBDA_MAP
-    try:
-        raw = get_settings().decay_sector_lambda_map
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise TypeError("sector lambda map must be an object")
-        SECTOR_LAMBDA_MAP = {
-            str(sector): float(value)
-            for sector, value in parsed.items()
-            if not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(float(value))
-            and 0.0 <= float(value) <= 10.0
-        }
-    except (json.JSONDecodeError, TypeError, ValueError):
-        SECTOR_LAMBDA_MAP = {"semantic": 0.02}
-    return SECTOR_LAMBDA_MAP
+    """从 Settings 读取扇区 -> lambda 映射；Settings 校验层已保证合法结构与取值范围。"""
+    parsed = json.loads(get_settings().decay_sector_lambda_map)
+    return {str(sector): float(value) for sector, value in parsed.items()}
 
 
 @dataclass(frozen=True)
@@ -166,18 +146,6 @@ def freshness_bonus(memory: MemoryRecord, *, now: datetime | None = None) -> flo
     if days_since_created >= bonus_window_days:
         return 1.0
     return 1.0 + (1.0 - days_since_created / bonus_window_days) * 0.25
-
-
-def _utc_now(now: datetime | None) -> datetime:
-    if now is None:
-        current = datetime.now(UTC)
-    else:
-        current = now
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=UTC)
-    else:
-        current = current.astimezone(UTC)
-    return current
 
 
 def _elapsed_days(now: datetime, earlier: datetime | None) -> float:

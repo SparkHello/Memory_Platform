@@ -142,6 +142,10 @@ _EMPLOYER_VALUE_RE = re.compile(
     r"|\bwork(?:ing|s)?\s+(?:at|for)\s+(?P<en_value>[^,.;!?]{1,60})",
     flags=re.IGNORECASE,
 )
+# 注意:以下 _*_GENERIC_VALUES / _CITY_REJECT_PREFIXES 是逐案例积累的启发式黑名单,
+# 每个条目都对应一次具体的错误提取。新增条目前的停止条件:能归纳为正则/结构规则
+# 时必须先改规则,只在无法归纳时才加条目;若某类错误已长期不再出现,对应条目应
+# 删除而不是永久保留。不要让这些集合无限增长。
 _EMPLOYER_GENERIC_VALUES = {
     "远程",
     "线上",
@@ -339,20 +343,13 @@ _SECTOR_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def apply_extraction_hints(
-    candidate: CandidateMemory,
-    *,
-    source_text: str | None = None,
-) -> CandidateMemory:
+def apply_extraction_hints(candidate: CandidateMemory) -> CandidateMemory:
     """Apply conservative post-extraction hints that are safer than broad guessing.
 
     The LLM still does the main extraction. This layer only nudges obvious sector
     collapses and fills temporal keys for a tiny whitelist of replaceable profile
     slots.
     """
-    # Kept as an ignored compatibility argument for older callers. Whole-batch
-    # source text must never participate in per-candidate inference.
-    del source_text
     if candidate.action == "ignore":
         return candidate
 

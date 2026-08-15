@@ -168,26 +168,6 @@ class OpenAICompatibleKnowledgeAgentClient:
             raise RuntimeError(
                 "Knowledge agent requires Model Gateway; direct providers are removed"
             )
-        return await self._create_model_gateway_completion(
-            model=model,
-            messages=messages,
-            tools=tools,
-            timeout_seconds=timeout_seconds,
-            affinity_scope=affinity_scope,
-        )
-
-    async def _create_model_gateway_completion(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        timeout_seconds: float,
-        affinity_scope: str,
-    ) -> dict[str, Any]:
-        runtime = self.config.model_runtime
-        if runtime is None or not runtime.is_central:
-            raise RuntimeError("central model runtime is not configured")
         allowed_routes = {self.config.flash_model, self.config.pro_model}
         if model not in allowed_routes:
             raise ValueError("knowledge agent requested an unconfigured central route")
@@ -244,9 +224,6 @@ class OpenAICompatibleKnowledgeAgentClient:
             raise ValueError("knowledge agent response must be a JSON object")
         data.setdefault("model", metadata.upstream_model)
         return data
-
-
-
 
 
 def _model_gateway_knowledge_payload(
@@ -716,13 +693,12 @@ class KnowledgeSearchAgent:
                 if tool_payload.get("ok"):
                     round_valid = True
 
-            if round_invalid:
-                invalid_streak += 1
-            elif round_valid:
+            if round_valid and not round_invalid:
                 invalid_streak = 0
             else:
                 invalid_streak += 1
-                last_failure = last_failure or "invalid_agent_response"
+                if not round_invalid:
+                    last_failure = last_failure or "invalid_agent_response"
 
             if invalid_streak >= 2:
                 return _LoopOutcome(
@@ -954,19 +930,19 @@ class KnowledgeSearchAgent:
     def _local_only_reason(self, *, request: str, include_sensitive: bool) -> str:
         if self.config.egress_policy == "none":
             return "egress_disabled"
-        if not _configured_provider_codes(self.config):
+        runtime = self.config.model_runtime
+        if runtime is None or not runtime.is_central:
             return "agent_not_configured"
         # The request itself is outbound data too.  A caller may ask a
         # sensitive question while leaving include_sensitive=false; that must
         # never bypass the global egress gate.
-        if detect_knowledge_text_sensitivity(request) != "normal" and (
+        sensitive_egress_blocked = (
             self.config.egress_policy != "all"
             or not self.config.allow_sensitive_egress
-        ):
-            return "sensitive_egress_disabled"
-        if include_sensitive and (
-            self.config.egress_policy != "all"
-            or not self.config.allow_sensitive_egress
+        )
+        if sensitive_egress_blocked and (
+            detect_knowledge_text_sensitivity(request) != "normal"
+            or include_sensitive
         ):
             return "sensitive_egress_disabled"
         return ""
@@ -1180,13 +1156,6 @@ async def _await_with_timeout(value: Any, timeout: float) -> Any:
     if inspect.isawaitable(value):
         return await asyncio.wait_for(value, timeout=timeout)
     return value
-
-
-def _configured_provider_codes(config: KnowledgeAgentConfig) -> list[str]:
-    """Central gateway is the only supported knowledge agent backend."""
-    if config.model_runtime is not None and config.model_runtime.is_central:
-        return ["G"]
-    return []
 
 
 def _response_model(response: Mapping[str, Any], *, fallback: str) -> str:

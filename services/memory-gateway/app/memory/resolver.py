@@ -12,11 +12,10 @@ from app.vector_util import cosine_similarity
 from app.memory.store import MemoryStore
 from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (
-    _char_overlap,
-    _has_negation,
     _memory_embedding_vector,
     _normalize,
     _term_jaccard,
+    pair_conflict,
 )
 from app.usage.context import model_usage_scope
 
@@ -27,6 +26,8 @@ EMBEDDING_SIMILARITY_THRESHOLD = 0.80
 SEMANTIC_COVERAGE_SIMILARITY_THRESHOLD = 0.70
 # 无向量可用时退化为词重叠（Jaccard）判断
 TERM_SIMILARITY_THRESHOLD = 0.5
+# 已确认相关的两条内容，否定极性不同且字符重叠达到该值时视为冲突
+CONFLICT_CHAR_OVERLAP_THRESHOLD = 0.45
 
 _GENERIC_ENTITIES = {
     "个人",
@@ -342,7 +343,11 @@ def _old_memory_covers_candidate(
     new_content = candidate.memory
     old_content = memory.content
     if (
-        _looks_conflicting(new_content, old_content)
+        pair_conflict(
+            new_content,
+            old_content,
+            similarity_threshold=CONFLICT_CHAR_OVERLAP_THRESHOLD,
+        )
         or _looks_superseding(new_content)
         or _has_intent_marker(new_content) != _has_intent_marker(old_content)
     ):
@@ -468,7 +473,11 @@ def _find_related_memory(
 
 
 def _related_content_relation(new_content: str, old_content: str) -> MemoryRelation:
-    if _looks_conflicting(new_content, old_content):
+    if pair_conflict(
+        new_content,
+        old_content,
+        similarity_threshold=CONFLICT_CHAR_OVERLAP_THRESHOLD,
+    ):
         return "conflict"
     if _looks_superseding(new_content):
         return "supersede"
@@ -481,12 +490,6 @@ def _related_reason_for_relation(relation: MemoryRelation) -> str:
         "supersede": "发现新信息可能取代同主题旧记忆",
         "supplement": "发现新信息补充了旧记忆的细节",
     }.get(relation, "发现相似旧记忆")
-
-
-def _looks_conflicting(new_content: str, old_content: str) -> bool:
-    if _has_negation(new_content) == _has_negation(old_content):
-        return False
-    return _char_overlap(new_content, old_content) >= 0.45
 
 
 def _looks_superseding(text: str) -> bool:

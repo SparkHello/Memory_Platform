@@ -1,4 +1,4 @@
-﻿"""记忆提取与解析的行为测试。
+"""记忆提取与解析的行为测试。
 
 覆盖保存门槛（importance / confidence / source_quote / 假设场景）、
 去重与更新逻辑，以及 memory_decision_logs 的记录行为。
@@ -1079,7 +1079,7 @@ def test_temporal_profile_hint_clears_unsupported_llm_key() -> None:
         temporal_predicate="current_city",
     )
 
-    hinted = apply_extraction_hints(candidate, source_text="我现在住上海。我喜欢咖啡")
+    hinted = apply_extraction_hints(candidate)
 
     assert hinted.temporal_subject is None
     assert hinted.temporal_predicate is None

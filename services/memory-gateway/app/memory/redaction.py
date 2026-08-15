@@ -14,13 +14,47 @@ REDACTED_CONTENT_TEXT = "内容已遮罩。请在详情页显式查看完整内�
 REDACTED_SOURCE_TEXT = "来源原文已遮罩。请在详情页显式查看完整内容。"
 
 
+def higher_sensitivity(
+    left: MemorySensitivity,
+    right: MemorySensitivity,
+) -> MemorySensitivity:
+    """返回两个敏感级别中较高的一个。
+
+    Fail closed：无法识别的级别一律按 sensitive 处理（store 边界与 ingest
+    审计共用语义，不得退化为按 normal 放行）。
+    """
+    normalized_left = left if left in _SENSITIVITY_RANK else "sensitive"
+    normalized_right = right if right in _SENSITIVITY_RANK else "sensitive"
+    return max((normalized_left, normalized_right), key=_SENSITIVITY_RANK.__getitem__)
+
+
 def sensitivity_floor(
     declared: MemorySensitivity,
     *texts: str | None,
 ) -> MemorySensitivity:
     """Raise a declared sensitivity to the deterministic local floor."""
     detected = detect_text_sensitivity("\n".join(text for text in texts if text))
-    return max((declared, detected), key=_SENSITIVITY_RANK.__getitem__)
+    return higher_sensitivity(declared, detected)
+
+
+def detect_local_sensitivity(
+    content: str,
+    source_message: str | None = None,
+    entities: list[str] | None = None,
+) -> MemorySensitivity:
+    """对 content + source_message + entities 拼接文本做本地敏感检测。
+
+    搜索硬过滤（search.py）、核心记忆来源筛选（core.py）与 store 写入下限
+    （store/helpers.py 的 _sensitivity_with_floor）共用同一份文本组装，
+    不再各自拼接。
+    """
+    return detect_text_sensitivity(
+        "\n".join(
+            part
+            for part in (content, source_message or "", *(entities or []))
+            if part
+        )
+    )
 
 
 def redact_memory_payload(

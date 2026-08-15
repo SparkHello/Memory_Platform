@@ -12,6 +12,7 @@ from app.memory.models import (
 from app.memory.report import build_memory_export
 from app.memory.search import SEARCH_CACHE
 from app.memory.store import MemoryStore
+from app.memory.store.decision_logs import _decision_log_referenced_memory_ids
 from app.memory.utils import parse_embedding_vector
 
 
@@ -405,7 +406,7 @@ class MemoryHealthChecker:
                     )
                 )
                 continue
-            for memory_id in sorted(_extract_memory_references(payload)):
+            for memory_id in sorted(_decision_log_referenced_memory_ids(payload)):
                 if memory_id in memory_ids:
                     continue
                 issues.append(
@@ -471,29 +472,3 @@ def _string_values(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item]
-
-
-def _extract_memory_references(value: Any) -> set[str]:
-    references: set[str] = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in {
-                "memory_id",
-                "target_memory_id",
-                "source_memory_id",
-                "confirm_memory_id",
-            } and isinstance(item, str):
-                references.add(item)
-            elif key in {
-                "memory_ids",
-                "merged_memory_ids",
-                "archived_memory_ids",
-                "evidence_memory_ids",
-            }:
-                references.update(_string_values(item))
-            else:
-                references.update(_extract_memory_references(item))
-    elif isinstance(value, list):
-        for item in value:
-            references.update(_extract_memory_references(item))
-    return {reference for reference in references if reference}

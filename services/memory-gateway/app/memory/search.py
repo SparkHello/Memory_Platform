@@ -20,7 +20,7 @@ from app.llm.model_gateway import (
 )
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
-from app.memory.redaction import detect_text_sensitivity
+from app.memory.redaction import detect_local_sensitivity, detect_text_sensitivity
 from app.memory.review_signals import (
     is_emotion_uncertain,
     is_expired,
@@ -452,7 +452,8 @@ class MemorySearchService:
     ):
         self.store = store
         self.embedding_client = embedding_client
-        # 评测等隔离场景关闭进程级缓存：缓存 key 只含 (user, query, limit)，
+        # 评测等隔离场景关闭进程级缓存：缓存 key 只含
+        # (user, query, limit, include_sensitive, embedding_space_id)，
         # 不区分数据源/检索模式，复用会让 keyword 与 embedding 基线互相污染。
         self.enable_cache = enable_cache
         self.last_cache_status = "bypass"
@@ -915,7 +916,7 @@ class MemorySearchService:
             _discard_search_cache_entry(key, cached_entry)
             return None
 
-        include_sensitive = bool(key[3]) if len(key) > 3 else False
+        include_sensitive = bool(key[3])
         temporal_mode = temporal_query_mode(query)
         temporal_window = temporal_query_window(query)
         hits: list[MemorySearchHit] = []
@@ -945,7 +946,7 @@ class MemorySearchService:
                 if isinstance(channels, list)
                 else ["cache"]
             )
-            cached_space_id = str(key[4]) if len(key) > 4 else ""
+            cached_space_id = str(key[4])
             if (
                 "embedding" in cached_channels
                 and (
@@ -988,7 +989,7 @@ class MemorySearchService:
             key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
             reverse=True,
         )
-        requested_limit = int(key[2]) if len(key) > 2 else len(hits)
+        requested_limit = int(key[2])
         return hits[:requested_limit]
 
     def _cache_embedding(self, key: tuple, vector: list[float], now: float) -> None:
@@ -1196,7 +1197,7 @@ class MemorySearchService:
             for hit in activated:
                 hit.memory.usage_count += 1
                 hit.memory.last_used_at = used_at
-                _refresh_hit_decay(hit)
+                _refresh_hit_ranking(hit)
         return hits
 
 
@@ -1521,10 +1522,6 @@ def _surface_review_signals(
     return signals
 
 
-def _refresh_hit_decay(hit: MemorySearchHit) -> None:
-    _refresh_hit_ranking(hit)
-
-
 def _refresh_hit_ranking(
     hit: MemorySearchHit,
     *,
@@ -1638,12 +1635,14 @@ def _metadata_penalty(memory: MemoryRecord, now: datetime) -> float:
 def _memory_is_locally_sensitive(memory: MemoryRecord) -> bool:
     if memory.sensitivity != "normal":
         return True
-    text = "\n".join(
-        part
-        for part in (memory.content, memory.source_message, *memory.entities)
-        if part
+    return (
+        detect_local_sensitivity(
+            memory.content,
+            memory.source_message,
+            memory.entities,
+        )
+        != "normal"
     )
-    return detect_text_sensitivity(text) != "normal"
 
 
 def _float_payload(value: object) -> float:

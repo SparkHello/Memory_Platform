@@ -1,15 +1,12 @@
 import json
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
 from app.llm.client import OpenAICompatibleClient
-from app.llm.prompts import (
-    render_memory_batch_extraction_messages,
-    render_memory_extraction_messages,
-)
+from app.llm.prompts import render_memory_batch_extraction_messages
 from app.memory.extraction_hints import apply_extraction_hints
 from app.memory.models import CandidateMemory
 from app.memory.redaction import (
@@ -17,8 +14,13 @@ from app.memory.redaction import (
     sensitivity_floor,
 )
 from app.memory.review_policy import normalize_time_uncertain_candidate
-from app.memory.review_signals import AGE_CONTEXT_PATTERN, parse_bare_age_answer
-from app.memory.utils import _has_negation, _parse_json_object, _terms
+from app.memory.review_signals import (
+    AGE_CONTEXT_PATTERN,
+    contextual_age_answer,
+    parse_bare_age_answer,
+)
+from app.memory.utils import _has_negation, _parse_json_object, _terms, _utc_now
+from app.sensitivity import EMAIL_PATTERN
 from app.openai_compat.schemas import ChatCompletionRequest
 from app.usage.context import model_usage_scope
 
@@ -104,10 +106,6 @@ _CREDENTIAL_VALUE_PATTERN = re.compile(
     r"(?:密码|口令|验证码|密钥|私钥|助记词|password|passcode|"
     r"api[-_ ]?key|access[-_ ]?token|secret[-_ ]?key|private[-_ ]?key)"
     r"\s*(?:是|为|is|=|:|：)?\s*([^\s,，。;；!?！？]{4,})",
-    re.IGNORECASE,
-)
-_EMAIL_PATTERN = re.compile(
-    r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])",
     re.IGNORECASE,
 )
 _LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[\s()\-./]?){4,}(?!\d)")
@@ -427,71 +425,6 @@ class LLMMemoryExtractor:
         self.llm_client = llm_client
         self.user_id = user_id
 
-    async def extract(self, *, user_message: str, assistant_message: str) -> ExtractionOutcome:
-        if (
-            len(user_message) > _MAX_BATCH_SOURCE_CHARS
-            or len(user_message) + len(assistant_message) > _MAX_BATCH_TOTAL_INPUT_CHARS
-        ):
-            return ExtractionOutcome(reason="提取输入超过资源边界")
-        try:
-            raw_output = await self._call_llm(
-                user_message=user_message,
-                assistant_message=assistant_message,
-            )
-        except Exception as exc:
-            return ExtractionOutcome(reason=f"调用提取模型失败：{exc}")
-
-        data = _parse_json_object(raw_output)
-        if data is None:
-            return ExtractionOutcome(
-                reason="提取模型输出的不是合法 JSON",
-                candidate_json=raw_output[:500],
-            )
-
-        try:
-            candidate = CandidateMemory.model_validate(data)
-        except ValidationError as exc:
-            first_error = exc.errors()[0]
-            field = ".".join(str(part) for part in first_error.get("loc", ()))
-            return ExtractionOutcome(
-                reason=f"提取输出不符合 schema（字段 {field}）",
-                candidate_json=json.dumps(data, ensure_ascii=False)[:500],
-            )
-
-        source_rejection = _raw_candidate_source_gate_reason(
-            candidate,
-            user_message=user_message,
-            require_quote_in_user_message=True,
-        )
-        if source_rejection:
-            return ExtractionOutcome(
-                candidate=candidate,
-                reason=source_rejection,
-                candidate_json=json.dumps(candidate.model_dump(), ensure_ascii=False),
-            )
-
-        candidate = _clear_unsupported_temporal_dates(candidate)
-        candidate = normalize_time_uncertain_candidate(candidate)
-        candidate = apply_extraction_hints(candidate)
-        candidate_json = json.dumps(candidate.model_dump(), ensure_ascii=False)
-        rejection = _gate_reason(
-            candidate,
-            user_message,
-            source_grounding_checked=True,
-        )
-        if rejection:
-            return ExtractionOutcome(
-                candidate=candidate,
-                reason=rejection,
-                candidate_json=candidate_json,
-            )
-        return ExtractionOutcome(
-            candidate=candidate,
-            accepted=True,
-            reason=candidate.reason or "通过保存校验",
-            candidate_json=candidate_json,
-        )
-
     async def extract_many(
         self,
         *,
@@ -635,30 +568,6 @@ class LLMMemoryExtractor:
             reason_code=_batch_reason_code(data, has_candidates=True),
             raw_output=raw_output[:500],
         )
-
-    async def _call_llm(self, *, user_message: str, assistant_message: str) -> str:
-        messages = render_memory_extraction_messages(
-            user_message=user_message,
-            assistant_message=assistant_message,
-        )
-        request = ChatCompletionRequest(
-            model="memory-extractor",
-            messages=messages,
-            temperature=0.0,
-            max_tokens=2048,
-            stream=False,
-        )
-        with model_usage_scope(user_id=self.user_id):
-            response = await self.llm_client.create_chat_completion(
-                request=request,
-                messages=messages,
-                thinking="disabled",
-            )
-        try:
-            content = response["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            return ""
-        return content if isinstance(content, str) else ""
 
     async def _call_llm_many(
         self,
@@ -885,20 +794,6 @@ def _eligible_for_preference_soft_path(
     return False
 
 
-def _gate_reason(
-    candidate: CandidateMemory,
-    user_message: str,
-    *,
-    source_grounding_checked: bool = False,
-) -> str | None:
-    return _validate_candidate_for_save(
-        candidate,
-        user_message=user_message,
-        require_quote_in_user_message=True,
-        source_grounding_checked=source_grounding_checked,
-    )
-
-
 def _raw_candidate_source_gate_reason(
     candidate: CandidateMemory,
     *,
@@ -959,16 +854,15 @@ def _candidate_for_raw_grounding(
 
     quote_age = _matched_age(_CURRENT_AGE_QUOTE_PATTERN.search(quote))
     if quote_age is None and context_quote_verified:
-        quote_age = _contextual_age_answer(quote, candidate.context_quote)
+        quote_age = contextual_age_answer(
+            source_quote=quote,
+            context_quote=candidate.context_quote,
+        )
     memory_age = _matched_age(_AGE_MEMORY_PATTERN.search(candidate.memory[prefix_match.end() :]))
     if quote_age is None or quote_age != memory_age:
         return candidate
 
-    base = now or datetime.now(UTC)
-    if base.tzinfo is None:
-        base = base.replace(tzinfo=UTC)
-    else:
-        base = base.astimezone(UTC)
+    base = _utc_now(now)
     if int(prefix_match.group("year")) != base.year:
         return candidate
     if int(prefix_match.group("month")) != base.month:
@@ -1011,12 +905,6 @@ def _context_quote_gate_reason(
         if not AGE_CONTEXT_PATTERN.search(context_quote):
             return "context_quote 未明确询问年龄，无法解释本轮数字回答"
     return None
-
-
-def _contextual_age_answer(source_quote: str, context_quote: str) -> int | None:
-    if not AGE_CONTEXT_PATTERN.search(context_quote):
-        return None
-    return _bare_age_answer(source_quote, "")
 
 
 def _bare_age_answer(source_quote: str, memory: str) -> int | None:
@@ -1348,7 +1236,7 @@ def _grounding_has_negation(text: str) -> bool:
 
 def _structured_values(text: str) -> set[tuple[str, str]]:
     values: set[tuple[str, str]] = set()
-    values.update(("邮箱", match.group(0)) for match in _EMAIL_PATTERN.finditer(text))
+    values.update(("邮箱", match.group(0)) for match in EMAIL_PATTERN.finditer(text))
     values.update(("数字", match.group(0)) for match in _LONG_NUMBER_PATTERN.finditer(text))
     values.update(("密钥", match.group(0)) for match in _TOKEN_SECRET_PATTERN.finditer(text))
     values.update(("凭据", match.group(1)) for match in _CREDENTIAL_VALUE_PATTERN.finditer(text))

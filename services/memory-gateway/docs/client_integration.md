@@ -57,11 +57,12 @@ For each tool-call leg, the gateway finds the last user message and re-injects r
 reused through the DB-validated search cache. Deleted or newly-sensitive memories are
 rechecked rather than retained as cached raw text. It preserves multimodal parts, tools,
 tool calls, tool results, reasoning fields, usage-only SSE events, and vendor extensions.
-The gateway removes `stream_options` only for selected BigModel/Mistral upstreams that
-reject it. For `memory-auto`, FLIT's AUTO reasoning is resolved after provider routing;
-Kimi K2.7 receives `thinking.keep=all`. Reasoning from both intermediate tool calls and
-the final assistant message in a tool turn is held only in bounded, process-local TTL
-caches keyed by user, conversation/turn, and tool-call ID as applicable, so history
+The gateway forwards `stream_options` unchanged; upstreams that reject it are handled
+by the Model Gateway channel adaptation layer. For `memory-auto`, FLIT's AUTO reasoning
+is resolved after provider routing; Kimi K2.7 receives `thinking.keep=all`. Reasoning
+from both intermediate tool calls and the final assistant message in a tool turn is held
+only in bounded, process-local TTL caches keyed by user, conversation/turn, and tool-call
+ID as applicable, so history
 omitted by FLIT can be replayed to the same provider. If that provider fails over, its
 reasoning text is not sent to the replacement provider; alias history without cached
 provenance is conservatively stripped. Only text parts are used as the search/ingest

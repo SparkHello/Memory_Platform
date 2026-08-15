@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 from app.memory.decay import life_score, score_memory
 from app.memory.models import (
+    CoreMemorySection,
     CoreMemorySectionName,
     MemoryRecord,
     MemoryRelation,
@@ -25,10 +26,10 @@ from app.memory.review_signals import (
 )
 from app.memory.store import MemoryStore
 from app.memory.utils import (
-    _has_negation,
-    _normalize,
+    PairTextSignals,
     _parse_iso_datetime,
-    _terms,
+    pair_relation_from_signals,
+    pair_text_signals,
 )
 
 
@@ -80,10 +81,7 @@ class MemoryReviewer:
 @dataclass
 class _PreparedMemory:
     record: MemoryRecord
-    normalized: str
-    terms: set[str]
-    chars: set[str]
-    has_negation: bool
+    pair_text: PairTextSignals
 
 
 def _review_after_recommendations(
@@ -333,11 +331,11 @@ def _core_evidence_recommendations(
         if not core_sections:
             continue
         valid_until = _parse_iso_datetime(memory.valid_until)
-        is_expired = valid_until is not None and valid_until < now
-        if memory.confidence >= 0.55 and not is_expired:
+        expired = valid_until is not None and valid_until < now
+        if memory.confidence >= 0.55 and not expired:
             continue
         risk_tags: list[MemoryReviewRiskTag] = ["core_evidence"]
-        if is_expired:
+        if expired:
             risk_tags.append("expired")
         recommendations.append(
             _recommendation(
@@ -355,27 +353,7 @@ def _core_evidence_recommendations(
 def _prepare_memory(memory: MemoryRecord) -> _PreparedMemory:
     return _PreparedMemory(
         record=memory,
-        normalized=_normalize(memory.content),
-        terms=_terms(memory.content),
-        chars={char.lower() for char in memory.content if not char.isspace()},
-        has_negation=_has_negation(memory.content),
-    )
-
-
-def _set_jaccard(left: set[str], right: set[str]) -> float:
-    if not left or not right:
-        return 0.0
-    return len(left & right) / len(left | right)
-
-
-def _pair_recommendation(
-    left: MemoryRecord,
-    right: MemoryRecord,
-) -> MemoryReviewRecommendation | None:
-    return _prepared_pair_recommendation(
-        _prepare_memory(left),
-        _prepare_memory(right),
-        core_map={},
+        pair_text=pair_text_signals(memory.content),
     )
 
 
@@ -385,12 +363,16 @@ def _prepared_pair_recommendation(
     *,
     core_map: dict[str, list[CoreMemorySectionName]],
 ) -> MemoryReviewRecommendation | None:
-    left_normalized = left.normalized
-    right_normalized = right.normalized
-    if not left_normalized or not right_normalized:
+    # 体检只把高度相似的同类型记忆交给用户确认：阈值 0.65（见 utils.pair_relation）。
+    relation, _score = pair_relation_from_signals(
+        left.pair_text,
+        right.pair_text,
+        similarity_threshold=0.65,
+    )
+    if relation == "none":
         return None
 
-    if left_normalized == right_normalized:
+    if relation == "same":
         return _recommendation(
             action="merge",
             relation="same",
@@ -402,34 +384,24 @@ def _prepared_pair_recommendation(
             core_map=core_map,
         )
 
-    if left_normalized in right_normalized:
+    if relation == "supplement":
+        if left.pair_text.normalized in right.pair_text.normalized:
+            reason = "后一条记忆包含前一条信息，建议合并为更完整版本"
+            suggested_content = right.record.content
+        else:
+            reason = "前一条记忆包含后一条信息，建议合并为更完整版本"
+            suggested_content = left.record.content
         return _recommendation(
             action="merge",
             relation="supplement",
-            reason="后一条记忆包含前一条信息，建议合并为更完整版本",
+            reason=reason,
             memory_ids=[left.record.id, right.record.id],
-            suggested_content=right.record.content,
-            risk_tags=["duplicate"],
-            severity="medium",
-            core_map=core_map,
-        )
-    if right_normalized in left_normalized:
-        return _recommendation(
-            action="merge",
-            relation="supplement",
-            reason="前一条记忆包含后一条信息，建议合并为更完整版本",
-            memory_ids=[left.record.id, right.record.id],
-            suggested_content=left.record.content,
+            suggested_content=suggested_content,
             risk_tags=["duplicate"],
             severity="medium",
             core_map=core_map,
         )
 
-    similarity = max(_set_jaccard(left.terms, right.terms), _set_jaccard(left.chars, right.chars))
-    if similarity < 0.65:
-        return None
-
-    relation = _prepared_content_relation(left, right)
     return _recommendation(
         action="review",
         relation=relation,
@@ -446,20 +418,25 @@ def _prepared_pair_recommendation(
     )
 
 
-def _prepared_content_relation(left: _PreparedMemory, right: _PreparedMemory) -> MemoryRelation:
-    if left.has_negation != right.has_negation:
-        return "conflict"
-    return "supersede"
-
-
-def _content_relation(left: str, right: str) -> MemoryRelation:
-    if _has_negation(left) != _has_negation(right):
-        return "conflict"
-    return "supersede"
-
-
 def _newer(left: MemoryRecord, right: MemoryRecord) -> MemoryRecord:
     return right if right.updated_at >= left.updated_at else left
+
+
+def _core_evidence_section_map(
+    store: MemoryStore,
+    *,
+    user_id: str,
+) -> dict[str, list[CoreMemorySection]]:
+    """memory_id → 引用它的核心记忆 section 列表。
+
+    review.py（投影为 section 名）与 review_revision.py（投影为 section
+    payload）共用这一份遍历，避免两份 `_core_evidence_map` 再分叉。
+    """
+    result: dict[str, list[CoreMemorySection]] = {}
+    for section in store.list_core_memory_sections(user_id=user_id):
+        for memory_id in section.evidence_memory_ids:
+            result.setdefault(memory_id, []).append(section)
+    return result
 
 
 def _core_evidence_map(
@@ -467,11 +444,12 @@ def _core_evidence_map(
     *,
     user_id: str,
 ) -> dict[str, list[CoreMemorySectionName]]:
-    result: dict[str, list[CoreMemorySectionName]] = {}
-    for section in store.list_core_memory_sections(user_id=user_id):
-        for memory_id in section.evidence_memory_ids:
-            result.setdefault(memory_id, []).append(section.section)
-    return result
+    return {
+        memory_id: [section.section for section in sections]
+        for memory_id, sections in _core_evidence_section_map(
+            store, user_id=user_id
+        ).items()
+    }
 
 
 def _recommendation(

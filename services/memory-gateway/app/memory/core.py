@@ -7,7 +7,7 @@ from app.llm.client import OpenAICompatibleClient
 from app.llm.prompts import render_core_memory_consolidation_messages
 from app.memory.extractor import has_text_grounding_anchor
 from app.memory.models import CoreMemorySection, CoreMemorySectionName, MemoryRecord
-from app.memory.redaction import detect_text_sensitivity
+from app.memory.redaction import detect_local_sensitivity, detect_text_sensitivity
 from app.memory.store import MemoryStore
 from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import _parse_json_object
@@ -255,13 +255,13 @@ def safe_core_memory_sections(
 def _is_safe_core_source(memory: MemoryRecord) -> bool:
     if memory.origin != "user_asserted" or memory.sensitivity != "normal":
         return False
-    text = "\n".join(
-        part
-        for part in (memory.content, memory.source_message, *memory.entities)
-        if part
-    )
     return (
-        detect_text_sensitivity(text) == "normal"
+        detect_local_sensitivity(
+            memory.content,
+            memory.source_message,
+            memory.entities,
+        )
+        == "normal"
         and is_current_temporal_memory(memory)
     )
 

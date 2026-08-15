@@ -15,11 +15,10 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from app.api.memories.common import *  # noqa: F403
-from app.cli_config import cli_paths
+from app.cli_config import cli_paths, default_model_gateway_home
 from app.llm.runtime import ModelRuntimeConfigurationError, resolve_model_runtime
 from app.stack_backup import (
     create_stack_backup,
-    default_model_gateway_home,
     validate_stack_backup,
 )
 

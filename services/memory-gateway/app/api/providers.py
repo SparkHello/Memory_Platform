@@ -10,10 +10,12 @@ Model Gateway control endpoint when it is loopback or HTTPS.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+import inspect
 from ipaddress import ip_address, ip_network
 import threading
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Header, Query
@@ -160,263 +162,202 @@ async def check_provider_admin_key(
     return response
 
 
-@router.get("/admin/configuration")
-async def provider_admin_configuration(
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    """Return the full redacted graph only after an explicit admin unlock."""
+class _AdminProxyRoute(NamedTuple):
+    method: str
+    path: str
+    upstream: str
+    name: str
+    path_params: tuple[str, ...] = ()
+    body: bool = True
+    description: str = ""
 
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+
+# Guarded admin proxy table. Every row is a pure forwarder: the endpoint only
+# hands (method, fixed upstream path, optional JSON body) to
+# ``_proxy_admin_request``, which enforces the three-tier boundary unchanged —
+# no write with a plain GATEWAY_API_KEY or the backend client key, only the
+# per-request admin key, forwarded solely to the configured Model Gateway when
+# it is HTTPS or loopback/private-opt-in HTTP. Upstream paths are fixed here;
+# the browser can never pick the proxy target URL.
+_ADMIN_PROXY_ROUTES: tuple[_AdminProxyRoute, ...] = (
+    _AdminProxyRoute(
         method="GET",
         path="/admin/configuration",
-        payload=None,
-    )
-
-
-@router.post("/channels/discover")
-async def discover_provider_channel(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        upstream="/admin/configuration",
+        name="provider_admin_configuration",
+        body=False,
+        description=(
+            "Return the full redacted graph only after an explicit admin unlock."
+        ),
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/channels/discover",
-        payload=payload,
-    )
-
-
-@router.post("/channels/probe-capabilities")
-async def probe_provider_channel_capabilities(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    """Proxy live capability probes; Model Gateway never persists the secret."""
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/channels/discover",
+        upstream="/admin/channels/discover",
+        name="discover_provider_channel",
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/channels/probe-capabilities",
-        payload=payload,
-    )
-
-
-@router.post("/channel-bundles/validate")
-async def validate_provider_channel_bundle(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/channels/probe-capabilities",
+        upstream="/admin/channels/probe-capabilities",
+        name="probe_provider_channel_capabilities",
+        description=(
+            "Proxy live capability probes; Model Gateway never persists the secret."
+        ),
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/channel-bundles/validate",
-        payload=payload,
-    )
-
-
-@router.post("/channel-bundles/apply")
-async def apply_provider_channel_bundle(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/channel-bundles/validate",
+        upstream="/admin/channel-bundles/validate",
+        name="validate_provider_channel_bundle",
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/channel-bundles/apply",
-        payload=payload,
-    )
-
-
-@router.patch("/connections/{connection_id}")
-async def update_provider_connection(
-    connection_id: str,
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/channel-bundles/apply",
+        upstream="/admin/channel-bundles/apply",
+        name="apply_provider_channel_bundle",
+    ),
+    _AdminProxyRoute(
         method="PATCH",
-        path=f"/admin/connections/{quote(connection_id, safe='')}",
-        payload=payload,
-    )
-
-
-@router.patch("/deployments/{deployment_id}")
-async def update_provider_deployment(
-    deployment_id: str,
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/connections/{connection_id}",
+        upstream="/admin/connections/{connection_id}",
+        name="update_provider_connection",
+        path_params=("connection_id",),
+    ),
+    _AdminProxyRoute(
         method="PATCH",
-        path=f"/admin/deployments/{quote(deployment_id, safe='')}",
-        payload=payload,
-    )
-
-
-@router.delete("/{collection}/{item_id}")
-async def delete_provider_object(
-    collection: Literal["connections", "deployments", "pricing"],
-    item_id: str,
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/deployments/{deployment_id}",
+        upstream="/admin/deployments/{deployment_id}",
+        name="update_provider_deployment",
+        path_params=("deployment_id",),
+    ),
+    _AdminProxyRoute(
         method="DELETE",
-        path=f"/admin/{collection}/{quote(item_id, safe='')}",
-        payload=payload,
-    )
-
-
-@router.post("/routes/validate")
-async def validate_provider_routes(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/{collection}/{item_id}",
+        upstream="/admin/{collection}/{item_id}",
+        name="delete_provider_object",
+        path_params=("collection", "item_id"),
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/routes/validate",
-        payload=payload,
-    )
-
-
-@router.put("/routes")
-async def apply_provider_routes(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/routes/validate",
+        upstream="/admin/routes/validate",
+        name="validate_provider_routes",
+    ),
+    _AdminProxyRoute(
         method="PUT",
-        path="/admin/routes",
-        payload=payload,
-    )
-
-
-@router.post("/connections")
-async def create_provider_connection(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/routes",
+        upstream="/admin/routes",
+        name="apply_provider_routes",
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/connections",
-        payload=payload,
-    )
-
-
-@router.post("/deployments")
-async def apply_provider_deployments(
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/connections",
+        upstream="/admin/connections",
+        name="create_provider_connection",
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path="/admin/deployments",
-        payload=payload,
-    )
-
-
-@router.put("/connections/{connection_id}/secret")
-async def update_provider_secret(
-    connection_id: str,
-    payload: dict[str, Any],
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/deployments",
+        upstream="/admin/deployments",
+        name="apply_provider_deployments",
+    ),
+    _AdminProxyRoute(
         method="PUT",
-        path=f"/admin/connections/{quote(connection_id, safe='')}/secret",
-        payload=payload,
-    )
-
-
-@router.post("/connections/{connection_id}/check")
-async def check_provider_connection(
-    connection_id: str,
-    settings: Annotated[Settings, Depends(get_settings)],
-    admin_key: Annotated[
-        str | None,
-        Header(alias="X-Model-Gateway-Admin-Key"),
-    ] = None,
-) -> JSONResponse:
-    return await _proxy_admin_request(
-        settings=settings,
-        admin_key=admin_key,
+        path="/connections/{connection_id}/secret",
+        upstream="/admin/connections/{connection_id}/secret",
+        name="update_provider_secret",
+        path_params=("connection_id",),
+    ),
+    _AdminProxyRoute(
         method="POST",
-        path=f"/admin/connections/{quote(connection_id, safe='')}/check",
-        payload=None,
+        path="/connections/{connection_id}/check",
+        upstream="/admin/connections/{connection_id}/check",
+        name="check_provider_connection",
+        path_params=("connection_id",),
+        body=False,
+    ),
+)
+
+# Path params typed more narrowly than plain ``str`` (keeps the 422 contract).
+_ADMIN_PROXY_PATH_PARAM_TYPES: dict[str, Any] = {
+    "collection": Literal["connections", "deployments", "pricing"],
+}
+
+
+def _build_admin_proxy_endpoint(spec: _AdminProxyRoute) -> Callable[..., Any]:
+    """Build one endpoint whose signature matches the former hand-written one.
+
+    FastAPI introspects ``__signature__`` for path params, the JSON body and
+    the ``X-Model-Gateway-Admin-Key`` header, so the generated endpoint keeps
+    the exact validation, auth-dependency and OpenAPI shape of the old
+    per-endpoint functions (``name`` preserves operationId and summary).
+    """
+
+    parameters = [
+        inspect.Parameter(
+            name,
+            inspect.Parameter.KEYWORD_ONLY,
+            annotation=_ADMIN_PROXY_PATH_PARAM_TYPES.get(name, str),
+        )
+        for name in spec.path_params
+    ]
+    if spec.body:
+        parameters.append(
+            inspect.Parameter(
+                "payload",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=dict[str, Any],
+            )
+        )
+    parameters.extend(
+        (
+            inspect.Parameter(
+                "settings",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=Annotated[Settings, Depends(get_settings)],
+            ),
+            inspect.Parameter(
+                "admin_key",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=Annotated[
+                    str | None,
+                    Header(alias="X-Model-Gateway-Admin-Key"),
+                ],
+                default=None,
+            ),
+        )
     )
+
+    async def admin_proxy_endpoint(**kwargs: Any) -> JSONResponse:
+        quoted = {
+            name: quote(str(kwargs[name]), safe="") for name in spec.path_params
+        }
+        return await _proxy_admin_request(
+            settings=kwargs["settings"],
+            admin_key=kwargs["admin_key"],
+            method=spec.method,
+            path=spec.upstream.format(**quoted),
+            payload=kwargs["payload"] if spec.body else None,
+        )
+
+    admin_proxy_endpoint.__name__ = spec.name
+    admin_proxy_endpoint.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters,
+        return_annotation=JSONResponse,
+    )
+    return admin_proxy_endpoint
+
+
+for _admin_proxy_spec in _ADMIN_PROXY_ROUTES:
+    router.add_api_route(
+        _admin_proxy_spec.path,
+        _build_admin_proxy_endpoint(_admin_proxy_spec),
+        methods=[_admin_proxy_spec.method],
+        name=_admin_proxy_spec.name,
+        description=_admin_proxy_spec.description or None,
+    )
+del _admin_proxy_spec
 
 
 async def _model_gateway_status(
@@ -570,13 +511,9 @@ def _status_from_control(
             {
                 "id": connection_id,
                 "name": str(connection.get("channel_operator") or connection_id),
-                "protocol": "openai_compatible",
                 "api_host": str(connection.get("base_url") or ""),
-                "api_key_env": "",
-                "legacy_api_key_envs": [],
                 "configured": bool(connection.get("configured")),
                 "models": models,
-                "urls": {},
             }
         )
 
@@ -621,7 +558,6 @@ def _status_from_control(
                 "targets": targets,
                 "usable": bool(route.get("enabled", True))
                 and any(target["configured"] for target in targets),
-                "migrated": True,
             }
         )
 

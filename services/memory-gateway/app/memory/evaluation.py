@@ -46,7 +46,6 @@ BLOCKING_LABEL_ISSUE_CODES = {
     "unknown_memory_id",
 }
 
-SECTOR_TYPES = ("episodic", "semantic", "procedural", "emotional", "reflective")
 DEGENERATE_TYPE_SHARE = 0.90
 SKEWED_TYPE_SHARE = 0.70
 SPARSE_TAG_COVERAGE = 0.20

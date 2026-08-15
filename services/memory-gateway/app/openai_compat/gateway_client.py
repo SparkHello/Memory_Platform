@@ -70,13 +70,10 @@ class GatewayHTTPResult:
 class CentralGatewayProvider:
     """Validated central attribution exposed to chat finalization and usage."""
 
-    code: str
-    base_url: str
     model: str
     deployment_id: str
     connection_id: str
     vendor: str
-    model_author: str
     route: str
 
 
@@ -375,13 +372,10 @@ class OpenAIChatGatewayClient:
                 headers={"content-type": "application/json; charset=utf-8"},
             ) from exc
         return CentralGatewayProvider(
-            code="",
-            base_url=self.runtime.base_url,
             model=metadata.upstream_model,
             deployment_id=metadata.deployment_id,
             connection_id=metadata.connection_id,
             vendor=metadata.channel_operator,
-            model_author=metadata.model_author,
             route=metadata.route,
         )
 

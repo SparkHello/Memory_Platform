@@ -184,7 +184,7 @@ def create_app() -> FastAPI:
     }
     app = FastAPI(
         title="memory-gateway",
-        version="0.2.0",
+        version="0.5.1",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
         docs_url="/docs" if openapi_enabled else None,
@@ -236,10 +236,6 @@ def create_app() -> FastAPI:
     app.include_router(usage_router)
 
     @app.get("/", include_in_schema=False)
-    @app.get("/dashboard", include_in_schema=False)
-    @app.get("/studio", include_in_schema=False)
-    @app.get("/memory-studio", include_in_schema=False)
-    @app.get("/记忆工作室", include_in_schema=False)
     def redirect_to_ui() -> RedirectResponse:
         return RedirectResponse(url="/ui/")
 

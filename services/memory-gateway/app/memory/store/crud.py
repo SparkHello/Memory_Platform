@@ -904,19 +904,6 @@ def mark_memories_used(
         )
     return now
 
-def touch_memory(
-    store: _ConnectableStore,
-    *,
-    memory_id: str,
-    user_id: str,
-) -> None:
-    """单条记忆 touch：递增 usage_count 并刷新 last_used_at。"""
-    mark_memories_used(
-        store,
-        memory_ids=[memory_id],
-        user_id=user_id,
-    )
-
 def update_memory_statuses(
     store: _ConnectableStore,
     *,

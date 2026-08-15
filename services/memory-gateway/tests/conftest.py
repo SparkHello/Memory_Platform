@@ -24,10 +24,8 @@ _RUNTIME_ENVIRONMENT_EXACT = {
     "MEMGW_SETTINGS_PATH",
     "MEMORY_CONSOLE_ADMIN_KEY",
     "MODEL_CATALOG_PATH",
-    "MODEL_GATEWAY_CONFIG_PATH",
     "MODEL_GATEWAY_HOME",
     "MODEL_GATEWAY_SECRETS_PATH",
-    "MODEL_GATEWAY_USAGE_DATABASE_PATH",
     "MODEL_ROUTES_PATH",
     "NO_PROXY",
     "PRICING_CATALOG_PATH",
@@ -100,7 +98,6 @@ os.environ.update(
         "MEMGW_SETTINGS_PATH": str(_SESSION_SETTINGS),
         "MEMGW_PROJECT_ROOT": str(Path(__file__).resolve().parents[1]),
         "MODEL_GATEWAY_HOME": str(_SESSION_MODEL_HOME),
-        "MODEL_GATEWAY_CONFIG_PATH": str(_SESSION_MODEL_HOME / "config.json"),
         "MODEL_GATEWAY_SECRETS_PATH": str(
             _SESSION_RUNTIME_ROOT / "model-secrets" / "secrets.env"
         ),
@@ -216,9 +213,7 @@ def isolate_test_runtime(tmp_path) -> Iterator[None]:
         "MEMGW_SETTINGS_PATH": "",
         "MEMGW_PROJECT_ROOT": str(Path(__file__).resolve().parents[1]),
         "MODEL_GATEWAY_HOME": str(model_home),
-        "MODEL_GATEWAY_CONFIG_PATH": str(model_home / "config.json"),
         "MODEL_GATEWAY_SECRETS_PATH": str(model_secrets),
-        "MODEL_GATEWAY_USAGE_DATABASE_PATH": str(model_home / "usage.db"),
         "DATABASE_PATH": str(tmp_path / "runtime-memory.db"),
         "AUTH_DATABASE_PATH": str(tmp_path / "runtime-auth.db"),
         "KNOWLEDGE_DATABASE_PATH": str(tmp_path / "runtime-knowledge.db"),
@@ -529,10 +524,10 @@ class FakeChatGatewayClient:
         self.last_stream: FakeGatewayStream | None = None
         self.error: GatewayUpstreamHTTPError | None = None
         self.provider = SimpleNamespace(
-            code="D",
             base_url="https://upstream.invalid/v1",
             api_key="test",
             model="test-upstream",
+            deployment_id="test-deployment",
         )
 
     def list_models(self) -> list[str]:

@@ -48,6 +48,8 @@ def _memory_migration_v3(connection: sqlite3.Connection) -> None:
 
 
 def _memory_migration_v4(connection: sqlite3.Connection) -> None:
+    # 激活与近期上下文通过本表在 TTL 内跨 worker/重启去重；ingest 使用独立
+    # durable outbox 作为崩溃恢复与终态幂等权威。
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_side_effect_claims (
@@ -141,4 +143,3 @@ if _MEMORY_SCHEMA_MIGRATIONS[-1][0] != MEMORY_SCHEMA_VERSION:
     raise RuntimeError(
         "app.schema_versions.MEMORY_SCHEMA_VERSION 与 memory 迁移列表不一致"
     )
-

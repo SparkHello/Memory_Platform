@@ -92,7 +92,11 @@ class MemoryStore:
         ttl_seconds: float,
     ) -> bool:
         return _chat_finalize.claim_chat_side_effect(
-            self, kind=kind, key=key, user_id=user_id, ttl_seconds=ttl_seconds
+            self,
+            kind=kind,
+            key=key,
+            user_id=user_id,
+            ttl_seconds=ttl_seconds,
         )
 
     def release_chat_side_effect_claim(
@@ -103,7 +107,10 @@ class MemoryStore:
         user_id: str,
     ) -> None:
         return _chat_finalize.release_chat_side_effect_claim(
-            self, kind=kind, key=key, user_id=user_id
+            self,
+            kind=kind,
+            key=key,
+            user_id=user_id,
         )
 
     def enqueue_chat_finalize_job(
@@ -820,15 +827,6 @@ class MemoryStore:
         return _crud.mark_memories_used(self, memory_ids=memory_ids, user_id=user_id)
 
 
-    def touch_memory(
-        self,
-        *,
-        memory_id: str,
-        user_id: str,
-    ) -> None:
-        return _crud.touch_memory(self, memory_id=memory_id, user_id=user_id)
-
-
     def list_undigested_memories(
         self, *, user_id: str, limit: int = 10, include_sensitive: bool = False
     ) -> list[MemoryRecord]:
@@ -860,10 +858,6 @@ class MemoryStore:
         include_sensitive: bool = False,
     ) -> tuple[list[MemoryRecord], int]:
         return _digest.apply_memory_digest(self, user_id=user_id, source_ids=source_ids, resolved_ids=resolved_ids, reflection=reflection, reflection_valence=reflection_valence, reflection_arousal=reflection_arousal, feel=feel, feel_valence=feel_valence, feel_arousal=feel_arousal, include_sensitive=include_sensitive)
-
-
-    def mark_digested(self, *, memory_ids: list[str], user_id: str) -> None:
-        return _digest.mark_digested(self, memory_ids=memory_ids, user_id=user_id)
 
 
     def update_memory_statuses(

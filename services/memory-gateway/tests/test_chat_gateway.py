@@ -3,15 +3,19 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
+import pytest
 
 from app.api import deps
 from app.api.chat_gateway import (
-    _cache_turn_reasoning,
-    _cache_tool_reasoning,
+    _TOOL_REASONING,
+    _TURN_REASONING,
+    _cache_reasoning,
     _fit_memory_context,
     _inject_memory_context,
     _restore_tool_reasoning,
+    _tool_reasoning_keys,
     _turn_fingerprint,
+    _turn_reasoning_keys,
     clear_chat_gateway_state,
 )
 from app.config import Settings, get_settings
@@ -1039,7 +1043,7 @@ def test_tool_loop_reuses_context_and_only_finalizes_final_text(
         if message.get("role") == "assistant" and message.get("tool_calls")
     )
     assert replayed_tool_message["reasoning_content"] == "需要查询"
-    assert fake_gateway.preferred_provider_codes[-1] == "D"
+    assert fake_gateway.preferred_provider_codes[-1] == "test-deployment"
     assert _usage_count(memory_store, memory.id) == 1
     assert fake_llm.extraction_calls == 1
 
@@ -1195,7 +1199,7 @@ def test_completed_tool_turn_restores_final_assistant_reasoning(
     ]
     assert assistant_messages[0]["reasoning_content"] == "工具前推理"
     assert assistant_messages[1]["reasoning_content"] == "工具后最终推理"
-    assert fake_gateway.preferred_provider_codes[-1] == "D"
+    assert fake_gateway.preferred_provider_codes[-1] == "test-deployment"
 
 
 def test_stream_gateway_forwards_sse_and_finalizes_after_done(
@@ -1336,7 +1340,7 @@ def test_streaming_tool_reasoning_is_restored_on_a_later_flit_turn(
         if message.get("role") == "assistant" and message.get("tool_calls")
     )
     assert replayed["reasoning_content"] == "流式推理"
-    assert fake_gateway.preferred_provider_codes[-1] == "D"
+    assert fake_gateway.preferred_provider_codes[-1] == "test-deployment"
 
 
 def test_streaming_final_tool_turn_reasoning_is_restored_on_the_next_user_turn(
@@ -1430,7 +1434,7 @@ def test_streaming_final_tool_turn_reasoning_is_restored_on_the_next_user_turn(
     ]
     assert assistant_messages[0]["reasoning_content"] == "工具前推理"
     assert assistant_messages[1]["reasoning_content"] == "工具后流式推理"
-    assert fake_gateway.preferred_provider_codes[-1] == "D"
+    assert fake_gateway.preferred_provider_codes[-1] == "test-deployment"
 
 
 def test_retried_final_turn_has_idempotent_memory_side_effects(
@@ -1478,30 +1482,32 @@ def test_retried_final_turn_remains_idempotent_after_process_cache_loss(
     assert fake_llm.extraction_calls == 1
 
 
+@pytest.mark.parametrize("kind", ["activate", "recent_context"])
 def test_chat_side_effect_claim_is_shared_between_store_connections(
     memory_store: MemoryStore,
+    kind: str,
 ) -> None:
     second_store = MemoryStore(memory_store.database_path)
 
     assert memory_store.claim_chat_side_effect(
-        kind="ingest",
+        kind=kind,
         key="same-turn",
         user_id="default",
         ttl_seconds=3600,
     )
     assert not second_store.claim_chat_side_effect(
-        kind="ingest",
+        kind=kind,
         key="same-turn",
         user_id="default",
         ttl_seconds=3600,
     )
     second_store.release_chat_side_effect_claim(
-        kind="ingest",
+        kind=kind,
         key="same-turn",
         user_id="default",
     )
     assert memory_store.claim_chat_side_effect(
-        kind="ingest",
+        kind=kind,
         key="same-turn",
         user_id="default",
         ttl_seconds=3600,
@@ -1683,15 +1689,10 @@ def test_model_gateway_reasoning_cache_uses_deployment_affinity() -> None:
         messages=messages,
         latest_user_index=0,
     )
-    provider = SimpleNamespace(
-        code="G",
-        model="deepseek-v3.2",
-        base_url="http://127.0.0.1:2030/v1",
-        deployment_id="siliconflow-deepseek-primary",
-        connection_id="siliconflow-cn",
-        vendor="siliconflow",
-    )
-    _cache_tool_reasoning(
+    provider = SimpleNamespace(deployment_id="siliconflow-deepseek-primary")
+    _cache_reasoning(
+        _TOOL_REASONING,
+        _tool_reasoning_keys,
         user_id="default",
         conversation_id=None,
         turn_fingerprint=fingerprint,
@@ -1713,27 +1714,27 @@ def test_model_gateway_reasoning_cache_uses_deployment_affinity() -> None:
     clear_chat_gateway_state()
 
 
-def test_tool_reasoning_cache_is_turn_scoped_and_provider_isolated() -> None:
+def test_tool_reasoning_cache_is_turn_scoped_and_deployment_isolated() -> None:
     clear_chat_gateway_state()
     messages = [
         {"role": "user", "content": "first"},
         {
             "role": "assistant",
             "content": None,
-            "reasoning_content": "client-m-state",
+            "reasoning_content": "client-a-state",
             "tool_calls": [{"id": "call-reused", "type": "function"}],
         },
         {"role": "tool", "tool_call_id": "call-reused", "content": "one"},
         {
             "role": "assistant",
             "content": "first done",
-            "reasoning_content": "unproven-final-m-state",
+            "reasoning_content": "unproven-final-a-state",
         },
         {"role": "user", "content": "second"},
         {
             "role": "assistant",
             "content": None,
-            "reasoning_content": "client-d-state",
+            "reasoning_content": "client-b-state",
             "tool_calls": [{"id": "call-reused", "type": "function"}],
         },
         {"role": "tool", "tool_call_id": "call-reused", "content": "two"},
@@ -1750,22 +1751,26 @@ def test_tool_reasoning_cache_is_turn_scoped_and_provider_isolated() -> None:
         messages=messages,
         latest_user_index=4,
     )
-    _cache_tool_reasoning(
+    _cache_reasoning(
+        _TOOL_REASONING,
+        _tool_reasoning_keys,
         user_id="default",
         conversation_id=None,
         turn_fingerprint=first_fingerprint,
         tool_call_ids=["call-reused"],
-        reasoning="cached-m-state",
-        provider=SimpleNamespace(code="M", model="mimo-test"),
+        reasoning="cached-a-state",
+        provider=SimpleNamespace(deployment_id="deployment-a"),
         ttl_seconds=60,
     )
-    _cache_tool_reasoning(
+    _cache_reasoning(
+        _TOOL_REASONING,
+        _tool_reasoning_keys,
         user_id="default",
         conversation_id=None,
         turn_fingerprint=second_fingerprint,
         tool_call_ids=["call-reused"],
-        reasoning="cached-d-state",
-        provider=SimpleNamespace(code="D", model="deepseek-test"),
+        reasoning="cached-b-state",
+        provider=SimpleNamespace(deployment_id="deployment-b"),
         ttl_seconds=60,
     )
 
@@ -1776,10 +1781,10 @@ def test_tool_reasoning_cache_is_turn_scoped_and_provider_isolated() -> None:
         strip_unknown=True,
     )
 
-    assert preferred == "D"
+    assert preferred == "deployment-b"
     assert "reasoning_content" not in messages[1]
     assert "reasoning_content" not in messages[3]
-    assert messages[5]["reasoning_content"] == "cached-d-state"
+    assert messages[5]["reasoning_content"] == "cached-b-state"
     clear_chat_gateway_state()
 
 
@@ -1809,13 +1814,15 @@ def test_final_reasoning_cache_is_bound_to_the_turn_tool_call_ids() -> None:
         messages=messages,
         latest_user_index=0,
     )
-    _cache_turn_reasoning(
+    _cache_reasoning(
+        _TURN_REASONING,
+        _turn_reasoning_keys,
         user_id="default",
         conversation_id=None,
         turn_fingerprint=fingerprint,
         tool_call_ids=["call-original-chat"],
         reasoning="private-original-state",
-        provider=SimpleNamespace(code="D", model="deepseek-test"),
+        provider=SimpleNamespace(deployment_id="deepseek-deployment"),
         ttl_seconds=60,
     )
 

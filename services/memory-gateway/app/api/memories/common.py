@@ -100,7 +100,7 @@ from app.memory.store import (
     PurgePreviewConflictError,
     RevisionConflictError,
 )
-from app.memory.utils import parse_embedding_vector
+from app.memory.utils import _ordered_unique, parse_embedding_vector
 from app.usage.context import model_usage_scope
 
 router = APIRouter(
@@ -656,16 +656,6 @@ def _affected_core_sections_for_memory_ids(
         for section in store.list_core_memory_sections(user_id=user_id)
         if touched & set(section.evidence_memory_ids)
     ]
-
-def _ordered_unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
 
 def _find_memories_needing_embedding(
     *,

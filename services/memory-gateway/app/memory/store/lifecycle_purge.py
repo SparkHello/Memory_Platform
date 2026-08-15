@@ -11,10 +11,10 @@ from app.memory.models import (
     CoreMemorySection,
     DecisionLog,
     MemoryRecord,
-    new_memory_id,
     utc_now_iso,
 )
 from app.memory.purge_preview import purge_memory_ids_digest
+from app.memory.store.decision_logs import _insert_decision_log
 from app.memory.store.helpers import (
     _ConnectableStore,
     _json_string_list,
@@ -162,8 +162,8 @@ def purge_archived_memory(
             affected_core_sections or [],
             internally_affected_core,
         )
-        log = DecisionLog(
-            id=new_memory_id(),
+        log = _insert_decision_log(
+            connection=connection,
             user_id=user_id,
             conversation_id=None,
             candidate_json=json.dumps(
@@ -187,23 +187,6 @@ def purge_archived_memory(
             decision="purge",
             reason="永久删除回收站记忆",
             created_at=purged_at,
-        )
-        connection.execute(
-            """
-            INSERT INTO memory_decision_logs (
-                id, user_id, conversation_id, candidate_json, decision, reason, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                log.id,
-                log.user_id,
-                log.conversation_id,
-                log.candidate_json,
-                log.decision,
-                log.reason,
-                log.created_at,
-            ),
         )
         connection.execute(
             """

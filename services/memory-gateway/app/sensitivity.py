@@ -17,6 +17,13 @@ SensitivityLevel = str
 
 SENSITIVITY_RANK: dict[str, int] = {"normal": 0, "private": 1, "sensitive": 2}
 
+# 邮箱形状的唯一定义：contact 类别检测与 extractor 结构化值扫描共用，
+# extractor 不得再维护本地副本。
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])",
+    re.IGNORECASE,
+)
+
 # These patterns intentionally require either a high-risk context word or a
 # recognizable identifier shape. They are a local safety floor, not a general
 # purpose PII classifier.
@@ -119,7 +126,7 @@ PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bphone number\b",
         r"\be-?mail address\b",
         r"(?<!\d)1[3-9]\d{9}(?!\d)",
-        r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])",
+        EMAIL_PATTERN.pattern,
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     ),
     "private_finance": (

@@ -315,7 +315,7 @@ curl \
 | `CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS` | `600` | 流式聊天等待相邻上游数据块的超时；独立于后台 LLM 任务的普通超时，兼容慢首 token 和长推理。 |
 | `CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS` | `120` | 流式聊天向上游上传请求体的超时；兼容 FLIT 的大图片/音频请求。 |
 | `CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES` | `16777216` | `/v1/chat/completions` 请求体上限；在解析多模态 JSON 前执行，超过时返回 `413 memory_gateway_request_too_large`。 |
-| `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环与网络重试窗口。记忆激活、上下文写入和 ingest claim 持久化到 SQLite，跨 worker/重启仍去重；推理回放仍是短期进程缓存。 |
+| `CHAT_GATEWAY_TURN_TTL_SECONDS` | `3600` | FLIT 工具循环与网络重试窗口。记忆激活和近期上下文使用 SQLite TTL claim 跨 worker/重启去重；ingest 由 durable outbox 的 `done` 终态去重并在崩溃后重放；推理回放仍是短期进程缓存。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS` | `2` | 自动记忆提取时附带的最近完整用户/助手轮数，用于解释“18”“那个”等省略回答；事实值仍必须来自本轮用户原文。 |
 | `CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS` | `8000` | 发送给记忆提取模型的“滚动摘要 + 最近原文”总字符上限。 |
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS` | `8` | 未压缩轮次达到该数量时，在聊天结束后的后台任务中压缩较早普通上下文。 |
@@ -390,7 +390,7 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 - 关键词回退不是把分类标签直接拼进正文：正文、主题和实体分字段打分，低频标签按查询内 IDF 加权；只有可审计的小型类别层级（如宠物、数码设备、电脑、拍照）能够单独扩展候选，并继续经过用户/宠物主语与“饮食偏好、拍照设备”等关系门控，避免宽泛标签制造无答案误召。
 - 自动注入只包含本地复核为普通级别的长期记忆、安全核心记忆和已匹配的普通级别分支摘要。物理隔离的知识库永不自动注入。
 - 动态记忆块插在客户端已有的稳定 system/developer 前缀之后，以尽量保留上游 prompt-prefix cache；记忆内容仍按每轮检索结果重新生成。
-- 原始多模态消息、`tools`、`tool_calls`、工具结果、上游 `reasoning_content`、usage chunk 和未知厂商字段继续透明转发。BigModel/Mistral 不兼容时才移除 `stream_options`。
+- 原始多模态消息、`tools`、`tool_calls`、工具结果、上游 `reasoning_content`、`stream_options`、usage chunk 和未知厂商字段继续透明转发；上游兼容性差异由 Model Gateway 渠道适配层处理。
 - `memory-auto` 会在实际 provider 确定后处理推理配置。工具中间调用和最终回答的推理状态按用户、轮次和 tool-call 在当前进程短期缓存；跨 provider 故障切换或无法证明来源时会删除不可信的旧推理原文。
 - `ALLOW_SENSITIVE_EGRESS=false` 会阻止敏感旧上下文进入远程提取、压缩、embedding、体检和知识代理，但不会拦截用户主动通过 `/v1` 发给聊天上游的当前消息。使用 `/v1` 即表示该聊天上游获准处理当前对话。
 
@@ -775,7 +775,7 @@ Windows 服务辅助脚本：
 
 - 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
 - OpenAI-compatible 入口只实现 `/v1/models` 与 `/v1/chat/completions`；不提供 Responses API、文件、音频或图片生成等其他 OpenAI API。
-- `/v1` 的记忆激活、近期上下文和长期 ingest 副作用 claim 已持久化到 SQLite；工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
+- `/v1` 的记忆激活和近期上下文通过 SQLite TTL claim 跨 worker/重启去重；长期 ingest 先写入 durable outbox，`done` 为终态，崩溃后由 drainer 重放。工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
 - FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点并持久化滚动摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。
 - 分支节点和长期记忆提取在完整最终回答后的后台任务中完成，属于最终一致；极快的并发下一轮可能暂时看不到刚结束的一轮。
 - 没有动态 conversation ID 时，短 TTL 内“完全相同的消息历史 + 完全相同的最终回答”无法与 HTTP 重试区分，会按重试去重；不同最终回答仍可独立 ingest。

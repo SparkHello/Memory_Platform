@@ -1,9 +1,13 @@
 from collections import OrderedDict
+from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
 import re
 import threading
+
+from app.memory.models import MemoryRelation
 
 
 # 进程内有界缓存：(memory_id, updated_at, embedding_space_id) -> 向量。
@@ -117,12 +121,16 @@ def _first_json_block(text: str) -> str | None:
     return match.group() if match else None
 
 
-def _term_jaccard(left: str, right: str) -> float:
-    left_terms = _terms(left)
-    right_terms = _terms(right)
-    if not left_terms or not right_terms:
+def _set_jaccard(left: Collection[str], right: Collection[str]) -> float:
+    if not left or not right:
         return 0.0
-    return len(left_terms & right_terms) / len(left_terms | right_terms)
+    left_set = set(left)
+    right_set = set(right)
+    return len(left_set & right_set) / len(left_set | right_set)
+
+
+def _term_jaccard(left: str, right: str) -> float:
+    return _set_jaccard(_terms(left), _terms(right))
 
 
 def _terms(text: str) -> set[str]:
@@ -138,11 +146,10 @@ def _terms(text: str) -> set[str]:
 
 
 def _char_overlap(left: str, right: str) -> float:
-    left_chars = {char.lower() for char in left if not char.isspace()}
-    right_chars = {char.lower() for char in right if not char.isspace()}
-    if not left_chars or not right_chars:
-        return 0.0
-    return len(left_chars & right_chars) / len(left_chars | right_chars)
+    return _set_jaccard(
+        {char.lower() for char in left if not char.isspace()},
+        {char.lower() for char in right if not char.isspace()},
+    )
 
 
 def _has_negation(text: str) -> bool:
@@ -169,3 +176,122 @@ def _has_negation(text: str) -> bool:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", text).strip("。.!?！？").lower()
+
+
+def _utc_now(now: datetime | None) -> datetime:
+    """统一的当前时间归一化：None 取当前 UTC；naive 视为 UTC；aware 转到 UTC。"""
+    if now is None:
+        return datetime.now(UTC)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    """保序去重，丢弃空值。"""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+@dataclass(frozen=True)
+class PairTextSignals:
+    """pair-relation 判定所需的文本预处理信号。
+
+    review.py 对同一批记忆做 O(n²) pair 扫描，预先计算一次信号以避免重复
+    normalize/terms/否定检测；一次性判定直接用 pair_relation 即可。
+    """
+
+    normalized: str
+    terms: frozenset[str]
+    chars: frozenset[str]
+    has_negation: bool
+
+
+def pair_text_signals(text: str) -> PairTextSignals:
+    return PairTextSignals(
+        normalized=_normalize(text),
+        terms=frozenset(_terms(text)),
+        chars=frozenset(char.lower() for char in text if not char.isspace()),
+        has_negation=_has_negation(text),
+    )
+
+
+def pair_relation(
+    left: str,
+    right: str,
+    *,
+    similarity_threshold: float,
+) -> tuple[MemoryRelation, float]:
+    """判定两条文本的 pair-relation，返回 (relation, 相似度分数)。
+
+    流程（review 体检与 review_revision 规则关联曾各自抄写一份，已收敛于此）：
+
+    1. 任一 normalize 后为空 → ("none", 0.0)
+    2. 完全一致 → ("same", 1.0)
+    3. 互为包含 → ("supplement", 0.92)
+    4. max(term jaccard, char overlap) 低于阈值 → ("none", 0.0)
+    5. 否定极性不同 → ("conflict", score)，否则 → ("supersede", score)
+
+    各调用方阈值保持现状，勿单方收紧或放宽：
+
+    - review.py 体检 pair 建议 0.65：只把高度相似的同类型记忆交给用户确认，
+      避免体检噪音；
+    - review_revision.py 规则关联候选 0.45：召回更多关联记忆供 AI 修改预览
+      参考，最终仍由模型与用户确认。
+
+    resolver.py 的冲突判定语义不同（只看 char overlap、不先排除
+    same/supplement），见 pair_conflict。
+    """
+    return pair_relation_from_signals(
+        pair_text_signals(left),
+        pair_text_signals(right),
+        similarity_threshold=similarity_threshold,
+    )
+
+
+def pair_relation_from_signals(
+    left: PairTextSignals,
+    right: PairTextSignals,
+    *,
+    similarity_threshold: float,
+) -> tuple[MemoryRelation, float]:
+    """pair_relation 的预处理信号版本，供 O(n²) pair 扫描复用。"""
+    if not left.normalized or not right.normalized:
+        return "none", 0.0
+    if left.normalized == right.normalized:
+        return "same", 1.0
+    if left.normalized in right.normalized or right.normalized in left.normalized:
+        return "supplement", 0.92
+    score = max(
+        _set_jaccard(left.terms, right.terms),
+        _set_jaccard(left.chars, right.chars),
+    )
+    if score < similarity_threshold:
+        return "none", 0.0
+    if left.has_negation != right.has_negation:
+        return "conflict", score
+    return "supersede", score
+
+
+def pair_conflict(
+    left: str,
+    right: str,
+    *,
+    similarity_threshold: float,
+) -> bool:
+    """否定极性不同且字符重叠达到阈值时判定两条内容冲突。
+
+    resolver.py 专用：其调用点已通过 embedding/jaccard 确认两条记忆相关，
+    只需再区分冲突/替代/补充；与 pair_relation 第 5 步不同，这里只看
+    char overlap（不取 term jaccard 的 max），也不排除 same/supplement。
+    调用方阈值现状 0.45。
+    """
+    if _has_negation(left) == _has_negation(right):
+        return False
+    return _char_overlap(left, right) >= similarity_threshold

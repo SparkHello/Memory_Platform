@@ -200,7 +200,7 @@ def test_memory_health_turns_export_failure_into_issue(monkeypatch, memory_store
 def test_memory_health_reports_search_cache_and_decision_log_info(
     memory_store: MemoryStore,
 ):
-    SEARCH_CACHE[("default", "coffee", 5)] = (
+    SEARCH_CACHE[("default", "coffee", 5, False, "")] = (
         9999999999.0,
         "2026-06-16T00:00:00+00:00",
         1,

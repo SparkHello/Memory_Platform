@@ -6,6 +6,23 @@ import time
 SchemaMigration = tuple[int, Callable[[sqlite3.Connection], None]]
 
 
+def _ensure_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    column_defs: dict[str, str],
+) -> None:
+    """Add missing columns to a table without touching existing ones."""
+    existing = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, definition in column_defs.items():
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            )
+
+
 def enable_wal_with_retry(
     connection: sqlite3.Connection,
     *,
