@@ -1,7 +1,7 @@
 ﻿# Memory Platform release installer for Windows PowerShell 5.1+.
 #
 # Download and run a fixed release; never pipe a mutable branch into iex:
-#   $Version = "v0.2.0"
+#   $Version = "v0.5.1"
 #   irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
 #   $env:MEMORY_PLATFORM_VERSION = $Version
 #   & .\install-memory-platform.ps1
@@ -1527,7 +1527,7 @@ function Remove-StaleHostBackups([string] $BackupDirectory, [int] $Retention) {
 
 function Invoke-MemoryPlatformInstall {
     $release = [Environment]::GetEnvironmentVariable("MEMORY_PLATFORM_VERSION")
-    if ([string]::IsNullOrWhiteSpace($release)) { $release = "v0.2.0" }
+    if ([string]::IsNullOrWhiteSpace($release)) { $release = "v0.5.1" }
     if (-not [Regex]::IsMatch($release, '^v[0-9]+\.[0-9]+\.[0-9]+$')) {
         Stop-Install "MEMORY_PLATFORM_VERSION 必须是 vX.Y.Z 形式的发布版本。"
     }

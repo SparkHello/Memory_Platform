@@ -86,16 +86,24 @@ def cli_paths(home: str | Path = "") -> CliPaths:
 
 
 def default_cli_home() -> Path:
-    override = os.getenv("MEMGW_HOME", "").strip()
+    return _default_service_home("MEMGW_HOME", "memory-gateway")
+
+
+def default_model_gateway_home() -> Path:
+    return _default_service_home("MODEL_GATEWAY_HOME", "model-gateway")
+
+
+def _default_service_home(override_env: str, directory_name: str) -> Path:
+    override = os.getenv(override_env, "").strip()
     if override:
         return Path(override).expanduser()
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "memory-gateway"
+        return Path.home() / "Library" / "Application Support" / directory_name
     if os.name == "nt":
         base = os.getenv("APPDATA", "").strip()
-        return (Path(base) if base else Path.home() / "AppData" / "Roaming") / "memory-gateway"
+        return (Path(base) if base else Path.home() / "AppData" / "Roaming") / directory_name
     base = os.getenv("XDG_CONFIG_HOME", "").strip()
-    return (Path(base) if base else Path.home() / ".config") / "memory-gateway"
+    return (Path(base) if base else Path.home() / ".config") / directory_name
 
 
 def discover_project_root(explicit: str | Path = "", *, paths: CliPaths | None = None) -> Path:

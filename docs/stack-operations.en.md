@@ -92,14 +92,14 @@ Then restart with `docker compose -f docker-compose.user.yml up -d` and point cl
 
 ```bash
 # macOS / Linux; select an immutable release
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
 MEMORY_HOST=0.0.0.0 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
 ```powershell
 # Windows PowerShell; select the same immutable release
-$Version = "v0.2.0"
+$Version = "v0.5.1"
 $env:MEMORY_HOST = "0.0.0.0"
 $env:MEMORY_PLATFORM_VERSION = $Version
 irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
@@ -227,7 +227,7 @@ Re-running either Docker release installer creates and re-verifies a portable ar
 Legacy all-in-one single-volume layouts are not migrated by the installers. Run the one-shot migration tool from the same release first, then re-run the installer:
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py
 python3 legacy-cutover.py
 ```

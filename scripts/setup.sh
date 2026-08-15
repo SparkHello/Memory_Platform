@@ -129,6 +129,8 @@ if [ "$MODE" = config ] && [ ! -f "$CONFIG_FILE" ]; then
   exit 2
 fi
 
+# Keep this first-access credential rejection list in sync with
+# services/memory-gateway/app/cli.py (_stack_install); change both together.
 SECRET_ENV_NAMES=""
 [ -z "${GATEWAY_API_KEY:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES GATEWAY_API_KEY"
 [ -z "${GATEWAY_SIGNING_SECRET:-}" ] || SECRET_ENV_NAMES="$SECRET_ENV_NAMES GATEWAY_SIGNING_SECRET"

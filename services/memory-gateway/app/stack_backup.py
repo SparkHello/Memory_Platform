@@ -11,7 +11,6 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
-import sys
 import tempfile
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -19,9 +18,12 @@ import zipfile
 
 from app.cli_config import (
     CliPaths,
+    _fsync_directory,
+    _fsync_file,
     is_secret_name,
     read_env_file,
     write_env_atomic,
+    write_json_atomic,
 )
 from app.schema_versions import (
     AUTH_SCHEMA_VERSION,
@@ -47,17 +49,10 @@ _DEVICE_LOCAL_SETTINGS = {
     "PROVIDERS_PATH",
     "ROUTES_PATH",
 }
-_PORTABLE_FILES = {
-    "memory/memory.db",
-    "memory/knowledge.db",
-    "memory/auth.db",
-    "memory/settings.json",
-    "memory/models.json",
-    "memory/routes.json",
-    "memory/pricing.json",
-    "model-gateway/config.json",
-    "model-gateway/usage.db",
-}
+# _V2_COMPONENTS is the single source of truth for the portable archive
+# layout (component name -> archive path -> whether restore requires it).
+# Every other component listing in this module is derived from it, so adding
+# a component only touches this table (plus its restore target/validator).
 _V2_COMPONENTS = {
     "memory_database": ("memory/memory.db", True),
     "knowledge_database": ("memory/knowledge.db", True),
@@ -69,25 +64,13 @@ _V2_COMPONENTS = {
     "model_gateway_config": ("model-gateway/config.json", True),
     "model_gateway_usage": ("model-gateway/usage.db", False),
 }
+_PORTABLE_FILES = {archive_name for archive_name, _ in _V2_COMPONENTS.values()}
 # Latest schema versions come from the shared single source of truth so this
 # module cannot silently fall behind a store migration. Backups written by any
 # older release (down to version 1 / pre-versioned 0) stay restorable.
 _SUPPORTED_MEMORY_SCHEMA_VERSION = MEMORY_SCHEMA_VERSION
 _SUPPORTED_KNOWLEDGE_SCHEMA_VERSION = KNOWLEDGE_SCHEMA_VERSION
 _SUPPORTED_AUTH_SCHEMA_VERSION = AUTH_SCHEMA_VERSION
-
-
-def default_model_gateway_home() -> Path:
-    override = os.getenv("MODEL_GATEWAY_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "model-gateway"
-    if os.name == "nt":
-        base = os.getenv("APPDATA", "").strip()
-        return (Path(base) if base else Path.home() / "AppData" / "Roaming") / "model-gateway"
-    base = os.getenv("XDG_CONFIG_HOME", "").strip()
-    return (Path(base) if base else Path.home() / ".config") / "model-gateway"
 
 
 def create_stack_backup(
@@ -209,9 +192,10 @@ def create_stack_backup(
             os.chmod(settings_path, 0o600)
             staged["memory/settings.json"] = settings_path
 
-            # Validate component identity before packaging, then validate the
-            # independently reopened archive once more below.
-            _validate_restore_payloads(staged, targets)
+            # Component identity is validated exactly once: against the
+            # independently reopened, hash-verified archive below. Validating
+            # the staging tree here too would only repeat that check on bytes
+            # the hash pass already proves identical.
             files = {
                 archive_name: {
                     "size": source.stat().st_size,
@@ -299,17 +283,13 @@ def validate_stack_backup(*, archive_path: Path) -> dict[str, Any]:
             manifest = _validated_manifest(archive)
             extracted = _verified_payloads(archive, manifest, staging)
         # Reuse the same payload validators as restore, with dummy target paths
-        # (validators only inspect the staged payload file).
+        # (validators only inspect the staged payload file). Derived from the
+        # single component table so a new component cannot drift here.
         dummy = Path(temporary_name)
         validation_targets: dict[str, tuple[Path, Callable[[Path], None] | None]] = {
-            "memory/memory.db": (dummy, _validate_memory_database),
-            "memory/knowledge.db": (dummy, _validate_knowledge_database),
-            "memory/auth.db": (dummy, _validate_auth_database),
-            "memory/models.json": (dummy, _validate_json_object),
-            "memory/routes.json": (dummy, _validate_json_object),
-            "memory/pricing.json": (dummy, _validate_json_object),
-            "model-gateway/config.json": (dummy, _validate_json_object),
-            "model-gateway/usage.db": (dummy, _validate_model_usage_database),
+            archive_name: (dummy, _COMPONENT_VALIDATORS[component])
+            for component, (archive_name, _required) in _V2_COMPONENTS.items()
+            if component in _COMPONENT_VALIDATORS
         }
         _validate_restore_payloads(extracted, validation_targets)
 
@@ -734,21 +714,24 @@ def _restore_targets(
     auth_database: Path,
     model_gateway_home: Path,
 ) -> dict[str, tuple[Path, Callable[[Path], None] | None]]:
+    # Target locations keyed by _V2_COMPONENTS component name; archive paths
+    # come from that single table. memory_settings is intentionally absent:
+    # it is merged into settings.env instead of replacing a file. Validators
+    # live in _COMPONENT_VALIDATORS beside the validator definitions below.
+    target_paths = {
+        "memory_database": memory_database,
+        "knowledge_database": knowledge_database,
+        "auth_database": auth_database,
+        "memory_models": paths.models,
+        "memory_routes": paths.routes,
+        "memory_pricing": paths.pricing,
+        "model_gateway_config": model_gateway_home / "config.json",
+        "model_gateway_usage": model_gateway_home / "usage.db",
+    }
     return {
-        "memory/memory.db": (memory_database, _validate_memory_database),
-        "memory/knowledge.db": (knowledge_database, _validate_knowledge_database),
-        "memory/auth.db": (auth_database, _validate_auth_database),
-        "memory/models.json": (paths.models, _validate_json_object),
-        "memory/routes.json": (paths.routes, _validate_json_object),
-        "memory/pricing.json": (paths.pricing, _validate_json_object),
-        "model-gateway/config.json": (
-            model_gateway_home / "config.json",
-            _validate_json_object,
-        ),
-        "model-gateway/usage.db": (
-            model_gateway_home / "usage.db",
-            _validate_model_usage_database,
-        ),
+        archive_name: (target_paths[component], _COMPONENT_VALIDATORS[component])
+        for component, (archive_name, _required) in _V2_COMPONENTS.items()
+        if component in target_paths
     }
 
 
@@ -1202,6 +1185,21 @@ def _validate_json_object(path: Path) -> None:
         raise ValueError(f"JSON 配置不能为空：{path.name}")
 
 
+# Per-component payload validators, keyed by _V2_COMPONENTS component name so
+# the archive layout stays single-source. memory/settings.json is validated
+# inline by _validate_restore_payloads and merged, never file-replaced.
+_COMPONENT_VALIDATORS: dict[str, Callable[[Path], None]] = {
+    "memory_database": _validate_memory_database,
+    "knowledge_database": _validate_knowledge_database,
+    "auth_database": _validate_auth_database,
+    "memory_models": _validate_json_object,
+    "memory_routes": _validate_json_object,
+    "memory_pricing": _validate_json_object,
+    "model_gateway_config": _validate_json_object,
+    "model_gateway_usage": _validate_model_usage_database,
+}
+
+
 def _validate_model_gateway_config(path: Path) -> None:
     try:
         from model_gateway.models import GatewayConfig
@@ -1282,19 +1280,58 @@ def _estimated_backup_payload_bytes(
     return total
 
 
+def _add_space_requirement(
+    requirements: dict[int, dict[str, Any]],
+    path: Path,
+    *,
+    bytes_required: int,
+    atomic_candidate: int = 0,
+) -> None:
+    probe = _existing_path(path)
+    device = int(probe.stat().st_dev)
+    bucket = requirements.setdefault(
+        device,
+        {"probe": probe, "bytes": 0, "largest_atomic": 0},
+    )
+    bucket["bytes"] += max(0, int(bytes_required))
+    bucket["largest_atomic"] = max(
+        int(bucket["largest_atomic"]),
+        max(0, int(atomic_candidate)),
+    )
+
+
+def _ensure_device_space(
+    requirements: dict[int, dict[str, Any]],
+    error_message: str,
+) -> None:
+    # Margin policy: both former call sites reserved max(16 MiB, 10% of the
+    # incoming bytes) per filesystem; that most conservative rule now applies
+    # uniformly to backup creation and restore.
+    for bucket in requirements.values():
+        incoming = int(bucket["bytes"])
+        required = (
+            incoming
+            + int(bucket["largest_atomic"])
+            + max(16 * 1024 * 1024, incoming // 10)
+        )
+        if shutil.disk_usage(bucket["probe"]).free < required:
+            raise ValueError(error_message)
+
+
 def _ensure_backup_space(parent: Path, payload_bytes: int) -> None:
     # Snapshot generation and archive verification are sequential, so the
     # peak is one uncompressed generation plus the completed archive. Deflate
     # can grow incompressible data slightly; retain a 1% margin and metadata
     # reserve rather than assuming compression will save space.
     archive_upper_bound = payload_bytes + max(1024 * 1024, payload_bytes // 100)
-    required = payload_bytes + archive_upper_bound + max(
-        16 * 1024 * 1024,
-        payload_bytes // 10,
+    requirements: dict[int, dict[str, Any]] = {}
+    _add_space_requirement(
+        requirements,
+        parent,
+        bytes_required=payload_bytes,
+        atomic_candidate=archive_upper_bound,
     )
-    probe = _existing_path(parent)
-    if shutil.disk_usage(probe).free < required:
-        raise ValueError("备份目标可用磁盘空间不足，拒绝开始备份")
+    _ensure_device_space(requirements, "备份目标可用磁盘空间不足，拒绝开始备份")
 
 
 def _archive_target(
@@ -1355,20 +1392,6 @@ def _ensure_restore_space(
     # deliberately remain under the Memory home and the settings rollback stays
     # on the secret volume. Account for each real filesystem independently.
     requirements: dict[int, dict[str, Any]] = {}
-
-    def add(path: Path, *, bytes_required: int, atomic_candidate: int = 0) -> None:
-        probe = _existing_path(path)
-        device = int(probe.stat().st_dev)
-        bucket = requirements.setdefault(
-            device,
-            {"probe": probe, "bytes": 0, "largest_atomic": 0},
-        )
-        bucket["bytes"] += max(0, int(bytes_required))
-        bucket["largest_atomic"] = max(
-            int(bucket["largest_atomic"]),
-            max(0, int(atomic_candidate)),
-        )
-
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise ValueError("备份 manifest 的 files 无效")
@@ -1381,24 +1404,24 @@ def _ensure_restore_space(
             targets=targets,
             settings_target=settings_target,
         )
-        add(target.parent, bytes_required=incoming, atomic_candidate=incoming)
+        _add_space_requirement(
+            requirements,
+            target.parent,
+            bytes_required=incoming,
+            atomic_candidate=incoming,
+        )
         if target.is_file():
             rollback_location = (
                 settings_target.parent
                 if archive_name == "memory/settings.json"
                 else rollback_parent
             )
-            add(rollback_location, bytes_required=target.stat().st_size)
-
-    for bucket in requirements.values():
-        incoming_and_rollback = int(bucket["bytes"])
-        required = (
-            incoming_and_rollback
-            + int(bucket["largest_atomic"])
-            + max(16 * 1024 * 1024, incoming_and_rollback // 10)
-        )
-        if shutil.disk_usage(bucket["probe"]).free < required:
-            raise ValueError("可用磁盘空间不足，拒绝开始恢复")
+            _add_space_requirement(
+                requirements,
+                rollback_location,
+                bytes_required=target.stat().st_size,
+            )
+    _ensure_device_space(requirements, "可用磁盘空间不足，拒绝开始恢复")
 
 
 def _existing_path(path: Path) -> Path:
@@ -1409,41 +1432,7 @@ def _existing_path(path: Path) -> Path:
 
 
 def _write_journal(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_file(path: Path) -> None:
-    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    # Same mkstemp + fsync + 0600 + atomic replace primitive as every other
+    # managed file (cli_config._write_text_atomic), without the convenience
+    # .bak so journal data never duplicates beside the rollback copies.
+    write_json_atomic(path, payload, backup=False)

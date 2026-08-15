@@ -4,7 +4,7 @@
 # daemon logs.  Generated access values are delivered only as host 0600 files.
 set -eu
 
-RELEASE="${MEMORY_PLATFORM_VERSION:-v0.2.0}"
+RELEASE="${MEMORY_PLATFORM_VERSION:-v0.5.1}"
 printf '%s\n' "$RELEASE" \
   | awk '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ { valid=1 } END { exit !valid }' \
   || { printf 'error: MEMORY_PLATFORM_VERSION 必须是 vX.Y.Z 形式的发布版本。\n' >&2; exit 1; }

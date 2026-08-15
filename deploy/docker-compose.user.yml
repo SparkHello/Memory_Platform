@@ -6,7 +6,7 @@
 # No API key is accepted through Compose environment variables or daemon logs.
 services:
   stack-init:
-    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.2.0}"
+    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.5.1}"
     pull_policy: missing
     network_mode: none
     environment:
@@ -34,7 +34,7 @@ services:
     restart: "no"
 
   model-gateway:
-    image: "${MEMORY_PLATFORM_MODEL_IMAGE:-ghcr.io/sparkhello/memory-platform-model:v0.2.0}"
+    image: "${MEMORY_PLATFORM_MODEL_IMAGE:-ghcr.io/sparkhello/memory-platform-model:v0.5.1}"
     pull_policy: missing
     depends_on:
       stack-init:
@@ -76,7 +76,7 @@ services:
       start_period: 20s
 
   memory-gateway:
-    image: "${MEMORY_PLATFORM_MEMORY_IMAGE:-ghcr.io/sparkhello/memory-platform-memory:v0.2.0}"
+    image: "${MEMORY_PLATFORM_MEMORY_IMAGE:-ghcr.io/sparkhello/memory-platform-memory:v0.5.1}"
     pull_policy: missing
     depends_on:
       stack-init:
@@ -125,7 +125,7 @@ services:
   # Provider/admin secrets are intentionally absent and networking is disabled.
   stack-maintenance:
     profiles: [maintenance]
-    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.2.0}"
+    image: "${MEMORY_PLATFORM_INIT_IMAGE:-ghcr.io/sparkhello/memory-platform-init:v0.5.1}"
     pull_policy: missing
     entrypoint: ["memgw"]
     user: "0:0"

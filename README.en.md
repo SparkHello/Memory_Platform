@@ -74,7 +74,7 @@ You need Docker Desktop and an API key for one model provider. You do not need P
 Choose a released version instead of tracking the mutable `main` branch. On macOS or Linux:
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
@@ -82,7 +82,7 @@ MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 Windows PowerShell uses the matching release installer (currently **experimental**: it passed PowerShell syntax regression and containerized fault-injection tests, but has not yet completed a disaster-recovery drill on a real NTFS + Docker Desktop machine — keep an extra manual backup of important data):
 
 ```powershell
-$Version = "v0.2.0"
+$Version = "v0.5.1"
 $env:MEMORY_PLATFORM_VERSION = $Version
 irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
 & .\install-memory-platform.ps1
@@ -110,7 +110,7 @@ If GHCR or GitHub is unreachable from your network, set an HTTPS proxy before re
 ### Manual path (to review each step)
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
 docker compose -f docker-compose.user.yml up -d
 ```

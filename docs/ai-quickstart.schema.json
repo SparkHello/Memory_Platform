@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memory-platform.local/schemas/ai-quickstart.schema.json",
   "title": "Memory Platform AI quickstart recipe",
-  "description": "A reviewable model setup recipe. API keys and other secrets are deliberately forbidden and must be supplied through stdin.",
+  "description": "A reviewable model setup recipe. API keys and other secrets are deliberately forbidden and must be supplied through stdin. Field-level validation is implemented and enforced by model_gateway.quickstart.QuickstartRecipe; this schema mirrors it for external tooling, and the model wins whenever the two drift.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "chat_model"],
@@ -30,8 +30,8 @@
     "base_url": {
       "type": "string",
       "format": "uri",
-      "pattern": "^https://",
-      "description": "Official OpenAI-compatible API base URL for this channel."
+      "pattern": "^https?://",
+      "description": "Official OpenAI-compatible API base URL for this channel. Remote hosts must use HTTPS; plain HTTP is accepted only for loopback addresses, matching model_gateway.http_safety.normalize_base_url."
     },
     "chat_model": {
       "type": "string",

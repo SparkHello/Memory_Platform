@@ -374,12 +374,12 @@ def test_stack_lifecycle_starts_model_first_and_stops_memory_first(
         lambda modelgw, home, arguments, **kwargs: calls.append("model:" + arguments[0]) or 0,
     )
     monkeypatch.setattr(
-        "app.cli._cmd_start",
-        lambda args, paths, project_root: calls.append("memory:start") or 0,
+        "app.cli._start_memory_service",
+        lambda **kwargs: calls.append("memory:start") or 0,
     )
     monkeypatch.setattr(
-        "app.cli._cmd_stop",
-        lambda args, paths, project_root: calls.append("memory:stop") or 0,
+        "app.cli._stop_memory_service",
+        lambda **kwargs: calls.append("memory:stop") or 0,
     )
 
     assert main([*args, "stack", "start"]) == 0
@@ -439,7 +439,7 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
     modelgw_calls: list[list[str]] = []
     monkeypatch.setattr(
         "app.cli._ensure_model_gateway_runtime",
-        lambda args, project_root: Path("/fake/modelgw"),
+        lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
         "app.cli._modelgw_json",
@@ -510,7 +510,7 @@ def _install_stack_mocks(tmp_path, monkeypatch) -> Path:
     )
     monkeypatch.setattr(
         "app.cli._ensure_model_gateway_runtime",
-        lambda args, project_root: Path("/fake/modelgw"),
+        lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
         "app.cli._modelgw_json",
@@ -604,7 +604,7 @@ def test_stack_install_generates_admin_key_once_when_missing(
     )
     monkeypatch.setattr(
         "app.cli._ensure_model_gateway_runtime",
-        lambda args, project_root: Path("/fake/modelgw"),
+        lambda *args, **kwargs: Path("/fake/modelgw"),
     )
     monkeypatch.setattr(
         "app.cli._modelgw_json",
@@ -813,9 +813,11 @@ def test_server_command_exports_settings_path_but_not_secret_values(
         monkeypatch.setenv(name, "environment-copy-must-be-removed")
 
     _, environment, _ = _server_command(
-        SimpleNamespace(host="0.0.0.0", port=None, reload=False),
-        paths,
-        PROJECT_ROOT,
+        paths=paths,
+        project_root=PROJECT_ROOT,
+        host="0.0.0.0",
+        port=None,
+        reload=False,
     )
 
     assert environment["MEMGW_SETTINGS_PATH"] == str(paths.settings_env)

@@ -93,14 +93,14 @@ MEMORY_HOST=0.0.0.0
 
 ```bash
 # macOS / Linux；VERSION 固定到目标 release
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
 MEMORY_HOST=0.0.0.0 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
 ```powershell
 # Windows PowerShell；固定到目标 release，先下载再执行
-$Version = "v0.2.0"
+$Version = "v0.5.1"
 $env:MEMORY_HOST = "0.0.0.0"
 $env:MEMORY_PLATFORM_VERSION = $Version
 irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
@@ -228,7 +228,7 @@ modelgw discover --preset <id> --non-interactive --json
 旧版 all-in-one 单卷布局不由安装器内嵌迁移。先运行同一 release 的一次性迁移工具，再重跑安装命令：
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py
 python3 legacy-cutover.py
 ```

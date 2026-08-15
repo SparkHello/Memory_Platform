@@ -17,7 +17,6 @@ import sys
 import time
 from typing import Any, Sequence
 from urllib.parse import urlparse
-from urllib.request import urlopen
 import webbrowser
 
 import httpx
@@ -26,6 +25,7 @@ from app.auth.tokens import AUTH_ROLES, AuthTokenStore
 from app.cli_config import (
     CliPaths,
     cli_paths,
+    default_model_gateway_home,
     discover_project_root,
     effective_environment,
     ensure_initialized,
@@ -41,13 +41,12 @@ from app.cli_config import (
 from app.config import Settings, describe_settings_error
 from app.stack_backup import (
     create_stack_backup,
-    default_model_gateway_home,
     recover_interrupted_stack_restore,
     restore_stack_backup,
 )
 
 
-VERSION = "0.2.0"
+VERSION = "0.5.1"
 _SECRET_ALIASES = {
     "gateway": "GATEWAY_API_KEY",
     "signing": "GATEWAY_SIGNING_SECRET",
@@ -155,9 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_commands(subparsers)
     _add_secret_commands(subparsers)
     _add_token_commands(subparsers)
-    _add_model_commands(subparsers)
-    _add_route_commands(subparsers)
-    _add_pricing_commands(subparsers)
+    _add_retired_direct_provider_command(subparsers, "model")
+    _add_retired_direct_provider_command(subparsers, "route")
+    _add_retired_direct_provider_command(subparsers, "pricing")
     return parser
 
 
@@ -315,18 +314,6 @@ def _add_retired_direct_provider_command(subparsers: Any, name: str) -> None:
     parser.set_defaults(handler=_cmd_direct_provider_removed)
 
 
-def _add_model_commands(subparsers: Any) -> None:
-    _add_retired_direct_provider_command(subparsers, "model")
-
-
-def _add_route_commands(subparsers: Any) -> None:
-    _add_retired_direct_provider_command(subparsers, "route")
-
-
-def _add_pricing_commands(subparsers: Any) -> None:
-    _add_retired_direct_provider_command(subparsers, "pricing")
-
-
 def _cmd_direct_provider_removed(args: Any, paths: CliPaths, project_root: Path) -> int:
     del args, paths, project_root
     print(_DIRECT_PROVIDER_MIGRATION_MESSAGE, file=sys.stderr)
@@ -382,8 +369,8 @@ def _check_custom_keys(environment: dict[str, str]) -> int:
     return 0
 
 
-def _stack_credential_directory(args: Any, paths: CliPaths) -> Path:
-    configured = str(getattr(args, "credential_dir", "") or "").strip()
+def _stack_credential_directory(credential_dir: str, paths: CliPaths) -> Path:
+    configured = credential_dir.strip()
     project_config = read_json(paths.project_file)
     remembered = str(project_config.get("credential_dir") or "").strip()
     selected_value = configured or remembered
@@ -546,6 +533,30 @@ def _provision_stack_console_credential(
 
 
 def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
+    return _stack_install(
+        paths=paths,
+        project_root=project_root,
+        model_gateway_source=args.model_gateway_source,
+        model_gateway_home=args.model_gateway_home,
+        credential_dir=args.credential_dir,
+        defer_credential_delivery=bool(args.defer_credential_delivery),
+        keep_backend_key=bool(args.keep_backend_key),
+        start=bool(args.start),
+    )
+
+
+def _stack_install(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    model_gateway_source: str,
+    model_gateway_home: str,
+    credential_dir: str,
+    defer_credential_delivery: bool,
+    keep_backend_key: bool,
+    start: bool,
+) -> int:
+    # 与 scripts/setup.sh 的 SECRET_ENV_NAMES 拒绝清单互为镜像；变更时同步对方。
     forbidden_environment_secrets = [
         name
         for name in (
@@ -573,9 +584,9 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     if custom_key_problem:
         return custom_key_problem
     persisted_settings = read_env_file(paths.settings_env)
-    defer_credentials = bool(getattr(args, "defer_credential_delivery", False))
+    defer_credentials = defer_credential_delivery
     credential_directory = (
-        None if defer_credentials else _stack_credential_directory(args, paths)
+        None if defer_credentials else _stack_credential_directory(credential_dir, paths)
     )
     gateway_credential_path = (
         credential_directory / "gateway.key" if credential_directory else None
@@ -610,8 +621,11 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     fresh_access_install = (
         not defer_credentials and not legacy_migration and not active_access_tokens
     )
-    modelgw = _ensure_model_gateway_runtime(args, project_root)
-    model_home = _stack_model_gateway_home(args)
+    modelgw = _ensure_model_gateway_runtime(
+        project_root,
+        model_gateway_source=model_gateway_source,
+    )
+    model_home = _resolve_model_gateway_home(model_gateway_home)
     if _run_modelgw(modelgw, model_home, ["init"]):
         return 1
 
@@ -702,7 +716,7 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
 
     environment = effective_environment(paths, project_root)
     backend_key = environment.get("MODEL_GATEWAY_API_KEY", "").strip()
-    if not args.keep_backend_key or not backend_key or is_placeholder_value(backend_key):
+    if not keep_backend_key or not backend_key or is_placeholder_value(backend_key):
         backend_key = secrets.token_urlsafe(48)
     result = _run_modelgw(
         modelgw,
@@ -812,23 +826,40 @@ def _cmd_stack_install(args: Any, paths: CliPaths, project_root: Path) -> int:
     if admin_credential_path is not None and admin_credential_path.exists():
         print("Model Gateway admin key 明文未显示：")
         print(f"  {admin_credential_path}")
-    if args.start:
-        return _cmd_stack_restart(
-            argparse.Namespace(
-                host="127.0.0.1",
-                port=None,
-                reload=False,
-                model_gateway_home=str(model_home),
-                force=False,
-            ),
-            paths,
-            project_root,
+    if start:
+        return _stack_restart(
+            paths=paths,
+            project_root=project_root,
+            host="127.0.0.1",
+            port=None,
+            reload=False,
+            force=False,
+            model_gateway_home=str(model_home),
         )
     print("下一步：memgw stack restart")
     return 0
 
 
 def _cmd_stack_start(args: Any, paths: CliPaths, project_root: Path) -> int:
+    return _stack_start(
+        paths=paths,
+        project_root=project_root,
+        host=args.host,
+        port=args.port,
+        reload=bool(args.reload),
+        model_gateway_home=args.model_gateway_home,
+    )
+
+
+def _stack_start(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    host: str,
+    port: int | None,
+    reload: bool,
+    model_gateway_home: str,
+) -> int:
     ensure_initialized(paths, project_root)
     environment = effective_environment(paths, project_root)
     settings = Settings(_env_file=None, **environment)
@@ -837,31 +868,48 @@ def _cmd_stack_start(args: Any, paths: CliPaths, project_root: Path) -> int:
     modelgw = _require_modelgw(project_root)
     model_result = _run_modelgw(
         modelgw,
-        _stack_model_gateway_home(args),
+        _resolve_model_gateway_home(model_gateway_home),
         ["start"],
     )
     if model_result:
         return model_result
-    memory_result = _cmd_start(args, paths, project_root)
+    memory_result = _start_memory_service(
+        paths=paths,
+        project_root=project_root,
+        host=host,
+        port=port,
+        reload=reload,
+    )
     if not memory_result:
         print("Memory Stack 已启动。")
     return memory_result
 
 
 def _cmd_stack_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
-    memory_result = _cmd_stop(
-        argparse.Namespace(force=bool(args.force)),
-        paths,
-        project_root,
+    return _stack_stop(
+        paths=paths,
+        project_root=project_root,
+        force=bool(args.force),
+        model_gateway_home=args.model_gateway_home,
     )
+
+
+def _stack_stop(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    force: bool,
+    model_gateway_home: str,
+) -> int:
+    memory_result = _stop_memory_service(paths=paths, force=force)
     modelgw = _find_modelgw(project_root)
     if modelgw is None:
         print("没有找到 modelgw；My_Memory 已按当前状态处理。", file=sys.stderr)
         return memory_result or 1
     model_result = _run_modelgw(
         modelgw,
-        _stack_model_gateway_home(args),
-        ["stop", *(["--force"] if args.force else [])],
+        _resolve_model_gateway_home(model_gateway_home),
+        ["stop", *(["--force"] if force else [])],
     )
     if not memory_result and not model_result:
         print("Memory Stack 已停止。")
@@ -869,10 +917,43 @@ def _cmd_stack_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 
 def _cmd_stack_restart(args: Any, paths: CliPaths, project_root: Path) -> int:
-    stop_result = _cmd_stack_stop(args, paths, project_root)
+    return _stack_restart(
+        paths=paths,
+        project_root=project_root,
+        host=args.host,
+        port=args.port,
+        reload=bool(args.reload),
+        force=bool(args.force),
+        model_gateway_home=args.model_gateway_home,
+    )
+
+
+def _stack_restart(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    host: str,
+    port: int | None,
+    reload: bool,
+    force: bool,
+    model_gateway_home: str,
+) -> int:
+    stop_result = _stack_stop(
+        paths=paths,
+        project_root=project_root,
+        force=force,
+        model_gateway_home=model_gateway_home,
+    )
     if stop_result:
         return stop_result
-    return _cmd_stack_start(args, paths, project_root)
+    return _stack_start(
+        paths=paths,
+        project_root=project_root,
+        host=host,
+        port=port,
+        reload=reload,
+        model_gateway_home=model_gateway_home,
+    )
 
 
 def _cmd_stack_status(args: Any, paths: CliPaths, project_root: Path) -> int:
@@ -880,7 +961,7 @@ def _cmd_stack_status(args: Any, paths: CliPaths, project_root: Path) -> int:
     print("Model Gateway", flush=True)
     print("-" * 36, flush=True)
     model_result = (
-        _run_modelgw(modelgw, _stack_model_gateway_home(args), ["status"])
+        _run_modelgw(modelgw, _resolve_model_gateway_home(args.model_gateway_home), ["status"])
         if modelgw is not None
         else 1
     )
@@ -898,12 +979,12 @@ def _cmd_stack_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
     print("-" * 36, flush=True)
     model_result = _run_modelgw(
         modelgw,
-        _stack_model_gateway_home(args),
+        _resolve_model_gateway_home(args.model_gateway_home),
         ["doctor"],
     )
     print("\nMy_Memory 检查")
     print("-" * 36)
-    memory_result = _cmd_doctor(args, paths, project_root)
+    memory_result = _doctor_memory(paths=paths, project_root=project_root)
     return model_result or memory_result
 
 
@@ -921,7 +1002,7 @@ def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
         memory_database=memory_database,
         knowledge_database=knowledge_database,
         auth_database=auth_database,
-        model_gateway_home=_stack_model_gateway_home(args),
+        model_gateway_home=_resolve_model_gateway_home(args.model_gateway_home),
         force=bool(args.force),
     )
     print(f"便携备份已创建：{result['archive']}")
@@ -931,19 +1012,21 @@ def _cmd_stack_backup(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 
 def _stop_stack_for_offline_restore(
-    args: Any,
+    *,
     paths: CliPaths,
     project_root: Path,
+    model_gateway_home: str,
 ) -> int:
     ensure_initialized(paths, project_root)
     modelgw = _find_modelgw(project_root)
-    memory_stop = _cmd_stop(argparse.Namespace(force=False), paths, project_root)
+    model_home = _resolve_model_gateway_home(model_gateway_home)
+    memory_stop = _stop_memory_service(paths=paths, force=False)
     if memory_stop:
         return memory_stop
     if modelgw is not None:
         model_stop = _run_modelgw(
             modelgw,
-            _stack_model_gateway_home(args),
+            model_home,
             ["stop"],
         )
         if model_stop:
@@ -954,7 +1037,7 @@ def _stop_stack_for_offline_restore(
         raise ValueError(
             f"端口 {memory_port} 上仍有 My_Memory 服务运行；请先停止非 memgw 管理的进程"
         )
-    if _model_gateway_health_ok(_stack_model_gateway_home(args)):
+    if _model_gateway_health_ok(model_home):
         raise ValueError("Model Gateway 仍在运行；拒绝替换其配置和用量数据库")
     return 0
 
@@ -966,7 +1049,11 @@ def _cmd_stack_recover_restore(
 ) -> int:
     if not args.yes:
         raise ValueError("恢复中断回滚会替换当前文件；确认后请加 --yes")
-    stopped = _stop_stack_for_offline_restore(args, paths, project_root)
+    stopped = _stop_stack_for_offline_restore(
+        paths=paths,
+        project_root=project_root,
+        model_gateway_home=args.model_gateway_home,
+    )
     if stopped:
         return stopped
     settings = Settings(_env_file=None, **effective_environment(paths, project_root))
@@ -978,7 +1065,7 @@ def _cmd_stack_recover_restore(
             settings.knowledge_database_path,
         ),
         auth_database=_resolve_runtime_path(project_root, settings.auth_database_path),
-        model_gateway_home=_stack_model_gateway_home(args),
+        model_gateway_home=_resolve_model_gateway_home(args.model_gateway_home),
     )
     print(f"已回滚 {result['recovered_journals']} 个中断的整栈恢复 journal。")
     return 0
@@ -987,7 +1074,11 @@ def _cmd_stack_recover_restore(
 def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
     if not args.yes:
         raise ValueError("恢复会替换当前数据库和配置；确认后请加 --yes")
-    stopped = _stop_stack_for_offline_restore(args, paths, project_root)
+    stopped = _stop_stack_for_offline_restore(
+        paths=paths,
+        project_root=project_root,
+        model_gateway_home=args.model_gateway_home,
+    )
     if stopped:
         return stopped
 
@@ -998,45 +1089,66 @@ def _cmd_stack_restore(args: Any, paths: CliPaths, project_root: Path) -> int:
         memory_database=_resolve_runtime_path(project_root, settings.database_path),
         knowledge_database=_resolve_runtime_path(project_root, settings.knowledge_database_path),
         auth_database=_resolve_runtime_path(project_root, settings.auth_database_path),
-        model_gateway_home=_stack_model_gateway_home(args),
+        model_gateway_home=_resolve_model_gateway_home(args.model_gateway_home),
     )
     print(f"已恢复 {len(result['restored'])} 个组件。")
     print(f"原文件回滚副本：{result['rollback']}")
 
-    install_result = _cmd_stack_install(
-        argparse.Namespace(
-            model_gateway_source=args.model_gateway_source,
-            model_gateway_home=args.model_gateway_home,
-            keep_backend_key=False,
-            start=False,
-        ),
-        paths,
-        project_root,
+    install_result = _stack_install(
+        paths=paths,
+        project_root=project_root,
+        model_gateway_source=args.model_gateway_source,
+        model_gateway_home=args.model_gateway_home,
+        credential_dir="",
+        defer_credential_delivery=False,
+        keep_backend_key=False,
+        start=False,
     )
     if install_result:
         return install_result
     print("供应商 API Key 和首次凭据文件不在备份中；缺失时请重新配置。")
     if args.start:
-        return _cmd_stack_start(
-            argparse.Namespace(
-                host="127.0.0.1",
-                port=None,
-                reload=False,
-                model_gateway_home=args.model_gateway_home,
-            ),
-            paths,
-            project_root,
+        return _stack_start(
+            paths=paths,
+            project_root=project_root,
+            host="127.0.0.1",
+            port=None,
+            reload=False,
+            model_gateway_home=args.model_gateway_home,
         )
     return 0
 
 
 def _cmd_run(args: Any, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
-    command, environment, _ = _server_command(args, paths, project_root)
+    command, environment, _ = _server_command(
+        paths=paths,
+        project_root=project_root,
+        host=args.host,
+        port=args.port,
+        reload=bool(args.reload),
+    )
     return subprocess.run(command, cwd=project_root, env=environment, check=False).returncode
 
 
 def _cmd_start(args: Any, paths: CliPaths, project_root: Path) -> int:
+    return _start_memory_service(
+        paths=paths,
+        project_root=project_root,
+        host=args.host,
+        port=args.port,
+        reload=bool(args.reload),
+    )
+
+
+def _start_memory_service(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    host: str,
+    port: int | None,
+    reload: bool,
+) -> int:
     ensure_initialized(paths, project_root)
     state = _read_state(paths)
     if state and _pid_running(int(state.get("pid", 0))) and _pid_matches_gateway(
@@ -1044,7 +1156,13 @@ def _cmd_start(args: Any, paths: CliPaths, project_root: Path) -> int:
     ):
         print(f"服务已经在运行，PID {state['pid']}。")
         return 0
-    command, environment, port = _server_command(args, paths, project_root)
+    command, environment, port = _server_command(
+        paths=paths,
+        project_root=project_root,
+        host=host,
+        port=port,
+        reload=reload,
+    )
     paths.log.parent.mkdir(parents=True, exist_ok=True)
     with paths.log.open("ab", buffering=0) as log_handle:
         popen_kwargs: dict[str, Any] = {
@@ -1086,6 +1204,10 @@ def _cmd_start(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 def _cmd_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
     del project_root
+    return _stop_memory_service(paths=paths, force=bool(args.force))
+
+
+def _stop_memory_service(*, paths: CliPaths, force: bool) -> int:
     state = _read_state(paths)
     if not state:
         print("没有 memgw 管理的后台服务记录。")
@@ -1095,7 +1217,7 @@ def _cmd_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
         paths.state.unlink(missing_ok=True)
         print("后台服务已经停止；已清理过期状态。")
         return 0
-    if not _pid_matches_gateway(pid) and not args.force:
+    if not _pid_matches_gateway(pid) and not force:
         raise ValueError(
             f"PID {pid} 当前命令无法确认为 memory-gateway；拒绝终止。"
             "确认后可使用 --force。"
@@ -1115,7 +1237,7 @@ def _cmd_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
     while _pid_running(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     if _pid_running(pid):
-        if not args.force:
+        if not force:
             print("服务未在 10 秒内退出；可使用 `memgw stop --force`。", file=sys.stderr)
             return 1
         if os.name == "nt":
@@ -1128,11 +1250,35 @@ def _cmd_stop(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 
 def _cmd_restart(args: Any, paths: CliPaths, project_root: Path) -> int:
-    stop_args = argparse.Namespace(force=args.force)
-    result = _cmd_stop(stop_args, paths, project_root)
+    return _restart_memory_service(
+        paths=paths,
+        project_root=project_root,
+        host=args.host,
+        port=args.port,
+        reload=bool(args.reload),
+        force=bool(args.force),
+    )
+
+
+def _restart_memory_service(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    host: str,
+    port: int | None,
+    reload: bool,
+    force: bool,
+) -> int:
+    result = _stop_memory_service(paths=paths, force=force)
     if result:
         return result
-    return _cmd_start(args, paths, project_root)
+    return _start_memory_service(
+        paths=paths,
+        project_root=project_root,
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 def _cmd_status(args: Any, paths: CliPaths, project_root: Path) -> int:
@@ -1155,11 +1301,15 @@ def _cmd_status(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 def _cmd_logs(args: Any, paths: CliPaths, project_root: Path) -> int:
     del project_root
+    return _show_logs(paths=paths, lines=args.lines, follow=bool(args.follow))
+
+
+def _show_logs(*, paths: CliPaths, lines: int, follow: bool) -> int:
     if not paths.log.exists():
         print(f"日志尚不存在：{paths.log}")
         return 1
-    _print_log_tail(paths.log, max(1, args.lines))
-    if not args.follow:
+    _print_log_tail(paths.log, max(1, lines))
+    if not follow:
         return 0
     with paths.log.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(0, os.SEEK_END)
@@ -1173,6 +1323,10 @@ def _cmd_logs(args: Any, paths: CliPaths, project_root: Path) -> int:
 
 def _cmd_open(args: Any, paths: CliPaths, project_root: Path) -> int:
     del args, project_root
+    return _open_console(paths=paths)
+
+
+def _open_console(*, paths: CliPaths) -> int:
     state = _read_state(paths) or {}
     port = int(state.get("port", 2026))
     url = f"http://localhost:{port}/ui"
@@ -1266,11 +1420,10 @@ def _cmd_secret_set(args: Any, paths: CliPaths, project_root: Path) -> int:
                 "http://127.0.0.1:2030/v1",
             )
             print("已使用本机 Model Gateway 默认地址 http://127.0.0.1:2030/v1。")
-        if getattr(args, "no_check", False):
+        if args.no_check:
             return 0
         print("正在检查 Model Gateway（只读取 /models，不会发起付费推理）……")
         return _run_model_gateway_check(paths, project_root, timeout_seconds=10.0)
-    raise ValueError(f"未知密钥类型：{args.name}")
 
 
 def _cmd_secret_delete(args: Any, paths: CliPaths, project_root: Path) -> int:
@@ -1311,10 +1464,27 @@ def _cli_auth_store(paths: CliPaths, project_root: Path) -> AuthTokenStore:
 
 
 def _cmd_token_create(args: Any, paths: CliPaths, project_root: Path) -> int:
-    created = _cli_auth_store(paths, project_root).create_token(
+    return _create_scoped_token(
+        paths=paths,
+        project_root=project_root,
         name=args.name,
-        user_id=args.user,
+        user=args.user,
         role=args.role,
+    )
+
+
+def _create_scoped_token(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    name: str,
+    user: str,
+    role: str,
+) -> int:
+    created = _cli_auth_store(paths, project_root).create_token(
+        name=name,
+        user_id=user,
+        role=role,
     )
     print("访问 token（仅显示这一次，请立即保存到对应设备）：")
     print(created.token)
@@ -1405,6 +1575,10 @@ def _run_model_gateway_check(
 
 def _cmd_doctor(args: Any, paths: CliPaths, project_root: Path) -> int:
     del args
+    return _doctor_memory(paths=paths, project_root=project_root)
+
+
+def _doctor_memory(*, paths: CliPaths, project_root: Path) -> int:
     ensure_initialized(paths, project_root)
     problems: list[str] = []
     python = _project_python(project_root)
@@ -1549,12 +1723,14 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
         if choice == "1":
             if running:
                 if _confirm("停止记忆服务？"):
-                    _cmd_stop(argparse.Namespace(force=False), paths, project_root)
+                    _stop_memory_service(paths=paths, force=False)
             else:
-                _cmd_start(
-                    argparse.Namespace(host="127.0.0.1", port=None, reload=False),
-                    paths,
-                    project_root,
+                _start_memory_service(
+                    paths=paths,
+                    project_root=project_root,
+                    host="127.0.0.1",
+                    port=None,
+                    reload=False,
                 )
         elif choice == "2":
             modelgw = _find_modelgw(project_root)
@@ -1568,7 +1744,7 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
                 subprocess.run([str(modelgw), "doctor"], check=False)
             else:
                 print("[注意] 没有找到独立模型服务。")
-            _cmd_doctor(None, paths, project_root)
+            _doctor_memory(paths=paths, project_root=project_root)
         elif choice == "4":
             name = input("设备或客户端名称：").strip()
             role = input("用途（chat/mcp/console，默认 chat）：").strip() or "chat"
@@ -1576,25 +1752,25 @@ def _cmd_menu(args: Any, paths: CliPaths, project_root: Path) -> int:
             if not name or role not in AUTH_ROLES:
                 print("名称不能为空，用途必须是 chat、mcp 或 console。")
             else:
-                _cmd_token_create(
-                    argparse.Namespace(name=name, role=role, user=user),
-                    paths,
-                    project_root,
+                _create_scoped_token(
+                    paths=paths,
+                    project_root=project_root,
+                    name=name,
+                    role=role,
+                    user=user,
                 )
         elif choice == "5":
-            _cmd_logs(argparse.Namespace(lines=40, follow=False), paths, project_root)
+            _show_logs(paths=paths, lines=40, follow=False)
         elif choice == "6":
-            _cmd_open(None, paths, project_root)
+            _open_console(paths=paths)
         elif choice == "7":
-            _cmd_restart(
-                argparse.Namespace(
-                    host="127.0.0.1",
-                    port=None,
-                    reload=False,
-                    force=False,
-                ),
-                paths,
-                project_root,
+            _restart_memory_service(
+                paths=paths,
+                project_root=project_root,
+                host="127.0.0.1",
+                port=None,
+                reload=False,
+                force=False,
             )
         else:
             print("没有这个选项，请输入菜单里的数字。")
@@ -1637,7 +1813,11 @@ def _require_modelgw(project_root: Path) -> Path:
     return modelgw
 
 
-def _ensure_model_gateway_runtime(args: Any, project_root: Path) -> Path:
+def _ensure_model_gateway_runtime(
+    project_root: Path,
+    *,
+    model_gateway_source: str,
+) -> Path:
     managed = (
         project_root / ".venv" / "Scripts" / "modelgw.exe"
         if os.name == "nt"
@@ -1646,7 +1826,7 @@ def _ensure_model_gateway_runtime(args: Any, project_root: Path) -> Path:
     if managed.is_file():
         return managed
 
-    explicit_source = str(getattr(args, "model_gateway_source", "") or "").strip()
+    explicit_source = model_gateway_source.strip()
     sibling_candidates = (
         project_root.parent / "Model_Gateway",
         project_root.parent / "model-gateway",
@@ -1687,8 +1867,8 @@ def _ensure_model_gateway_runtime(args: Any, project_root: Path) -> Path:
     )
 
 
-def _stack_model_gateway_home(args: Any) -> Path:
-    value = str(getattr(args, "model_gateway_home", "") or "").strip()
+def _resolve_model_gateway_home(model_gateway_home: str) -> Path:
+    value = model_gateway_home.strip()
     return Path(value).expanduser().resolve() if value else default_model_gateway_home()
 
 
@@ -1786,12 +1966,19 @@ def _model_service_status(paths: CliPaths, project_root: Path) -> str:
     return "已连接并运行" if response.status_code == 200 else "已经连接，但当前不可用"
 
 
-def _server_command(args: Any, paths: CliPaths, project_root: Path) -> tuple[list[str], dict[str, str], int]:
+def _server_command(
+    *,
+    paths: CliPaths,
+    project_root: Path,
+    host: str,
+    port: int | None,
+    reload: bool,
+) -> tuple[list[str], dict[str, str], int]:
     python = _project_python(project_root)
     if not python.exists():
         raise ValueError(f"项目虚拟环境不存在：{python}；请先创建 .venv")
     project_config = read_json(paths.project_file)
-    port = int(args.port or project_config.get("port") or 2026)
+    port = int(port or project_config.get("port") or 2026)
     if not 1 <= port <= 65535:
         raise ValueError("端口必须在 1–65535 之间")
     command = [
@@ -1800,11 +1987,11 @@ def _server_command(args: Any, paths: CliPaths, project_root: Path) -> tuple[lis
         "uvicorn",
         "app.main:app",
         "--host",
-        args.host,
+        host,
         "--port",
         str(port),
     ]
-    if args.reload:
+    if reload:
         command.append("--reload")
     # The service reads its private 0600 file itself. Passing only the path
     # prevents gateway/backend/provider/signing material from lingering in
@@ -1943,10 +2130,15 @@ def _pid_matches_gateway(pid: int) -> bool:
 
 def _health_ok(port: int) -> bool:
     try:
-        with urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
-            return response.status == 200
-    except Exception:
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/health",
+            timeout=1,
+            follow_redirects=False,
+            trust_env=False,
+        )
+    except httpx.HTTPError:
         return False
+    return response.status_code == 200
 
 
 def _wait_for_health(port: int, process: subprocess.Popen[Any], *, timeout_seconds: float) -> bool:

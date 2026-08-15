@@ -74,7 +74,7 @@ Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜�
 macOS / Linux 终端（版本号必须固定到要安装的 release）：
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
@@ -82,7 +82,7 @@ MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 Windows PowerShell 5.1+（同样固定到明确的 release）：
 
 ```powershell
-$Version = "v0.2.0"
+$Version = "v0.5.1"
 irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
 $env:MEMORY_PLATFORM_VERSION = $Version
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-memory-platform.ps1
@@ -114,7 +114,7 @@ Windows 安装器目前仍标记为实验性；正式数据请先阅读[栈运�
 ### 手工方式（想自己控制每一步）
 
 ```bash
-VERSION=v0.2.0
+VERSION=v0.5.1
 curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
 mkdir -m 700 credentials
 printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" > .env

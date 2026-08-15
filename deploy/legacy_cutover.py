@@ -11,7 +11,7 @@ fresh and split layouts.  This script is deliberately self-contained
 
 Environment inputs mirror ``deploy/install.sh``:
 
-- ``MEMORY_PLATFORM_VERSION``   release tag to migrate to (default v0.2.0)
+- ``MEMORY_PLATFORM_VERSION``   release tag to migrate to (default v0.5.1)
 - ``MEMORY_PLATFORM_DIR``       install directory (auto-discovered if unique)
 - ``COMPOSE_PROJECT_NAME``      explicit compose project override
 - ``MEMORY_HOST`` / ``MEMORY_PORT``  publish address (default 127.0.0.1:2026)
@@ -50,7 +50,7 @@ FORBIDDEN_ENV_KEYS = {
     "COMPOSE_PATH_SEPARATOR",
 }
 
-RELEASE = os.environ.get("MEMORY_PLATFORM_VERSION", "v0.2.0")
+RELEASE = os.environ.get("MEMORY_PLATFORM_VERSION", "v0.5.1")
 IMAGE_REGISTRY = os.environ.get("MEMORY_IMAGE_REGISTRY", "ghcr.io")
 
 
