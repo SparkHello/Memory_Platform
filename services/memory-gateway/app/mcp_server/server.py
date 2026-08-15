@@ -116,12 +116,9 @@ def _knowledge_indexer(store: KnowledgeStore) -> KnowledgeEmbeddingIndexer:
 
 
 def _search_service(store: MemoryStore, embedding_client: EmbeddingClient) -> MemorySearchService:
-    settings = get_settings()
     return MemorySearchService(
         store=store,
         embedding_client=embedding_client,
-        time_ripple_delta=settings.time_ripple_delta,
-        time_ripple_window_hours=settings.time_ripple_window_hours,
     )
 
 
@@ -232,28 +229,11 @@ def _knowledge_model_dump(value: object) -> dict:
 
 
 def _knowledge_document_to_dict(value: object) -> dict:
-    payload = _knowledge_model_dump(value)
-    payload["document_ref"] = str(
-        payload.get("document_ref") or payload.get("ref") or ""
-    )
-    payload["size_bytes"] = int(
-        payload.get("size_bytes") or payload.get("byte_size") or 0
-    )
-    return payload
+    return _knowledge_model_dump(value)
 
 
 def _knowledge_version_to_dict(value: object) -> dict:
-    payload = _knowledge_model_dump(value)
-    payload["version_ref"] = str(
-        payload.get("version_ref") or payload.get("ref") or ""
-    )
-    payload["size_bytes"] = int(
-        payload.get("size_bytes") or payload.get("byte_size") or 0
-    )
-    payload["sha256"] = str(
-        payload.get("sha256") or payload.get("content_sha256") or ""
-    )
-    return payload
+    return _knowledge_model_dump(value)
 
 
 def _knowledge_commit_to_dict(value: object) -> dict:
@@ -262,9 +242,6 @@ def _knowledge_commit_to_dict(value: object) -> dict:
         payload["document"] = _knowledge_document_to_dict(payload["document"])
     if "version" in payload:
         payload["version"] = _knowledge_version_to_dict(payload["version"])
-    payload["duplicate"] = bool(
-        payload.get("duplicate", payload.get("deduplicated", False))
-    )
     return payload
 
 
@@ -560,13 +537,6 @@ async def search_knowledge(
                         "baseline_refs": [],
                         "tool_steps": [],
                     },
-                    "agent_used": False,
-                    "agent_model": "",
-                    "agent_rounds": 0,
-                    "upgraded": False,
-                    "fallback_reason": "scope_empty",
-                    "elapsed_ms": 0,
-                    "steps": [],
                 }
             )
         result = await agent.search(
@@ -606,13 +576,6 @@ async def search_knowledge(
                 "results": excerpts,
                 "local_candidates": local_candidates,
                 "metadata": metadata,
-                "agent_used": metadata["agent_used"],
-                "agent_model": metadata["model"],
-                "agent_rounds": metadata["rounds"],
-                "upgraded": metadata["escalated"],
-                "fallback_reason": metadata["fallback_reason"],
-                "elapsed_ms": metadata["elapsed_ms"],
-                "steps": metadata["tool_steps"],
             }
         )
     except Exception as exc:
@@ -669,7 +632,7 @@ async def begin_knowledge_upload(
     tags: list[str] = [],
     metadata: dict[str, str] = {},
 ) -> str:
-    """开始一次持久化分段上传，返回 upload_id。
+    """开始一次持久化分段上传，返回会话 ``id``；后续工具参数仍叫 upload_id。
 
     content_type 仅支持 text/plain 或 text/markdown。replace_document_ref 为空时创建
     新文档；传入现有 document 引用时创建不可变新版本，并在提交时检查并发修改。
@@ -705,7 +668,6 @@ async def begin_knowledge_upload(
             )
         )
         payload = _knowledge_model_dump(session)
-        payload["upload_id"] = str(payload.get("upload_id") or payload.get("id") or "")
         return _dump({"ok": True, **payload})
     except Exception as exc:
         return _knowledge_error(exc, operation="begin_knowledge_upload")

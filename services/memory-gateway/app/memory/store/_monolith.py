@@ -816,10 +816,8 @@ class MemoryStore:
         *,
         memory_ids: list[str],
         user_id: str,
-        time_ripple_delta: float = 0.0,
-        time_ripple_window_hours: int = 48,
     ) -> str | None:
-        return _crud.mark_memories_used(self, memory_ids=memory_ids, user_id=user_id, time_ripple_delta=time_ripple_delta, time_ripple_window_hours=time_ripple_window_hours)
+        return _crud.mark_memories_used(self, memory_ids=memory_ids, user_id=user_id)
 
 
     def touch_memory(
@@ -827,10 +825,8 @@ class MemoryStore:
         *,
         memory_id: str,
         user_id: str,
-        time_ripple_delta: float = 0.0,
-        time_ripple_window_hours: int = 48,
     ) -> None:
-        return _crud.touch_memory(self, memory_id=memory_id, user_id=user_id, time_ripple_delta=time_ripple_delta, time_ripple_window_hours=time_ripple_window_hours)
+        return _crud.touch_memory(self, memory_id=memory_id, user_id=user_id)
 
 
     def list_undigested_memories(

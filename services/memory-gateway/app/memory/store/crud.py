@@ -54,7 +54,6 @@ from app.memory.store.spaces import (
 )
 from app.memory.store.temporal import (
     _apply_temporal_invalidation,
-    _apply_time_ripple,
     _detach_temporal_position,
     _rebuild_temporal_key,
 )
@@ -887,8 +886,6 @@ def mark_memories_used(
     *,
     memory_ids: list[str],
     user_id: str,
-    time_ripple_delta: float = 0.0,
-    time_ripple_window_hours: int = 48,
 ) -> str | None:
     unique_ids = _ordered_unique([str(memory_id) for memory_id in memory_ids if memory_id])
     if not unique_ids:
@@ -905,14 +902,6 @@ def mark_memories_used(
             """,
             (now, user_id, *unique_ids),
         )
-        _apply_time_ripple(
-            connection=connection,
-            user_id=user_id,
-            seed_ids=unique_ids,
-            used_at=now,
-            delta=time_ripple_delta,
-            window_hours=time_ripple_window_hours,
-        )
     return now
 
 def touch_memory(
@@ -920,16 +909,12 @@ def touch_memory(
     *,
     memory_id: str,
     user_id: str,
-    time_ripple_delta: float = 0.0,
-    time_ripple_window_hours: int = 48,
 ) -> None:
     """单条记忆 touch：递增 usage_count 并刷新 last_used_at。"""
     mark_memories_used(
         store,
         memory_ids=[memory_id],
         user_id=user_id,
-        time_ripple_delta=time_ripple_delta,
-        time_ripple_window_hours=time_ripple_window_hours,
     )
 
 def update_memory_statuses(

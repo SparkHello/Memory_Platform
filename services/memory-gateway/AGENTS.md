@@ -191,7 +191,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/config.py`：配置入口。读取 `.env` / `MEMGW_SETTINGS_PATH`；模型运行时仅 `MODEL_GATEWAY_*`，不再接受 `UPSTREAM_*` / `LLM_*` 直连字段。
 - `app/cli.py`、`app/cli_config.py`：`memgw` 控制台、后台进程管理、仓库外原子配置/密钥写入、独立 Model Gateway client 接线和 PATH 安装；direct-provider secret/model/route 子命令仅返回迁移提示。
 - `app/stack_backup.py`：统一 Memory Stack 便携备份/恢复。使用 SQLite backup API 在线快照记忆、知识与用量库，导出 Model Gateway 脱敏配置和非密钥设置；恢复前校验清单哈希及所有 SQLite/JSON，并为被替换文件保留仓库外回滚副本。不得把任何 API Key 加入便携包。
-- `app/catalog/pricing.json`：本地历史 usage 展示用的已知模型公开原价内嵌快照，无 overlay 入口。**模型路由目录已删除**；connection/deployment/route/pricing 运营数据在 Model Gateway 维护。
+- 模型路由目录与本地价格快照已删除；connection/deployment/route/pricing 运营数据和用量账本在 Model Gateway 维护。`/usage/summary` 只代理中央汇总。
 - `app/api/memories/`：`/memories` HTTP 按域拆分（crud/search/core/conversation/export/graph/review/evaluation/purge/item），共享 `common.router`；URL 不变。
 - `app/api/deps.py`：REST 鉴权、`X-User-Id`、MemoryStore、LLM client 和 embedding client 依赖。
 - `app/api/chat_gateway.py`：`/v1/models` 与 `/v1/chat/completions`；组装安全上下文、FLIT 工具轮次召回/推理状态缓存、SSE 透明转发、最终回答幂等激活/提取。
@@ -248,7 +248,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts/audit_memory_db.py --database data/memory.db --env-file .env` |
 | 核心记忆整理和历史 | `pytest tests/test_core_memory.py` |
 | LLM client 编码或上游请求格式 | `pytest tests/test_llm_client.py tests/test_memory_extraction.py` |
-| 模型用量、官方价格映射、实际 provider 归账 | `pytest tests/test_model_usage.py tests/test_llm_client.py tests/test_chat_gateway.py tests/test_chat_streaming.py` |
+| 模型用量归因与中央汇总代理 | `pytest tests/test_model_usage.py tests/test_llm_client.py tests/test_chat_gateway.py tests/test_chat_streaming.py` |
 | 前端 UI、`/ui` 静态挂载 | `cd ui; npm run build`，必要时再启动后端访问 `http://localhost:2026/ui/` |
 | 知识库版本、格式解析、混合检索、上传、代理、REST/MCP | `pytest tests/test_knowledge_store.py tests/test_knowledge_import.py tests/test_knowledge_retrieval.py tests/test_knowledge_agent.py tests/test_knowledge_api.py tests/test_knowledge_mcp.py tests/test_mcp_server.py` |
 
@@ -288,7 +288,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改知识文档、索引、上传或 MCP 契约时，同步检查独立数据库路径、用户隔离、引用逐字性、代理 fallback、知识备份、README 与 `docs/client_integration.md`；不要让知识结果进入任何 memory 流程。
 - 修改 REST 鉴权时，同步检查 MCP 鉴权，因为 MCP 子应用不走 FastAPI dependency。
 - 修改搜索排序时，重点跑 `tests/test_memory_search.py` 和 MCP 搜索相关测试。
-- 修改 `usage_count`、`mark_memories_used` 或 Time Ripple 时，确认默认 `TIME_RIPPLE_DELTA=0.0` 无副作用，且敏感/归档/钉选记忆不会被邻近激活。
+- 修改 `usage_count` 或 `mark_memories_used` 时，只强化真正进入回答的头部命中，不要给邻近记忆偷偷加激活计数。
 - 修改客户端接入文案、MCP instructions 或记忆提取 prompt 时，同步检查 `README.md`、`docs/client_integration.md`、`app/mcp_server/server.py` 和 `app/llm/prompts.py`，保持“提交原文、不猜 temporal key、activation_count 不是精确次数”的口径一致。
 - 修改保存门槛时，重点跑 `tests/test_memory_extraction.py` 和 `tests/test_mcp_server.py`。
 - 修改召回评测时，保持 `k<=20` 与真实搜索上限一致，并确认快照临时文件在过滤成功后才原子发布。
@@ -300,7 +300,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 修改 Windows 服务端口、NSSM 路径或访问脚本时，同步更新 README 的 Windows 服务模式和故障排查。
 - 修改 MCP 工具、REST 端点、记忆字段、保存门槛或当前限制时，同步更新 README 和本文件，避免下一位 agent 读到旧契约。
 - 修改 `/v1` 代理时同步检查 FLIT 的 SSE、multimodal、tools/reasoning 原样保留，同一 user turn 指纹复用、最终回答判定、敏感自动注入边界和后台副作用幂等；运行三组 chat gateway 定向测试。
-- 新 provider/渠道/套餐/模型只在独立 Model Gateway 的 connection/deployment/route/pricing 中配置，禁止把供应商特例写回 Memory Gateway。本地 `app/catalog/pricing.json` 仅服务历史模型用量展示；中央响应的 vendor/upstream-model Header 是归账权威，缺失时不得猜价。
+- 新 provider/渠道/套餐/模型只在独立 Model Gateway 的 connection/deployment/route/pricing 中配置，禁止把供应商特例写回 Memory Gateway。中央响应的 vendor/upstream-model Header 是归账权威，缺失时不得猜价。
 - 修改“模型与路由”写入能力时，必须保持三层边界：普通 `GATEWAY_API_KEY` 不可写、Model Gateway backend key 不可写、只有请求期提供的 admin client key 可写；不得记录、回显或持久化 admin key/渠道 key，也不得允许浏览器指定代理目标 URL。admin key 只可转发到 HTTPS 或本机 `localhost`/回环 HTTP 的 Model Gateway。路由应用继续依赖 Model Gateway 的完整 schema 校验、revision 冲突检测、原子替换和热加载。
 - 修改 `memgw stack` 或便携备份时，保持两个服务的逻辑/权限隔离但只暴露一个用户入口；启动顺序为 Model Gateway → My_Memory，停止顺序相反。备份只能包含 SQLite 一致性快照、脱敏配置和非密钥设置，恢复必须先验证全部内容、确认服务已停止并保留回滚副本。测试不得读取或修改真实数据库和真实用户配置目录。
 - 测试应继续使用 fake LLM，不要引入真实网络调用。

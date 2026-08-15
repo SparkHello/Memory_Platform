@@ -63,7 +63,6 @@ def score_memory(memory: MemoryRecord, *, now: datetime | None = None) -> Memory
     days = _elapsed_days(current, _parse_iso_datetime(last_active_at(memory)))
     status = getattr(memory, "status", "dynamic") or "dynamic"
 
-    # 扇区 lambda 查表 (P0→P1: 当前所有记忆 type=semantic，P1 后自动激活)
     sector_lambda_map = _load_sector_lambda_map()
     sector_lambda = sector_lambda_map.get(
         memory.type,

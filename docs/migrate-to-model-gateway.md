@@ -33,7 +33,7 @@ Memory Gateway **不再支持** 通过 `UPSTREAM_*` / `LLM_*` / 本地 `models.j
    - `LLM_MIMO_*` / `LLM_KIMI_*` / `LLM_DEEPSEEK_*` / `LLM_PROVIDER_PRIORITY`
    - `MODEL_CATALOG_PATH` / `MODEL_ROUTES_PATH`（已删除；路由只在 Model Gateway）
    - `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL`（改用中央 embedding route + `MODEL_GATEWAY_EMBEDDING_SPACE_ID`）
-   - `PRICING_CATALOG_PATH`（已移除；历史价格快照改用内嵌 `app/catalog/pricing.json`，不再有 overlay 入口，deploy 也不再写入）
+   - `PRICING_CATALOG_PATH`（已移除；用量与价格只在 Model Gateway）
 
 4. 不要再运行 `memgw model` / `memgw route` / `memgw pricing` 或
    `memgw secret set/delete mimo|kimi|deepseek|upstream|embedding`：这些命令只会打印迁移提示并以状态码 2 退出。

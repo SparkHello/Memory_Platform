@@ -1,26 +1,18 @@
-"""Temporal chain and time-ripple helpers for MemoryStore."""
+"""Temporal chain helpers for MemoryStore."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import json
 import sqlite3
-from typing import Any
 
 from app.memory.models import MemoryRecord, new_memory_id, normalize_optional_text, utc_now_iso
-from app.memory.store.constants import _TIME_RIPPLE_MAX_CANDIDATES
 from app.memory.store.decision_logs import _insert_decision_log
 from app.memory.store.helpers import (
     _ConnectableStore,
-    _bounded_float,
-    _casefold_set,
-    _coerce_int,
     _insert_memory_row,
-    _json_string_list,
     _row_to_memory,
     _space_ids_for_memory_ids_on_connection,
     _temporal_snapshot,
-    _time_ripple_anchor,
-    _time_ripple_profiles,
 )
 from app.memory.store.spaces import _replace_memory_space_links
 from app.memory.utils import _parse_iso_datetime
@@ -144,106 +136,6 @@ def get_next_temporal_boundary(
         if (parsed := _parse_iso_datetime(value)) is not None and parsed > current
     ]
     return min(boundaries) if boundaries else None
-
-def _apply_time_ripple(
-    *,
-    connection: sqlite3.Connection,
-    user_id: str,
-    seed_ids: list[str],
-    used_at: str,
-    delta: float,
-    window_hours: int,
-) -> None:
-    ripple_delta = _bounded_float(delta, default=0.0)
-    if ripple_delta <= 0:
-        return
-    capped_window_hours = max(1, min(720, _coerce_int(window_hours, default=48)))
-    window_seconds = capped_window_hours * 60 * 60
-
-    seed_placeholders = ", ".join("?" for _ in seed_ids)
-    seed_rows = connection.execute(
-        f"""
-        SELECT id, valid_from, created_at, topics_json
-        FROM memories
-        WHERE user_id = ? AND archived = 0 AND id IN ({seed_placeholders})
-        """,
-        (user_id, *seed_ids),
-    ).fetchall()
-    seed_profiles = _time_ripple_profiles(seed_rows)
-    if not seed_profiles:
-        return
-
-    seed_id_set = set(seed_profiles)
-    link_rows = connection.execute(
-        """
-        SELECT memory_id, space_id
-        FROM memory_space_links
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchall()
-    spaces_by_memory_id: dict[str, set[str]] = {}
-    for row in link_rows:
-        spaces_by_memory_id.setdefault(str(row["memory_id"]), set()).add(str(row["space_id"]))
-    for memory_id, profile in seed_profiles.items():
-        profile["spaces"] = spaces_by_memory_id.get(memory_id, set())
-
-    candidate_rows = connection.execute(
-        f"""
-        SELECT id, valid_from, created_at, topics_json
-        FROM memories
-        WHERE user_id = ?
-          AND archived = 0
-          AND id NOT IN ({seed_placeholders})
-          AND COALESCE(status, 'dynamic') IN ('dynamic', 'resolved')
-          AND COALESCE(sensitivity, 'normal') NOT IN ('private', 'sensitive')
-          AND COALESCE(origin, 'user_asserted') = 'user_asserted'
-        """,
-        (user_id, *seed_ids),
-    ).fetchall()
-    scored_candidates: list[tuple[int, float, str]] = []
-    for row in candidate_rows:
-        candidate_id = str(row["id"])
-        if candidate_id in seed_id_set:
-            continue
-        candidate_anchor = _time_ripple_anchor(row)
-        if candidate_anchor is None:
-            continue
-        candidate_topics = _casefold_set(_json_string_list(row["topics_json"]))
-        candidate_spaces = spaces_by_memory_id.get(candidate_id, set())
-
-        best_shared = 0
-        best_distance = float("inf")
-        for profile in seed_profiles.values():
-            shared_count = len(candidate_spaces & profile["spaces"])
-            shared_count += len(candidate_topics & profile["topics"])
-            if shared_count <= 0:
-                continue
-            distance_seconds = abs((candidate_anchor - profile["anchor"]).total_seconds())
-            if distance_seconds > window_seconds:
-                continue
-            if shared_count > best_shared or (
-                shared_count == best_shared and distance_seconds < best_distance
-            ):
-                best_shared = shared_count
-                best_distance = distance_seconds
-        if best_shared > 0:
-            scored_candidates.append((best_shared, best_distance, candidate_id))
-
-    if not scored_candidates:
-        return
-    scored_candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    ripple_ids = [item[2] for item in scored_candidates[:_TIME_RIPPLE_MAX_CANDIDATES]]
-    ripple_placeholders = ", ".join("?" for _ in ripple_ids)
-    connection.execute(
-        f"""
-        UPDATE memories
-        SET usage_count = COALESCE(usage_count, 0) + ?,
-            last_used_at = ?
-        WHERE user_id = ? AND archived = 0 AND id IN ({ripple_placeholders})
-        """,
-        (ripple_delta, used_at, user_id, *ripple_ids),
-    )
 
 def _rebuild_temporal_key(
     *,

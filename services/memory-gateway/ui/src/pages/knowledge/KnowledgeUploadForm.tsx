@@ -174,7 +174,7 @@ export function KnowledgeUploadForm({
         tags,
         metadata
       });
-      uploadId = session.upload_id || session.id;
+      uploadId = session.id;
       const parts = splitText(text, PART_SIZE);
       setProgress({ completed: 0, total: parts.length, label: "正在上传正文" });
       for (let index = 0; index < parts.length; index += 1) {
@@ -497,7 +497,7 @@ function notifyCommit(result: KnowledgeUploadCommitResult, replaceDocumentRef: s
   }
   const embeddingFailed = result.embedding?.status === "failed";
   notify(
-    result.duplicate || result.deduplicated
+    result.deduplicated
       ? "正文未变化，已保留当前版本"
       : embeddingFailed
         ? "文档已建立关键词索引；向量索引失败，可稍后重建"

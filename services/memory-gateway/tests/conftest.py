@@ -631,8 +631,7 @@ def client(
     monkeypatch.setenv("MODEL_GATEWAY_BASE_URL", "http://127.0.0.1:2030/v1")
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "pytest-central-backend-key")
     monkeypatch.setenv("MODEL_GATEWAY_EMBEDDING_SPACE_ID", "")
-    monkeypatch.setenv("TIME_RIPPLE_DELTA", "0.0")
-    monkeypatch.setenv("TIME_RIPPLE_WINDOW_HOURS", "48")
+
     monkeypatch.setenv("CHAT_GATEWAY_MAX_REQUEST_BODY_BYTES", "65536")
     get_settings.cache_clear()
     clear_chat_gateway_state()

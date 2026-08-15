@@ -132,93 +132,6 @@ export interface AuthTokenRevokeResult {
   record: AuthTokenRecord;
 }
 
-export interface UsageTotals {
-  calls: number;
-  measured_calls: number;
-  priced_calls: number;
-  unmeasured_calls: number;
-  unpriced_calls: number;
-  input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-  cost_cny: number;
-  cache_hit_rate?: number | null;
-}
-
-export interface UsageModelBreakdown extends UsageTotals {
-  provider: string;
-  provider_label: string;
-  model: string;
-  kind: "chat" | "embedding";
-}
-
-export interface UsageOperationBreakdown extends UsageTotals {
-  operation: string;
-}
-
-export interface UsageDailyBreakdown extends UsageTotals {
-  date: string;
-}
-
-export interface UsageEvent {
-  id: string;
-  operation: string;
-  provider: string;
-  provider_label: string;
-  provider_code: string;
-  model: string;
-  kind: "chat" | "embedding";
-  input_tokens?: number | null;
-  cached_input_tokens?: number | null;
-  output_tokens?: number | null;
-  total_tokens?: number | null;
-  usage_available: boolean;
-  price_available: boolean;
-  cost_cny?: number | null;
-  currency: string;
-  price_key: string;
-  pricing_as_of: string;
-  pricing_source_url: string;
-  created_at: string;
-}
-
-export interface UsagePrice {
-  key: string;
-  provider: string;
-  provider_label: string;
-  model: string;
-  kind: "chat" | "embedding";
-  currency: string;
-  input_cache_hit_per_million: string;
-  input_cache_miss_per_million: string;
-  output_per_million: string;
-  source_url: string;
-  input_token_min: number;
-  input_token_max?: number | null;
-  input_range_label: string;
-  as_of: string;
-}
-
-export interface LocalModelUsageSummary {
-  range: {
-    days?: number | null;
-    start?: string | null;
-    end: string;
-  };
-  totals: UsageTotals;
-  by_model: UsageModelBreakdown[];
-  by_operation: UsageOperationBreakdown[];
-  daily: UsageDailyBreakdown[];
-  recent: UsageEvent[];
-  pricing: {
-    as_of: string;
-    currency: string;
-    models: UsagePrice[];
-    note: string;
-  };
-}
-
 export interface CentralUsageDeployment {
   deployment_id: string;
   connection_id: string;
@@ -261,7 +174,7 @@ export interface CentralModelUsageSummary {
   };
 }
 
-export type ModelUsageSummary = LocalModelUsageSummary | CentralModelUsageSummary;
+export type ModelUsageSummary = CentralModelUsageSummary;
 
 export interface MemoryRecord {
   id: string;
@@ -956,14 +869,11 @@ export type KnowledgeSearchQuality = "fast" | "balanced" | "deep";
 export interface KnowledgeVersion {
   id: string;
   ref: string;
-  version_ref?: string;
   document_id?: string;
   document_ref?: string;
   version_number: number;
   content_sha256: string;
-  sha256?: string;
   byte_size: number;
-  size_bytes?: number;
   character_count?: number;
   content?: string;
   index_status: KnowledgeIndexStatus;
@@ -978,7 +888,6 @@ export interface KnowledgeVersion {
 export interface KnowledgeDocument {
   id: string;
   ref: string;
-  document_ref?: string;
   user_id?: string;
   title: string;
   source_name: string;
@@ -994,7 +903,6 @@ export interface KnowledgeDocument {
   current_version_number?: number | null;
   current_version?: KnowledgeVersion | null;
   byte_size?: number;
-  size_bytes?: number;
   character_count?: number;
   index_status?: KnowledgeIndexStatus;
   index_error?: string | null;
@@ -1012,30 +920,15 @@ export interface KnowledgeStatus {
   available?: boolean;
   status?: string;
   error?: string | null;
-  active_documents?: number;
-  deleted_documents?: number;
-  failed_indexes?: number;
-  indexing_failed?: number;
-  failed_versions?: number;
-  index_failures?: number;
   counts?: {
     active?: number;
     deleted?: number;
-    failed?: number;
-    failed_indexes?: number;
+    index_failed?: number;
     [key: string]: number | undefined;
   };
   agent_enabled?: boolean;
   agent_egress_policy?: string;
   agent_timeout_seconds?: number;
-  agent_provider_priority?: string;
-  agent_configured_providers?: string[];
-  agent_rate_limit_cooldown_seconds?: number;
-  llm_provider_priority?: string;
-  llm_configured_providers?: string[];
-  llm_rate_limit_cooldown_seconds?: number;
-  agent_mimo_model?: string;
-  agent_kimi_model?: string;
   agent_flash_model?: string;
   agent_pro_model?: string;
   sensitive_egress_enabled?: boolean;
@@ -1049,7 +942,6 @@ export interface KnowledgeStatus {
 
 export interface KnowledgeUploadSession {
   id: string;
-  upload_id?: string;
   expires_at?: string;
   expected_version_id?: string | null;
 }
@@ -1059,7 +951,6 @@ export interface KnowledgeUploadCommitResult {
   version: KnowledgeVersion;
   created?: boolean;
   deduplicated?: boolean;
-  duplicate?: boolean;
   embedding?: {
     status?: KnowledgeEmbeddingStatus;
     stored?: number;
@@ -1078,21 +969,15 @@ export interface KnowledgeSearchHit {
   chunk_ref: string;
   title: string;
   source_name?: string;
-  heading_path?: string[] | string;
   title_path?: string[] | string;
   char_start?: number;
   char_end?: number;
-  start_char?: number;
-  end_char?: number;
   line_start?: number;
   line_end?: number;
-  start_line?: number;
-  end_line?: number;
   excerpt: string;
   score?: number;
   match_signals?: string[];
   channels?: string[];
-  match_reason?: string;
   sensitivity?: MemorySensitivity;
 }
 
@@ -1111,23 +996,8 @@ export interface KnowledgeAgentStep {
 
 export interface KnowledgeSearchResponse {
   data?: KnowledgeSearchHit[];
-  results?: KnowledgeSearchHit[];
   local_candidates?: KnowledgeSearchHit[];
   request?: string;
-  agent_used?: boolean;
-  agent_model?: string | null;
-  model?: string | null;
-  agent_rounds?: number;
-  rounds?: number;
-  upgraded?: boolean;
-  escalated?: boolean;
-  agent_attempted?: boolean;
-  fallback_reason?: string | null;
-  elapsed_ms?: number;
-  baseline_count?: number;
-  query_plan?: string[];
-  steps?: KnowledgeAgentStep[];
-  tool_steps?: KnowledgeAgentStep[];
   metadata?: {
     agent_used?: boolean;
     agent_attempted?: boolean;
@@ -1141,20 +1011,6 @@ export interface KnowledgeSearchResponse {
     baseline_count?: number;
     tool_steps?: KnowledgeAgentStep[];
   };
-  agent?: {
-    agent_used?: boolean;
-    agent_attempted?: boolean;
-    model?: string;
-    rounds?: number;
-    flash_rounds?: number;
-    pro_rounds?: number;
-    escalated?: boolean;
-    fallback_reason?: string;
-    elapsed_ms?: number;
-    baseline_count?: number;
-    tool_steps?: KnowledgeAgentStep[];
-  };
-  [key: string]: unknown;
 }
 
 export interface KnowledgeReadResponse {
@@ -1167,8 +1023,6 @@ export interface KnowledgeReadResponse {
   text?: string;
   char_start?: number;
   char_end?: number;
-  start_char?: number;
-  end_char?: number;
   line_start?: number;
   line_end?: number;
   complete: boolean;

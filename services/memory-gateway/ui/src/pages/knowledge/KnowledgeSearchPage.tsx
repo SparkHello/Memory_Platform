@@ -62,9 +62,6 @@ export function KnowledgeSearchPage({
   // 前端超时跟随后端 KNOWLEDGE_AGENT_TIMEOUT_SECONDS（留 10s 余量）；status 未加载时回退 35s。
   const searchTimeoutMs = status?.agent_timeout_seconds ? status.agent_timeout_seconds * 1000 + 10000 : 35000;
   const egressWarning = Boolean(status?.agent_enabled && status.agent_egress_policy && status.agent_egress_policy !== "none");
-  const providerSummary = (status?.agent_configured_providers || [])
-    .map((provider) => PROVIDER_LABELS[provider] || provider)
-    .join(" → ");
 
   const runSearch = async () => {
     const cleanRequest = request.trim();
@@ -109,15 +106,15 @@ export function KnowledgeSearchPage({
   const hits = useMemo(() => resultHits(result), [result]);
   const localCandidates = result?.local_candidates || [];
   const documentByRef = useMemo(() => new Map(documents.map((document) => [knowledgeDocumentRef(document), document])), [documents]);
-  const metadata = result?.metadata || result?.agent;
-  const agentUsed = metadata?.agent_used ?? result?.agent_used ?? false;
-  const model = metadata?.model || result?.agent_model || result?.model || "本地索引";
-  const rounds = metadata?.rounds ?? result?.agent_rounds ?? result?.rounds ?? 0;
-  const steps = metadata?.tool_steps || result?.tool_steps || result?.steps || [];
-  const fallbackReason = metadata?.fallback_reason || result?.fallback_reason;
-  const upgraded = metadata?.escalated ?? result?.escalated ?? result?.upgraded ?? false;
-  const elapsedMs = metadata?.elapsed_ms ?? result?.elapsed_ms;
-  const baselineCount = metadata?.baseline_count ?? result?.baseline_count;
+  const metadata = result?.metadata;
+  const agentUsed = metadata?.agent_used ?? false;
+  const model = metadata?.model || "本地索引";
+  const rounds = metadata?.rounds ?? 0;
+  const steps = metadata?.tool_steps || [];
+  const fallbackReason = metadata?.fallback_reason;
+  const upgraded = metadata?.escalated ?? false;
+  const elapsedMs = metadata?.elapsed_ms;
+  const baselineCount = metadata?.baseline_count;
 
   return (
     <div className="page-stack knowledge-search-page">
@@ -223,11 +220,8 @@ export function KnowledgeSearchPage({
         <div className="notice warning knowledge-egress-notice">
           <ShieldAlert size={18} />
           <span>
-            远程知识代理已启用{providerSummary ? `（${providerSummary}）` : ""}。检索需求和获准的候选正文可能按优先级发送给相应服务商。
-            {status?.agent_rate_limit_cooldown_seconds
-              ? ` 某个服务商返回 429 后，当前进程会暂时跳过它至少 ${numberText(status.agent_rate_limit_cooldown_seconds)} 秒。`
-              : ""}
-            请根据实际启用的服务商确认数据处理条款。
+            远程知识代理已启用。检索需求和获准的候选正文会发给当前配置的知识检索模型。
+            请确认该渠道的数据处理条款。
           </span>
         </div>
       )}
@@ -251,19 +245,12 @@ export function KnowledgeSearchPage({
             <div className="notice warning"><ShieldAlert size={17} /><span>代理未采用，已返回本地基线：{fallbackReason}</span></div>
           )}
 
-          {(result.query_plan?.length || steps.length) && (
+          {steps.length > 0 && (
             <section className="panel knowledge-steps-panel">
               <div className="panel-header"><div><h2>查询条件与工具步骤</h2><p className="muted">仅显示可审计的工具参数摘要，不展示模型思维链。</p></div></div>
-              {result.query_plan && result.query_plan.length > 0 && (
-                <div className="knowledge-query-plan">
-                  {result.query_plan.map((query, index) => <code key={`${query}-${index}`}>{query}</code>)}
-                </div>
-              )}
-              {steps.length > 0 && (
-                <ol className="knowledge-step-list">
-                  {steps.map((step, index) => <AgentStepView key={index} step={step} index={index} />)}
-                </ol>
-              )}
+              <ol className="knowledge-step-list">
+                {steps.map((step, index) => <AgentStepView key={index} step={step} index={index} />)}
+              </ol>
             </section>
           )}
 
@@ -368,12 +355,6 @@ export function KnowledgeSearchPage({
   );
 }
 
-const PROVIDER_LABELS: Record<string, string> = {
-  M: "MiMo",
-  K: "Kimi",
-  D: "DeepSeek"
-};
-
 function parseTags(value: string): string[] {
   return [...new Set(value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean))];
 }
@@ -401,7 +382,7 @@ function AgentStepView({ step, index }: { step: KnowledgeAgentStep; index: numbe
 }
 
 function resultHits(result: KnowledgeSearchResponse | null): KnowledgeSearchHit[] {
-  return result?.results || result?.data || [];
+  return result?.data || [];
 }
 
 function qualityLabel(value: KnowledgeSearchQuality): string {
@@ -411,21 +392,21 @@ function qualityLabel(value: KnowledgeSearchQuality): string {
 }
 
 function headingText(hit: KnowledgeSearchHit): string {
-  const heading = hit.heading_path || hit.title_path;
+  const heading = hit.title_path;
   if (Array.isArray(heading)) return heading.join(" / ");
   return heading || hit.source_name || "正文";
 }
 
 function lineText(hit: KnowledgeSearchHit): string {
-  const start = hit.line_start ?? hit.start_line;
-  const end = hit.line_end ?? hit.end_line;
+  const start = hit.line_start;
+  const end = hit.line_end;
   if (start === undefined) return "";
   return end !== undefined && end !== start ? `第 ${start}–${end} 行` : `第 ${start} 行`;
 }
 
 function matchSignals(hit: KnowledgeSearchHit): string {
   const signals = hit.match_signals || hit.channels || [];
-  return hit.match_reason || (signals.length ? signals.join(" · ") : "本地索引命中");
+  return signals.length ? signals.join(" · ") : "本地索引命中";
 }
 
 function referenceLabel(reference: string): string {

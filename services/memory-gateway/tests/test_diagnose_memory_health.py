@@ -233,7 +233,7 @@ def test_recall_health_active_with_spread_usage(tmp_path: Path) -> None:
     assert _verdict(result, "recall_health")["state"] == "active"
 
 
-def test_fractional_time_ripple_usage_is_preserved_as_activation(tmp_path: Path) -> None:
+def test_fractional_usage_count_is_preserved_as_activation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     ids = _seed(store, 12, type="semantic")
     with sqlite3.connect(store.database_path) as connection:

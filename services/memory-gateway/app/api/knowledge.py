@@ -145,14 +145,6 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
             "agent_enabled": False,
             "agent_egress_policy": settings.knowledge_agent_egress_policy,
             "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
-            "agent_provider_priority": "",
-            "agent_configured_providers": [],
-            "agent_rate_limit_cooldown_seconds": 0.0,
-            "llm_provider_priority": "",
-            "llm_configured_providers": [],
-            "llm_rate_limit_cooldown_seconds": 0.0,
-            "agent_mimo_model": "",
-            "agent_kimi_model": "",
             "agent_flash_model": "",
             "agent_pro_model": "",
             "sensitive_egress_enabled": settings.allow_sensitive_egress,
@@ -168,14 +160,6 @@ def _knowledge_runtime_status(settings: Settings) -> dict[str, Any]:
         "agent_enabled": settings.knowledge_agent_egress_policy != "none",
         "agent_egress_policy": settings.knowledge_agent_egress_policy,
         "agent_timeout_seconds": settings.knowledge_agent_timeout_seconds,
-        "agent_provider_priority": "G",
-        "agent_configured_providers": ["G"],
-        "agent_rate_limit_cooldown_seconds": 0.0,
-        "llm_provider_priority": "G",
-        "llm_configured_providers": ["G"],
-        "llm_rate_limit_cooldown_seconds": 0.0,
-        "agent_mimo_model": "",
-        "agent_kimi_model": "",
         "agent_flash_model": model_runtime.route_for("knowledge.fast"),
         "agent_pro_model": model_runtime.route_for("knowledge.pro"),
         "sensitive_egress_enabled": settings.allow_sensitive_egress,
@@ -215,14 +199,9 @@ def get_knowledge_document(
     store: Annotated[KnowledgeStore, Depends(get_knowledge_store)],
 ) -> dict:
     detail = _store_call(store.get_document_detail, user_id=user_id, document_ref=document_id)
-    if isinstance(detail, tuple):
-        document, versions = detail
-    else:
-        document = detail["document"] if isinstance(detail, dict) else detail.document
-        versions = detail["versions"] if isinstance(detail, dict) else detail.versions
     return {
-        "document": _document_payload(document),
-        "versions": [_version_payload(item) for item in versions],
+        "document": _document_payload(detail["document"]),
+        "versions": [_version_payload(item) for item in detail["versions"]],
     }
 
 
@@ -243,9 +222,7 @@ def begin_knowledge_upload(
         tags=body.tags,
         metadata=body.metadata,
     )
-    payload = _model_payload(session)
-    payload["upload_id"] = payload.get("id", "")
-    return payload
+    return _model_payload(session)
 
 
 @router.put("/uploads/{upload_id}/parts/{sequence}")
@@ -533,16 +510,8 @@ async def search_knowledge(
     return {
         "request": body.request,
         "data": hits,
-        "results": hits,
         "local_candidates": local_candidates,
         "metadata": metadata,
-        "agent_used": metadata["agent_used"],
-        "agent_model": metadata["model"] or None,
-        "agent_rounds": metadata["rounds"],
-        "upgraded": metadata["escalated"],
-        "fallback_reason": metadata["fallback_reason"] or None,
-        "elapsed_ms": metadata["elapsed_ms"],
-        "steps": metadata["tool_steps"],
     }
 
 
@@ -721,16 +690,8 @@ def _empty_search_payload(request: str, *, fallback_reason: str) -> dict:
     return {
         "request": request,
         "data": [],
-        "results": [],
         "local_candidates": [],
         "metadata": metadata,
-        "agent_used": False,
-        "agent_model": None,
-        "agent_rounds": 0,
-        "upgraded": False,
-        "fallback_reason": fallback_reason,
-        "elapsed_ms": 0,
-        "steps": [],
     }
 
 
@@ -778,27 +739,11 @@ def _model_payload(value) -> dict:
 
 
 def _version_payload(version: KnowledgeVersion | dict) -> dict:
-    payload = _model_payload(version)
-    payload.update(
-        {
-            "version_ref": payload.get("ref", payload.get("version_ref", "")),
-            "document_ref": payload.get("document_ref", ""),
-            "sha256": payload.get("content_sha256", payload.get("sha256", "")),
-            "size_bytes": payload.get("byte_size", payload.get("size_bytes", 0)),
-        }
-    )
-    return payload
+    return _model_payload(version)
 
 
 def _document_payload(document: KnowledgeDocument | dict) -> dict:
-    payload = _model_payload(document)
-    payload.update(
-        {
-            "document_ref": payload.get("ref", payload.get("document_ref", "")),
-            "size_bytes": payload.get("byte_size", payload.get("size_bytes", 0)),
-        }
-    )
-    return payload
+    return _model_payload(document)
 
 
 def _commit_payload(result) -> dict:
@@ -807,18 +752,11 @@ def _commit_payload(result) -> dict:
         **payload,
         "document": _document_payload(payload["document"]),
         "version": _version_payload(payload["version"]),
-        "duplicate": bool(payload.get("deduplicated", False)),
     }
 
 
 def _search_hit_payload(hit: KnowledgeSearchHit | dict) -> dict:
-    payload = _model_payload(hit)
-    payload["heading_path"] = payload.get("title_path", [])
-    payload["start_char"] = payload.get("char_start", 0)
-    payload["end_char"] = payload.get("char_end", 0)
-    payload["start_line"] = payload.get("line_start", 1)
-    payload["end_line"] = payload.get("line_end", 1)
-    return payload
+    return _model_payload(hit)
 
 
 def _bounded_search_hit_payloads(

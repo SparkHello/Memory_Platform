@@ -19,7 +19,6 @@ import app.memory.store.migrations as memory_store_module
 from app.knowledge.store import KnowledgeStore
 from app.memory.store import MemoryStore
 from app.schema_migrations import enable_wal_with_retry
-from app.usage.store import UsageStore
 
 
 _LATEST_MEMORY_SCHEMA_VERSION = 6
@@ -537,18 +536,3 @@ class TestKnowledgeSchemaMigrations:
                 "WHERE type = 'table' AND name = 'knowledge_documents'"
             ).fetchone()
         assert table is None
-
-
-def test_usage_store_concurrent_fresh_database_initialization_is_serialized(tmp_path) -> None:
-    db_path = str(tmp_path / "concurrent-usage.db")
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        list(executor.map(lambda _: UsageStore(db_path).init_db(), range(16)))
-
-    with UsageStore(db_path)._connect() as connection:
-        table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'model_usage_events'"
-        ).fetchone()
-        assert table is not None
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

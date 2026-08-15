@@ -549,7 +549,10 @@ def create_app(
                 }
             )
 
+    # Compatibility aliases shipped before the channel-oriented names. Keep
+    # them callable for existing clients but out of newly generated schemas.
     @app.post("/admin/channels/discover")
+    @app.post("/admin/discover", include_in_schema=False)
     async def discover_admin_candidate(request: Request) -> Response:
         context = await _admin_context(request)
         if isinstance(context, JSONResponse):
@@ -721,10 +724,12 @@ def create_app(
         )
 
     @app.post("/admin/channel-bundles/validate")
+    @app.post("/admin/bundles/validate", include_in_schema=False)
     async def validate_admin_bundle(request: Request) -> Response:
         return await _handle_admin_bundle(request, apply=False)
 
     @app.post("/admin/channel-bundles/apply")
+    @app.put("/admin/bundles", include_in_schema=False)
     async def apply_admin_bundle(request: Request) -> Response:
         async with admin_write_lock:
             return await _handle_admin_bundle(request, apply=True)

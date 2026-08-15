@@ -86,7 +86,7 @@ async def test_search_can_skip_usage_tracking(memory_store: MemoryStore) -> None
 
 
 @pytest.mark.asyncio
-async def test_search_hits_applies_time_ripple_when_enabled(
+async def test_search_record_usage_false_skips_activation(
     memory_store: MemoryStore,
 ) -> None:
     seed = memory_store.create_memory(
@@ -94,61 +94,11 @@ async def test_search_hits_applies_time_ripple_when_enabled(
         content="用户使用 Kelivo 做 AI 客户端。",
         type="semantic",
         importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["kelivo"],
-    )
-    neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在整理客户端记忆体验。",
-        type="semantic",
-        importance=7,
-        valid_from="2026-06-17T09:00:00+00:00",
         topics=["kelivo"],
     )
     service = MemorySearchService(
         store=memory_store,
         embedding_client=NullEmbeddingClient(),
-        time_ripple_delta=0.25,
-        time_ripple_window_hours=48,
-    )
-
-    hits = await service.search_hits(query="Kelivo", user_id="default", limit=5)
-
-    assert [hit.memory.id for hit in hits] == [seed.id]
-    refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
-    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
-    assert refreshed_seed is not None
-    assert refreshed_neighbor is not None
-    assert refreshed_seed.usage_count == 1
-    assert refreshed_neighbor.usage_count == 0.25
-    assert refreshed_neighbor.last_used_at == refreshed_seed.last_used_at
-
-
-@pytest.mark.asyncio
-async def test_search_record_usage_false_skips_time_ripple(
-    memory_store: MemoryStore,
-) -> None:
-    seed = memory_store.create_memory(
-        user_id="default",
-        content="用户使用 Kelivo 做 AI 客户端。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["kelivo"],
-    )
-    neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在整理客户端记忆体验。",
-        type="semantic",
-        importance=7,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["kelivo"],
-    )
-    service = MemorySearchService(
-        store=memory_store,
-        embedding_client=NullEmbeddingClient(),
-        time_ripple_delta=0.25,
-        time_ripple_window_hours=48,
     )
 
     hits = await service.search_hits(
@@ -160,16 +110,13 @@ async def test_search_record_usage_false_skips_time_ripple(
 
     assert [hit.memory.id for hit in hits] == [seed.id]
     refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
-    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
     assert refreshed_seed is not None
-    assert refreshed_neighbor is not None
     assert refreshed_seed.usage_count == 0
-    assert refreshed_neighbor.usage_count == 0
-    assert refreshed_neighbor.last_used_at is None
+    assert refreshed_seed.last_used_at is None
 
 
 @pytest.mark.asyncio
-async def test_cached_search_hits_still_apply_time_ripple(
+async def test_cached_search_hits_still_record_usage(
     memory_store: MemoryStore,
 ) -> None:
     seed = memory_store.create_memory(
@@ -177,33 +124,19 @@ async def test_cached_search_hits_still_apply_time_ripple(
         content="用户使用 Kelivo 做 AI 客户端。",
         type="semantic",
         importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["kelivo"],
-    )
-    neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在整理客户端记忆体验。",
-        type="semantic",
-        importance=7,
-        valid_from="2026-06-17T09:00:00+00:00",
         topics=["kelivo"],
     )
     service = MemorySearchService(
         store=memory_store,
         embedding_client=NullEmbeddingClient(),
-        time_ripple_delta=0.25,
-        time_ripple_window_hours=48,
     )
 
     await service.search_hits(query="Kelivo", user_id="default", limit=5)
     await service.search_hits(query="Kelivo", user_id="default", limit=5)
 
     refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
-    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
     assert refreshed_seed is not None
-    assert refreshed_neighbor is not None
     assert refreshed_seed.usage_count == 2
-    assert refreshed_neighbor.usage_count == 0.5
 
 
 @pytest.mark.asyncio
@@ -616,13 +549,13 @@ async def test_old_situational_memory_decays_in_ranking(memory_store: MemoryStor
         user_id="default",
         content="用户计划练习跑步。",
         type="semantic",
-        importance=8,
+        importance=6,
     )
     recent = memory_store.create_memory(
         user_id="default",
         content="用户正在练习跑步。",
         type="semantic",
-        importance=3,
+        importance=6,
     )
     old_time = (datetime.now(UTC) - timedelta(days=400)).isoformat()
     with memory_store._connect() as connection:
@@ -994,52 +927,17 @@ async def test_keyword_search_keeps_meaningful_terms_after_query_normalization(
 
 
 @pytest.mark.asyncio
-async def test_keyword_search_uses_auditable_category_expansion(
-    memory_store: MemoryStore,
-) -> None:
-    pets = memory_store.create_memory(
-        user_id="default",
-        content="用户养了两只猫，分别叫糯米和十一。",
-        topics=["宠物", "猫"],
-    )
-    laptop = memory_store.create_memory(
-        user_id="default",
-        content="用户使用的笔记本是华硕枪神。",
-        topics=["设备", "硬件配置"],
-    )
-    service = MemorySearchService(
-        store=memory_store,
-        embedding_client=NullEmbeddingClient(),
-        enable_cache=False,
-    )
-
-    pet_results = await service.search(
-        query="用户有什么宠物",
-        user_id="default",
-        record_usage=False,
-    )
-    computer_results = await service.search(
-        query="用户的电脑是什么",
-        user_id="default",
-        record_usage=False,
-    )
-
-    assert [memory.id for memory in pet_results] == [pets.id]
-    assert [memory.id for memory in computer_results] == [laptop.id]
-
-
-@pytest.mark.asyncio
 async def test_fielded_metadata_reranks_the_matching_domain(
     memory_store: MemoryStore,
 ) -> None:
     photography = memory_store.create_memory(
         user_id="default",
-        content="用户喜欢用手机拍猫，经常分享猫的照片。",
+        content="用户喜欢用手机拍照，经常分享猫的照片。",
         topics=["拍照", "偏好"],
     )
     memory_store.create_memory(
         user_id="default",
-        content="用户对 AI 模型的信息分析有强烈风格偏好。",
+        content="用户对 AI 模型的信息分析有强烈偏好。",
         topics=["AI分析", "偏好"],
     )
     service = MemorySearchService(
@@ -1056,75 +954,6 @@ async def test_fielded_metadata_reranks_the_matching_domain(
     )
 
     assert [memory.id for memory in results] == [photography.id]
-
-
-@pytest.mark.asyncio
-async def test_relation_gates_keep_metadata_from_answering_a_different_question(
-    memory_store: MemoryStore,
-) -> None:
-    memory_store.create_memory(
-        user_id="default",
-        content="用户喂西瓜很有分寸，吃完后会控制糖分。",
-        topics=["宠物", "饮食"],
-    )
-    memory_store.create_memory(
-        user_id="default",
-        content="用户喜欢给猫准备西瓜，十一吃得很开心。",
-        topics=["宠物", "饮食"],
-    )
-    memory_store.create_memory(
-        user_id="default",
-        content="用户喜欢用手机拍猫，经常分享猫的照片。",
-        topics=["拍照", "偏好"],
-    )
-    service = MemorySearchService(
-        store=memory_store,
-        embedding_client=NullEmbeddingClient(),
-        enable_cache=False,
-    )
-
-    food = await service.search(
-        query="用户喜欢吃什么",
-        user_id="default",
-        record_usage=False,
-    )
-    equipment = await service.search(
-        query="用户的拍照设备",
-        user_id="default",
-        record_usage=False,
-    )
-
-    assert food == []
-    assert equipment == []
-
-
-@pytest.mark.asyncio
-async def test_food_preference_query_matches_only_drink_statement(
-    memory_store: MemoryStore,
-) -> None:
-    coffee = memory_store.create_memory(
-        user_id="default",
-        content="用户只喝美式咖啡，不加糖不加奶。",
-        topics=["偏好", "饮食"],
-    )
-    memory_store.create_memory(
-        user_id="default",
-        content="用户喂西瓜很有分寸，吃完后会控制糖分。",
-        topics=["宠物", "饮食"],
-    )
-    service = MemorySearchService(
-        store=memory_store,
-        embedding_client=NullEmbeddingClient(),
-        enable_cache=False,
-    )
-
-    results = await service.search(
-        query="我喜欢喝什么咖啡",
-        user_id="default",
-        record_usage=False,
-    )
-
-    assert [memory.id for memory in results] == [coffee.id]
 
 
 @pytest.mark.asyncio

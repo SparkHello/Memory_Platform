@@ -76,8 +76,6 @@ KNOWLEDGE_EMBEDDING_MIN_COSINE=0.25
 KNOWLEDGE_HYBRID_VECTOR_WEIGHT=0.65
 EVAL_DIR=eval                    # 召回评测工作区（含真实数据快照，勿提交 git）
 REQUEST_TIMEOUT_SECONDS=60       # 上游请求超时
-TIME_RIPPLE_DELTA=0.0            # 实验性邻近激活，0.0 = 关闭，普通用户不要改
-TIME_RIPPLE_WINDOW_HOURS=48
 ```
 
 完整配置表见 `README.md` 的「配置项」一节和 `app/config.py`。

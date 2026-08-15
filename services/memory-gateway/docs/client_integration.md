@@ -231,11 +231,8 @@ The physical SQLite column is `usage_count`, but client-facing UI and copy shoul
 `activation_count`. It measures how active a memory has been in retrieval/surfacing flows,
 not an exact number of user-visible searches.
 
-By default `TIME_RIPPLE_DELTA=0.0`, so no neighbor activation is added. Time Ripple is an
-experimental compatibility feature; ordinary clients should leave it disabled. If it is
-enabled for testing, search or explicit touch can add fractional activation to nearby
-memories that share a space/topic and are close in time. Do not present this value as a
-precise hit count.
+Do not present this value as a precise hit count. Search only increments
+activation on memories that actually entered the answer.
 
 ## Read-Only Data Audit
 
@@ -252,6 +249,5 @@ For machine-readable output:
 ```
 
 The audit script opens SQLite in read-only mode, checks P0/P1 columns, reports legacy type
-residue, invalid lifecycle states, JSON-column parse errors, temporal/supersession counts,
-and Time Ripple configuration. It prints only `TIME_RIPPLE_*` values from configuration and
-never prints gateway or provider keys.
+residue, invalid lifecycle states, JSON-column parse errors, and temporal/supersession
+counts. It never prints gateway or provider keys.

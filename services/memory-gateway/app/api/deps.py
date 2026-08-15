@@ -107,7 +107,6 @@ def get_embedding_client(
             model_gateway_mode=True,
             timeout_seconds=settings.request_timeout_seconds,
             allow_sensitive_egress=settings.allow_sensitive_egress,
-            usage_recorder=None,
             usage_hmac_secret=settings.gateway_signing_secret,
         )
     return NullEmbeddingClient()
@@ -166,8 +165,6 @@ def get_memory_search_service(
     return MemorySearchService(
         store=store,
         embedding_client=embedding_client,
-        time_ripple_delta=settings.time_ripple_delta,
-        time_ripple_window_hours=settings.time_ripple_window_hours,
     )
 
 

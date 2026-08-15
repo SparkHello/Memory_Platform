@@ -1213,8 +1213,6 @@ async def _safe_memory_search(
     keyword_search = MemorySearchService(
         store=store,
         embedding_client=NullEmbeddingClient(),
-        time_ripple_delta=settings.time_ripple_delta,
-        time_ripple_window_hours=settings.time_ripple_window_hours,
         enable_cache=False,
     )
     try:
@@ -1366,23 +1364,6 @@ async def _finalize_stream_turn(
         await finalize(assistant_text=capture.assistant_text)
 
 
-def _usage_provider_arguments(provider: Any) -> dict[str, Any]:
-    deployment_id = str(getattr(provider, "deployment_id", "") or "").strip()
-    vendor = str(getattr(provider, "vendor", "") or "").strip()
-    return {
-        "model": str(getattr(provider, "model", "") or ""),
-        "provider_code": (
-            "" if deployment_id else str(getattr(provider, "code", "") or "")
-        ),
-        "base_url": str(getattr(provider, "base_url", "") or ""),
-        # A central gateway may expose a reseller's deployment of a familiar
-        # model. Missing origin metadata must stay unpriced instead of being
-        # guessed from the model name as the official first-party provider.
-        "provider_override": (vendor or "model-gateway") if deployment_id else "",
-        "use_local_pricing": not bool(deployment_id),
-    }
-
-
 async def _finalize_turn(
     *,
     key: str,
@@ -1421,8 +1402,6 @@ async def _finalize_turn(
                     # 一致，避免"被检索曝光"就自增的正反馈。
                     memory_ids=memory_ids[:ACTIVATION_LIMIT],
                     user_id=user_id,
-                    time_ripple_delta=settings.time_ripple_delta,
-                    time_ripple_window_hours=settings.time_ripple_window_hours,
                 )
             )
         except Exception:

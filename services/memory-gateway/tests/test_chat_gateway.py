@@ -12,7 +12,6 @@ from app.api.chat_gateway import (
     _inject_memory_context,
     _restore_tool_reasoning,
     _turn_fingerprint,
-    _usage_provider_arguments,
     clear_chat_gateway_state,
 )
 from app.config import Settings, get_settings
@@ -35,7 +34,6 @@ from app.usage.attribution import (
     MODEL_GATEWAY_OPERATION_HEADER,
     MODEL_GATEWAY_USER_TAG_HEADER,
 )
-from app.usage.store import UsageStore
 
 
 class RecordingEmbeddingClient:
@@ -160,10 +158,6 @@ def test_v1_gateway_uses_central_runtime_without_rewriting_extensions(
     assert captured["headers"][MODEL_GATEWAY_CORRELATION_HEADER.lower()].startswith("mgc_")
     assert captured["headers"][MODEL_GATEWAY_USER_TAG_HEADER.lower()].startswith("usr_")
     assert "forged" not in json.dumps(captured["headers"])
-    assert UsageStore(memory_store.database_path).summary(
-        user_id="default",
-        days=None,
-    )["totals"]["calls"] == 0
 
 
 def test_chat_gateway_rejects_oversized_body_before_forwarding(
@@ -1716,13 +1710,6 @@ def test_model_gateway_reasoning_cache_uses_deployment_affinity() -> None:
 
     assert preferred == "siliconflow-deepseek-primary"
     assert messages[1]["reasoning_content"] == "deployment-private-state"
-    assert _usage_provider_arguments(provider) == {
-        "model": "deepseek-v3.2",
-        "provider_code": "",
-        "base_url": "http://127.0.0.1:2030/v1",
-        "provider_override": "siliconflow",
-        "use_local_pricing": False,
-    }
     clear_chat_gateway_state()
 
 

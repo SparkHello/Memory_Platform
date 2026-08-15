@@ -30,7 +30,7 @@ def _upload(
         },
     )
     assert begun.status_code == 200, begun.text
-    upload_id = begun.json()["upload_id"]
+    upload_id = begun.json()["id"]
     midpoint = max(1, len(text) // 2)
     parts = [text[:midpoint], text[midpoint:]] if midpoint < len(text) else [text]
     for sequence, part in enumerate(parts):
@@ -96,7 +96,7 @@ def test_segmented_upload_requires_then_accepts_sensitivity_confirmation(
             "sensitivity": "normal",
         },
     )
-    upload_id = begun.json()["upload_id"]
+    upload_id = begun.json()["id"]
     appended = client.put(
         f"/knowledge/uploads/{upload_id}/parts/0",
         headers=headers,
@@ -143,8 +143,8 @@ def test_knowledge_rest_upload_search_and_lossless_read(
     ) * 120
     created = _upload(client, auth_headers, text, user_id="alice")
 
-    assert created["document"]["document_ref"].startswith("knowledge://document/")
-    assert created["version"]["version_ref"].startswith("knowledge://version/")
+    assert created["document"]["ref"].startswith("knowledge://document/")
+    assert created["version"]["ref"].startswith("knowledge://version/")
     assert created["version"]["index_status"] == "ready"
 
     listed = client.get(
@@ -167,8 +167,8 @@ def test_knowledge_rest_upload_search_and_lossless_read(
     )
     assert searched.status_code == 200, searched.text
     payload = searched.json()
-    assert payload["agent_used"] is False
-    assert payload["fallback_reason"] in {"egress_disabled", "agent_not_configured"}
+    assert payload["metadata"]["agent_used"] is False
+    assert payload["metadata"]["fallback_reason"] in {"egress_disabled", "agent_not_configured"}
     assert payload["data"]
     assert payload["local_candidates"]
     assert all("excerpt" not in item for item in payload["local_candidates"])
@@ -176,8 +176,8 @@ def test_knowledge_rest_upload_search_and_lossless_read(
     assert sum(len(item["excerpt"]) for item in payload["data"]) <= 8000
     hit = payload["data"][0]
     assert hit["excerpt"] in text
-    assert hit["document_ref"] == created["document"]["document_ref"]
-    assert hit["version_ref"] == created["version"]["version_ref"]
+    assert hit["document_ref"] == created["document"]["ref"]
+    assert hit["version_ref"] == created["version"]["ref"]
     assert hit["chunk_ref"].startswith("knowledge://chunk/")
     assert text[hit["char_start"] : hit["char_end"]].startswith(hit["excerpt"])
 
@@ -188,7 +188,7 @@ def test_knowledge_rest_upload_search_and_lossless_read(
             "/knowledge/read",
             headers=_headers(auth_headers, "alice"),
             json={
-                "reference": created["version"]["version_ref"],
+                "reference": created["version"]["ref"],
                 "cursor": cursor,
                 "max_chars": 777,
                 "include_sensitive": False,
@@ -209,7 +209,7 @@ def test_knowledge_rest_upload_search_and_lossless_read(
 def test_knowledge_rest_versions_deduplicate_and_restore_history(client, auth_headers) -> None:
     first_text = "# v1\n\n第一版逐字正文。"
     first = _upload(client, auth_headers, first_text, user_id="alice")
-    document_ref = first["document"]["document_ref"]
+    document_ref = first["document"]["ref"]
 
     duplicate = _upload(
         client,
@@ -238,7 +238,7 @@ def test_knowledge_rest_versions_deduplicate_and_restore_history(client, auth_he
     assert restored.status_code == 200, restored.text
     restored_payload = restored.json()
     assert restored_payload["version"]["version_number"] == 3
-    assert restored_payload["version"]["sha256"] == first["version"]["sha256"]
+    assert restored_payload["version"]["content_sha256"] == first["version"]["content_sha256"]
     assert restored_payload["version"]["id"] != first["version"]["id"]
 
 
@@ -269,7 +269,7 @@ def test_knowledge_rest_isolation_delete_restore_and_confirmed_purge(
     unreadable = client.post(
         "/knowledge/read",
         headers=_headers(auth_headers, "alice"),
-        json={"reference": alice["version"]["version_ref"]},
+        json={"reference": alice["version"]["ref"]},
     )
     assert unreadable.status_code == 404
 
@@ -313,7 +313,7 @@ def test_knowledge_export_restore_is_separate_and_rebinds_user(client, auth_head
         "第二版",
         user_id="alice",
         title="迁移文档",
-        replace_document_ref=first["document"]["document_ref"],
+        replace_document_ref=first["document"]["ref"],
     )
 
     exported = client.get("/knowledge/export", headers=_headers(auth_headers, "alice"))
@@ -335,7 +335,7 @@ def test_knowledge_export_restore_is_separate_and_rebinds_user(client, auth_head
     ).json()["data"]
     assert len(bob) == 1
     assert bob[0]["user_id"] == "bob"
-    assert bob[0]["document_ref"] != first["document"]["document_ref"]
+    assert bob[0]["ref"] != first["document"]["ref"]
 
 
 def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers) -> None:
@@ -348,11 +348,7 @@ def test_knowledge_status_reports_agent_egress_and_timeout(client, auth_headers)
     assert payload["agent_timeout_seconds"] == 25.0
     assert payload["model_runtime"] == "central"
     assert payload["model_gateway_enabled"] is True
-    assert payload["agent_provider_priority"] == "G"
-    assert payload["agent_configured_providers"] == ["G"]
-    assert payload["agent_rate_limit_cooldown_seconds"] == 0.0
-    assert payload["llm_provider_priority"] == "G"
-    assert payload["llm_configured_providers"] == ["G"]
-    assert payload["llm_rate_limit_cooldown_seconds"] == 0.0
+    assert payload["agent_flash_model"]
+    assert payload["agent_pro_model"]
     assert payload["max_document_bytes"] == 50 * 1024 * 1024
     assert payload["embedding_batch_size"] == 20

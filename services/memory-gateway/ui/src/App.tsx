@@ -103,15 +103,7 @@ export function App() {
       if (report.counts.deleted_memories > 0) {
         next.memories = { text: String(report.counts.deleted_memories), tone: "muted" };
       }
-      const failedIndexes =
-        knowledge?.failed_indexes ??
-        knowledge?.indexing_failed ??
-        knowledge?.failed_versions ??
-        knowledge?.index_failures ??
-        knowledge?.counts?.index_failed ??
-        knowledge?.counts?.failed_indexes ??
-        knowledge?.counts?.failed ??
-        0;
+      const failedIndexes = knowledge?.counts?.index_failed ?? 0;
       if (failedIndexes > 0) {
         next.knowledge = { text: String(failedIndexes), tone: "warning" };
       }

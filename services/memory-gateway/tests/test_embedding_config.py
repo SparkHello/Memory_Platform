@@ -255,7 +255,6 @@ async def test_embedding_rejects_unexpected_model_gateway_space(monkeypatch) -> 
 @pytest.mark.asyncio
 async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> None:
     captured_headers: list[dict[str, str]] = []
-    local_usage_calls: list[dict] = []
     responses = [
         {"X-Model-Gateway-Embedding-Space": "memory-embed-v1"},
         {
@@ -306,11 +305,6 @@ async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> 
         expected_space_id="memory-embed-v1",
         model_gateway_mode=True,
         usage_hmac_secret="embedding-test-signing-secret-0123456789abcdef",
-        usage_recorder=type(
-            "Recorder",
-            (),
-            {"record_response": lambda _self, **kwargs: local_usage_calls.append(kwargs)},
-        )(),
     )
 
     assert await client.embed("第一次") is None
@@ -326,7 +320,6 @@ async def test_embedding_model_gateway_requires_origin_metadata(monkeypatch) -> 
         headers[MODEL_GATEWAY_USER_TAG_HEADER].startswith("usr_")
         for headers in captured_headers
     )
-    assert local_usage_calls == []
 
 
 @pytest.mark.asyncio

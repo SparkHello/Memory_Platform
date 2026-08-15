@@ -60,24 +60,6 @@ def _json_like_safe(value: str) -> bool:
     )
 
 
-def _time_ripple_anchor(row: sqlite3.Row):
-    return _parse_iso_datetime(row["valid_from"] or row["created_at"])
-
-
-def _time_ripple_profiles(rows: list[sqlite3.Row]) -> dict[str, dict]:
-    profiles: dict[str, dict] = {}
-    for row in rows:
-        anchor = _time_ripple_anchor(row)
-        if anchor is None:
-            continue
-        profiles[str(row["id"])] = {
-            "anchor": anchor,
-            "topics": _casefold_set(_json_string_list(row["topics_json"])),
-            "spaces": set(),
-        }
-    return profiles
-
-
 def _casefold_set(values: list[str]) -> set[str]:
     return {value.casefold() for value in values if value}
 

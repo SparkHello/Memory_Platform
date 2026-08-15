@@ -1,10 +1,25 @@
 ﻿import json
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.config import get_settings
+from app.memory.review_revision import ReviewRevisionError
 from app.memory.store import MemoryStore
 from app.memory.utils import _parse_iso_datetime
+
+
+def test_review_preview_signing_fails_closed_without_secret() -> None:
+    import app.memory.review_revision as revision
+
+    with pytest.raises(ReviewRevisionError) as signing_error:
+        revision._sign_preview(secret="", payload={"version": 2})
+    assert signing_error.value.status_code == 503
+
+    token = revision._sign_preview(secret="configured-secret", payload={"version": 2})
+    with pytest.raises(ReviewRevisionError) as verification_error:
+        revision._verify_preview(secret="", token=token)
+    assert verification_error.value.status_code == 503
 
 
 def test_sensitive_review_is_blocked_before_remote_llm(

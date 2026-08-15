@@ -215,7 +215,7 @@ def test_epub_binary_import_is_searchable_and_keeps_metadata(
         },
     )
     assert search.status_code == 200, search.text
-    assert search.json()["results"][0]["document_ref"] == payload["document"]["document_ref"]
+    assert search.json()["data"][0]["document_ref"] == payload["document"]["ref"]
 
 
 def test_binary_import_reports_invalid_metadata_as_validation_error(

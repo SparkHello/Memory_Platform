@@ -445,18 +445,6 @@ class Settings(BaseSettings):
                     "decay sector lambda values must be finite numbers between 0 and 10"
                 )
         return value
-    time_ripple_delta: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        validation_alias="TIME_RIPPLE_DELTA",
-    )
-    time_ripple_window_hours: int = Field(
-        default=48,
-        ge=1,
-        le=720,
-        validation_alias="TIME_RIPPLE_WINDOW_HOURS",
-    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

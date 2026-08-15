@@ -1039,6 +1039,8 @@ def _verify_preview(*, secret: str, token: str) -> dict:
         payload_json = _unb64(payload_part)
         expected = hmac.new(_secret_bytes(secret), payload_json, hashlib.sha256).digest()
         actual = _unb64(signature_part)
+    except ReviewRevisionError:
+        raise
     except Exception as exc:
         raise ReviewRevisionError(409, "修改预览 token 无效") from exc
     if not hmac.compare_digest(expected, actual):

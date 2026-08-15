@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 import json
-import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -43,12 +42,6 @@ JSON_MEMORY_COLUMNS = [
     "entities_json",
 ]
 
-TIME_RIPPLE_KEYS = {
-    "TIME_RIPPLE_DELTA": "0.0",
-    "TIME_RIPPLE_WINDOW_HOURS": "48",
-}
-
-
 @dataclass
 class Finding:
     severity: str
@@ -70,11 +63,9 @@ def run_audit(
         "status": "ok",
         "findings": [],
         "counts": {},
-        "config": _time_ripple_config(env_file=env_file, environ=environ),
+        "config": {},
     }
     findings: list[Finding] = []
-
-    _audit_time_ripple_config(result["config"], findings)
 
     if not database_path.exists():
         findings.append(
@@ -153,16 +144,7 @@ def format_text_report(result: Mapping[str, object]) -> str:
         "memory-gateway database audit",
         f"Database: {result.get('database')}",
         f"Status: {str(result.get('status')).upper()}",
-        "",
-        "Time Ripple config:",
     ]
-    config = result.get("config", {})
-    if isinstance(config, dict):
-        for key in TIME_RIPPLE_KEYS:
-            item = config.get(key, {})
-            if isinstance(item, dict):
-                lines.append(f"- {key}={item.get('value')} ({item.get('source')})")
-
     counts = result.get("counts", {})
     if isinstance(counts, dict) and counts:
         lines.extend(["", "Counts:"])
@@ -445,111 +427,6 @@ def _audit_decision_logs(connection: sqlite3.Connection, counts: dict[str, objec
     )
 
 
-def _time_ripple_config(
-    *,
-    env_file: str | Path | None,
-    environ: Mapping[str, str] | None,
-) -> dict[str, dict[str, str]]:
-    environ = os.environ if environ is None else environ
-    values: dict[str, dict[str, str]] = {
-        key: {"value": default, "source": "default"} for key, default in TIME_RIPPLE_KEYS.items()
-    }
-    file_values = _read_env_file(env_file)
-    for key in TIME_RIPPLE_KEYS:
-        if key in file_values:
-            values[key] = {"value": file_values[key], "source": str(env_file)}
-        if key in environ:
-            values[key] = {"value": environ[key], "source": "environment"}
-    return values
-
-
-def _read_env_file(env_file: str | Path | None) -> dict[str, str]:
-    if env_file is None:
-        return {}
-    path = Path(env_file)
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key not in TIME_RIPPLE_KEYS:
-            continue
-        values[key] = _strip_env_value(value.strip())
-    return values
-
-
-def _strip_env_value(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
-def _audit_time_ripple_config(config: object, findings: list[Finding]) -> None:
-    if not isinstance(config, dict):
-        return
-    delta_item = config.get("TIME_RIPPLE_DELTA", {})
-    window_item = config.get("TIME_RIPPLE_WINDOW_HOURS", {})
-    delta_value = delta_item.get("value") if isinstance(delta_item, dict) else None
-    window_value = window_item.get("value") if isinstance(window_item, dict) else None
-
-    try:
-        delta = float(str(delta_value))
-    except (TypeError, ValueError):
-        findings.append(
-            Finding(
-                severity="warning",
-                code="invalid_time_ripple_delta",
-                message="TIME_RIPPLE_DELTA could not be parsed as a float.",
-                details={"value": delta_value},
-            )
-        )
-    else:
-        if delta < 0 or delta > 1:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    code="time_ripple_delta_out_of_range",
-                    message="TIME_RIPPLE_DELTA is outside the supported 0.0-1.0 range.",
-                    details={"value": delta_value},
-                )
-            )
-        elif delta != 0.0:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    code="time_ripple_enabled",
-                    message="TIME_RIPPLE_DELTA is not 0.0; usage_count may include neighbor activation.",
-                    details={"value": delta_value},
-                )
-            )
-
-    try:
-        window = int(str(window_value))
-    except (TypeError, ValueError):
-        findings.append(
-            Finding(
-                severity="warning",
-                code="invalid_time_ripple_window",
-                message="TIME_RIPPLE_WINDOW_HOURS could not be parsed as an integer.",
-                details={"value": window_value},
-            )
-        )
-    else:
-        if window < 1 or window > 720:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    code="time_ripple_window_out_of_range",
-                    message="TIME_RIPPLE_WINDOW_HOURS is outside the supported 1-720 range.",
-                    details={"value": window_value},
-                )
-            )
-
-
 def _finalize_result(result: dict[str, object], findings: list[Finding]) -> dict[str, object]:
     serialized_findings = [asdict(finding) for finding in findings]
     result["findings"] = serialized_findings
@@ -570,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--env-file",
         default=".env",
-        help="Optional .env path used only for TIME_RIPPLE_* keys. Use an empty value to skip.",
+        help="Optional .env path kept for CLI compatibility; ignored by the audit.",
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument(

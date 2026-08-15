@@ -34,7 +34,7 @@ from app.schema_migrations import (
 from app.schema_versions import KNOWLEDGE_SCHEMA_VERSION
 from app.sensitivity import SENSITIVITY_RANK as _SENSITIVITY_RANK, detect_text_sensitivity
 from app.sqlite_util import ClosingSQLiteConnection as _ClosingSQLiteConnection
-from app.vector_util import cosine_similarity
+from app.vector_util import try_cosine_similarity
 
 
 _DOCUMENT_PREFIX: Final = "knowledge://document/"
@@ -1810,8 +1810,8 @@ class KnowledgeStore:
                 candidate = _validated_vector(json.loads(row["vector_json"]))
             except (TypeError, json.JSONDecodeError, KnowledgeValidationError):
                 continue
-            cosine = cosine_similarity(vector, candidate)
-            if cosine < min_cosine:
+            cosine = try_cosine_similarity(vector, candidate)
+            if cosine is None or cosine < min_cosine:
                 continue
             payload = dict(row)
             payload["rank"] = cosine

@@ -1202,7 +1202,7 @@ def test_init_repairs_legacy_active_links_into_recycle_bin(tmp_path) -> None:
     assert latest_after.supersedes == old.id
 
 
-def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
+def test_mark_memories_used_only_increments_selected_rows(
     memory_store: MemoryStore,
 ) -> None:
     seed = memory_store.create_memory(
@@ -1210,7 +1210,6 @@ def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
         content="用户在推进记忆网关。",
         type="semantic",
         importance=7,
-        valid_from="2026-06-17T08:00:00+00:00",
         topics=["memory"],
     )
     neighbor = memory_store.create_memory(
@@ -1218,15 +1217,12 @@ def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
         content="用户在整理记忆召回体验。",
         type="semantic",
         importance=7,
-        valid_from="2026-06-17T09:00:00+00:00",
         topics=["memory"],
     )
 
     used_at = memory_store.mark_memories_used(
         memory_ids=[seed.id],
         user_id="default",
-        time_ripple_delta=0.0,
-        time_ripple_window_hours=48,
     )
 
     assert used_at is not None
@@ -1238,212 +1234,6 @@ def test_time_ripple_delta_zero_has_no_neighbor_side_effect(
     assert refreshed_seed.last_used_at == used_at
     assert refreshed_neighbor.usage_count == 0
     assert refreshed_neighbor.last_used_at is None
-
-
-def test_time_ripple_activates_same_space_or_topic_within_window(
-    memory_store: MemoryStore,
-) -> None:
-    space = memory_store.upsert_memory_space(user_id="default", name="Work")
-    seed = memory_store.create_memory(
-        user_id="default",
-        content="用户在推进 Kelivo 记忆体验。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["kelivo"],
-        space_ids=[space.id],
-    )
-    topic_neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在梳理长期记忆的召回规则。",
-        type="semantic",
-        importance=7,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["kelivo"],
-    )
-    space_neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在工作空间记录产品决策。",
-        type="semantic",
-        importance=7,
-        valid_from="2026-06-17T10:00:00+00:00",
-        topics=["product"],
-        space_ids=[space.id],
-    )
-
-    used_at = memory_store.mark_memories_used(
-        memory_ids=[seed.id],
-        user_id="default",
-        time_ripple_delta=0.25,
-        time_ripple_window_hours=48,
-    )
-
-    assert used_at is not None
-    refreshed_seed = memory_store.get_memory(memory_id=seed.id, user_id="default")
-    refreshed_topic = memory_store.get_memory(memory_id=topic_neighbor.id, user_id="default")
-    refreshed_space = memory_store.get_memory(memory_id=space_neighbor.id, user_id="default")
-    assert refreshed_seed is not None
-    assert refreshed_topic is not None
-    assert refreshed_space is not None
-    assert refreshed_seed.usage_count == 1
-    assert refreshed_topic.usage_count == 0.25
-    assert refreshed_topic.last_used_at == used_at
-    assert refreshed_space.usage_count == 0.25
-    assert refreshed_space.last_used_at == used_at
-
-
-def test_time_ripple_skips_ineligible_neighbors(memory_store: MemoryStore) -> None:
-    seed = memory_store.create_memory(
-        user_id="default",
-        content="用户在推进记忆系统。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["memory"],
-    )
-    other_user = memory_store.create_memory(
-        user_id="other",
-        content="其他用户也在推进记忆系统。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    outside_window = memory_store.create_memory(
-        user_id="default",
-        content="用户很久以前整理过记忆系统。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-20T09:00:00+00:00",
-        topics=["memory"],
-    )
-    no_shared_tag = memory_store.create_memory(
-        user_id="default",
-        content="用户喜欢安静的阅读环境。",
-        type="emotional",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["reading"],
-    )
-    soft_deleted = memory_store.create_memory(
-        user_id="default",
-        content="用户删除前的记忆系统记录。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    status_archived = memory_store.create_memory(
-        user_id="default",
-        content="用户归档的记忆系统记录。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    pinned = memory_store.create_memory(
-        user_id="default",
-        content="用户钉选的记忆系统记录。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    private = memory_store.create_memory(
-        user_id="default",
-        content="用户的私密记忆系统记录。",
-        type="semantic",
-        importance=8,
-        sensitivity="private",
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    sensitive = memory_store.create_memory(
-        user_id="default",
-        content="用户的敏感记忆系统记录。",
-        type="semantic",
-        importance=8,
-        sensitivity="sensitive",
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["memory"],
-    )
-    memory_store.archive_memory(memory_id=soft_deleted.id, user_id="default")
-    _set_memory_status(memory_store, status_archived.id, "archived")
-    _set_memory_status(memory_store, pinned.id, "pinned")
-
-    memory_store.mark_memories_used(
-        memory_ids=[seed.id],
-        user_id="default",
-        time_ripple_delta=0.5,
-        time_ripple_window_hours=24,
-    )
-
-    assert memory_store.get_memory(memory_id=other_user.id, user_id="other").usage_count == 0
-    for memory_id in [
-        outside_window.id,
-        no_shared_tag.id,
-        status_archived.id,
-        pinned.id,
-        private.id,
-        sensitive.id,
-    ]:
-        memory = memory_store.get_memory(memory_id=memory_id, user_id="default")
-        assert memory is not None
-        assert memory.usage_count == 0
-
-    with memory_store._connect() as connection:
-        row = connection.execute(
-            "SELECT usage_count FROM memories WHERE id = ? AND user_id = ?",
-            (soft_deleted.id, "default"),
-        ).fetchone()
-    assert row is not None
-    assert row["usage_count"] == 0
-
-
-def test_time_ripple_deduplicates_neighbor_across_multiple_seeds(
-    memory_store: MemoryStore,
-) -> None:
-    first = memory_store.create_memory(
-        user_id="default",
-        content="用户在推进 A 计划。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T08:00:00+00:00",
-        topics=["alpha"],
-    )
-    second = memory_store.create_memory(
-        user_id="default",
-        content="用户在推进 B 计划。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T08:30:00+00:00",
-        topics=["beta"],
-    )
-    neighbor = memory_store.create_memory(
-        user_id="default",
-        content="用户在整合 A/B 计划。",
-        type="semantic",
-        importance=8,
-        valid_from="2026-06-17T09:00:00+00:00",
-        topics=["alpha", "beta"],
-    )
-
-    memory_store.mark_memories_used(
-        memory_ids=[first.id, second.id],
-        user_id="default",
-        time_ripple_delta=0.2,
-        time_ripple_window_hours=48,
-    )
-
-    refreshed_first = memory_store.get_memory(memory_id=first.id, user_id="default")
-    refreshed_second = memory_store.get_memory(memory_id=second.id, user_id="default")
-    refreshed_neighbor = memory_store.get_memory(memory_id=neighbor.id, user_id="default")
-    assert refreshed_first is not None
-    assert refreshed_second is not None
-    assert refreshed_neighbor is not None
-    assert refreshed_first.usage_count == 1
-    assert refreshed_second.usage_count == 1
-    assert refreshed_neighbor.usage_count == 0.2
 
 
 def test_create_memory_with_review_after_and_evidence(memory_store: MemoryStore) -> None:

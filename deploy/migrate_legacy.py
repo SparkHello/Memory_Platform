@@ -19,7 +19,6 @@ import tempfile
 
 from app.cli_config import read_env_file, write_env_atomic
 from app.auth.tokens import AuthTokenStore
-from app.usage.pricing import load_pricing_catalog
 from model_gateway.config_store import load_config, read_secrets, write_config
 
 
@@ -77,15 +76,11 @@ def main() -> int:
 
     memory_config = MEMORY_DATA / "config"
     memory_config.mkdir(parents=True, mode=0o700, exist_ok=False)
-    # project.json is required; local models/routes catalogs are legacy backup
-    # only (routing lives in Model Gateway). pricing.json still backs local
-    # usage ledger display for known historical model IDs.
+    # project.json is required; local models/routes/pricing catalogs are
+    # leftover backup artifacts only (routing and usage live in Model Gateway).
     _copy_file(legacy_memory / "project.json", memory_config / "project.json", required=True)
     for filename in ("models.json", "routes.json", "pricing.json"):
         _copy_file(legacy_memory / filename, memory_config / filename, required=False)
-    pricing_path = memory_config / "pricing.json"
-    if pricing_path.is_file():
-        load_pricing_catalog(pricing_path)
 
     legacy_eval = legacy_memory / "eval"
     if legacy_eval.exists():

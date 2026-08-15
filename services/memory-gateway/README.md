@@ -345,8 +345,6 @@ curl \
 | `UI_DIST_DIR` | 空 | Web 控制台静态文件目录；为空时使用后端旁的 `<repo>/ui/dist`。显式配置必须指向含 `index.html` 与 `assets/` 的专用 Vite 构建目录；服务只暴露 UI 入口、已知根资源和 `assets/*`。 |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | 上游 HTTP 请求超时。 |
 | `DECAY_*` | 见 `.env.example` | 遗忘曲线、短期/长期权重、已解决/已消化衰减参数；lambda/alpha 不得为负，权重与生命周期因子范围为 `[0,1]`。 |
-| `TIME_RIPPLE_DELTA` | `0.0` | 实验性邻近记忆激活增量。`0.0` 表示关闭。 |
-| `TIME_RIPPLE_WINDOW_HOURS` | `48` | Time Ripple 的时间邻近窗口。 |
 
 ### 模型路由与价格管理
 
@@ -542,7 +540,7 @@ curl \
 Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与费用」页改为代理 Model Gateway 的用量汇总，按当前用户的归因标签隔离返回。实际渠道、provider/model、Token、币种、分档和价格快照以 Model Gateway 为准（`modelgw usage summary`），避免官方、硅基流动、阿里云等同名模型被错误套价；Model Gateway 不可用时接口返回 503。
 
 - 汇总只含用量元数据，不保存提示词、回复或知识正文；本地只向 Model Gateway 发送按用户生成的不可逆归因标签。
-- 旧版本 direct-provider 时代本地保存的历史计量事件仍保留在本地 usage 数据库中并随备份迁移；内嵌 `app/catalog/pricing.json` 历史价格快照仅供这些旧记录展示，不再有外部 overlay 入口。
+- Memory Gateway 不再维护本地用量账本或价格目录。旧备份包里的 `memory/pricing.json` 仅作遗留文件接受，恢复时不作为运行时真相。
 
 ## REST 接口概览
 
@@ -772,7 +770,6 @@ Windows 服务辅助脚本：
 - chat token 只允许 `/v1`，MCP token 只允许 `/mcp`，Console token 才能访问管理 REST；每枚都固定 user、可单独撤销。legacy all-scope key 仅保留一个版本迁移期。
 - Web Console 不允许撤销某个用户最后一个仍可用的 Console token；接口稳定返回 `409 last_active_console_token`，避免页面把自己永久锁在门外。需要轮换当前 Console token 时，先在运行主机执行 `memgw token create --role console --name <名称> --user <用户>`，保存新 token 并确认可登录后再撤销旧 token。
 - Console token 只能读取模型配置状态；`/providers/*` 写入另需独立 Model Gateway admin key。页面不把 admin key 写入 `localStorage`，Memory Gateway 也不保存或回显它；上游渠道 key 只单向写入 Model Gateway 的隔离 secret volume。
-- Time Ripple 默认关闭。只有明确实验时才设置 `TIME_RIPPLE_DELTA > 0`。
 
 ## 当前边界与后续方向
 

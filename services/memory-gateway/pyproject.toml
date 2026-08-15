@@ -35,9 +35,6 @@ memgw = "app.cli:main"
 where = ["."]
 include = ["app*"]
 
-[tool.setuptools.package-data]
-app = ["catalog/*.json"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

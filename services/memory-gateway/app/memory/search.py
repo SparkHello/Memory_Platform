@@ -37,7 +37,6 @@ from app.memory.temporal import (
 )
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
 from app.usage.context import current_usage_context, model_usage_scope
-from app.usage.recorder import UsageRecorder
 from app.usage.attribution import model_gateway_usage_headers
 from app.vector_util import cosine_similarity
 
@@ -121,67 +120,6 @@ _GENERIC_METADATA_LABELS = {
     "时间事实",
     "沟通偏好",
 }
-# Keyword fallback cannot infer even common hypernym/hyponym relations from
-# character n-grams.  Keep a deliberately small, auditable taxonomy for broad
-# category questions; embeddings remain responsible for open-ended semantics.
-_KEYWORD_CATEGORY_EXPANSIONS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (
-        ("宠物", "pet", "pets"),
-        ("宠物", "猫", "狗", "犬", "兔", "鸟", "hamster", "cat", "dog", "pet"),
-    ),
-    (
-        ("数码产品", "数码设备", "电子产品", "consumer electronics"),
-        (
-            "设备",
-            "硬件",
-            "电脑",
-            "笔记本",
-            "手机",
-            "平板",
-            "耳机",
-            "相机",
-            "镜头",
-            "显卡",
-            "散热器",
-            "computer",
-            "laptop",
-            "phone",
-            "tablet",
-            "headphone",
-            "camera",
-        ),
-    ),
-    (
-        ("电脑", "计算机", "computer", "pc"),
-        ("电脑", "计算机", "笔记本", "台式机", "主机", "computer", "laptop", "desktop", "pc"),
-    ),
-    (
-        ("拍照", "摄影", "photography"),
-        ("拍照", "摄影", "拍摄", "照片", "相片", "photo", "photography"),
-    ),
-)
-_USER_FOOD_PREFERENCE_QUERY_RE = re.compile(
-    r"(?:喜欢|爱|偏好).{0,4}(?:吃|喝|食物|饮食)|(?:吃|喝).{0,4}(?:什么|哪些)"
-    r"|\b(?:what|which).{0,20}(?:user|they|he|she).{0,20}(?:eat|drink|food)"
-    r"|\b(?:user|they|he|she).{0,20}(?:like|love|prefer).{0,10}(?:eat|drink|food)\b",
-    re.IGNORECASE,
-)
-_USER_FOOD_STATEMENT_RE = re.compile(
-    r"^(?:用户|我|本人)(?:自己|平时|通常|经常|常常|每天|早餐|午餐|晚餐|也|会|只|仅)?"
-    r"(?:明确)?(?:(?:喜欢|爱|偏好|不喜欢|不爱).{0,4}(?:吃|喝|食物|饮食)"
-    r"|(?:常吃|常喝|只喝|仅喝|不喝|吃|喝))"
-    r"|^(?:用户|我|本人).{0,8}(?:饮食|食物|口味)(?:偏好|习惯)"
-    r"|^(?:the\s+)?user.{0,12}(?:like|love|prefer|eat|drink|food)",
-    re.IGNORECASE,
-)
-_PHOTO_EQUIPMENT_QUERY_RE = re.compile(
-    r"(?:拍照|摄影|拍摄).{0,5}(?:设备|器材|相机|镜头|型号)"
-    r"|(?:设备|器材|相机|镜头|型号).{0,5}(?:拍照|摄影|拍摄)"
-)
-_PHOTO_EQUIPMENT_STATEMENT_RE = re.compile(
-    r"(?:拍照|摄影|拍摄).{0,12}(?:设备|器材|相机|镜头|型号)"
-    r"|(?:设备|器材|相机|镜头|型号).{0,12}(?:拍照|摄影|拍摄)"
-)
 _SURFACE_MODES: set[MemorySurfaceMode] = {
     "balanced",
     "important",
@@ -378,7 +316,6 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         model_gateway_mode: bool = False,
         timeout_seconds: float = 60.0,
         allow_sensitive_egress: bool = False,
-        usage_recorder: UsageRecorder | None = None,
         usage_hmac_secret: str = "",
     ):
         self.base_url = base_url
@@ -390,7 +327,6 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self.model_gateway_mode = bool(model_gateway_mode)
         self.timeout_seconds = timeout_seconds
         self.allow_sensitive_egress = allow_sensitive_egress
-        self.usage_recorder = usage_recorder
         self.usage_hmac_secret = usage_hmac_secret
 
     async def embed(self, text: str) -> list[float] | None:
@@ -479,28 +415,6 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return []
 
-        if (
-            self.usage_recorder is not None
-            and not self.model_gateway_mode
-            and isinstance(data, dict)
-        ):
-            await anyio.to_thread.run_sync(
-                partial(
-                    self.usage_recorder.record_response,
-                    payload=data,
-                    model=(
-                        metadata.upstream_model
-                        if self.model_gateway_mode
-                        else self.model
-                    ),
-                    kind="embedding",
-                    base_url=self.base_url,
-                    provider_override=(
-                        metadata.channel_operator if self.model_gateway_mode else ""
-                    ),
-                    use_local_pricing=not self.model_gateway_mode,
-                )
-            )
         try:
             items = data.get("data")
             if not isinstance(items, list):
@@ -534,8 +448,6 @@ class MemorySearchService:
         *,
         store: MemoryStore,
         embedding_client: EmbeddingClient,
-        time_ripple_delta: float = 0.0,
-        time_ripple_window_hours: int = 48,
         enable_cache: bool = True,
     ):
         self.store = store
@@ -545,8 +457,6 @@ class MemorySearchService:
         self.enable_cache = enable_cache
         self.last_cache_status = "bypass"
         self.last_embedding_cache_status = "bypass"
-        self.time_ripple_delta = max(0.0, min(1.0, float(time_ripple_delta or 0.0)))
-        self.time_ripple_window_hours = max(1, min(720, int(time_ripple_window_hours or 48)))
 
     async def search(
         self,
@@ -821,20 +731,13 @@ class MemorySearchService:
     ) -> list[MemoryRecord] | None:
         """尝试用 FTS5 索引生成关键词候选；返回 None 表示走全表扫描。
 
-        单字 CJK 与类别标记通道在打分层不要求共享查询词，term 索引无法
-        为它们生成完整候选，出现时整体回退，保证召回不缩水。
+        单字 CJK 在打分层不要求共享查询词，term 索引无法为它们生成完整
+        候选，出现时整体回退，保证召回不缩水。
         """
         all_terms: set[str] = set()
         for variant in keyword_variants:
             keyword_query = _keyword_query_text(variant)
             if _single_cjk_keyword(keyword_query) is not None:
-                return None
-            query_lower = keyword_query.lower()
-            compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_lower)
-            if _keyword_category_markers(
-                query_lower=query_lower,
-                compact_query=compact_query,
-            ):
                 return None
             all_terms |= _terms(keyword_query)
         if not all_terms:
@@ -1182,10 +1085,6 @@ class MemorySearchService:
         query_lower = keyword_query.lower()
         compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_lower)
         allow_substring_match = len(compact_query) >= 2
-        category_markers = _keyword_category_markers(
-            query_lower=query_lower,
-            compact_query=compact_query,
-        )
 
         indexed: list[
             tuple[MemoryRecord, str, set[str], set[str], set[str], list[str]]
@@ -1234,19 +1133,10 @@ class MemorySearchService:
                 for label in labels
                 if _is_strong_metadata_label_match(label, compact_query)
             ]
-            category_match = bool(
-                category_markers
-                and _memory_matches_category_markers(
-                    memory,
-                    content_lower=content_lower,
-                    markers=category_markers,
-                )
-            )
             if (
                 not shared_terms
                 and not substring_match
                 and not single_cjk_match
-                and not category_match
             ):
                 continue
             term_score = min(45.0, len(shared_terms) * 18.0)
@@ -1273,7 +1163,6 @@ class MemorySearchService:
                 45.0,
                 metadata_idf_score + min(30.0, len(exact_metadata_labels) * 22.0),
             )
-            category_score = 45.0 if category_match else 0.0
             score = min(
                 100.0,
                 term_score
@@ -1281,8 +1170,7 @@ class MemorySearchService:
                 + substring_score
                 + single_cjk_score
                 + char_score
-                + metadata_score
-                + category_score,
+                + metadata_score,
             )
             if score >= KEYWORD_MIN_SCORE:
                 scored.append((score, memory))
@@ -1303,8 +1191,6 @@ class MemorySearchService:
         used_at = self.store.mark_memories_used(
             memory_ids=[hit.memory.id for hit in activated],
             user_id=user_id,
-            time_ripple_delta=self.time_ripple_delta,
-            time_ripple_window_hours=self.time_ripple_window_hours,
         )
         if used_at:
             for hit in activated:
@@ -1352,20 +1238,6 @@ def _query_memory_subject_conflict(query: str, memory: MemoryRecord) -> bool:
     """用户本人问题不应被宠物等其他主语的高相似文本截胡。"""
     compact_query = re.sub(r"\s+", "", query)
     content = memory.content.lstrip()
-    if (
-        _USER_FOOD_PREFERENCE_QUERY_RE.search(compact_query)
-        and not _USER_FOOD_STATEMENT_RE.search(content)
-    ):
-        return True
-    if (
-        _PHOTO_EQUIPMENT_QUERY_RE.search(compact_query)
-        and not _PHOTO_EQUIPMENT_STATEMENT_RE.search(content)
-        and not any(
-            label.casefold() in {"拍照设备", "摄影设备", "摄影器材"}
-            for label in memory.topics
-        )
-    ):
-        return True
     if not _EXPLICIT_USER_QUERY_RE.match(compact_query):
         return False
     if any(term in compact_query for term in _RELATED_ENTITY_QUERY_TERMS):
@@ -1373,44 +1245,6 @@ def _query_memory_subject_conflict(query: str, memory: MemoryRecord) -> bool:
     if memory.temporal_subject and memory.temporal_subject.lower() in {"用户", "user", "我"}:
         return False
     return not content.startswith(("用户", "我", "本人"))
-
-
-def _keyword_category_markers(
-    *,
-    query_lower: str,
-    compact_query: str,
-) -> tuple[str, ...]:
-    markers: list[str] = []
-    for triggers, expansion in _KEYWORD_CATEGORY_EXPANSIONS:
-        if any(
-            (
-                bool(re.search(rf"\b{re.escape(trigger)}\b", query_lower))
-                if trigger.isascii()
-                else trigger in compact_query
-            )
-            for trigger in triggers
-        ):
-            markers.extend(expansion)
-    return tuple(dict.fromkeys(markers))
-
-
-def _memory_matches_category_markers(
-    memory: MemoryRecord,
-    *,
-    content_lower: str,
-    markers: tuple[str, ...],
-) -> bool:
-    searchable = " ".join(
-        (content_lower, *memory.topics, *memory.entities)
-    ).casefold()
-    return any(
-        (
-            bool(re.search(rf"\b{re.escape(marker.casefold())}(?:s)?\b", searchable))
-            if marker.isascii()
-            else marker.casefold() in searchable
-        )
-        for marker in markers
-    )
 
 
 def _is_strong_metadata_label_match(label: str, compact_query: str) -> bool:
@@ -1796,8 +1630,7 @@ def _total_rank_score(
 
 def _metadata_penalty(memory: MemoryRecord, now: datetime) -> float:
     return (
-        _decay_penalty(memory, now)
-        + _validity_penalty(memory, now, embedding_mode=False)
+        _validity_penalty(memory, now, embedding_mode=False)
         + _sensitivity_penalty(memory, embedding_mode=False)
     )
 
@@ -1818,25 +1651,6 @@ def _float_payload(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _decay_penalty(memory: MemoryRecord, now: datetime) -> float:
-    rate, cap, grace_days = {
-        "episodic": (0.0020, 0.40, 14),
-        "semantic": (0.0010, 0.25, 30),
-        "procedural": (0.0005, 0.12, 60),
-        "emotional": (0.0003, 0.08, 60),
-        "reflective": (0.0004, 0.10, 60),
-    }.get(memory.type, (0.0010, 0.20, 30))
-    if rate <= 0:
-        return 0.0
-
-    anchor = _parse_iso_datetime(memory.last_used_at or memory.updated_at or memory.created_at)
-    if anchor is None:
-        return 0.0
-    elapsed_days = max(0.0, (now - anchor).total_seconds() / 86400)
-    decaying_days = max(0.0, elapsed_days - grace_days)
-    return min(cap, decaying_days * rate)
 
 
 def _validity_penalty(memory: MemoryRecord, now: datetime, *, embedding_mode: bool) -> float:

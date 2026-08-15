@@ -102,6 +102,65 @@ async def test_chunk_embeddings_add_semantic_recall_and_expose_channels(
     assert "rrf" in hits[0].match_signals
 
 
+def test_zero_norm_embeddings_are_never_search_hits(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    result = _commit(
+        knowledge_store,
+        "# Invalid vector\n\nThis chunk receives a zero-norm embedding.",
+        title="零向量",
+    )
+    chunks = knowledge_store.list_chunks_for_embedding(
+        "alice",
+        result.version.ref,
+    )
+    knowledge_store.replace_chunk_embeddings(
+        "alice",
+        result.version.ref,
+        model="broken-embedding-v1",
+        embedding_space_id="knowledge-space-a",
+        vectors={chunk.ref: [0.0, 0.0] for chunk in chunks},
+        total_chunks=len(chunks),
+    )
+
+    hits = knowledge_store.search_chunks_by_embedding(
+        "alice",
+        [1.0, 0.0],
+        embedding_space_id="knowledge-space-a",
+        min_cosine=0.0,
+    )
+
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_retrieval_service_reads_chunk_refs_off_event_loop(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    result = _commit(
+        knowledge_store,
+        "# Referenced chunk\n\nExact content loaded through the retrieval service.",
+        title="引用读取",
+    )
+    chunk = knowledge_store.list_chunks_for_embedding(
+        "alice",
+        result.version.ref,
+    )[0]
+    service = KnowledgeRetrievalService(
+        store=knowledge_store,
+        embedding_client=FakeEmbeddingClient(),
+    )
+
+    hits = await service.get_chunks_by_refs(
+        user_id="alice",
+        chunk_refs=[chunk.ref],
+        include_sensitive=False,
+    )
+
+    assert [hit.chunk_ref for hit in hits] == [chunk.ref]
+    assert hits[0].excerpt == chunk.content
+
+
 @pytest.mark.asyncio
 async def test_embedding_failure_falls_back_to_keyword_results(
     knowledge_store: KnowledgeStore,

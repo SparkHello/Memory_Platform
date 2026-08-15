@@ -80,7 +80,7 @@ def _upload(
             client,
             headers,
             "append_knowledge_upload",
-            {"upload_id": begun["upload_id"], "sequence": sequence, "text": text},
+            {"upload_id": begun["id"], "sequence": sequence, "text": text},
         )
         assert appended["ok"] is True
     content = "".join(parts)
@@ -89,7 +89,7 @@ def _upload(
         headers,
         "commit_knowledge_upload",
         {
-            "upload_id": begun["upload_id"],
+            "upload_id": begun["id"],
             "expected_parts": len(parts),
             "expected_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         },
@@ -131,8 +131,8 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
     )
     assert committed_v1["ok"] is True
     assert committed_v1["version"]["index_status"] == "ready"
-    document_ref = committed_v1["document"]["document_ref"]
-    version_v1 = committed_v1["version"]["version_ref"]
+    document_ref = committed_v1["document"]["ref"]
+    version_v1 = committed_v1["version"]["ref"]
 
     listed = _call(
         client,
@@ -141,7 +141,7 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
         {"query": "火星蓝", "status": "active", "limit": 10},
     )
     assert listed["ok"] is True
-    assert [item["document_ref"] for item in listed["documents"]] == [document_ref]
+    assert [item["ref"] for item in listed["documents"]] == [document_ref]
 
     searched = _call(
         client,
@@ -156,8 +156,8 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
         },
     )
     assert searched["ok"] is True
-    assert searched["agent_used"] is False
-    assert searched["fallback_reason"] == "egress_disabled"
+    assert searched["metadata"]["agent_used"] is False
+    assert searched["metadata"]["fallback_reason"] == "egress_disabled"
     assert searched["results"]
     assert searched["local_candidates"]
     assert all("excerpt" not in item for item in searched["local_candidates"])
@@ -245,7 +245,7 @@ def test_knowledge_mcp_upload_search_read_and_management_chain(
         },
     )
     assert restored_version["ok"] is True
-    version_v3 = restored_version["version"]["version_ref"]
+    version_v3 = restored_version["version"]["ref"]
     assert restored_version["version"]["version_number"] == 3
 
     reindexed = _call(
@@ -345,7 +345,7 @@ def test_knowledge_mcp_can_raise_sensitivity_but_cannot_bypass_user_confirmation
         title="普通手册",
         parts=["# 常规内容\n\n不含敏感信息的操作说明。"],
     )
-    document_ref = committed["document"]["document_ref"]
+    document_ref = committed["document"]["ref"]
     assert committed["document"]["sensitivity"] == "normal"
 
     upgraded = _call(
@@ -379,7 +379,7 @@ def test_knowledge_mcp_can_raise_sensitivity_but_cannot_bypass_user_confirmation
         alice,
         "append_knowledge_upload",
         {
-            "upload_id": begun["upload_id"],
+            "upload_id": begun["id"],
             "sequence": 0,
             "text": text,
         },
@@ -391,7 +391,7 @@ def test_knowledge_mcp_can_raise_sensitivity_but_cannot_bypass_user_confirmation
         alice,
         "commit_knowledge_upload",
         {
-            "upload_id": begun["upload_id"],
+            "upload_id": begun["id"],
             "expected_parts": 1,
             "expected_sha256": hashlib.sha256(text.encode()).hexdigest(),
         },
@@ -424,7 +424,7 @@ def test_knowledge_mcp_enforces_part_limit_user_isolation_and_no_purge(
         client,
         alice,
         "append_knowledge_upload",
-        {"upload_id": begun["upload_id"], "sequence": 0, "text": "x" * 20001},
+        {"upload_id": begun["id"], "sequence": 0, "text": "x" * 20001},
     )
     assert oversized["ok"] is False
     assert oversized["error"]["code"] == "validation_error"
@@ -433,17 +433,17 @@ def test_knowledge_mcp_enforces_part_limit_user_isolation_and_no_purge(
         client,
         alice,
         "append_knowledge_upload",
-        {"upload_id": begun["upload_id"], "sequence": 0, "text": "ALICE-ONLY-INDEX"},
+        {"upload_id": begun["id"], "sequence": 0, "text": "ALICE-ONLY-INDEX"},
     )
     assert appended["ok"] is True
     committed = _call(
         client,
         alice,
         "commit_knowledge_upload",
-        {"upload_id": begun["upload_id"], "expected_parts": 1},
+        {"upload_id": begun["id"], "expected_parts": 1},
     )
-    document_ref = committed["document"]["document_ref"]
-    version_ref = committed["version"]["version_ref"]
+    document_ref = committed["document"]["ref"]
+    version_ref = committed["version"]["ref"]
 
     bob_list = _call(
         client,
@@ -488,4 +488,4 @@ def test_knowledge_mcp_enforces_part_limit_user_isolation_and_no_purge(
         "list_knowledge_documents",
         {"query": "隔离", "status": "active", "limit": 10},
     )
-    assert [item["document_ref"] for item in still_present["documents"]] == [document_ref]
+    assert [item["ref"] for item in still_present["documents"]] == [document_ref]

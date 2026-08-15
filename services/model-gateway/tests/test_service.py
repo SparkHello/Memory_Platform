@@ -54,6 +54,47 @@ def test_admin_configuration_is_filtered_and_never_returns_secrets(gateway_home)
     assert len(payload["revision"]) == 64
 
 
+def test_legacy_admin_aliases_match_canonical_routes(gateway_home) -> None:
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    cases = (
+        ("POST", "/admin/channels/discover", "POST", "/admin/discover"),
+        (
+            "POST",
+            "/admin/channel-bundles/validate",
+            "POST",
+            "/admin/bundles/validate",
+        ),
+        (
+            "POST",
+            "/admin/channel-bundles/apply",
+            "PUT",
+            "/admin/bundles",
+        ),
+    )
+
+    with TestClient(app) as client:
+        for canonical_method, canonical_path, alias_method, alias_path in cases:
+            canonical = client.request(
+                canonical_method,
+                canonical_path,
+                headers={"authorization": "Bearer admin-token"},
+                json={},
+            )
+            alias = client.request(
+                alias_method,
+                alias_path,
+                headers={"authorization": "Bearer admin-token"},
+                json={},
+            )
+
+            assert alias.status_code == canonical.status_code
+            assert alias.json() == canonical.json()
+            assert alias.status_code != 404
+
+
 def test_admin_portable_config_exports_schema_without_secret_values(
     gateway_home,
 ) -> None:

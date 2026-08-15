@@ -42,7 +42,6 @@ from app.request_limits import (
 )
 from app.security_headers import SecurityHeadersMiddleware
 from app.stack_backup import assert_no_interrupted_stack_restore
-from app.usage.store import UsageStore
 
 
 UI_DIST_DIR = Path(__file__).resolve().parent.parent / "ui" / "dist"
@@ -71,15 +70,6 @@ def _resolve_ui_dist_dir(settings) -> Path:
             )
         return resolved
     return UI_DIST_DIR
-
-
-async def _daily_usage_prune(store: UsageStore) -> None:
-    while True:
-        try:
-            await asyncio.to_thread(store.prune)
-        except Exception:
-            logger.exception("usage 保留策略执行失败；将在下个周期重试。")
-        await asyncio.sleep(24 * 60 * 60)
 
 
 def _normalized_ui_request_path(path: str) -> str | None:
@@ -122,8 +112,8 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         settings = get_settings()
         assert_no_interrupted_stack_restore(cli_paths().home)
-        # Model routing lives in Model Gateway. Local catalog/pricing files are
-        # legacy artifacts retained only for stack backup restore validation.
+        # Model routing and usage ledgers live in Model Gateway. Local
+        # catalog/pricing files are leftover backup artifacts only.
         _validate_database_paths(
             settings.database_path,
             settings.knowledge_database_path,
@@ -132,7 +122,6 @@ def create_app() -> FastAPI:
         initialize_request_spool_directories(settings)
         AuthTokenStore(settings.auth_database_path).init_db()
         MemoryStore(settings.database_path).init_db()
-        UsageStore(settings.database_path).init_db()
         app.state.knowledge_init_error = ""
         try:
             KnowledgeStore(
@@ -171,11 +160,6 @@ def create_app() -> FastAPI:
             )
         except Exception:
             logger.exception("启动聊天 finalize outbox drainer 失败；服务继续运行。")
-        # Apply the usage retention policy daily so always-on deployments do
-        # not depend on restarts to bound the events table.
-        usage_prune_task = asyncio.create_task(
-            _daily_usage_prune(UsageStore(settings.database_path))
-        )
         try:
             # mount 的子应用不会被 FastAPI 触发 lifespan，MCP 的 session manager 在这里启动
             async with mcp.session_manager.run():
@@ -183,7 +167,6 @@ def create_app() -> FastAPI:
         finally:
             for background_task in (
                 drainer_task,
-                usage_prune_task,
                 embedding_refresh_task,
             ):
                 if background_task is not None:

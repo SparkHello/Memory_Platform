@@ -50,7 +50,6 @@ def test_clean_database_has_no_findings(tmp_path: Path) -> None:
     assert result["findings"] == []
     assert result["counts"]["memory_count"] == 1
     assert result["counts"]["legacy_type_count"] == 0
-    assert result["config"]["TIME_RIPPLE_DELTA"]["value"] == "0.0"
 
 
 def test_missing_required_columns_are_errors(tmp_path: Path) -> None:
@@ -124,15 +123,3 @@ def test_negative_and_fractional_usage_counts_are_reported(tmp_path: Path) -> No
     assert "fractional_usage_count" in _codes(result, severity="warning")
     assert result["counts"]["negative_usage_count"] == 1
     assert result["counts"]["fractional_usage_count"] == 1
-
-
-def test_time_ripple_non_default_delta_is_warning(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    result = _audit(
-        store.database_path,
-        environ={"TIME_RIPPLE_DELTA": "0.4", "TIME_RIPPLE_WINDOW_HOURS": "48"},
-    )
-
-    assert result["status"] == "warning"
-    assert "time_ripple_enabled" in _codes(result, severity="warning")
-    assert result["config"]["TIME_RIPPLE_DELTA"]["value"] == "0.4"
