@@ -69,7 +69,7 @@ printf '%s\n' "$USER_PROVIDED_API_KEY" | \
 
 可用预设为 `deepseek`、`kimi-cn`、`mimo` 和 `dashscope-cn`；自定义渠道改用 `--base-url https://...`。交互式 `modelgw quickstart` 会自动执行同类 `/models` 读取并显示模型编号，失败时才回退为手工输入精确模型 ID。
 
-quickstart 默认拒绝覆盖已有的 `memory.*` / `knowledge.*` 文字 route。交互模式会显示现有 route 并要求确认；自动化必须在 recipe 中显式设置 `replace_existing_routes=true`，或在参数模式中加 `--replace-existing-routes`。已有多渠道 fallback 时优先使用精细 `modelgw route`，不要用 quickstart 收缩配置。
+quickstart 默认拒绝覆盖已有的 `memory.` / `knowledge.` 文字用途 route。交互模式会显示现有 route 并要求确认；自动化必须在 recipe 中显式设置 `replace_existing_routes=true`，或在参数模式中加 `--replace-existing-routes`。已有多渠道 fallback 时优先使用精细 `modelgw route`，不要用 quickstart 收缩配置。
 
 ## 安装与 PATH
 
@@ -98,10 +98,18 @@ Windows 会创建用户级 `modelgw.cmd` 并提示需要加入用户 `Path` 的�
 ```bash
 modelgw client add memory-gateway \
   --kind backend \
-  --route 'memory.*' \
-  --route 'knowledge.*' \
+  --route memory.chat \
+  --route memory.extract \
+  --route memory.compact \
+  --route memory.core \
+  --route memory.review \
+  --route knowledge.fast \
+  --route knowledge.pro \
+  --route memory.embedding \
   --set-secret
 ```
+
+`--route` 支持 glob，但对 `memory-gateway` 使用通配权限属于用户显式自定义，不是推荐默认值；平台安装与 quickstart bootstrap 都只授予上面的八条精确 route。
 
 再按供应商官方文档填写连接。普通 OpenAI-compatible 渠道使用 `generic`；只有确实需要已实现的推理参数兼容规则时才选 `kimi`、`deepseek`、`mimo` 或百炼 Qwen 使用的 `dashscope_openai`。后者把通用推理开关转换成 DashScope 的 `enable_thinking`，不会依赖用户手写 request transform：
 

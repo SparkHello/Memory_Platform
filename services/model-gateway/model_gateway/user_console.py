@@ -4,7 +4,6 @@ import argparse
 from datetime import UTC, datetime
 import getpass
 from pathlib import Path
-import secrets
 import shutil
 import subprocess
 from typing import Any, Iterable
@@ -23,12 +22,12 @@ from model_gateway.config_store import (
 )
 from model_gateway.health import HEALTH_STATUS_LABELS
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
+from model_gateway.memory_client import provision_memory_gateway_client
 from model_gateway.models import (
     ADAPTER_NAMES,
     AuthConfig,
     BillingPlan,
     Capabilities,
-    ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
     derive_embedding_space,
@@ -456,32 +455,20 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
             raise ValueError(f"没有找到记忆服务启动器：{candidate}")
         memgw = candidate
 
-    payload = config.model_dump(mode="python")
-    clients = dict(payload["clients"])
-    existing = config.clients.get("memory-gateway")
-    secret_ref = (
-        existing.secret_ref
-        if existing is not None
-        else default_secret_ref("CLIENT", "memory-gateway")
-    )
-    clients["memory-gateway"] = ClientConfig(
-        kind="backend",
-        secret_ref=secret_ref,
-        allowed_routes=["memory.*", "knowledge.*"],
-        allow_direct_deployments=False,
-        allow_legacy_weak_secret=(
-            existing.allow_legacy_weak_secret if existing is not None else False
-        ),
-    ).model_dump(mode="python")
-    payload["clients"] = clients
-    updated = GatewayConfig.model_validate(payload)
     secret_values = read_secrets(paths.secrets)
-    client_key = secret_values.get(secret_ref) or secrets.token_urlsafe(32)
+    memory_client = provision_memory_gateway_client(config, secret_values)
+    updated = config
+    if memory_client.created:
+        payload = config.model_dump(mode="python")
+        clients = dict(payload["clients"])
+        clients["memory-gateway"] = memory_client.client.model_dump(mode="python")
+        payload["clients"] = clients
+        updated = GatewayConfig.model_validate(payload)
     commit_control_plane(
         paths,
         expected_revision=source_revision(config, paths.config),
         config=updated,
-        secret_updates={secret_ref: client_key},
+        secret_updates={memory_client.client.secret_ref: memory_client.key},
     )
 
     if not _gateway_healthy(paths, updated):
@@ -497,7 +484,7 @@ def _connect_memory_service(paths: GatewayPaths, args: argparse.Namespace) -> No
     if run_memgw(
         memgw,
         ["secret", "set", "model-gateway", "--stdin"],
-        input_text=client_key + "\n",
+        input_text=memory_client.key + "\n",
     ) != 0:
         raise ValueError("记忆服务没有通过连接检查；密钥已经安全保存，可检查日志后重试")
 

@@ -13,6 +13,14 @@ class AuthenticationError(ValueError):
     pass
 
 
+class SecretSnapshotError(ValueError):
+    """Safe, value-free validation failure for a candidate secret snapshot."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 MAX_CLIENT_TOKEN_BYTES = 1024
 MIN_CLIENT_TOKEN_BYTES = 32
 MAX_PROVIDER_SECRET_BYTES = 65_536
@@ -123,6 +131,56 @@ def provider_secret_header_value(value: str) -> str:
     ):
         raise ValueError("上游连接密钥必须是 1-65536 字节的无空白可打印 ASCII")
     return value
+
+
+def validate_secret_snapshot(
+    *,
+    config: GatewayConfig,
+    secrets: dict[str, str],
+) -> None:
+    """Validate every configured credential used by a candidate config.
+
+    Missing values remain valid because connections and clients may be staged
+    before their credential is supplied.  Referenced non-empty values must be
+    safe for their eventual use before the atomic control-plane commit starts.
+    Orphan secret values are intentionally ignored until a config references
+    them.
+    """
+
+    for connection_id, connection in config.connections.items():
+        value = secrets.get(connection.auth.secret_ref, "")
+        if not value:
+            continue
+        try:
+            provider_secret_header_value(value)
+        except ValueError as exc:
+            raise SecretSnapshotError(
+                f"connection {connection_id} 的上游密钥格式无效",
+                reason="provider_secret_invalid",
+            ) from exc
+
+    for client_id, client in config.clients.items():
+        value = secrets.get(client.secret_ref, "")
+        if not value:
+            continue
+        try:
+            client_token_bytes(
+                value,
+                allow_legacy_weak=client.allow_legacy_weak_secret,
+            )
+        except ValueError as exc:
+            raise SecretSnapshotError(
+                f"client {client_id} 的密钥格式或强度无效",
+                reason="client_secret_invalid",
+            ) from exc
+
+    try:
+        validate_secret_domains(config=config, secrets=secrets)
+    except ValueError as exc:
+        raise SecretSnapshotError(
+            "密钥配置冲突：client 与上游连接密钥的权限域或唯一性无效",
+            reason="secret_domain_conflict",
+        ) from exc
 
 
 def validate_secret_domains(

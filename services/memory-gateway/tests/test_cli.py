@@ -501,6 +501,52 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
     assert "knowledge.*" not in backend_call
 
 
+def test_stack_install_quickstart_stack_install_keeps_backend_policy_stable(
+    tmp_path,
+) -> None:
+    from model_gateway.config_store import gateway_paths, load_config, read_secrets
+    from model_gateway.memory_client import CHAT_ROUTES, EMBEDDING_ROUTE
+    from model_gateway.quickstart import QuickstartSpec, apply_quickstart
+
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    model_home = tmp_path / "model-home"
+    install_arguments = [
+        *args,
+        "stack",
+        "install",
+        "--model-gateway-home",
+        str(model_home),
+    ]
+
+    assert main(install_arguments) == 0
+    model_paths = gateway_paths(model_home)
+    first_config = load_config(model_paths.config)
+    first_client = first_config.clients["memory-gateway"]
+    first_key = read_secrets(model_paths.secrets)[first_client.secret_ref]
+    assert first_client.allowed_routes == [*CHAT_ROUTES, EMBEDDING_ROUTE]
+
+    quickstart = apply_quickstart(
+        model_paths,
+        QuickstartSpec(
+            channel_operator="example",
+            base_url="https://api.example.test/v1",
+            chat_model="example-chat",
+            api_key="upstream-sensitive-token",
+        ),
+    )
+    after_quickstart = load_config(model_paths.config).clients["memory-gateway"]
+    assert quickstart.created_memory_client is False
+    assert quickstart.memory_client_key == first_key
+    assert after_quickstart == first_client
+
+    assert main(install_arguments) == 0
+    after_second_install = load_config(model_paths.config).clients["memory-gateway"]
+    assert after_second_install == first_client
+    assert "memory.*" not in after_second_install.allowed_routes
+    assert "knowledge.*" not in after_second_install.allowed_routes
+
+
 def _install_stack_mocks(tmp_path, monkeypatch) -> Path:
     model_home = tmp_path / "model-home"
     model_home.mkdir()

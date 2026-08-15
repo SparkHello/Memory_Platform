@@ -15,6 +15,7 @@ from model_gateway.config_store import (
     load_config,
     read_secrets,
     set_secret,
+    write_config,
 )
 from model_gateway.quickstart import (
     CHAT_ROUTES,
@@ -25,6 +26,7 @@ from model_gateway.quickstart import (
     discover_model_ids,
     load_quickstart_file,
 )
+from model_gateway.models import ClientConfig, GatewayConfig, RouteConfig
 
 
 def _base_spec(**overrides: object) -> QuickstartSpec:
@@ -55,7 +57,10 @@ def test_apply_quickstart_wires_connection_model_and_all_chat_routes(tmp_path: P
     # A standalone quickstart creates the backend client so memgw can connect.
     assert result.created_memory_client is True
     assert "memory-gateway" in config.clients
-    assert config.clients["memory-gateway"].allowed_routes == ["memory.*", "knowledge.*"]
+    assert config.clients["memory-gateway"].allowed_routes == [
+        *CHAT_ROUTES,
+        EMBEDDING_ROUTE,
+    ]
 
 
 def test_apply_quickstart_stores_secrets_without_leaking_into_config(tmp_path: Path) -> None:
@@ -123,25 +128,20 @@ def test_apply_quickstart_reuses_existing_memory_client_key(tmp_path: Path) -> N
     # already exist. Quickstart must not diverge from that key.
     paths = gateway_paths(tmp_path / "gateway-home")
     initialize(paths)
-    assert (
-        main(
-            [
-                "--home",
-                str(paths.home),
-                "client",
-                "add",
-                "memory-gateway",
-                "--kind",
-                "backend",
-                "--route",
-                "memory.*",
-                "--route",
-                "knowledge.*",
-            ]
-        )
-        == 0
-    )
+    client_arguments = [
+        "--home",
+        str(paths.home),
+        "client",
+        "add",
+        "memory-gateway",
+        "--kind",
+        "backend",
+    ]
+    for route_id in (*CHAT_ROUTES, EMBEDDING_ROUTE):
+        client_arguments.extend(["--route", route_id])
+    assert main(client_arguments) == 0
     config = load_config(paths.config)
+    original_client = config.clients["memory-gateway"]
     synced_ref = config.clients["memory-gateway"].secret_ref
     synced_key = "already_synced_backend_key_0123456789_ABC"
     set_secret(paths.secrets, synced_ref, synced_key)
@@ -150,6 +150,53 @@ def test_apply_quickstart_reuses_existing_memory_client_key(tmp_path: Path) -> N
 
     assert result.created_memory_client is False
     assert result.memory_client_key == synced_key
+    assert load_config(paths.config).clients["memory-gateway"] == original_client
+
+
+def test_apply_quickstart_preserves_every_existing_memory_client_attribute(
+    tmp_path: Path,
+) -> None:
+    paths = gateway_paths(tmp_path / "gateway-home")
+    initialize(paths)
+    original_client = ClientConfig(
+        kind="interactive",
+        secret_ref="CLIENT_CUSTOM_MEMORY",
+        allowed_routes=["custom.memory.route"],
+        allow_direct_deployments=True,
+        allow_legacy_weak_secret=True,
+        enabled=False,
+    )
+    write_config(
+        paths.config,
+        GatewayConfig(clients={"memory-gateway": original_client}),
+    )
+    legacy_key = "legacy-client-key"
+    set_secret(paths.secrets, original_client.secret_ref, legacy_key)
+
+    result = apply_quickstart(paths, _base_spec())
+
+    assert result.created_memory_client is False
+    assert result.memory_client_key == legacy_key
+    assert load_config(paths.config).clients["memory-gateway"] == original_client
+
+
+def test_new_matching_route_is_not_implicitly_authorized_for_fresh_client(
+    tmp_path: Path,
+) -> None:
+    paths = gateway_paths(tmp_path / "gateway-home")
+    initialize(paths)
+    result = apply_quickstart(paths, _base_spec())
+    config = load_config(paths.config)
+    payload = config.model_dump(mode="python")
+    payload["routes"]["memory.future"] = RouteConfig(
+        kind="chat",
+        targets=[result.chat_deployment_id],
+    ).model_dump(mode="python")
+    write_config(paths.config, GatewayConfig.model_validate(payload))
+
+    client = load_config(paths.config).clients["memory-gateway"]
+    assert client.allowed_routes == [*CHAT_ROUTES, EMBEDDING_ROUTE]
+    assert client.allows_route("memory.future") is False
 
 
 def test_apply_quickstart_rejects_incomplete_embedding_spec(tmp_path: Path) -> None:

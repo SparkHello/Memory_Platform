@@ -25,6 +25,7 @@ from model_gateway.auth import (
     client_token_bytes,
     provider_secret_header_value,
     validate_secret_domains,
+    validate_secret_snapshot,
 )
 from model_gateway.config_store import (
     ConfigConflict,
@@ -1428,6 +1429,32 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "已配置的上游连接密钥均可安全放入 HTTP Header",
                 )
             )
+        protected_transforms = [
+            (deployment_id, fields)
+            for deployment_id, deployment in sorted(config.deployments.items())
+            if (fields := deployment.request_transform.protected_fields())
+        ]
+        if protected_transforms:
+            checks.append(
+                _check(
+                    "request_transform_safety",
+                    "warning",
+                    "以下 deployment 使用旧版 request_transform 保留字段；"
+                    "运行时会跳过目标，请删除规则或改用命名 adapter："
+                    + "; ".join(
+                        f"{deployment_id} ({', '.join(fields)})"
+                        for deployment_id, fields in protected_transforms
+                    ),
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "request_transform_safety",
+                    "ok",
+                    "deployment request_transform 未修改网关保留字段",
+                )
+            )
         if not config.routes:
             checks.append(_check("routes", "warning", "尚未配置功能路由"))
         else:
@@ -1510,7 +1537,7 @@ def _cmd_secret_set(args: argparse.Namespace) -> int:
         except ValueError as exc:
             raise CLIError(str(exc)) from exc
     try:
-        validate_secret_domains(config=candidate_config, secrets=candidate_secrets)
+        validate_secret_snapshot(config=candidate_config, secrets=candidate_secrets)
     except ValueError as exc:
         raise CLIError(str(exc)) from exc
     payload: dict[str, Any] = {"saved": True, "secret_ref": secret_ref, "checks": []}
@@ -1644,7 +1671,7 @@ def _cmd_client_add(args: argparse.Namespace) -> int:
             client_token_bytes(value)
             candidate_secrets = read_secrets(paths.secrets)
             candidate_secrets[secret_ref] = value
-            validate_secret_domains(config=config, secrets=candidate_secrets)
+            validate_secret_snapshot(config=config, secrets=candidate_secrets)
         except ValueError as exc:
             raise CLIError(str(exc)) from exc
         refreshed = load_config(paths.config)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 import sqlite3
 
 from app.memory.store import conversation
@@ -130,6 +131,103 @@ def _memory_migration_v6(connection: sqlite3.Connection) -> None:
     )
 
 
+def _memory_migration_v7(connection: sqlite3.Connection) -> None:
+    """Add lease ownership and enforce bounded, body-free terminal jobs."""
+    table_exists = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'chat_finalize_jobs'
+        """
+    ).fetchone()
+    if table_exists is None:
+        return
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(chat_finalize_jobs)")
+    }
+    if "lease_token" not in columns:
+        connection.execute("ALTER TABLE chat_finalize_jobs ADD COLUMN lease_token TEXT")
+    if "lease_expires_at" not in columns:
+        connection.execute(
+            "ALTER TABLE chat_finalize_jobs ADD COLUMN lease_expires_at TEXT"
+        )
+
+    now = datetime.now(UTC)
+    now_text = now.isoformat()
+    age_cutoff = (now - timedelta(hours=24)).isoformat()
+    # Terminal rows do not need the copied chat turn. Also terminate rows that
+    # can no longer be attempted before a v7 worker can claim them.
+    connection.execute(
+        """
+        UPDATE chat_finalize_jobs
+        SET payload_json = '', lease_token = NULL, lease_expires_at = NULL
+        WHERE status IN ('done', 'failed')
+        """
+    )
+    connection.execute(
+        "UPDATE chat_finalize_jobs SET attempts = 8 WHERE attempts > 8"
+    )
+    connection.execute(
+        """
+        UPDATE chat_finalize_jobs
+        SET status = 'failed', payload_json = '',
+            lease_token = NULL, lease_expires_at = NULL,
+            last_error = COALESCE(last_error, 'max_attempts_exceeded'),
+            updated_at = ?
+        WHERE status IN ('pending', 'running') AND attempts >= 8
+        """,
+        (now_text,),
+    )
+    connection.execute(
+        """
+        UPDATE chat_finalize_jobs
+        SET status = 'failed', payload_json = '',
+            lease_token = NULL, lease_expires_at = NULL,
+            last_error = COALESCE(last_error, 'max_age_exceeded'),
+            updated_at = ?
+        WHERE status IN ('pending', 'running') AND created_at <= ?
+        """,
+        (now_text, age_cutoff),
+    )
+
+    rows = connection.execute(
+        """
+        SELECT id, user_id
+        FROM chat_finalize_jobs
+        WHERE status IN ('pending', 'running')
+        ORDER BY user_id, created_at DESC, rowid DESC
+        """
+    ).fetchall()
+    counts: dict[str, int] = {}
+    overflow: list[str] = []
+    for row in rows:
+        user_id = str(row[1])
+        counts[user_id] = counts.get(user_id, 0) + 1
+        if counts[user_id] > 100:
+            overflow.append(str(row[0]))
+    for offset in range(0, len(overflow), 500):
+        batch = overflow[offset : offset + 500]
+        placeholders = ", ".join("?" for _ in batch)
+        connection.execute(
+            f"""
+            UPDATE chat_finalize_jobs
+            SET status = 'failed', payload_json = '',
+                lease_token = NULL, lease_expires_at = NULL,
+                last_error = COALESCE(last_error, 'queue_limit_exceeded'),
+                updated_at = ?
+            WHERE id IN ({placeholders})
+              AND status IN ('pending', 'running')
+            """,
+            (now_text, *batch),
+        )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_finalize_jobs_claim
+        ON chat_finalize_jobs(status, lease_expires_at, created_at)
+        """
+    )
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
     (2, _memory_migration_v2),
@@ -137,6 +235,7 @@ _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]
     (4, _memory_migration_v4),
     (5, _memory_migration_v5),
     (6, _memory_migration_v6),
+    (7, _memory_migration_v7),
 ]
 
 if _MEMORY_SCHEMA_MIGRATIONS[-1][0] != MEMORY_SCHEMA_VERSION:

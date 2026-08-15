@@ -8,12 +8,15 @@ from model_gateway.config_store import (
     initialize,
     load_config,
     read_secrets,
+    set_secret,
     write_config,
 )
+from model_gateway.memory_client import CHAT_ROUTES, EMBEDDING_ROUTE
 from model_gateway.models import (
     AuthConfig,
     BillingPlan,
     Capabilities,
+    ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
     GatewayConfig,
@@ -147,8 +150,75 @@ def test_user_console_connects_memory_service_without_showing_client_key(
     client = config.clients["memory-gateway"]
     client_key = read_secrets(paths.secrets)[client.secret_ref]
     assert len(client_key) >= 32
-    assert client.allowed_routes == ["memory.*", "knowledge.*"]
+    assert client.allowed_routes == [*CHAT_ROUTES, EMBEDDING_ROUTE]
+    assert client.allows_route("memory.future") is False
     assert calls[0][0][:3] == ["config", "set", "MODEL_GATEWAY_BASE_URL"]
     assert calls[1][0] == ["secret", "set", "model-gateway", "--stdin"]
     assert calls[1][1] == client_key + "\n"
     assert client_key not in capsys.readouterr().out
+
+
+def test_user_console_preserves_existing_memory_client_policy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "gateway-home"
+    paths = gateway_paths(home)
+    initialize(paths)
+    connection = ConnectionConfig(
+        channel_operator="example",
+        base_url="https://api.example.test/v1",
+        auth=AuthConfig(type="bearer", secret_ref="CONNECTION_EXAMPLE"),
+        billing_plan=BillingPlan(type="payg", name="default"),
+    )
+    deployment = DeploymentConfig(
+        connection="example-account",
+        upstream_model="example-chat",
+        model_author="example",
+        capabilities=Capabilities(streaming=True),
+        request_transform=RequestTransform(),
+    )
+    original_client = ClientConfig(
+        kind="interactive",
+        secret_ref="CLIENT_CUSTOM_MEMORY",
+        allowed_routes=["custom.memory.route"],
+        allow_direct_deployments=True,
+        allow_legacy_weak_secret=True,
+        enabled=False,
+    )
+    write_config(
+        paths.config,
+        GatewayConfig(
+            clients={"memory-gateway": original_client},
+            connections={"example-account": connection},
+            deployments={"example-chat": deployment},
+            routes={
+                route_id: RouteConfig(
+                    kind="chat",
+                    targets=["example-chat"],
+                    max_attempts=1,
+                )
+                for route_id in user_console.CHAT_PURPOSES
+            },
+        ),
+    )
+    legacy_key = "legacy-client-key"
+    set_secret(paths.secrets, original_client.secret_ref, legacy_key)
+
+    calls: list[tuple[list[str], str | None]] = []
+    monkeypatch.setattr(user_console, "find_memgw", lambda: Path("/fake/memgw"))
+    monkeypatch.setattr(user_console, "_gateway_healthy", lambda paths, config: True)
+    monkeypatch.setattr(
+        user_console,
+        "run_memgw",
+        lambda command, arguments, input_text=None: calls.append((arguments, input_text)) or 0,
+    )
+    answers = iter(["3", "n", "0"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    assert user_console.run_user_console(_args(home)) == 0
+
+    assert load_config(paths.config).clients["memory-gateway"] == original_client
+    assert read_secrets(paths.secrets)[original_client.secret_ref] == legacy_key
+    assert calls[1][0] == ["secret", "set", "model-gateway", "--stdin"]
+    assert calls[1][1] == legacy_key + "\n"

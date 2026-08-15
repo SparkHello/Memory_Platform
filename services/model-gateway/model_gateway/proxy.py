@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import time
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Literal, Mapping
 
 import httpx
 
@@ -19,6 +19,7 @@ from model_gateway.models import (
     ConnectionConfig,
 )
 from model_gateway.routing import (
+    RequestRequirements,
     ResolvedRoute,
     RouteTarget,
     Router,
@@ -49,6 +50,10 @@ class ProxyResponseTooLarge(httpx.ReadError):
     pass
 
 
+class RequestPreparationError(ValueError):
+    """Every resolved target failed a local, pre-send configuration check."""
+
+
 @dataclass(slots=True)
 class ProxyHTTPResult:
     content: bytes
@@ -57,6 +62,12 @@ class ProxyHTTPResult:
     target: RouteTarget | None
     attempts: int
     attempt_traces: tuple[AttemptTrace, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRoute:
+    route: ResolvedRoute
+    payloads: Mapping[str, dict[str, Any]]
 
 
 class ProxyUpstreamStream:
@@ -140,6 +151,7 @@ class RawOpenAIProxy:
         secrets: Mapping[str, str],
         request_headers: Mapping[str, str],
         reasoning_origin_deployment: str = "",
+        prepared_payloads: Mapping[str, dict[str, Any]] | None = None,
     ) -> ProxyHTTPResult:
         last_result: ProxyHTTPResult | None = None
         last_network_error: httpx.HTTPError | None = None
@@ -176,10 +188,14 @@ class RawOpenAIProxy:
                     "POST",
                     url,
                     headers=upstream_headers(target, secret, request_headers),
-                    json=prepare_payload(
-                        payload,
-                        target,
-                        reasoning_origin_deployment=reasoning_origin_deployment,
+                    json=(
+                        prepared_payloads[target.deployment_id]
+                        if prepared_payloads is not None
+                        else prepare_payload(
+                            payload,
+                            target,
+                            reasoning_origin_deployment=reasoning_origin_deployment,
+                        )
                     ),
                 )
                 response = await client.send(request, stream=True)
@@ -274,6 +290,7 @@ class RawOpenAIProxy:
         secrets: Mapping[str, str],
         request_headers: Mapping[str, str],
         reasoning_origin_deployment: str = "",
+        prepared_payloads: Mapping[str, dict[str, Any]] | None = None,
     ) -> ProxyUpstreamStream | ProxyHTTPResult:
         last_result: ProxyHTTPResult | None = None
         last_network_error: httpx.HTTPError | None = None
@@ -310,10 +327,14 @@ class RawOpenAIProxy:
                     "POST",
                     url,
                     headers=upstream_headers(target, secret, request_headers),
-                    json=prepare_payload(
-                        payload,
-                        target,
-                        reasoning_origin_deployment=reasoning_origin_deployment,
+                    json=(
+                        prepared_payloads[target.deployment_id]
+                        if prepared_payloads is not None
+                        else prepare_payload(
+                            payload,
+                            target,
+                            reasoning_origin_deployment=reasoning_origin_deployment,
+                        )
                     ),
                 )
                 response = await client.send(request, stream=True)
@@ -840,6 +861,58 @@ def prepare_payload(
         # intentionally last so an adapter/transform cannot remove or alter it.
         forwarded["dimensions"] = target.deployment.dimensions
     return forwarded
+
+
+def prepare_resolved_route(
+    *,
+    route: ResolvedRoute,
+    payload: dict[str, Any],
+    secrets: Mapping[str, str],
+    kind: Literal["chat", "embedding"],
+    reasoning_origin_deployment: str = "",
+) -> PreparedRoute:
+    """Prepare and revalidate every target before any provider attempt.
+
+    Route selection validates the client payload.  Named adapters and legacy
+    deployment transforms run afterwards and can produce a target-specific
+    payload, so the final shape must satisfy the same deployment capability
+    contract.  Invalid targets are skipped like other ineligible targets; a
+    request fails locally only when none remains.
+    """
+
+    prepared_targets: list[RouteTarget] = []
+    prepared_payloads: dict[str, dict[str, Any]] = {}
+    for target in route.targets:
+        if target.deployment.request_transform.protected_fields():
+            continue
+        secret = secrets.get(target.connection.auth.secret_ref, "")
+        if secret:
+            try:
+                provider_secret_header_value(secret)
+            except ValueError:
+                continue
+        forwarded = prepare_payload(
+            payload,
+            target,
+            reasoning_origin_deployment=reasoning_origin_deployment,
+        )
+        final_requirements = RequestRequirements.from_payload(
+            forwarded,
+            kind=kind,
+        )
+        if final_requirements.missing_from(target.deployment):
+            continue
+        prepared_targets.append(target)
+        prepared_payloads[target.deployment_id] = forwarded
+
+    if not prepared_targets:
+        raise RequestPreparationError(
+            "所有 route target 的最终请求形状或上游密钥配置均无效"
+        )
+    return PreparedRoute(
+        route=replace(route, targets=tuple(prepared_targets)),
+        payloads=prepared_payloads,
+    )
 
 
 def _valid_embedding_response(content: bytes, *, dimensions: int) -> bool:

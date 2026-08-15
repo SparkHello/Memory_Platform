@@ -41,6 +41,37 @@ BillingPlanType = Literal[
 ]
 BILLING_PLAN_TYPES: tuple[str, ...] = get_args(BillingPlanType)
 
+# These top-level request fields are owned by routing, named adapters or the
+# embedding identity contract.  A free-form deployment transform may still
+# carry provider-specific tuning parameters, but it must not rewrite the
+# request semantics that the router validates before selecting a target.
+REQUEST_TRANSFORM_PROTECTED_FIELDS = frozenset(
+    {
+        "dimensions",
+        "enable_thinking",
+        "function_call",
+        "functions",
+        "input",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "stream",
+        "thinking",
+        "tool_choice",
+        "tools",
+    }
+)
+
+# These fields have always been rejected by schema v2.  Keep that load-time
+# guarantee while handling the newly protected fields as a bounded legacy
+# compatibility case at the control-plane/runtime boundaries.
+_STRICT_REQUEST_TRANSFORM_FIELDS = frozenset(
+    {"model", "messages", "input", "stream"}
+)
+
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 FORBIDDEN_UPSTREAM_FORWARD_HEADERS = frozenset(
     {
@@ -332,12 +363,41 @@ class RequestTransform(StrictModel):
 
     @model_validator(mode="after")
     def protect_semantic_fields(self) -> "RequestTransform":
-        protected = {"model", "messages", "input", "stream"}
         touched = set(self.remove) | set(self.set_if_missing) | set(self.force)
-        invalid = sorted(touched & protected)
+        invalid = sorted(touched & _STRICT_REQUEST_TRANSFORM_FIELDS)
         if invalid:
             raise ValueError("request_transform 不能修改核心字段：" + ", ".join(invalid))
         return self
+
+    def protected_fields(self) -> tuple[str, ...]:
+        """Return protected top-level names without exposing configured values."""
+
+        touched = set(self.remove) | set(self.set_if_missing) | set(self.force)
+        return tuple(sorted(touched & REQUEST_TRANSFORM_PROTECTED_FIELDS))
+
+    def protected_projection(self) -> dict[str, Any]:
+        """Comparable protected operations used for v2 transition validation.
+
+        The projection is deliberately never formatted into an error or log:
+        transform values may contain provider-specific data.  Only field names
+        are safe to expose through doctor and control-plane errors.
+        """
+
+        return {
+            "remove": sorted(
+                set(self.remove) & REQUEST_TRANSFORM_PROTECTED_FIELDS
+            ),
+            "set_if_missing": {
+                name: value
+                for name, value in self.set_if_missing.items()
+                if name in REQUEST_TRANSFORM_PROTECTED_FIELDS
+            },
+            "force": {
+                name: value
+                for name, value in self.force.items()
+                if name in REQUEST_TRANSFORM_PROTECTED_FIELDS
+            },
+        }
 
 
 class DeploymentConfig(StrictModel):

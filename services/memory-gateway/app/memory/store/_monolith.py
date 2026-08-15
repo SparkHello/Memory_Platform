@@ -135,31 +135,35 @@ class MemoryStore:
         self,
         *,
         job_id: str,
+        lease_token: str,
         status: str,
         last_error: str | None = None,
-        bump_attempts: bool = False,
     ) -> bool:
         return _chat_finalize.mark_chat_finalize_job(
             self,
             job_id=job_id,
+            lease_token=lease_token,
             status=status,
             last_error=last_error,
-            bump_attempts=bump_attempts,
+        )
+
+    def claim_chat_finalize_job(
+        self,
+        *,
+        job_id: str | None = None,
+        lease_seconds: float = _chat_finalize.CHAT_FINALIZE_LEASE_SECONDS,
+        exclude_job_ids: tuple[str, ...] = (),
+    ) -> dict[str, object] | None:
+        return _chat_finalize.claim_chat_finalize_job(
+            self,
+            job_id=job_id,
+            lease_seconds=lease_seconds,
+            exclude_job_ids=exclude_job_ids,
         )
 
     def prune_chat_finalize_jobs(self, *, keep_per_user: int = 5000) -> int:
         return _chat_finalize.prune_chat_finalize_jobs(
             self, keep_per_user=keep_per_user
-        )
-
-    def list_recoverable_chat_finalize_jobs(
-        self,
-        *,
-        limit: int = 20,
-        stale_running_seconds: float = 120.0,
-    ) -> list[dict[str, object]]:
-        return _chat_finalize.list_recoverable_chat_finalize_jobs(
-            self, limit=limit, stale_running_seconds=stale_running_seconds
         )
 
     @staticmethod

@@ -106,6 +106,45 @@ def test_transforms_cannot_touch_semantic_fields(field: str) -> None:
         RequestTransform(force={field: "changed"})
 
 
+@pytest.mark.parametrize("group", ["remove", "set_if_missing", "force"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "enable_thinking",
+        "function_call",
+        "functions",
+        "parallel_tool_calls",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "thinking",
+        "tool_choice",
+        "tools",
+    ],
+)
+def test_legacy_protected_transforms_load_and_report_only_field_names(
+    group: str,
+    field: str,
+) -> None:
+    marker = "legacy-sensitive-transform-value"
+    value = [field] if group == "remove" else {field: marker}
+
+    transform = RequestTransform.model_validate({group: value})
+
+    assert transform.protected_fields() == (field,)
+    assert marker not in ", ".join(transform.protected_fields())
+
+
+def test_provider_specific_transform_parameters_remain_available() -> None:
+    transform = RequestTransform(
+        remove=["unsupported_vendor_option"],
+        set_if_missing={"temperature": 0.25},
+        force={"vendor_extension": {"mode": "account-specific"}},
+    )
+
+    assert transform.protected_fields() == ()
+
+
 def test_per_token_pricing_requires_official_source() -> None:
     payload = config_payload()
     payload["pricing"]["official-chat-2026-08"]["source_url"] = ""

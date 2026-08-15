@@ -10,8 +10,14 @@
       "kind": "backend",
       "secret_ref": "CLIENT_MEMORY_GATEWAY",
       "allowed_routes": [
-        "memory.*",
-        "knowledge.*"
+        "memory.chat",
+        "memory.extract",
+        "memory.compact",
+        "memory.core",
+        "memory.review",
+        "knowledge.fast",
+        "knowledge.pro",
+        "memory.embedding"
       ],
       "allow_direct_deployments": false,
       "enabled": true

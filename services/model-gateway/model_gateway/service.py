@@ -37,15 +37,18 @@ from model_gateway.capability_probe import (
 from model_gateway.auth import (
     AuthenticationError,
     AuthenticatedClient,
+    SecretSnapshotError,
     authenticate_client,
     client_token_bytes,
     provider_secret_header_value,
     validate_secret_domains,
+    validate_secret_snapshot,
 )
 from model_gateway.config_store import (
     ConfigConflict,
     ConfigError,
     ConfigManager,
+    ControlPlaneValidationError,
     GatewayPaths,
     commit_control_plane,
     configuration_revision,
@@ -53,7 +56,13 @@ from model_gateway.config_store import (
 )
 from model_gateway.health import HealthCheckError, check_health
 from model_gateway.models import AuthConfig, ConnectionConfig, GatewayConfig, PricingConfig
-from model_gateway.proxy import ProxyHTTPResult, ProxyUpstreamStream, RawOpenAIProxy
+from model_gateway.proxy import (
+    ProxyHTTPResult,
+    ProxyUpstreamStream,
+    RawOpenAIProxy,
+    RequestPreparationError,
+    prepare_resolved_route,
+)
 from model_gateway.routing import (
     RequestRequirements,
     RouteAffinityUnavailable,
@@ -132,6 +141,8 @@ def create_app(
             )
         except ConfigConflict:
             return _config_stale_error()
+        except ControlPlaneValidationError as exc:
+            return _candidate_validation_error(exc)
         manager.force_reload()
         return commit
 
@@ -493,13 +504,9 @@ def create_app(
             candidate_secrets = dict(secrets)
             candidate_secrets[connection.auth.secret_ref] = payload.value
             try:
-                validate_secret_domains(config=config, secrets=candidate_secrets)
-            except ValueError:
-                return _error(
-                    400,
-                    "渠道密钥不能与任何本地 client 密钥相同",
-                    error_type="model_gateway_secret_domain_conflict",
-                )
+                validate_secret_snapshot(config=config, secrets=candidate_secrets)
+            except SecretSnapshotError as exc:
+                return _candidate_validation_error(exc)
             revision = configuration_revision(paths.config)
             if payload.revision and payload.revision != revision:
                 return _config_stale_error()
@@ -604,13 +611,12 @@ def create_app(
         candidate_secrets = dict(secrets)
         candidate_secrets[connection.auth.secret_ref] = payload.secret_value
         try:
-            validate_secret_domains(config=candidate_config, secrets=candidate_secrets)
-        except ValueError:
-            return _error(
-                400,
-                "渠道密钥不能与任何本地 client 密钥相同",
-                error_type="model_gateway_secret_domain_conflict",
+            validate_secret_snapshot(
+                config=candidate_config,
+                secrets=candidate_secrets,
             )
+        except SecretSnapshotError as exc:
+            return _candidate_validation_error(exc)
         report = await check_health(
             config=candidate_config,
             secrets=candidate_secrets,
@@ -690,7 +696,9 @@ def create_app(
             probe_config = GatewayConfig.model_validate(graph)
             probe_secrets = dict(secrets)
             probe_secrets[connection.auth.secret_ref] = payload.candidate_key
-            validate_secret_domains(config=probe_config, secrets=probe_secrets)
+            validate_secret_snapshot(config=probe_config, secrets=probe_secrets)
+        except SecretSnapshotError as exc:
+            return _candidate_validation_error(exc)
         except (ValueError, ValidationError) as exc:
             return _error(
                 400,
@@ -753,7 +761,9 @@ def create_app(
             ) = bundle_candidate(config, payload)
             candidate_secrets = dict(secrets)
             candidate_secrets[secret_ref] = payload.connection.secret
-            validate_secret_domains(config=candidate, secrets=candidate_secrets)
+            validate_secret_snapshot(config=candidate, secrets=candidate_secrets)
+        except SecretSnapshotError as exc:
+            return _candidate_validation_error(exc)
         except (ValueError, ValidationError) as exc:
             return _error(
                 400,
@@ -1138,6 +1148,18 @@ async def _proxy_request(
                 error_type="model_gateway_embedding_dimensions_mismatch",
             )
 
+    try:
+        prepared = prepare_resolved_route(
+            route=resolved,
+            payload=payload,
+            secrets=secrets,
+            kind=kind,
+            reasoning_origin_deployment=reasoning_origin,
+        )
+    except RequestPreparationError:
+        return _configuration_invalid_error()
+    resolved = prepared.route
+
     # Authentication, JSON validation and route/capability resolution have all
     # succeeded, but no provider HTTP request has been built or sent yet.  Keep
     # enough durable room for this logical request and every allowed attempt.
@@ -1171,6 +1193,7 @@ async def _proxy_request(
             secrets=secrets,
             request_headers=request.headers,
             reasoning_origin_deployment=reasoning_origin,
+            prepared_payloads=prepared.payloads,
         )
         if isinstance(result, ProxyHTTPResult):
             event_id, ledger_complete = await _record_non_stream(
@@ -1220,6 +1243,7 @@ async def _proxy_request(
         secrets=secrets,
         request_headers=request.headers,
         reasoning_origin_deployment=reasoning_origin,
+        prepared_payloads=prepared.payloads,
     )
     event_id, ledger_complete = await _record_non_stream(
         usage_store,
@@ -1588,6 +1612,43 @@ def _config_stale_error() -> JSONResponse:
     )
 
 
+def _candidate_validation_error(
+    exc: ControlPlaneValidationError | SecretSnapshotError,
+) -> JSONResponse:
+    if exc.reason in {"provider_secret_invalid", "client_secret_invalid"}:
+        return _error(
+            400,
+            "候选密钥格式或强度无效",
+            error_type="model_gateway_secret_invalid",
+        )
+    if exc.reason == "secret_domain_conflict":
+        return _error(
+            400,
+            "候选密钥与现有 client/provider 密钥冲突",
+            error_type="model_gateway_secret_domain_conflict",
+        )
+    return _error(
+        400,
+        "候选配置未通过完整安全校验",
+        error_type="model_gateway_config_invalid",
+    )
+
+
+def _configuration_invalid_error() -> JSONResponse:
+    code = "model_gateway_configuration_invalid"
+    return JSONResponse(
+        {
+            "error": {
+                "message": "网关目标配置无效；请运行 modelgw doctor 修复后重试",
+                "type": code,
+                "code": code,
+            }
+        },
+        status_code=503,
+        headers={"x-model-gateway-attempts": "0"},
+    )
+
+
 def _candidate_discovery_ok(report: Any) -> bool:
     return bool(report.connections) and all(
         connection.status in {"connected", "connected_unverified"}
@@ -1635,6 +1696,8 @@ def _has_ready_route(config: Any, secrets: dict[str, str]) -> bool:
                 connection,
                 route.kind,
             ):
+                continue
+            if deployment.request_transform.protected_fields():
                 continue
             if connection.usage_scope == "interactive_only" and not any(
                 client.kind == "interactive" for client in allowed_clients

@@ -3,14 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-import secrets
 from typing import Any, Literal, get_args
 
 import httpx
 from pydantic import Field, StrictBool, ValidationError, field_validator
 
 from model_gateway.auth import (
-    client_token_bytes,
     provider_secret_header_value,
     validate_secret_domains,
 )
@@ -23,6 +21,11 @@ from model_gateway.config_store import (
 )
 from model_gateway.discovery import fetch_model_listing_sync, parse_model_listing
 from model_gateway.ids import default_secret_ref, slug_id, unique_id
+from model_gateway.memory_client import (
+    CHAT_ROUTES,
+    EMBEDDING_ROUTE,
+    provision_memory_gateway_client,
+)
 from model_gateway.models import (
     ADAPTER_NAMES,
     BILLING_PLAN_TYPES,
@@ -31,7 +34,6 @@ from model_gateway.models import (
     BillingPlan,
     BillingPlanType,
     Capabilities,
-    ClientConfig,
     ConnectionConfig,
     DeploymentConfig,
     derive_embedding_space,
@@ -40,21 +42,6 @@ from model_gateway.models import (
     RouteConfig,
     StrictModel,
 )
-
-
-# The eight stable business routes the memory service expects. A first run
-# points every chat purpose at a single deployment so one model can carry all
-# text work; the user can split purposes later without touching code.
-CHAT_ROUTES: tuple[str, ...] = (
-    "memory.chat",
-    "memory.extract",
-    "memory.compact",
-    "memory.core",
-    "memory.review",
-    "knowledge.fast",
-    "knowledge.pro",
-)
-EMBEDDING_ROUTE = "memory.embedding"
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,42 +451,20 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
     payload["deployments"] = deployments
     payload["routes"] = routes
 
-    # Ensure the memory-gateway backend client exists so a standalone quickstart
-    # (no prior `stack install`) still yields a working connection. When it
-    # already exists, reuse its secret_ref and existing key so we never diverge
-    # from a key `stack install` already synced to memgw.
-    clients = dict(payload["clients"])
-    existing_client = config.clients.get("memory-gateway")
-    created_memory_client = existing_client is None
-    if existing_client is not None:
-        client_secret_ref = existing_client.secret_ref
-    else:
-        client_secret_ref = default_secret_ref("CLIENT", "memory-gateway")
-    clients["memory-gateway"] = ClientConfig(
-        kind="backend",
-        secret_ref=client_secret_ref,
-        allowed_routes=["memory.*", "knowledge.*"],
-        allow_direct_deployments=False,
-        allow_legacy_weak_secret=(
-            existing_client.allow_legacy_weak_secret
-            if existing_client is not None
-            else False
-        ),
-    ).model_dump(mode="python")
-    payload["clients"] = clients
+    # Memory Gateway owns the desired permissions for its managed client. A
+    # standalone quickstart may bootstrap the client with the exact eight
+    # defaults, but it must never rewrite an existing client's policy.
+    memory_client = provision_memory_gateway_client(config, existing_secrets)
+    if memory_client.created:
+        clients = dict(payload["clients"])
+        clients["memory-gateway"] = memory_client.client.model_dump(mode="python")
+        payload["clients"] = clients
 
-    memory_client_key = existing_secrets.get(client_secret_ref) or secrets.token_urlsafe(32)
+    client_secret_ref = memory_client.client.secret_ref
+    memory_client_key = memory_client.key
 
     # Single validation of the whole relationship graph before the sole write.
     validated = GatewayConfig.model_validate(payload)
-    client_token_bytes(
-        memory_client_key,
-        allow_legacy_weak=(
-            existing_client.allow_legacy_weak_secret
-            if existing_client is not None
-            else False
-        ),
-    )
     candidate_secrets = dict(existing_secrets)
     candidate_secrets[connection_secret_ref] = spec.api_key.strip()
     candidate_secrets[client_secret_ref] = memory_client_key
@@ -522,5 +487,5 @@ def apply_quickstart(paths: GatewayPaths, spec: QuickstartSpec) -> QuickstartRes
         embedding_deployment_id=embedding_deployment_id,
         embedding_space=resolved_embedding_space,
         embedding_dimensions=spec.embedding_dimensions if embedding_deployment_id else None,
-        created_memory_client=created_memory_client,
+        created_memory_client=memory_client.created,
     )

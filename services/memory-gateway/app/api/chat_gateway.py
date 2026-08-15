@@ -43,7 +43,7 @@ from app.memory.conversation_context import (
     safe_extraction_context,
 )
 from app.memory.ingest import MemoryIngestService
-from app.memory.models import MemoryRecord, RecentContextSummary
+from app.memory.models import MemoryIngestResult, MemoryRecord, RecentContextSummary
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.search import (
     ACTIVATION_LIMIT,
@@ -164,7 +164,6 @@ _TURN_SIDE_EFFECT_CACHE_MAX = 4096
 # ingest 则由 durable outbox 的终态负责跨重启幂等。
 _ACTIVATED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
 _RECENT_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
-_INGESTED_TURNS = _ExpiringState(max_entries=_TURN_SIDE_EFFECT_CACHE_MAX)
 _TOOL_REASONING = _ExpiringState(max_entries=256)
 _TURN_REASONING = _ExpiringState(max_entries=256)
 
@@ -173,7 +172,6 @@ def clear_chat_gateway_state() -> None:
     """Clear process-local turn caches; used by tests and application reloads."""
     _ACTIVATED_TURNS.clear()
     _RECENT_TURNS.clear()
-    _INGESTED_TURNS.clear()
     _TOOL_REASONING.clear()
     _TURN_REASONING.clear()
 
@@ -1546,6 +1544,13 @@ async def _finalize_turn(
     job_id = hashlib.sha256(
         f"ingest\0{user_id}\0{ingest_key}".encode("utf-8")
     ).hexdigest()
+    payload = {
+        "user_text": user_text,
+        "assistant_text": assistant_text,
+        "conversation_id": source_conversation_id,
+        "extraction_context": extraction_context,
+        "context_quote_source": context_quote_source,
+    }
     # Durable intent before claim/process so crash recovery can finish extract.
     try:
         store.enqueue_chat_finalize_job(
@@ -1553,29 +1558,67 @@ async def _finalize_turn(
             user_id=user_id,
             kind="ingest",
             claim_key=ingest_key,
-            payload={
-                "user_text": user_text,
-                "assistant_text": assistant_text,
-                "conversation_id": source_conversation_id,
-                "extraction_context": extraction_context,
-                "context_quote_source": context_quote_source,
-            },
+            payload=payload,
         )
     except Exception:
-        logger.exception("聊天网关无法写入 finalize outbox；继续尝试本轮提取。")
+        # If durability itself is unavailable, do exactly one best-effort pure
+        # ingest call. It must not attempt to mutate an outbox row that may not
+        # exist (the former fallback silently did so before ingesting).
+        logger.exception("聊天网关无法写入 finalize outbox；直接尝试本轮提取一次。")
+        try:
+            result = await _execute_ingest_payload(
+                store=store,
+                embedding_client=embedding_client,
+                llm_client=llm_client,
+                settings=settings,
+                user_id=user_id,
+                payload=payload,
+            )
+            if result.retryable:
+                logger.warning(
+                    "聊天网关 finalize outbox 不可用，直接提取返回可重试错误：%s",
+                    getattr(result, "reason", "") or "retryable_upstream",
+                )
+        except Exception:
+            logger.exception("聊天网关直接提取长期记忆失败；不影响聊天响应。")
+        return
     await _run_ingest_finalize_job(
         store=store,
         embedding_client=embedding_client,
         llm_client=llm_client,
         settings=settings,
         job_id=job_id,
+    )
+
+
+async def _execute_ingest_payload(
+    *,
+    store: MemoryStore,
+    embedding_client: EmbeddingClient,
+    llm_client: OpenAICompatibleClient,
+    settings: Settings,
+    user_id: str,
+    payload: dict[str, object],
+) -> MemoryIngestResult:
+    """Execute ingest without reading or mutating durable queue state."""
+
+    def optional_text(field_name: str) -> str | None:
+        value = payload.get(field_name)
+        return str(value) if value is not None else None
+
+    return await MemoryIngestService(
+        store=store,
+        embedding_client=embedding_client,
+        llm_client=llm_client,
+        allow_sensitive_egress=settings.allow_sensitive_egress,
+    ).ingest(
         user_id=user_id,
-        ingest_key=ingest_key,
-        user_text=user_text,
-        assistant_text=assistant_text,
-        conversation_id=source_conversation_id,
-        extraction_context=extraction_context,
-        context_quote_source=context_quote_source,
+        text=str(payload.get("user_text") or ""),
+        conversation_id=optional_text("conversation_id"),
+        assistant_message=str(payload.get("assistant_text") or ""),
+        conversation_context=optional_text("extraction_context"),
+        context_quote_source=optional_text("context_quote_source"),
+        source="chat_gateway",
     )
 
 
@@ -1585,71 +1628,87 @@ async def _run_ingest_finalize_job(
     embedding_client: EmbeddingClient,
     llm_client: OpenAICompatibleClient,
     settings: Settings,
-    job_id: str,
-    user_id: str,
-    ingest_key: str,
-    user_text: str,
-    assistant_text: str,
-    conversation_id: str | None,
-    extraction_context: str | None,
-    context_quote_source: str | None,
-) -> bool:
-    """Run one durable ingest job. Returns True when the job actually ran."""
-    if not _INGESTED_TURNS.claim(ingest_key, settings.chat_gateway_turn_ttl_seconds):
-        # 本轮正在本进程内执行；保持 job 现状，由崩溃恢复兜底。
-        return False
+    job_id: str | None = None,
+    exclude_job_ids: tuple[str, ...] = (),
+) -> str | None:
+    """Claim and run one durable ingest job, returning its id when executed."""
     try:
-        # Mark running only after winning the claim so a losing duplicate
-        # delivery never overwrites the winner's state, and never after the
-        # winner already marked the job done (guarded in the store).
-        marked = store.mark_chat_finalize_job(
+        job = store.claim_chat_finalize_job(
             job_id=job_id,
-            status="running",
-            bump_attempts=True,
+            exclude_job_ids=exclude_job_ids,
         )
-        if not marked:
-            # Job 已由早前的执行为 done（终态，崩溃重启后也不会回翻）；
-            # 保留 claim，本轮不再重复提取。
-            return False
     except Exception:
-        logger.exception("聊天网关无法标记 finalize job 为 running")
+        logger.exception("聊天网关无法领取 finalize job")
+        return None
+    if job is None:
+        return None
+
+    claimed_job_id = str(job["id"])
+    lease_token = str(job["lease_token"])
+    attempts = int(job.get("attempts") or 0)
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     try:
-        result = await MemoryIngestService(
+        result = await _execute_ingest_payload(
             store=store,
             embedding_client=embedding_client,
             llm_client=llm_client,
-            allow_sensitive_egress=settings.allow_sensitive_egress,
-        ).ingest(
-            user_id=user_id,
-            text=user_text,
-            conversation_id=conversation_id,
-            assistant_message=assistant_text,
-            conversation_context=extraction_context,
-            context_quote_source=context_quote_source,
-            source="chat_gateway",
+            settings=settings,
+            user_id=str(job.get("user_id") or "default"),
+            payload=payload,
         )
-        if result.retryable:
-            _INGESTED_TURNS.release(ingest_key)
-            store.mark_chat_finalize_job(
-                job_id=job_id,
-                status="pending",
-                last_error=result.reason or "retryable_upstream",
-            )
-            return True
-        store.mark_chat_finalize_job(job_id=job_id, status="done")
-        return True
     except Exception as exc:
-        _INGESTED_TURNS.release(ingest_key)
         try:
-            store.mark_chat_finalize_job(
-                job_id=job_id,
-                status="pending",
-                last_error=f"{type(exc).__name__}",
+            terminal = attempts >= 8
+            marked = store.mark_chat_finalize_job(
+                job_id=claimed_job_id,
+                lease_token=lease_token,
+                status="failed" if terminal else "pending",
+                last_error=(
+                    "max_attempts_exceeded"
+                    if terminal
+                    else type(exc).__name__
+                ),
             )
+            if not marked:
+                logger.warning(
+                    "聊天 finalize job %s 的 lease 已被替换，忽略异常回写。",
+                    claimed_job_id,
+                )
         except Exception:
             logger.exception("聊天网关无法回写 finalize job 状态")
         logger.exception("聊天网关后台提取长期记忆失败；不影响聊天响应。")
-        return True
+        return claimed_job_id
+
+    try:
+        if result.retryable:
+            terminal = attempts >= 8
+            marked = store.mark_chat_finalize_job(
+                job_id=claimed_job_id,
+                lease_token=lease_token,
+                status="failed" if terminal else "pending",
+                last_error=(
+                    "max_attempts_exceeded"
+                    if terminal
+                    else getattr(result, "reason", "") or "retryable_upstream"
+                ),
+            )
+        else:
+            marked = store.mark_chat_finalize_job(
+                job_id=claimed_job_id,
+                lease_token=lease_token,
+                status="done",
+            )
+        if not marked:
+            logger.warning(
+                "聊天 finalize job %s 的 lease 已被替换，忽略过期执行结果。",
+                claimed_job_id,
+            )
+    except Exception:
+        # Keep the row running until its lease expires. A transient state-write
+        # failure must not masquerade as an ingest failure or overwrite it with
+        # a second, weaker transition.
+        logger.exception("聊天网关无法回写 finalize job 执行结果")
+    return claimed_job_id
 
 
 async def recover_pending_chat_finalize_jobs(
@@ -1661,60 +1720,20 @@ async def recover_pending_chat_finalize_jobs(
     limit: int = 10,
 ) -> int:
     """Replay durable ingest jobs left pending after a crash or restart."""
-    try:
-        jobs = await anyio.to_thread.run_sync(
-            partial(
-                store.list_recoverable_chat_finalize_jobs,
-                limit=limit,
-                stale_running_seconds=120.0,
-            )
-        )
-    except Exception:
-        logger.exception("聊天网关读取 finalize outbox 失败")
-        return 0
     recovered = 0
-    for job in jobs:
-        if str(job.get("kind") or "") != "ingest":
-            continue
-        if int(job.get("attempts") or 0) >= 8:
-            try:
-                store.mark_chat_finalize_job(
-                    job_id=str(job["id"]),
-                    status="failed",
-                    last_error="max_attempts_exceeded",
-                )
-            except Exception:
-                logger.exception("无法将超次 finalize job 标记为 failed")
-            continue
-        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        executed = await _run_ingest_finalize_job(
+    attempted_ids: list[str] = []
+    for _ in range(max(1, min(int(limit), 100))):
+        executed_job_id = await _run_ingest_finalize_job(
             store=store,
             embedding_client=embedding_client,
             llm_client=llm_client,
             settings=settings,
-            job_id=str(job["id"]),
-            user_id=str(job.get("user_id") or "default"),
-            ingest_key=str(job.get("claim_key") or ""),
-            user_text=str(payload.get("user_text") or ""),
-            assistant_text=str(payload.get("assistant_text") or ""),
-            conversation_id=(
-                str(payload["conversation_id"])
-                if payload.get("conversation_id") is not None
-                else None
-            ),
-            extraction_context=(
-                str(payload["extraction_context"])
-                if payload.get("extraction_context") is not None
-                else None
-            ),
-            context_quote_source=(
-                str(payload["context_quote_source"])
-                if payload.get("context_quote_source") is not None
-                else None
-            ),
+            exclude_job_ids=tuple(attempted_ids),
         )
-        if executed:
-            recovered += 1
+        if executed_job_id is None:
+            break
+        attempted_ids.append(executed_job_id)
+        recovered += 1
     return recovered
 
 

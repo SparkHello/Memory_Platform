@@ -8,7 +8,12 @@ import httpx
 from fastapi.testclient import TestClient
 
 from model_gateway.service import create_app
-from model_gateway.config_store import load_config, read_secrets, write_config
+from model_gateway.config_store import (
+    load_config,
+    read_secrets,
+    write_config,
+    write_secrets,
+)
 
 from conftest import (
     ADMIN_CLIENT_TOKEN,
@@ -402,6 +407,133 @@ def test_service_returns_stable_422_when_capability_is_unavailable(gateway_home)
         "code": "model_gateway_capability_unavailable",
         "required_capabilities": ["json_schema"],
     }
+    assert upstream_calls == 0
+
+
+def test_service_skips_legacy_unsafe_target_before_provider_attempt(
+    gateway_home,
+) -> None:
+    config = load_config(gateway_home.config)
+    config.routes["memory.chat"].fallback_scope = "any_channel"
+    config.deployments["chat-official"].request_transform.force[
+        "tool_choice"
+    ] = "auto"
+    write_config(gateway_home.config, config)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert calls == ["reseller.example"]
+    assert response.headers["x-model-gateway-deployment"] == "chat-reseller"
+    assert response.headers["x-model-gateway-attempts"] == "1"
+
+
+def test_service_returns_stable_503_when_all_targets_have_unsafe_transforms(
+    gateway_home,
+) -> None:
+    config = load_config(gateway_home.config)
+    config.routes["memory.chat"].fallback_scope = "any_channel"
+    for deployment in config.deployments.values():
+        if deployment.kind == "chat":
+            deployment.request_transform.force["response_format"] = {
+                "type": "json_object"
+            }
+    write_config(gateway_home.config, config)
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": []},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "message": "网关目标配置无效；请运行 modelgw doctor 修复后重试",
+        "type": "model_gateway_configuration_invalid",
+        "code": "model_gateway_configuration_invalid",
+    }
+    assert response.headers["x-model-gateway-attempts"] == "0"
+    assert upstream_calls == 0
+
+
+def test_service_revalidates_named_adapter_final_payload_capabilities(
+    gateway_home,
+) -> None:
+    config = load_config(gateway_home.config)
+    config.routes["memory.chat"].required_capabilities = []
+    config.connections["official"].adapter = "deepseek"
+    deployment = config.deployments["chat-official"]
+    deployment.reasoning_default = "enabled"
+    deployment.capabilities.reasoning = False
+    write_config(gateway_home.config, config)
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": []},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == (
+        "model_gateway_configuration_invalid"
+    )
+    assert response.headers["x-model-gateway-attempts"] == "0"
+    assert upstream_calls == 0
+
+
+def test_service_returns_stable_503_for_legacy_invalid_provider_secret(
+    gateway_home,
+) -> None:
+    secrets = read_secrets(gateway_home.secrets)
+    secrets["UPSTREAM_OFFICIAL"] = "invalid provider secret"
+    write_secrets(gateway_home.secrets, secrets)
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={})
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": []},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == (
+        "model_gateway_configuration_invalid"
+    )
+    assert response.headers["x-model-gateway-attempts"] == "0"
     assert upstream_calls == 0
 
 

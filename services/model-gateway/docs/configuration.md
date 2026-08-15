@@ -52,12 +52,18 @@ modelgw --json schema
 ```bash
 modelgw client add memory-gateway \
   --kind backend \
-  --route 'memory.*' \
-  --route 'knowledge.*' \
+  --route memory.chat \
+  --route memory.extract \
+  --route memory.compact \
+  --route memory.core \
+  --route memory.review \
+  --route knowledge.fast \
+  --route knowledge.pro \
+  --route memory.embedding \
   --set-secret
 ```
 
-`--set-secret` 使用无回显输入。也可以先添加，再运行 `modelgw secret set memory-gateway`。
+`--set-secret` 使用无回显输入。也可以先添加，再运行 `modelgw secret set memory-gateway`。`--route` 支持 glob，但 `memory-gateway` 的通配权限仅用于用户明确决定的自定义策略，不是推荐默认值。
 
 schema v1 升级时，原有短 client key 会以显式 `allow_legacy_weak_secret=true` 兼容到完成轮换为止；`modelgw doctor` 只报告对应 client ID，不显示密钥。执行 `modelgw secret set CLIENT_ID` 写入合格新 token 后，会把兼容标记与密钥一起原子更新。schema v2 新 client 不使用隐式弱密钥回退。
 
@@ -125,7 +131,9 @@ DeepSeek V4 仍须在 deployment 上额外声明 `dashscope_deepseek_v4`，以�
 
 `tool_choice_with_reasoning` 在 provider 请求发出前校验推理与工具选择的组合，默认 `auto_only`：允许省略、`none` 或 `auto`，拒绝 `required` 和具体函数对象。`any` 明确允许全部选择；`none` 只允许省略或显式 `none`，连 `auto` 也拒绝。客户端显式关闭推理时不应用该限制。这个策略用于表达实际账号/模型端点的协议能力；adapter 不会为了让请求“看起来成功”而静默删除或改写 `tool_choice`。
 
-请求变换按 `remove`、`set_if_missing`、`force` 声明，并在 adapter 之后执行；它可用于某个账号或模型版本的已知差异，但不能触碰核心字段 `model`、`messages` 或 `input`。
+请求变换按 `remove`、`set_if_missing`、`force` 声明，并在 adapter 之后执行；它只用于某个账号或模型版本的非语义参数差异。自由变换不能触碰网关负责校验的字段：`model`、`messages`、`input`、`stream`、`dimensions`，推理字段 `thinking`、`enable_thinking`、`reasoning`、`reasoning_effort`，工具字段 `tools`、`functions`、`parallel_tool_calls`、`tool_choice`、`function_call`，以及 `response_format`。这些差异应通过明确的命名 adapter 和 deployment 能力表达。
+
+控制面会拒绝新增或修改上述保留字段；删除旧规则仍然允许。为便于升级修复，历史配置中此前可写入的保留字段仍可加载，`modelgw doctor` 会仅报告 deployment 与字段名，不显示 transform 值。数据面不会执行这类旧规则，而是跳过该 target。adapter 和安全 transform 执行后，网关会按最终 payload 再做一次能力校验；单个无效 target 可跳过，全部无效时在未请求 provider 的情况下返回 `503 model_gateway_configuration_invalid` 和 `X-Model-Gateway-Attempts: 0`。客户端原始请求本身能力不足仍返回 `422 model_gateway_capability_unavailable`。
 
 Embedding deployment 最终必须具有 `embedding_space` 和 `dimensions`。普通 quickstart、终端菜单、CLI deployment add 和管理 bundle 只需给出精确上游模型 ID 与维度；未显式覆盖时，网关按规范化渠道运营方、URL origin、精确模型 ID 和维度生成稳定、可打印且不跨渠道碰撞的空间 ID。`embedding_space` 显式值保留给确认过向量兼容性的专家迁移场景。
 

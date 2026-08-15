@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from dotenv import dotenv_values
 
+from model_gateway.auth import SecretSnapshotError, validate_secret_snapshot
 from model_gateway.models import GatewayConfig, validate_id
 from model_gateway.storage import ensure_write_capacity
 
@@ -27,6 +28,14 @@ class ConfigError(ValueError):
 
 class ConfigConflict(ConfigError):
     pass
+
+
+class ControlPlaneValidationError(ConfigError):
+    """A value-free candidate snapshot failure safe for CLI/API mapping."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        self.reason = reason
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,15 +289,24 @@ def commit_control_plane(
                 candidate_secrets.pop(name, None)
             else:
                 candidate_secrets[name] = value
-        # Recheck value-domain isolation inside the lock. A concurrent writer
-        # must not be able to race two individually valid client/provider
-        # updates into an ambiguous credential snapshot.
-        from model_gateway.auth import validate_secret_domains
-
-        validate_secret_domains(
-            config=candidate_config,
-            secrets=candidate_secrets,
+        _validate_request_transform_transition(
+            current=current_config,
+            candidate=candidate_config,
         )
+
+        # Validate the complete referenced credential snapshot inside the
+        # lock. A concurrent writer must not be able to race individually valid
+        # updates into an unsafe provider header or an ambiguous client domain.
+        try:
+            validate_secret_snapshot(
+                config=candidate_config,
+                secrets=candidate_secrets,
+            )
+        except SecretSnapshotError as exc:
+            raise ControlPlaneValidationError(
+                str(exc),
+                reason=exc.reason,
+            ) from exc
 
         # The transaction needs room for durable before-images, candidate
         # temporary files and its journal.  Refuse before creating any of them
@@ -346,6 +364,31 @@ def commit_control_plane(
             revision=configuration_revision(paths.config),
             config=committed,
             secrets=read_secrets(paths.secrets),
+        )
+
+
+def _validate_request_transform_transition(
+    *,
+    current: GatewayConfig,
+    candidate: GatewayConfig,
+) -> None:
+    """Allow legacy protected transforms only while their projection is unchanged."""
+
+    for deployment_id, deployment in candidate.deployments.items():
+        protected_fields = deployment.request_transform.protected_fields()
+        if not protected_fields:
+            continue
+        previous = current.deployments.get(deployment_id)
+        if previous is not None and (
+            previous.request_transform.protected_projection()
+            == deployment.request_transform.protected_projection()
+        ):
+            continue
+        raise ControlPlaneValidationError(
+            "deployment "
+            f"{deployment_id} 的 request_transform 不能新增或修改网关保留字段："
+            + ", ".join(protected_fields),
+            reason="request_transform_invalid",
         )
 
 

@@ -70,6 +70,65 @@ def test_cli_can_set_deployment_adapter_profile(tmp_path: Path, capsys) -> None:
     capsys.readouterr()
 
 
+def test_cli_rejects_protected_transform_but_allows_provider_parameter(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    home = tmp_path / "gateway-home"
+    assert run_cli(home, "init") == 0
+    assert (
+        run_cli(
+            home,
+            "connection",
+            "add",
+            "provider",
+            "--vendor",
+            "provider",
+            "--base-url",
+            "https://provider.example/v1",
+        )
+        == 0
+    )
+
+    assert (
+        run_cli(
+            home,
+            "deployment",
+            "add",
+            "unsafe-chat",
+            "--connection",
+            "provider",
+            "--model",
+            "chat-v1",
+            "--force-param",
+            'tool_choice="auto"',
+        )
+        == 2
+    )
+    assert "unsafe-chat" not in load_config(home / "config.json").deployments
+
+    assert (
+        run_cli(
+            home,
+            "deployment",
+            "add",
+            "safe-chat",
+            "--connection",
+            "provider",
+            "--model",
+            "chat-v1",
+            "--force-param",
+            "temperature=0.25",
+        )
+        == 0
+    )
+    transform = load_config(home / "config.json").deployments[
+        "safe-chat"
+    ].request_transform
+    assert transform.force == {"temperature": 0.25}
+    capsys.readouterr()
+
+
 def test_cli_derives_embedding_space_when_not_explicitly_overridden(
     tmp_path: Path,
     capsys,
@@ -408,6 +467,32 @@ def test_doctor_warns_for_migrated_weak_client_and_rotation_clears_override(
     config = load_config(paths.config)
     assert config.clients["memory-gateway"].allow_legacy_weak_secret is False
     assert read_secrets(paths.secrets)["CLIENT_MEMORY_GATEWAY"] == STRONG_LOCAL_TOKEN
+
+
+def test_doctor_warns_for_legacy_protected_transform_without_leaking_value(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from conftest import config_payload
+    from model_gateway.config_store import write_config
+    from model_gateway.models import GatewayConfig
+
+    home = tmp_path / "gateway-home"
+    paths = gateway_paths(home)
+    assert run_cli(home, "init") == 0
+    payload = config_payload()
+    marker = "legacy-transform-sensitive-marker"
+    payload["deployments"]["chat-official"]["request_transform"] = {
+        "force": {"tool_choice": marker}
+    }
+    write_config(paths.config, GatewayConfig.model_validate(payload))
+
+    assert run_cli(home, "doctor") == 0
+    output = capsys.readouterr().out
+    assert "request_transform_safety" in output
+    assert "chat-official" in output
+    assert "tool_choice" in output
+    assert marker not in output
 
 
 def test_serve_container_network_requires_exact_explicit_host(

@@ -134,13 +134,19 @@ python3.12 -m venv .venv
 .venv/bin/modelgw install-path
 ```
 
-按 [Model Gateway README](../model-gateway/README.md) 添加 connection、deployment 和八条 `memory.*` / `knowledge.*` route，然后创建只允许这些 route 的 backend client，并启动服务：
+按 [Model Gateway README](../model-gateway/README.md) 添加 connection、deployment 和八条精确的 Memory/Knowledge route，然后创建只允许这些 route 的 backend client，并启动服务：
 
 ```bash
 modelgw client add memory-gateway \
   --kind backend \
-  --route 'memory.*' \
-  --route 'knowledge.*' \
+  --route memory.chat \
+  --route memory.extract \
+  --route memory.compact \
+  --route memory.core \
+  --route memory.review \
+  --route knowledge.fast \
+  --route knowledge.pro \
+  --route memory.embedding \
   --set-secret
 modelgw doctor
 modelgw start

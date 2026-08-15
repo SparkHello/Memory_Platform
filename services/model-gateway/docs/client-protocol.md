@@ -126,11 +126,12 @@ X-Model-Gateway-Reasoning-Origin-Deployment: chat-primary
 1. 深拷贝客户端 payload，并把 route 名换成 `upstream_model`；
 2. 如果 reasoning origin 与实际 target 不同，清理 assistant 私有 reasoning；
 3. 运行显式 deployment `adapter_profile`，否则运行 connection 的 `generic`/`kimi`/`deepseek`/`mimo`/`dashscope_openai` adapter；
-4. 应用 deployment 的 `remove`、`set_if_missing`、`force` 变换。
+4. 应用不触碰网关保留语义字段的 deployment `remove`、`set_if_missing`、`force` 变换；
+5. 从最终 payload 重新推导能力要求，只把满足要求且密钥可安全写入上游 Header 的 target 交给代理发送。
 
 命名 adapter 判断推理设置时，客户端显式 `thinking.type` 优先于 `reasoning_effort`，二者都缺失时才使用 deployment 的 `reasoning_default`。`generic` 不解释推理字段，保持客户端协议。
 
-adapter 只修改已明确实现的请求兼容字段；它不会重新构造成功响应。
+adapter 只修改已明确实现的请求兼容字段；它不会重新构造成功响应。历史配置中的不安全自由变换可加载以便 `doctor` 定位和删除，但对应 target 不会收到请求；所有 target 都因本地配置无效被排除时返回 `503 model_gateway_configuration_invalid`，且 provider 尝试数为零。
 
 ## 透明响应与流式边界
 

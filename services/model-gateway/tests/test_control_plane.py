@@ -17,6 +17,7 @@ from conftest import (
 import model_gateway.config_store as config_store
 from model_gateway.config_store import (
     ConfigConflict,
+    ControlPlaneValidationError,
     commit_control_plane,
     configuration_revision,
     gateway_paths,
@@ -25,6 +26,7 @@ from model_gateway.config_store import (
     read_secrets,
     recover_control_plane,
     source_revision,
+    write_config,
     write_secrets,
 )
 from model_gateway.models import GatewayConfig, RouteConfig, derive_embedding_space
@@ -266,6 +268,108 @@ def test_committed_cleanup_fsyncs_external_secret_store_directory(
     assert external_secrets.parent in fsynced
     assert paths.home in fsynced
     assert not list(external_secrets.parent.glob(".*.txn-*.before"))
+
+
+@pytest.mark.parametrize("group", ["remove", "set_if_missing", "force"])
+def test_control_plane_rejects_new_protected_request_transform_atomically(
+    tmp_path: Path,
+    group: str,
+) -> None:
+    paths = gateway_paths(tmp_path / "home")
+    initialize(paths)
+    original = GatewayConfig.model_validate(config_payload())
+    write_config(paths.config, original)
+    before = paths.config.read_bytes()
+    payload = original.model_dump(mode="python", exclude_none=False)
+    value = ["tool_choice"] if group == "remove" else {"tool_choice": "auto"}
+    payload["deployments"]["chat-official"]["request_transform"][group] = value
+    candidate = GatewayConfig.model_validate(payload)
+
+    with pytest.raises(ControlPlaneValidationError) as caught:
+        commit_control_plane(
+            paths,
+            expected_revision=source_revision(original, paths.config),
+            config=candidate,
+        )
+
+    assert caught.value.reason == "request_transform_invalid"
+    assert paths.config.read_bytes() == before
+    assert not paths.journal.exists()
+
+
+def test_control_plane_preserves_but_cannot_modify_legacy_protected_transform(
+    tmp_path: Path,
+) -> None:
+    paths = gateway_paths(tmp_path / "home")
+    initialize(paths)
+    payload = config_payload()
+    payload["deployments"]["chat-official"]["request_transform"] = {
+        "force": {"tool_choice": "auto"}
+    }
+    legacy = GatewayConfig.model_validate(payload)
+    write_config(paths.config, legacy)
+
+    unchanged_payload = legacy.model_dump(mode="python", exclude_none=False)
+    unchanged_payload["server"]["port"] = 2099
+    unchanged = GatewayConfig.model_validate(unchanged_payload)
+    committed = commit_control_plane(
+        paths,
+        expected_revision=source_revision(legacy, paths.config),
+        config=unchanged,
+    )
+    assert committed.config.server.port == 2099
+
+    changed_payload = committed.config.model_dump(mode="python", exclude_none=False)
+    changed_payload["deployments"]["chat-official"]["request_transform"][
+        "force"
+    ]["tool_choice"] = "required"
+    changed = GatewayConfig.model_validate(changed_payload)
+    with pytest.raises(ControlPlaneValidationError) as caught:
+        commit_control_plane(
+            paths,
+            expected_revision=committed.revision,
+            config=changed,
+        )
+    assert caught.value.reason == "request_transform_invalid"
+
+    repaired_payload = committed.config.model_dump(mode="python", exclude_none=False)
+    repaired_payload["deployments"]["chat-official"]["request_transform"] = {}
+    repaired = GatewayConfig.model_validate(repaired_payload)
+    repaired_commit = commit_control_plane(
+        paths,
+        expected_revision=committed.revision,
+        config=repaired,
+    )
+    assert (
+        repaired_commit.config.deployments[
+            "chat-official"
+        ].request_transform.protected_fields()
+        == ()
+    )
+
+
+def test_control_plane_rejects_referenced_invalid_provider_secret_before_writes(
+    tmp_path: Path,
+) -> None:
+    paths = gateway_paths(tmp_path / "home")
+    initialize(paths)
+    original = GatewayConfig.model_validate(config_payload())
+    write_config(paths.config, original)
+    write_secrets(paths.secrets, {"UPSTREAM_OFFICIAL": "valid-provider-secret"})
+    config_before = paths.config.read_bytes()
+    secrets_before = paths.secrets.read_bytes()
+
+    with pytest.raises(ControlPlaneValidationError) as caught:
+        commit_control_plane(
+            paths,
+            expected_revision=source_revision(original, paths.config),
+            secret_updates={"UPSTREAM_OFFICIAL": "invalid\r\nheader"},
+        )
+
+    assert caught.value.reason == "provider_secret_invalid"
+    assert paths.config.read_bytes() == config_before
+    assert paths.secrets.read_bytes() == secrets_before
+    assert not paths.journal.exists()
 
 
 def test_channel_bundle_validates_key_then_commits_atomically(gateway_home) -> None:
@@ -607,6 +711,25 @@ def test_ready_requires_a_routable_configured_provider(tmp_path: Path, gateway_h
         )
         response = client.get("/readyz")
         assert response.status_code == 503
+
+
+def test_ready_ignores_targets_with_legacy_protected_transform(gateway_home) -> None:
+    config = load_config(gateway_home.config)
+    for deployment in config.deployments.values():
+        deployment.request_transform.force["tool_choice"] = "auto"
+    write_config(gateway_home.config, config)
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == (
+        "no_enabled_route_with_configured_provider"
+    )
 
 
 def test_ready_fails_closed_when_disk_config_reload_is_broken(gateway_home) -> None:

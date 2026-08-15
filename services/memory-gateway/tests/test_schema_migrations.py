@@ -8,6 +8,7 @@
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 import json
 import multiprocessing
 from queue import Empty
@@ -21,7 +22,7 @@ from app.memory.store import MemoryStore
 from app.schema_migrations import enable_wal_with_retry
 
 
-_LATEST_MEMORY_SCHEMA_VERSION = 6
+_LATEST_MEMORY_SCHEMA_VERSION = 7
 
 
 def _initialize_memory_store_in_process(db_path: str, start, results) -> None:
@@ -88,6 +89,163 @@ class TestMemorySchemaMigrations:
         assert memory is None
         rows = store.list_memories(user_id="default")
         assert len(rows) == 1
+
+    def test_v6_finalize_jobs_migrate_to_leases_and_privacy_bounds(
+        self,
+        tmp_path,
+    ) -> None:
+        db_path = str(tmp_path / "v6-finalize.db")
+        store = MemoryStore(db_path)
+        now = datetime.now(UTC)
+        current = now.isoformat()
+        old = (now - timedelta(hours=25)).isoformat()
+        with store._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE chat_finalize_jobs (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    claim_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending', 'running', 'done', 'failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(kind, claim_key)
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO chat_finalize_jobs (
+                    id, user_id, kind, claim_key, payload_json, status,
+                    attempts, last_error, created_at, updated_at
+                ) VALUES (?, ?, 'ingest', ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                [
+                    (
+                        "done-with-text",
+                        "alice",
+                        "done-claim",
+                        '{"user_text":"private done text"}',
+                        "done",
+                        1,
+                        current,
+                        current,
+                    ),
+                    (
+                        "failed-with-text",
+                        "alice",
+                        "failed-claim",
+                        '{"user_text":"private failed text"}',
+                        "failed",
+                        12,
+                        current,
+                        current,
+                    ),
+                    (
+                        "pending-keep",
+                        "alice",
+                        "pending-claim",
+                        '{"user_text":"retry me"}',
+                        "pending",
+                        1,
+                        current,
+                        current,
+                    ),
+                    (
+                        "attempt-limit",
+                        "alice",
+                        "attempt-claim",
+                        '{"user_text":"too many"}',
+                        "pending",
+                        8,
+                        current,
+                        current,
+                    ),
+                    (
+                        "too-old",
+                        "alice",
+                        "old-claim",
+                        '{"user_text":"too old"}',
+                        "running",
+                        1,
+                        old,
+                        old,
+                    ),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO chat_finalize_jobs (
+                    id, user_id, kind, claim_key, payload_json, status,
+                    attempts, last_error, created_at, updated_at
+                ) VALUES (?, 'bounded', 'ingest', ?, ?, 'pending', 0, NULL, ?, ?)
+                """,
+                [
+                    (
+                        f"bounded-{index:03d}",
+                        f"bounded-claim-{index:03d}",
+                        '{"user_text":"bounded private text"}',
+                        current,
+                        current,
+                    )
+                    for index in range(101)
+                ],
+            )
+            connection.execute("PRAGMA user_version = 6")
+
+        store.init_db()
+
+        assert _user_version(db_path) == 7
+        with store._connect() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(chat_finalize_jobs)"
+                ).fetchall()
+            }
+            assert {"lease_token", "lease_expires_at"}.issubset(columns)
+            rows = {
+                str(row["id"]): row
+                for row in connection.execute(
+                    """
+                    SELECT id, status, payload_json, last_error, attempts
+                    FROM chat_finalize_jobs
+                    WHERE user_id = 'alice'
+                    """
+                ).fetchall()
+            }
+            live_bounded = connection.execute(
+                """
+                SELECT COUNT(*) FROM chat_finalize_jobs
+                WHERE user_id = 'bounded' AND status IN ('pending', 'running')
+                """
+            ).fetchone()[0]
+            overflow = connection.execute(
+                """
+                SELECT status, payload_json, last_error
+                FROM chat_finalize_jobs
+                WHERE user_id = 'bounded' AND status = 'failed'
+                """
+            ).fetchall()
+
+        assert rows["done-with-text"]["payload_json"] == ""
+        assert rows["failed-with-text"]["payload_json"] == ""
+        assert rows["failed-with-text"]["attempts"] == 8
+        assert rows["pending-keep"]["status"] == "pending"
+        assert rows["pending-keep"]["payload_json"]
+        assert rows["attempt-limit"]["status"] == "failed"
+        assert rows["attempt-limit"]["payload_json"] == ""
+        assert rows["too-old"]["status"] == "failed"
+        assert rows["too-old"]["payload_json"] == ""
+        assert live_bounded == 100
+        assert len(overflow) == 1
+        assert overflow[0]["payload_json"] == ""
+        assert overflow[0]["last_error"] == "queue_limit_exceeded"
 
     def test_concurrent_fresh_database_initialization_is_serialized(self, tmp_path) -> None:
         db_path = str(tmp_path / "concurrent-memory.db")
@@ -212,7 +370,7 @@ class TestMemorySchemaMigrations:
         assert memory.embedding_space_id is None  # 旧向量不按当前配置猜空间
 
     def test_already_migrated_database_does_not_rerun_migration(self, tmp_path) -> None:
-        """v1 老库只运行新增的 v2/v3/v4，不重跑历史迁移。"""
+        """v1 老库只运行后续迁移，不重跑历史迁移。"""
         db_path = tmp_path / "locked-memory.db"
         legacy = MemoryStore(str(db_path))
         with legacy._connect() as connection:
@@ -236,7 +394,7 @@ class TestMemorySchemaMigrations:
             )
             connection.execute("PRAGMA user_version = 1")
 
-        # 只运行 v2/v3/v4：应补空间、revision 和 claim 表，但不重跑 v1。
+        # 只运行 v2-v7：应补空间、revision 和 claim/outbox 表，但不重跑 v1。
         with MemoryStore(str(db_path))._connect() as connection:
             MemoryStore._run_migrations(connection)
             assert (
