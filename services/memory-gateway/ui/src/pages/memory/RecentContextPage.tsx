@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   ChevronDown,
@@ -9,10 +9,11 @@ import {
   Search,
   Trash2
 } from "lucide-react";
-import { MemoryApi, isAbortError } from "../../api";
+import { MemoryApi } from "../../api";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import { PageHeader } from "../../components/PageHeader";
 import type { ConfirmFn } from "../../hooks/useConfirm";
+import { useAsyncData } from "../../hooks/useAsyncData";
 import type {
   ConversationBranchList,
   ConversationBranchNode,
@@ -24,12 +25,6 @@ import type { Notify } from "../pageTypes";
 type ContextData = {
   branches: ConversationBranchList;
   summaries: RecentContextSummary[];
-};
-
-type ContextState = {
-  loading: boolean;
-  error: string | null;
-  data: ContextData | null;
 };
 
 type ContextTab = "branches" | "summaries";
@@ -51,11 +46,6 @@ export function RecentContextPage({
   notify: Notify;
   confirm: ConfirmFn;
 }) {
-  const [state, setState] = useState<ContextState>({
-    loading: true,
-    error: null,
-    data: null
-  });
   const [tab, setTab] = useState<ContextTab>("branches");
   const [branchStatus, setBranchStatus] = useState<BranchStatus>("active");
   const [query, setQuery] = useState("");
@@ -63,35 +53,29 @@ export function RecentContextPage({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [mutatingId, setMutatingId] = useState<string | null>(null);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setState((current) => ({ ...current, loading: true, error: null }));
-    try {
+  const { state, reload: load } = useAsyncData<ContextData>(
+    async (signal) => {
       const [branches, summaries] = await Promise.all([
         api.conversationBranches(limit, branchStatus, signal),
         api.recentContext(signal)
       ]);
-      setState({ loading: false, error: null, data: { branches, summaries } });
-      setExpanded((current) => {
-        const loadedIds = new Set(branches.data.map((node) => node.id));
-        const retained = new Set([...current].filter((id) => loadedIds.has(id)));
-        if (retained.size > 0 || branches.data.length === 0) return retained;
-        return newestBranchPath(branches.data);
-      });
-    } catch (error) {
-      if (isAbortError(error)) return;
-      setState((current) => ({
-        loading: false,
-        error: errorMessage(error),
-        data: current.data
-      }));
-    }
-  }, [api, branchStatus, limit]);
+      return { branches, summaries };
+    },
+    [api, branchStatus, limit],
+    { keepPreviousData: true }
+  );
 
+  // 每次成功加载后收敛展开集：保留仍然存在的节点，全空时默认展开最新路径。
+  const loadedBranches = state.data?.branches;
   useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+    if (!loadedBranches) return;
+    setExpanded((current) => {
+      const loadedIds = new Set(loadedBranches.data.map((node) => node.id));
+      const retained = new Set([...current].filter((id) => loadedIds.has(id)));
+      if (retained.size > 0 || loadedBranches.data.length === 0) return retained;
+      return newestBranchPath(loadedBranches.data);
+    });
+  }, [loadedBranches]);
 
   const allNodes = state.data?.branches.data || [];
   const visibleNodes = useMemo(

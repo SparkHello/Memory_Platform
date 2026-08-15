@@ -38,9 +38,9 @@ import type {
 import { errorMessage } from "../../utils/format";
 import { isProviderSetupReady } from "../../utils/providerSetup";
 import { AddChannelModelPanel } from "./AddChannelModelPanel";
-import { NewChannelWizard, ROUTE_LABELS } from "./NewChannelWizard";
+import { NewChannelWizard } from "./NewChannelWizard";
+import { ROUTE_LABELS, type ProviderFeedback } from "./providerShared";
 
-type Feedback = { tone: "success" | "warning" | "error"; message: string };
 type ConnectionCheckState = "checking" | ModelGatewayConnectionCheck;
 
 export function ProvidersPage({
@@ -65,7 +65,7 @@ export function ProvidersPage({
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [checks, setChecks] = useState<Record<string, ConnectionCheckState>>({});
   const [busyAction, setBusyAction] = useState("");
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [feedback, setFeedback] = useState<ProviderFeedback | null>(null);
   const [validatedSignature, setValidatedSignature] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [addModelConnectionId, setAddModelConnectionId] = useState("");

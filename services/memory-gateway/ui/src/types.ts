@@ -257,11 +257,6 @@ export interface MemorySpace {
   last_memory_updated_at?: string | null;
 }
 
-export interface MemorySpaceDetail {
-  space: MemorySpace;
-  memories: MemoryRecord[];
-}
-
 export interface MemoryUpdateResult {
   updated: boolean;
   memory?: MemoryRecord;
@@ -319,18 +314,6 @@ export interface CoreMemorySection {
   created_at: string;
   updated_at: string;
   revision: number;
-}
-
-export interface CoreMemoryUpdatePayload {
-  content?: string;
-  evidence_memory_ids?: string[];
-  confidence?: number;
-}
-
-export interface CoreMemoryUpdateResult {
-  updated: boolean;
-  action: "create" | "update" | "ignore";
-  core_memory: CoreMemorySection;
 }
 
 export interface CoreMemoryHistoryItem extends CoreMemorySection {
@@ -1058,13 +1041,9 @@ export interface ProviderModelInfo {
 export interface ProviderInfo {
   id: string;
   name: string;
-  protocol: string;
   api_host: string;
-  api_key_env: string;
-  legacy_api_key_envs: string[];
   configured: boolean;
   models: ProviderModelInfo[];
-  urls: { website?: string; api_key?: string; docs?: string };
 }
 
 export interface RouteTargetInfo {
@@ -1081,7 +1060,6 @@ export interface RouteInfo {
   description: string;
   targets: RouteTargetInfo[];
   usable: boolean;
-  migrated: boolean;
 }
 
 export interface ModelGatewayConnectionInfo {
@@ -1267,21 +1245,6 @@ export interface ModelGatewayCapabilityProbeResult {
   note?: string;
 }
 
-export interface ModelGatewayConnectionCreateResult {
-  valid: boolean;
-  applied: boolean;
-  connection_id: string;
-  revision: string;
-}
-
-export interface ModelGatewayConnectionCreateBody {
-  revision: string;
-  channel_operator: string;
-  adapter: string;
-  base_url: string;
-  dry_run?: boolean;
-}
-
 export interface ModelGatewayDeploymentDraftInput {
   id?: string;
   upstream_model: string;
@@ -1378,10 +1341,8 @@ export interface ProvidersStatus {
   runtime: {
     model_gateway_enabled: boolean;
     model_gateway_base_url: string;
-    chat_source: "model_gateway" | "legacy_direct";
+    chat_source: "model_gateway" | "unavailable";
     knowledge_source: string;
-    providers_path: string;
-    routes_path: string;
   };
   embedding: {
     model: string;

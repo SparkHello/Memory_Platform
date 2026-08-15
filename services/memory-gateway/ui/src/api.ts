@@ -8,8 +8,6 @@ import type {
   ConversationBranchRestoreResult,
   CoreMemoryHistoryItem,
   CoreMemorySection,
-  CoreMemoryUpdatePayload,
-  CoreMemoryUpdateResult,
   DecisionLog,
   MemoryExport,
   ModelUsageSummary,
@@ -20,8 +18,6 @@ import type {
   ModelGatewayCapabilityProbeResult,
   ModelGatewayChannelBundleBody,
   ModelGatewayConnectionCheck,
-  ModelGatewayConnectionCreateBody,
-  ModelGatewayConnectionCreateResult,
   ModelGatewayControlSnapshot,
   ModelGatewayDeploymentApplyBody,
   ModelGatewayDeploymentApplyResult,
@@ -42,7 +38,6 @@ import type {
   MemorySearchRecord,
   MemorySourceExplanation,
   MemorySpace,
-  MemorySpaceDetail,
   MemorySpacesUpdatePayload,
   MemorySurfaceRecord,
   MemoryUpdatePayload,
@@ -387,19 +382,6 @@ export class MemoryApi {
         timeoutMessage: "渠道检查超时，请确认 Model Gateway 和供应商服务可访问"
       }
     );
-  }
-
-  async createProviderConnection(
-    body: ModelGatewayConnectionCreateBody,
-    adminKey: string,
-    signal?: AbortSignal
-  ): Promise<ModelGatewayConnectionCreateResult> {
-    return this.request("/providers/connections", {
-      method: "POST",
-      body,
-      headers: { "X-Model-Gateway-Admin-Key": adminKey },
-      signal
-    });
   }
 
   async applyProviderDeployments(
@@ -751,19 +733,6 @@ export class MemoryApi {
       method: "DELETE",
       signal
     });
-  }
-
-  async memorySpace(
-    spaceId: string,
-    options: RedactionOptions = {},
-    signal?: AbortSignal
-  ): Promise<MemorySpaceDetail> {
-    return this.request(
-      `/memories/spaces/${encodeURIComponent(spaceId)}?limit=1000${redactionSuffix(
-        options.redactSensitive
-      )}`,
-      { signal }
-    );
   }
 
   async searchMemories(
@@ -1179,30 +1148,6 @@ export class MemoryApi {
     return payload.data || [];
   }
 
-  async getCoreMemorySection(
-    section: CoreMemorySection["section"],
-    signal?: AbortSignal
-  ): Promise<CoreMemorySection> {
-    const payload = await this.request<{ core_memory: CoreMemorySection }>(
-      `/memories/core/${encodeURIComponent(section)}`,
-      { signal }
-    );
-    return payload.core_memory;
-  }
-
-  async updateCoreMemorySection(
-    section: CoreMemorySection["section"],
-    payload: CoreMemoryUpdatePayload,
-    expectedRevision: number,
-    signal?: AbortSignal
-  ): Promise<CoreMemoryUpdateResult> {
-    return this.request(`/memories/core/${encodeURIComponent(section)}`, {
-      method: "PATCH",
-      body: { ...payload, expected_revision: expectedRevision },
-      signal
-    });
-  }
-
   async coreHistory(signal?: AbortSignal): Promise<CoreMemoryHistoryItem[]> {
     const payload = await this.request<{ data: CoreMemoryHistoryItem[] }>(
       "/memories/core/history?limit=200",
@@ -1395,17 +1340,6 @@ export class MemoryApi {
         severity: options.severity || undefined,
         review_after: options.reviewAfter || undefined,
         content: options.content || undefined
-      },
-      signal
-    });
-  }
-
-  async mergeMemories(memoryIds: string[], content?: string | null, signal?: AbortSignal): Promise<unknown> {
-    return this.request("/memories/merge", {
-      method: "POST",
-      body: {
-        memory_ids: memoryIds,
-        content: content || undefined
       },
       signal
     });

@@ -9,7 +9,7 @@ import {
   TriangleAlert,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MemoryApi } from "../../api";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import { loadSettings } from "../../storage";
@@ -30,30 +30,8 @@ import { copyText } from "../../utils/files";
 import { channelUrlKey, distinctEmbeddingBaseUrl } from "../../utils/channelUrl";
 import { filterDiscoveredChatModels } from "../../utils/discoveredModels";
 import { errorMessage } from "../../utils/format";
+import { CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./providerShared";
 
-type Feedback = { tone: "success" | "warning" | "error"; message: string };
-
-export const ROUTE_LABELS: Record<string, string> = {
-  "memory.chat": "日常聊天",
-  "memory.extract": "提取长期记忆",
-  "memory.compact": "压缩对话上下文",
-  "memory.core": "整理核心记忆",
-  "memory.review": "记忆体检",
-  "knowledge.fast": "快速知识检索",
-  "knowledge.pro": "深度知识检索",
-  "memory.embedding": "语义搜索",
-  "pricing.research": "价格信息研究"
-};
-
-export const CHAT_ROUTE_IDS = [
-  "memory.chat",
-  "memory.extract",
-  "memory.compact",
-  "memory.core",
-  "memory.review",
-  "knowledge.fast",
-  "knowledge.pro"
-] as const;
 const EMBEDDING_ROUTE_ID = "memory.embedding";
 
 const CHANNEL_PRESETS = [
@@ -136,18 +114,6 @@ const PLAN_OPTIONS: Array<{ value: ModelGatewayPlan; label: string }> = [
   { value: "coding_plan", label: "Coding Plan（自管）" },
   { value: "direct_tool_only", label: "仅官方工具直连" },
   { value: "custom", label: "自定义" }
-];
-
-const CAPABILITY_OPTIONS: Array<{
-  key: keyof ModelGatewayCapabilities;
-  label: string;
-}> = [
-  { key: "tools", label: "工具调用 tools" },
-  { key: "parallel_tools", label: "并行工具 parallel_tools" },
-  { key: "reasoning", label: "推理 reasoning" },
-  { key: "multimodal_input", label: "多模态输入 multimodal_input" },
-  { key: "json_object", label: "JSON 对象 json_object" },
-  { key: "json_schema", label: "JSON Schema json_schema" }
 ];
 
 /** Clash/Surge TUN fake-ip range; only applied when the user opts in. */
@@ -281,10 +247,11 @@ export function NewChannelWizard({
   const [embeddingSpace, setEmbeddingSpace] = useState("");
   const [embeddingSpaceEdited, setEmbeddingSpaceEdited] = useState(false);
   const [embeddingRouteOperation, setEmbeddingRouteOperation] = useState<ModelGatewayRouteOperation>("keep");
-  const [validated, setValidated] = useState(false);
+  const [validatedSignature, setValidatedSignature] = useState<string | null>(null);
+  const [discoverySignature, setDiscoverySignature] = useState<string | null>(null);
   const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply" | "probe">("");
   const [probeNote, setProbeNote] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [feedback, setFeedbackState] = useState<ProviderFeedback | null>(null);
   const [done, setDone] = useState(false);
   const [appliedSummary, setAppliedSummary] = useState({ deployments: 0, routes: 0 });
   /** One-time chat token minted after successful apply; never Console key. */
@@ -295,13 +262,26 @@ export function NewChannelWizard({
   const [showClientToken, setShowClientToken] = useState(false);
   const [clientTokenCopied, setClientTokenCopied] = useState(false);
 
+  // discovery 的有效性由输入签名派生：签名与发起发现时不同即视为过期，
+  // 等价于原来在每个字段 onChange 里手动 setDiscovery(null)。
+  const discoveryInputsSignature = JSON.stringify({
+    channel_operator: operator.trim(),
+    base_url: baseUrl.trim(),
+    adapter,
+    auth_type: authType,
+    allowed_private_networks: parseCidrList(allowedPrivateNetworks),
+    candidate_key: apiKey.trim()
+  });
+  const discoveryStale = discovery !== null && discoverySignature !== discoveryInputsSignature;
+  const effectiveDiscovery = discoveryStale ? null : discovery;
+
   const hasAdminKey = Boolean(adminKey.trim());
-  const models = discovery?.models || [];
+  const models = effectiveDiscovery?.models || [];
   const visibleChatModels = useMemo(
     () => filterDiscoveredChatModels(models, chatModelQuery),
     [models, chatModelQuery]
   );
-  const discoveryCheck = discovery?.report.connections[0];
+  const discoveryCheck = effectiveDiscovery?.report.connections[0];
   const canAssignBackendRoutes = usageScope === "backend_allowed";
   const embeddingRoute = control.routes.find((route) => route.id === EMBEDDING_ROUTE_ID);
   const currentEmbedding = embeddingRoute?.targets[0]
@@ -323,16 +303,13 @@ export function NewChannelWizard({
     [control.routes]
   );
 
-  const invalidateBundle = () => {
-    setValidated(false);
-    setFeedback(null);
-  };
-
-  const invalidateDiscovery = () => {
-    setDiscovery(null);
-    setChatModel("");
-    invalidateBundle();
-  };
+  // 反馈只经由带序号的 setter 写入；字段改动（签名变化）且期间没有流程写过反馈时，
+  // 由 buildBundle 下方的签名 effect 统一清掉过期提示，代替过去每个 onChange 里的手动 invalidate。
+  const feedbackSeqRef = useRef(0);
+  const setFeedback = useCallback((value: ProviderFeedback | null) => {
+    feedbackSeqRef.current += 1;
+    setFeedbackState(value);
+  }, []);
 
   const selectPreset = (id: PresetId) => {
     setPreset(id);
@@ -355,7 +332,6 @@ export function NewChannelWizard({
         setAuthType(found.auth_type);
       }
     }
-    invalidateDiscovery();
   };
 
   const toggleCapability = (key: keyof ModelGatewayCapabilities, checked: boolean) => {
@@ -365,7 +341,6 @@ export function NewChannelWizard({
       if (key === "tools" && !checked) next.parallel_tools = false;
       return next;
     });
-    invalidateBundle();
   };
 
   const refreshSuggestedSpace = (
@@ -380,41 +355,37 @@ export function NewChannelWizard({
   const updateEmbeddingModel = (value: string) => {
     setEmbeddingModel(value);
     refreshSuggestedSpace(value);
-    invalidateBundle();
   };
 
   const updateEmbeddingDimensions = (value: string) => {
     setEmbeddingDimensions(value);
     refreshSuggestedSpace(embeddingModel, value);
-    invalidateBundle();
   };
 
   const updateEmbeddingBaseUrl = (value: string) => {
     setEmbeddingBaseUrl(value);
     setEmbeddingBaseUrlEdited(true);
     refreshSuggestedSpace(embeddingModel, embeddingDimensions, value);
-    invalidateBundle();
   };
 
+  const keepFeedbackRef = useRef(false);
   const setFakeIpEnabled = (enabled: boolean) => {
     const current = parseCidrList(allowedPrivateNetworks).filter(
       (item) => item !== FAKE_IP_CIDR
     );
+    // 发现失败的错误文案本身在引导用户勾选此项后重试，所以这次失效保留该提示。
+    keepFeedbackRef.current = true;
     if (enabled) {
       setAllowedPrivateNetworks(joinCidrList([...current, FAKE_IP_CIDR]));
     } else {
       setAllowedPrivateNetworks(joinCidrList(current));
     }
-    setDiscovery(null);
-    setChatModel("");
-    setValidated(false);
   };
 
   const discover = async () => {
     if (!hasAdminKey || busy || !operator.trim() || !baseUrl.trim() || !apiKey.trim()) return;
     setBusy("discover");
     setFeedback(null);
-    setValidated(false);
     try {
       const result = await api.discoverProviderChannel(
         {
@@ -433,6 +404,7 @@ export function NewChannelWizard({
         throw new Error("模型发现响应没有确认零落盘，已停止后续配置");
       }
       setDiscovery(result);
+      setDiscoverySignature(discoveryInputsSignature);
       setShowFakeIpOptIn(false);
       setChatModelQuery("");
       const chatIds = filterDiscoveredChatModels(result.models).map((model) => model.id);
@@ -445,6 +417,7 @@ export function NewChannelWizard({
       });
     } catch (cause) {
       setDiscovery(null);
+      setDiscoverySignature(null);
       const detail = errorMessage(cause, { credential: "admin" });
       // 只有明确命中 fake-ip 网段特征时才引导用户勾选 TUN 选项；
       // 泛化的"私网/安全校验"字样也会出现在与代理无关的错误里。
@@ -552,6 +525,35 @@ export function NewChannelWizard({
     };
   };
 
+  // 校验有效性由 bundle 签名派生：任何字段改动都会让已校验签名失配，
+  // 必须重新 dry_run——等价于原来散布在每个 setter/onChange 里的 invalidateBundle()。
+  const bundle = buildBundle();
+  const bundleSignature = JSON.stringify(bundle);
+  const validated = bundle !== null && validatedSignature === bundleSignature;
+
+  const wizardSigsRef = useRef<{ sigs: string; feedbackSeq: number } | null>(null);
+  useEffect(() => {
+    const sigs = `${discoveryInputsSignature}\n${bundleSignature}`;
+    const prev = wizardSigsRef.current;
+    wizardSigsRef.current = { sigs, feedbackSeq: feedbackSeqRef.current };
+    // 签名没变、或本次签名变化由 discover/probe/apply 等流程自身引起（同批写过反馈）时保留提示。
+    if (!prev || prev.sigs === sigs || prev.feedbackSeq !== feedbackSeqRef.current) return;
+    if (keepFeedbackRef.current) {
+      keepFeedbackRef.current = false;
+      return;
+    }
+    setFeedbackState(null);
+  }, [discoveryInputsSignature, bundleSignature]);
+
+  // 发现输入变化后，基于旧发现结果的模型选择一并作废（等价原 invalidateDiscovery 清空）。
+  // 派生清空不是用户编辑：标记一次，避免连锁清掉同批流程刚写下的提示（如 apply 成功）。
+  useEffect(() => {
+    if (discoveryStale && chatModel) {
+      keepFeedbackRef.current = true;
+      setChatModel("");
+    }
+  }, [discoveryStale, chatModel]);
+
   const probeCapabilities = async () => {
     if (!hasAdminKey || busy || !operator.trim() || !baseUrl.trim() || !apiKey.trim() || !chatModel.trim()) {
       setFeedback({
@@ -590,7 +592,6 @@ export function NewChannelWizard({
         json_schema: Boolean(result.capabilities.json_schema)
       };
       setCapabilities(next);
-      invalidateBundle();
       const summary = CAPABILITY_OPTIONS.filter((option) => next[option.key])
         .map((option) => option.label)
         .join("、");
@@ -613,8 +614,7 @@ export function NewChannelWizard({
   };
 
   const validate = async () => {
-    if (!discovery || busy) return;
-    const bundle = buildBundle();
+    if (!effectiveDiscovery || busy) return;
     if (!bundle) {
       setFeedback({
         tone: "error",
@@ -628,7 +628,7 @@ export function NewChannelWizard({
     setFeedback(null);
     try {
       const result = await api.validateProviderChannelBundle(bundle, adminKey.trim());
-      setValidated(true);
+      setValidatedSignature(bundleSignature);
       const splitEmbedding =
         Boolean(result.embedding_connection_id) &&
         result.embedding_connection_id !== result.connection_id;
@@ -639,7 +639,7 @@ export function NewChannelWizard({
           : `配置检查通过：将保存 ${result.deployment_ids.length} 个模型，变更 ${result.changed_routes.length} 条用途。尚未写入。`
       });
     } catch (cause) {
-      setValidated(false);
+      setValidatedSignature(null);
       setFeedback({
         tone: "error",
         message: `${errorMessage(cause, { credential: "admin" })}；完整 bundle 未落盘，现有配置保持不变。`
@@ -651,9 +651,8 @@ export function NewChannelWizard({
 
   const apply = async () => {
     if (!validated || busy) return;
-    const bundle = buildBundle();
     if (!bundle) {
-      setValidated(false);
+      setValidatedSignature(null);
       return;
     }
     setBusy("apply");
@@ -744,7 +743,7 @@ export function NewChannelWizard({
         });
       }
     } catch (cause) {
-      setValidated(false);
+      setValidatedSignature(null);
       setFeedback({
         tone: "error",
         message: `${errorMessage(cause, { credential: "admin" })}；未收到成功确认。服务端不会留下半套配置，但超时或断线时整套提交可能已经生效；请先刷新配置确认，勿直接重试。`
@@ -949,7 +948,7 @@ export function NewChannelWizard({
                     <span>渠道简称</span>
                     <input
                       value={operator}
-                      onChange={(event) => { setOperator(event.target.value); invalidateDiscovery(); }}
+                      onChange={(event) => { setOperator(event.target.value); }}
                       spellCheck={false}
                       placeholder="例如 my-proxy"
                       disabled={Boolean(busy)}
@@ -959,7 +958,7 @@ export function NewChannelWizard({
                     <span>官方 API 地址（远程必须 HTTPS）</span>
                     <input
                       value={baseUrl}
-                      onChange={(event) => { setBaseUrl(event.target.value); invalidateDiscovery(); }}
+                      onChange={(event) => { setBaseUrl(event.target.value); }}
                       spellCheck={false}
                       placeholder="https://api.example.com/v1"
                       disabled={Boolean(busy)}
@@ -977,7 +976,7 @@ export function NewChannelWizard({
                   <input
                     type={showApiKey ? "text" : "password"}
                     value={apiKey}
-                    onChange={(event) => { setApiKey(event.target.value); invalidateDiscovery(); }}
+                    onChange={(event) => { setApiKey(event.target.value); }}
                     autoComplete="new-password"
                     spellCheck={false}
                     placeholder="sk-..."
@@ -994,19 +993,19 @@ export function NewChannelWizard({
                 <div className="provider-field-grid">
                   <label className="field-block">
                     <span>适配器</span>
-                    <select value={adapter} onChange={(event) => { setAdapter(event.target.value as ModelGatewayAdapter); invalidateDiscovery(); }} disabled={Boolean(busy)}>
+                    <select value={adapter} onChange={(event) => { setAdapter(event.target.value as ModelGatewayAdapter); }} disabled={Boolean(busy)}>
                       {ADAPTER_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}
                     </select>
                   </label>
                   <label className="field-block">
                     <span>计费计划</span>
-                    <select value={plan} onChange={(event) => { setPlan(event.target.value as ModelGatewayPlan); invalidateBundle(); }} disabled={Boolean(busy)}>
+                    <select value={plan} onChange={(event) => { setPlan(event.target.value as ModelGatewayPlan); }} disabled={Boolean(busy)}>
                       {PLAN_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                     </select>
                   </label>
                   <label className="field-block">
                     <span>使用范围</span>
-                    <select value={usageScope} onChange={(event) => { setUsageScope(event.target.value as ModelGatewayUsageScope); invalidateBundle(); }} disabled={Boolean(busy)}>
+                    <select value={usageScope} onChange={(event) => { setUsageScope(event.target.value as ModelGatewayUsageScope); }} disabled={Boolean(busy)}>
                       <option value="backend_allowed">允许记忆后台任务</option>
                       <option value="interactive_only">仅人工交互</option>
                       <option value="disabled">保存但禁用</option>
@@ -1014,7 +1013,7 @@ export function NewChannelWizard({
                   </label>
                   <label className="field-block">
                     <span>鉴权 Header</span>
-                    <select value={authType} onChange={(event) => { setAuthType(event.target.value as "bearer" | "x-api-key"); invalidateDiscovery(); }} disabled={Boolean(busy)}>
+                    <select value={authType} onChange={(event) => { setAuthType(event.target.value as "bearer" | "x-api-key"); }} disabled={Boolean(busy)}>
                       <option value="bearer">Authorization: Bearer</option>
                       <option value="x-api-key">X-API-Key</option>
                     </select>
@@ -1023,7 +1022,7 @@ export function NewChannelWizard({
                     <span>允许的私网 CIDR（逗号分隔）</span>
                     <input
                       value={allowedPrivateNetworks}
-                      onChange={(event) => { setAllowedPrivateNetworks(event.target.value); invalidateDiscovery(); }}
+                      onChange={(event) => { setAllowedPrivateNetworks(event.target.value); }}
                       spellCheck={false}
                       placeholder="例如 192.168.50.0/24 或 198.18.0.0/15"
                       disabled={Boolean(busy)}
@@ -1067,12 +1066,12 @@ export function NewChannelWizard({
                   disabled={!hasAdminKey || Boolean(busy) || !operator.trim() || !baseUrl.trim() || !apiKey.trim()}
                 >
                   <PlugZap size={16} aria-hidden />
-                  {busy === "discover" ? "正在只读发现" : discovery ? "重新发现模型" : "只读发现模型"}
+                  {busy === "discover" ? "正在只读发现" : effectiveDiscovery ? "重新发现模型" : "只读发现模型"}
                 </button>
               </div>
             </div>
 
-            {discovery && (
+            {effectiveDiscovery && (
               <>
                 <div className="provider-wizard-step">
                   <h3><span className="provider-step-index" aria-hidden>2</span>选择模型与路由</h3>
@@ -1093,7 +1092,7 @@ export function NewChannelWizard({
                           )}
                           <select
                             value={chatModel}
-                            onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }}
+                            onChange={(event) => { setChatModel(event.target.value); }}
                             disabled={Boolean(busy)}
                             aria-label="聊天模型"
                           >
@@ -1115,14 +1114,14 @@ export function NewChannelWizard({
                           )}
                         </>
                       ) : (
-                        <input value={chatModel} onChange={(event) => { setChatModel(event.target.value); invalidateBundle(); }} spellCheck={false} placeholder="精确 upstream_model ID" disabled={Boolean(busy)} aria-label="聊天模型" />
+                        <input value={chatModel} onChange={(event) => { setChatModel(event.target.value); }} spellCheck={false} placeholder="精确 upstream_model ID" disabled={Boolean(busy)} aria-label="聊天模型" />
                       )}
                     </div>
                     <label className="field-block">
                       <span>现有文本路由</span>
                       <select
                         value={chatRouteOperation}
-                        onChange={(event) => { setChatRouteOperation(event.target.value as ModelGatewayRouteOperation); invalidateBundle(); }}
+                        onChange={(event) => { setChatRouteOperation(event.target.value as ModelGatewayRouteOperation); }}
                         disabled={!canAssignBackendRoutes || Boolean(busy)}
                       >
                         <option value="keep">保持不变（默认）</option>
@@ -1148,18 +1147,18 @@ export function NewChannelWizard({
                     <div className="provider-field-grid">
                       <label className="field-block">
                         <span>模型作者</span>
-                        <input value={modelAuthor} onChange={(event) => { setModelAuthor(event.target.value); invalidateBundle(); }} spellCheck={false} placeholder="留空则记为 unknown" disabled={Boolean(busy)} />
+                        <input value={modelAuthor} onChange={(event) => { setModelAuthor(event.target.value); }} spellCheck={false} placeholder="留空则记为 unknown" disabled={Boolean(busy)} />
                       </label>
                       <label className="field-block">
                         <span>适配 profile</span>
-                        <select value={adapterProfile} onChange={(event) => { setAdapterProfile(event.target.value as "inherit" | "dashscope_deepseek_v4"); invalidateBundle(); }} disabled={Boolean(busy)}>
+                        <select value={adapterProfile} onChange={(event) => { setAdapterProfile(event.target.value as "inherit" | "dashscope_deepseek_v4"); }} disabled={Boolean(busy)}>
                           <option value="inherit">继承渠道适配器</option>
                           <option value="dashscope_deepseek_v4">DashScope DeepSeek V4 Flash/Pro</option>
                         </select>
                       </label>
                       <label className="field-block">
                         <span>默认推理模式</span>
-                        <select value={reasoningDefault} onChange={(event) => { setReasoningDefault(event.target.value as "inherit" | "enabled" | "disabled"); invalidateBundle(); }} disabled={Boolean(busy)}>
+                        <select value={reasoningDefault} onChange={(event) => { setReasoningDefault(event.target.value as "inherit" | "enabled" | "disabled"); }} disabled={Boolean(busy)}>
                           <option value="inherit">继承请求</option>
                           <option value="enabled">默认开启</option>
                           <option value="disabled">默认关闭</option>
@@ -1196,7 +1195,7 @@ export function NewChannelWizard({
                   </details>
 
                   <label className="provider-route-toggle provider-embedding-toggle">
-                    <input type="checkbox" checked={embeddingEnabled} onChange={(event) => { setEmbeddingEnabled(event.target.checked); invalidateBundle(); }} disabled={Boolean(busy)} />
+                    <input type="checkbox" checked={embeddingEnabled} onChange={(event) => { setEmbeddingEnabled(event.target.checked); }} disabled={Boolean(busy)} />
                     <span>同时保存一个向量模型（可选）</span>
                   </label>
 
@@ -1226,13 +1225,13 @@ export function NewChannelWizard({
                       </label>
                       <label className="field-block">
                         <span>向量空间名称</span>
-                        <input value={embeddingSpace} onChange={(event) => { setEmbeddingSpace(event.target.value); setEmbeddingSpaceEdited(true); invalidateBundle(); }} spellCheck={false} placeholder="不可与不同模型/维度混用" disabled={Boolean(busy)} />
+                        <input value={embeddingSpace} onChange={(event) => { setEmbeddingSpace(event.target.value); setEmbeddingSpaceEdited(true); }} spellCheck={false} placeholder="不可与不同模型/维度混用" disabled={Boolean(busy)} />
                       </label>
                       <label className="field-block">
                         <span>现有向量路由</span>
                         <select
                           value={embeddingRouteOperation}
-                          onChange={(event) => { setEmbeddingRouteOperation(event.target.value as ModelGatewayRouteOperation); invalidateBundle(); }}
+                          onChange={(event) => { setEmbeddingRouteOperation(event.target.value as ModelGatewayRouteOperation); }}
                           disabled={!canAssignBackendRoutes || !embeddingRoute || Boolean(busy)}
                         >
                           <option value="keep">保持不变（默认）</option>

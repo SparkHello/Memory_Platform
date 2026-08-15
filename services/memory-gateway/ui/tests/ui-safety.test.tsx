@@ -299,7 +299,7 @@ describe("two-phase batch purge", () => {
 });
 
 describe("revision-aware memory clients", () => {
-  it("adds expected_revision to every Memory and Core PATCH", async () => {
+  it("adds expected_revision to every Memory PATCH", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -313,19 +313,6 @@ describe("revision-aware memory clients", () => {
           status: 200,
           headers: { "Content-Type": "application/json" }
         })
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            updated: true,
-            action: "update",
-            core_memory: { revision: 4 }
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" }
-          }
-        )
       );
     vi.stubGlobal("fetch", fetchMock);
     const api = new MemoryApi({
@@ -336,7 +323,6 @@ describe("revision-aware memory clients", () => {
 
     await api.updateMemory("memory-a", { content: "new content" }, 7);
     await api.updateMemorySpaces("memory-a", { space_ids: ["space-a"] }, 8);
-    await api.updateCoreMemorySection("goals", { content: "new goal" }, 3);
 
     const requests = fetchMock.mock.calls.map(([, init]) => {
       const request = init as RequestInit;
@@ -344,8 +330,7 @@ describe("revision-aware memory clients", () => {
     });
     expect(requests).toEqual([
       { content: "new content", expected_revision: 7 },
-      { space_ids: ["space-a"], expected_revision: 8 },
-      { content: "new goal", expected_revision: 3 }
+      { space_ids: ["space-a"], expected_revision: 8 }
     ]);
   });
 });

@@ -9,16 +9,7 @@ import type {
 } from "../../types";
 import { filterDiscoveredChatModels } from "../../utils/discoveredModels";
 import { errorMessage } from "../../utils/format";
-import { CHAT_ROUTE_IDS } from "./NewChannelWizard";
-
-type Feedback = { tone: "success" | "warning" | "error"; message: string };
-
-const CAPABILITY_OPTIONS: Array<{ key: keyof ModelGatewayCapabilities; label: string }> = [
-  { key: "tools", label: "工具调用 tools" },
-  { key: "parallel_tools", label: "并行工具 parallel_tools" },
-  { key: "reasoning", label: "推理 reasoning" },
-  { key: "json_object", label: "JSON 对象 json_object" }
-];
+import { CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./providerShared";
 
 export function AddChannelModelPanel({
   api,
@@ -51,7 +42,7 @@ export function AddChannelModelPanel({
   const [capabilities, setCapabilities] = useState<ModelGatewayCapabilities>({});
   const [validated, setValidated] = useState(false);
   const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply">("");
-  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [feedback, setFeedback] = useState<ProviderFeedback | null>(null);
   const [done, setDone] = useState(false);
 
   const visibleModels = useMemo(() => {
