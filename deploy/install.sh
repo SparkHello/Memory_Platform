@@ -1324,7 +1324,7 @@ if [ "$LAYOUT" = split ]; then
 fi
 case "$OLD_MEMORY_READINESS:$OLD_MODEL_READINESS" in
   *unknown*)
-    fail "无法可靠建立旧服务 readiness 基线（Memory=$OLD_MEMORY_READINESS, Model=$OLD_MODEL_READINESS）；旧服务未停机"
+    fail "无法可靠建立旧服务 readiness 基线（Memory=${OLD_MEMORY_READINESS}, Model=${OLD_MODEL_READINESS}）；旧服务未停机"
     ;;
 esac
 
@@ -1462,7 +1462,7 @@ accept_existing_stack() {
 
 report_existing_plan_success() {
   say ""
-  say "Memory Platform $RELEASE 已通过 $PLAN_ACTION 验收（$PLAN_REASON）"
+  say "Memory Platform ${RELEASE} 已通过 ${PLAN_ACTION} 验收（${PLAN_REASON}）"
   say "  Web Console:  http://$HOST_PROBE:$PORT/ui/"
   say "  Client URL:   http://$HOST_PROBE:$PORT/v1"
   say "  Model:        memory-auto"
@@ -1487,7 +1487,7 @@ if [ "$PLAN_ACTION" = noop ]; then
 fi
 
 if [ "$PLAN_ACTION" = repair ]; then
-  say "==> 仅修复退化服务（$PLAN_REPAIR_SCOPE），不创建全量备份或停止整栈"
+  say "==> 仅修复退化服务（${PLAN_REPAIR_SCOPE}），不创建全量备份或停止整栈"
   case "$PLAN_REPAIR_SCOPE" in
     model|both)
       compose_candidate_live up -d --no-deps --force-recreate model-gateway \
