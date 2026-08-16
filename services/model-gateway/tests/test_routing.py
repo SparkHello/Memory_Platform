@@ -8,9 +8,12 @@ from model_gateway.auth import AuthenticatedClient
 from model_gateway.models import GatewayConfig
 from model_gateway.routing import (
     RequestRequirements,
+    RouteAffinityUnavailable,
     RouteCapabilityUnavailable,
     RouteForbidden,
+    RouteNotFound,
     RouteUnavailable,
+    RoutingError,
     Router,
     RuntimeHealthRegistry,
     retry_after_seconds,
@@ -358,3 +361,237 @@ def test_retry_after_must_be_finite_and_is_capped() -> None:
     assert retry_after_seconds("-10") == 0
     assert retry_after_seconds("999999999") == 86_400
     assert retry_after_seconds("120", cap_seconds=60) == 60
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        (RoutingError, 400),
+        (RouteNotFound, 404),
+        (RouteForbidden, 403),
+        (RouteUnavailable, 503),
+        (RouteAffinityUnavailable, 409),
+        (RouteCapabilityUnavailable, 422),
+    ],
+)
+def test_routing_error_status_codes_are_pinned(
+    error_type: type[RoutingError], expected_status: int
+) -> None:
+    assert error_type.status_code == expected_status
+
+
+def test_finite_cooldown_clamps_into_bounded_window() -> None:
+    from model_gateway.routing import _finite_cooldown
+
+    assert _finite_cooldown(0.0) == 0.0
+    assert _finite_cooldown(-5.0) == 0.0
+    assert _finite_cooldown(float("inf")) == 0.0
+    assert _finite_cooldown(float("nan")) == 0.0
+    assert _finite_cooldown(999_999_999.0) == 86_400.0
+    assert _finite_cooldown(12.5) == 12.5
+
+
+def test_rate_limit_failure_defers_connection_by_larger_of_cooldown_and_retry_after(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    gateway_config.connections["official"].rate_limit_cooldown_seconds = 30.0
+    now = [100.0]
+    health = RuntimeHealthRegistry(clock=lambda: now[0])
+    router = Router(runtime_health=health)
+    route = router.resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    target = route.targets[0]
+    assert target.connection_id == "official"
+
+    health.record_http(target, status_code=429)
+    assert health.remaining_target("official", target.deployment_id) == 30.0
+
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=429, retry_after=60.0)
+    assert health.remaining_target("official", target.deployment_id) == 60.0
+
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=429, retry_after=5.0)
+    assert health.remaining_target("official", target.deployment_id) == 30.0
+
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=430)
+    assert health.remaining_target("official", target.deployment_id) == 0.0
+
+
+def test_auth_and_billing_failures_defer_whole_connection_for_at_least_30s(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    gateway_config.connections["official"].rate_limit_cooldown_seconds = 10.0
+    now = [100.0]
+    health = RuntimeHealthRegistry(clock=lambda: now[0])
+    router = Router(runtime_health=health)
+    route = router.resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    target = route.targets[0]
+
+    health.record_http(target, status_code=401)
+    assert health.remaining_target("official", target.deployment_id) == 30.0
+
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=402)
+    assert health.remaining_target("official", target.deployment_id) == 30.0
+
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=403)
+    assert health.remaining_target("official", target.deployment_id) == 0.0
+
+    gateway_config.connections["official"].rate_limit_cooldown_seconds = 60.0
+    health.clear_connection("official", (target.deployment_id,))
+    health.record_http(target, status_code=401)
+    assert health.remaining_target("official", target.deployment_id) == 60.0
+
+
+def test_mid_window_success_resets_server_failure_counter(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    now = [100.0]
+    health = RuntimeHealthRegistry(
+        clock=lambda: now[0],
+        server_failure_threshold=3,
+        server_failure_cooldown_seconds=20,
+    )
+    router = Router(runtime_health=health)
+    route = router.resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    target = route.targets[0]
+
+    health.record_http(target, status_code=500)
+    health.record_http(target, status_code=500)
+    assert health.remaining_target(target.connection_id, target.deployment_id) == 0.0
+
+    health.record_http(target, status_code=200)
+    health.record_http(target, status_code=500)
+    health.record_http(target, status_code=500)
+    assert health.remaining_target(target.connection_id, target.deployment_id) == 0.0
+
+    health.record_http(target, status_code=500)
+    assert health.remaining_target(target.connection_id, target.deployment_id) == 20.0
+
+
+def test_cooldown_remaining_and_availability_boundaries(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    now = [100.0]
+    health = RuntimeHealthRegistry(clock=lambda: now[0])
+    router = Router(runtime_health=health)
+    route = router.resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    target = route.targets[0]
+
+    assert health.remaining("unknown-connection") == 0.0
+    health.defer("official", 20.0)
+    assert health.remaining("official") == 20.0
+    assert health.remaining_target("official", "any-deployment") == 20.0
+
+    now[0] += 19.5
+    assert health.remaining("official") == 0.5
+    assert health.available(target) is False
+
+    now[0] += 0.5
+    assert health.remaining("official") == 0.0
+    assert health.available(target) is True
+
+
+def test_plain_chat_payload_requires_no_optional_capabilities() -> None:
+    requirements = RequestRequirements.from_payload(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        kind="chat",
+    )
+    assert requirements.streaming is False
+    assert requirements.tools is False
+    assert requirements.parallel_tools is False
+    assert requirements.reasoning is False
+    assert requirements.multimodal_input is False
+    assert requirements.json_object is False
+    assert requirements.json_schema is False
+    assert requirements.reasoning_state == "unspecified"
+    assert requirements.tool_choice == "absent"
+    assert requirements.required_capabilities == ()
+
+
+def test_parallel_tool_calls_flag_alone_implies_tools() -> None:
+    with_parallel = RequestRequirements.from_payload(
+        {"messages": [], "parallel_tool_calls": True},
+        kind="chat",
+    )
+    assert with_parallel.parallel_tools is True
+    assert with_parallel.tools is True
+
+    empty_tools = RequestRequirements.from_payload(
+        {"messages": [], "tools": []},
+        kind="chat",
+    )
+    assert empty_tools.tools is False
+
+
+def test_reasoning_default_enabled_blocks_required_tool_choice(
+    gateway_config: GatewayConfig,
+) -> None:
+    deployment = gateway_config.deployments["chat-official"]
+    deployment.reasoning_default = "enabled"
+    requirements = RequestRequirements.from_payload(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        },
+        kind="chat",
+    )
+    assert "tool_choice_with_reasoning" in requirements.missing_from(deployment)
+
+    requirements = RequestRequirements.from_payload(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "auto",
+            "reasoning_effort": "low",
+        },
+        kind="chat",
+    )
+    assert "tool_choice_with_reasoning" not in requirements.missing_from(deployment)
+
+
+def test_route_records_are_immutable(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    import dataclasses
+
+    resolved = Router().resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        resolved.targets[0].deployment_id = "mutated"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        resolved.requested_model = "mutated"

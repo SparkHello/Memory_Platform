@@ -371,3 +371,212 @@ async def test_live_health_keeps_success_as_warning_when_ledger_record_fails(
     assert "结果仍保留" in deployment.detail
     assert connection.level == "warning"
     assert monitor.consume_after_successful_probe() == "disk_unavailable"
+
+
+def _deployment_health(deployment_id: str, level: str) -> "DeploymentHealth":
+    from model_gateway.health import DeploymentHealth
+
+    status_by_level = {
+        "ok": "available",
+        "warning": "connected_unlisted",
+        "error": "invalid_response",
+        "skipped": "disabled",
+    }
+    return DeploymentHealth(
+        deployment_id=deployment_id,
+        kind="chat",
+        upstream_model="author/model",
+        status=status_by_level[level],
+        level=level,
+        detail="detail",
+    )
+
+
+def test_health_report_summary_counts_each_level_exactly() -> None:
+    import dataclasses
+
+    from model_gateway.health import ConnectionHealth, HealthReport
+
+    healthy = ConnectionHealth(
+        connection_id="c1",
+        channel_operator="op",
+        status="connected",
+        level="ok",
+        detail="",
+        deployments=(
+            _deployment_health("d1", "ok"),
+            _deployment_health("d2", "warning"),
+        ),
+    )
+    failing = ConnectionHealth(
+        connection_id="c2",
+        channel_operator="op",
+        status="invalid_response",
+        level="error",
+        detail="",
+        deployments=(_deployment_health("d3", "error"),),
+    )
+    skipped = ConnectionHealth(
+        connection_id="c3",
+        channel_operator="op",
+        status="disabled",
+        level="skipped",
+        detail="",
+        deployments=(_deployment_health("d4", "skipped"),),
+    )
+    report = HealthReport(mode="discovery", connections=(healthy, failing, skipped))
+
+    assert report.summary == {
+        "connections": 3,
+        "deployments": 4,
+        "ok": 1,
+        "warnings": 1,
+        "errors": 1,
+        "skipped": 1,
+    }
+    assert report.has_errors is True
+
+    clean = HealthReport(
+        mode="discovery",
+        connections=(
+            ConnectionHealth(
+                connection_id="c1",
+                channel_operator="op",
+                status="connected",
+                level="ok",
+                detail="",
+                deployments=(_deployment_health("d1", "ok"),),
+            ),
+        ),
+    )
+    assert clean.has_errors is False
+    assert clean.summary["errors"] == 0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        clean.connections[0].deployments[0].level = "error"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "discovery", "expected_status", "expected_level"),
+    [
+        (401, True, "auth_failed", "error"),
+        (403, False, "auth_failed", "error"),
+        (429, True, "rate_limited", "warning"),
+        (404, True, "check_unsupported", "warning"),
+        (405, True, "check_unsupported", "warning"),
+        (404, False, "model_not_found", "error"),
+        (500, True, "provider_error", "error"),
+    ],
+)
+def test_http_failure_maps_status_codes_to_levels(
+    status_code: int, discovery: bool, expected_status: str, expected_level: str
+) -> None:
+    from model_gateway.health import _http_failure
+
+    status, level, detail = _http_failure(status_code, discovery=discovery)
+    assert status == expected_status
+    assert level == expected_level
+    assert str(status_code) in detail
+    assert detail
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_clamped_to_a_minimum_of_100ms(
+    gateway_config: GatewayConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import model_gateway.discovery as discovery
+
+    captured: dict[str, float] = {}
+    real_probe_client = discovery.probe_client
+
+    def spy(
+        connection, timeout_seconds: float, transport
+    ):
+        captured["timeout"] = timeout_seconds
+        return real_probe_client(connection, timeout_seconds, transport)
+
+    monkeypatch.setattr(discovery, "probe_client", spy)
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        timeout_seconds=0,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"object": "list", "data": []}
+            )
+        ),
+    )
+    assert report.connections[0].status == "connected"
+    assert captured["timeout"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_discovered_model_listing_caps_at_five_hundred_entries(
+    gateway_config: GatewayConfig,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [{"id": f"author/model-{index}"} for index in range(600)],
+            },
+        )
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        transport=httpx.MockTransport(handler),
+    )
+    connection = report.connections[0]
+    assert connection.discovered_model_count == 600
+    assert len(connection.discovered_models) == 500
+    assert connection.discovered_models[0] == "author/model-0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disable_kind", "expected_detail"),
+    [
+        ("enabled", "connection 已禁用"),
+        ("usage_scope", "connection 已禁用"),
+    ],
+)
+async def test_disabled_connections_are_skipped_without_any_request(
+    gateway_config: GatewayConfig,
+    disable_kind: str,
+    expected_detail: str,
+) -> None:
+    if disable_kind == "enabled":
+        gateway_config.connections["official"].enabled = False
+    else:
+        gateway_config.connections["official"].usage_scope = "disabled"
+
+    report = await check_health(
+        config=gateway_config,
+        secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+        connection_id="official",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail("disabled connection must not be probed")
+        ),
+    )
+    connection = report.connections[0]
+    assert connection.status == "disabled"
+    assert connection.level == "skipped"
+    assert connection.detail == expected_detail
+    assert all(item.level == "skipped" for item in connection.deployments)
+
+
+@pytest.mark.asyncio
+async def test_unknown_connection_id_is_rejected(gateway_config: GatewayConfig) -> None:
+    from model_gateway.health import HealthCheckError
+
+    with pytest.raises(HealthCheckError, match="未知 connection"):
+        await check_health(
+            config=gateway_config,
+            secrets={"UPSTREAM_OFFICIAL": "provider-secret"},
+            connection_id="does-not-exist",
+        )

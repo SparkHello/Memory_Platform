@@ -566,3 +566,367 @@ def test_concurrent_prune_never_double_counts_the_same_raw_event(tmp_path: Path)
 
     assert sum(int(result["raw_events_pruned"]) for result in results) == 1
     assert store.summary(days=365, operation="memory.concurrent")["calls"] == 1
+
+
+def _chat_target(gateway_config: GatewayConfig, backend_client: AuthenticatedClient):
+    route = Router().resolve(
+        requested_model="memory.chat",
+        kind="chat",
+        client=backend_client,
+        config=gateway_config,
+    )
+    return route.targets[0]
+
+
+def _capture(prompt: int, completion: int) -> UsageCapture:
+    capture = UsageCapture()
+    capture.from_non_stream(
+        b'{"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}'
+        % (prompt, completion, prompt + completion)
+    )
+    return capture
+
+
+def test_unpriced_attempts_bucket_into_unpriced_currency_only(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    trace = AttemptTrace(
+        attempt_index=1,
+        target=target,
+        status_code=200,
+        outcome="success",
+        failure_class="none",
+        request_sent=True,
+        response_complete=True,
+        capture=_capture(10, 2),
+    )
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    store.record(
+        client_id="memory-gateway",
+        kind="chat",
+        route_id="memory.chat",
+        target=target,
+        status_code=200,
+        latency_ms=5,
+        attempts=1,
+        complete=True,
+        capture=_capture(10, 2),
+        attempt_traces=(trace,),
+    )
+
+    summary = store.summary()
+    assert summary["estimated_costs"] == {}
+    assert summary["attempts"]["unknown_cost_attempts"] == 1
+    assert summary["attempts"]["by_currency"] == {
+        "UNPRICED": {
+            "known_attempts": 0,
+            "unknown_attempts": 1,
+            "estimated_cost": "0",
+        }
+    }
+    events = store.events()
+    assert events[0]["attempt_costs"] == {}
+    assert events[0]["unknown_cost_attempts"] == 1
+
+
+def test_prune_rollup_separates_unpriced_known_unknown_and_not_sent_attempts(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    not_sent = AttemptTrace(
+        attempt_index=1,
+        target=target,
+        status_code=None,
+        outcome="connect_failure",
+        failure_class="connect_error",
+        request_sent=False,
+        capture=UsageCapture(),
+    )
+    unknown_price = AttemptTrace(
+        attempt_index=2,
+        target=target,
+        status_code=200,
+        outcome="success",
+        failure_class="none",
+        request_sent=True,
+        response_complete=True,
+        capture=_capture(10, 2),
+    )
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    store.record(
+        client_id="memory-gateway",
+        kind="chat",
+        route_id="memory.chat",
+        target=target,
+        status_code=200,
+        latency_ms=5,
+        attempts=2,
+        complete=True,
+        capture=_capture(10, 2),
+        attempt_traces=(not_sent, unknown_price),
+    )
+
+    store.prune(raw_days=30, now=datetime.now(UTC) + timedelta(days=40))
+
+    with sqlite3.connect(tmp_path / "usage.db") as connection:
+        row = connection.execute(
+            "SELECT currency, estimated_cost, known_attempts, unknown_attempts, "
+            "not_sent_attempts FROM cost_daily"
+        ).fetchone()
+    assert row == ("UNPRICED", "0", 1, 1, 1)
+
+    summary = store.summary()
+    assert summary["attempts"]["by_currency"] == {
+        "UNPRICED": {
+            "known_attempts": 1,
+            "unknown_attempts": 1,
+            "estimated_cost": "0",
+        }
+    }
+    assert summary["attempts"]["known_cost_attempts"] == 1
+    assert summary["attempts"]["unknown_cost_attempts"] == 1
+    assert summary["attempts"]["not_sent_attempts"] == 1
+
+
+def test_prune_daily_rollup_counts_exactly_the_2xx_without_price_window(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    for status in (199, 200, 299, 300, 500):
+        store.record(
+            client_id="memory-gateway",
+            kind="chat",
+            route_id="memory.chat",
+            target=target,
+            status_code=status,
+            latency_ms=1,
+            attempts=1,
+            complete=status == 200,
+            capture=_capture(5, 2),
+        )
+
+    store.prune(raw_days=30, now=datetime.now(UTC) + timedelta(days=40))
+
+    with sqlite3.connect(tmp_path / "usage.db") as connection:
+        row = connection.execute(
+            "SELECT calls, complete_calls, input_tokens, output_tokens, "
+            "total_tokens, incomplete_cost_calls FROM usage_daily"
+        ).fetchone()
+    assert row == (5, 1, 25, 10, 35, 2)
+    assert store.summary()["calls"] == 5
+    assert store.summary()["incomplete_cost_calls"] == 2
+
+
+def test_summary_counts_success_without_price_but_not_other_statuses(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    for status in (204, 402):
+        store.record(
+            client_id="memory-gateway",
+            kind="chat",
+            route_id="memory.chat",
+            target=target,
+            status_code=status,
+            latency_ms=1,
+            attempts=1,
+            complete=True,
+            capture=_capture(5, 2),
+        )
+
+    summary = store.summary()
+    assert summary["calls"] == 2
+    assert summary["incomplete_cost_calls"] == 1
+
+
+def test_events_limit_is_clamped_between_one_and_five_hundred(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    for index in range(3):
+        store.record(
+            client_id="client",
+            kind="chat",
+            route_id="memory.chat",
+            target=target,
+            status_code=200,
+            latency_ms=1,
+            attempts=1,
+            complete=True,
+            capture=UsageCapture(),
+        )
+    assert len(store.events(limit=0)) == 1
+    assert len(store.events(limit=2)) == 2
+
+    for index in range(501):
+        store.record(
+            client_id="bulk-client",
+            kind="chat",
+            route_id="memory.chat",
+            target=target,
+            status_code=200,
+            latency_ms=1,
+            attempts=1,
+            complete=True,
+            capture=UsageCapture(),
+        )
+    assert len(store.events(limit=100_000)) == 500
+
+
+def test_events_and_summary_day_windows_clamp_to_at_least_one_day(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    target = _chat_target(gateway_config, backend_client)
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    store.record(
+        client_id="client",
+        kind="chat",
+        route_id="memory.chat",
+        target=target,
+        status_code=200,
+        latency_ms=1,
+        attempts=1,
+        complete=True,
+        capture=UsageCapture(),
+    )
+    old_id = store.record(
+        client_id="client",
+        kind="chat",
+        route_id="memory.chat",
+        target=target,
+        status_code=200,
+        latency_ms=1,
+        attempts=1,
+        complete=True,
+        capture=UsageCapture(),
+    )
+    backdated = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    with sqlite3.connect(tmp_path / "usage.db") as connection:
+        connection.execute(
+            "UPDATE usage_events SET created_at = ? WHERE id = ?", (backdated, old_id)
+        )
+
+    assert store.summary(days=0)["days"] == 1
+    assert store.summary(days=0)["calls"] == 1
+    assert store.summary(days=2)["calls"] == 2
+    assert len(store.events(days=0)) == 1
+    assert len(store.events(days=2)) == 2
+
+
+def test_single_tier_prices_missing_input_and_boundary_hits_first_tier() -> None:
+    single_tier = PricingConfig.model_validate(
+        {
+            "mode": "per_token",
+            "currency": "USD",
+            "tiers": [{"input": "1", "output": "2"}],
+            "source_url": "https://vendor.example/pricing",
+        }
+    )
+    cost, complete = estimate_cost(
+        {"input_tokens": None, "output_tokens": 5, "total_tokens": 5},
+        single_tier,
+    )
+    assert cost == Decimal("0.00001")
+    assert complete is False
+
+    cost, complete = estimate_cost(
+        {"input_tokens": None, "output_tokens": 5, "total_tokens": 5},
+        pricing(),
+    )
+    assert cost is None
+    assert complete is False
+
+    cost, complete = estimate_cost(
+        {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105},
+        pricing(),
+    )
+    assert cost == Decimal("0.00011")
+    assert complete is True
+
+
+def test_cached_tokens_equal_to_input_are_fully_priced_at_cache_rate() -> None:
+    cost, complete = estimate_cost(
+        {
+            "input_tokens": 10,
+            "cached_input_tokens": 10,
+            "output_tokens": 1,
+            "total_tokens": 11,
+        },
+        pricing(),
+    )
+    assert cost == Decimal("0.000003")
+    assert complete is True
+
+
+def test_prompt_tokens_details_cached_tokens_are_parsed() -> None:
+    from model_gateway.usage import _parse_usage
+
+    parsed = _parse_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_tokens_details": {"cached_tokens": 40},
+        }
+    )
+    assert parsed == {
+        "input_tokens": 100,
+        "cached_input_tokens": 40,
+        "output_tokens": 5,
+        "total_tokens": 105,
+    }
+
+
+def test_metadata_only_usage_drops_invalid_counters_and_keeps_details() -> None:
+    from model_gateway.usage import metadata_only_usage
+
+    cleaned = metadata_only_usage(
+        {
+            "prompt_tokens": 10,
+            "cached_tokens": 4,
+            "total_tokens": -1,
+            "prompt_tokens_details": {"cached_tokens": 4, "junk": "x"},
+            "input_tokens_details": "oops",
+            "model": "should-not-appear",
+        }
+    )
+    assert cleaned == {
+        "prompt_tokens": 10,
+        "cached_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 4},
+    }
+    assert metadata_only_usage({"prompt_tokens": True, "total_tokens": 1.5}) is None
+
+
+def test_safe_metadata_id_enforces_length_and_character_contract() -> None:
+    from model_gateway.usage import safe_metadata_id
+
+    assert safe_metadata_id("a-b_c.d:e", max_length=10, allow_slash=False) == "a-b_c.d:e"
+    assert safe_metadata_id("a/b", max_length=10, allow_slash=True) == "a/b"
+    assert safe_metadata_id("a/b", max_length=10, allow_slash=False) == ""
+    assert safe_metadata_id("a" * 10, max_length=10, allow_slash=False) == "a" * 10
+    assert safe_metadata_id("a" * 11, max_length=10, allow_slash=False) == ""
+    assert safe_metadata_id(" spaces ", max_length=10, allow_slash=False) == "spaces"
+    assert safe_metadata_id("", max_length=10, allow_slash=False) == ""

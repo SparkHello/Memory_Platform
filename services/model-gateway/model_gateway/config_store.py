@@ -653,7 +653,7 @@ class ConfigManager:
         self._lock = threading.Lock()
         self._config: GatewayConfig | None = None
         self._secrets: dict[str, str] = {}
-        self._revision: tuple[int, int] = (-1, -1)
+        self._revision: tuple[int, int, int, int] = (-1, -1, -1, -1)
         self._last_reload_error = ""
 
     def snapshot(self) -> tuple[GatewayConfig, dict[str, str]]:
@@ -661,7 +661,14 @@ class ConfigManager:
         # deliberate secret-first/config-last intermediate state.
         with control_plane_lock(self.paths):
             _recover_control_plane_unlocked(self.paths)
-            revision = (_mtime_ns(self.paths.config), _mtime_ns(self.paths.secrets))
+            # Size guards against same-mtime rewrites: filesystems with coarse
+            # mtime granularity can stamp two different writes identically.
+            revision = (
+                _mtime_ns(self.paths.config),
+                _size_bytes(self.paths.config),
+                _mtime_ns(self.paths.secrets),
+                _size_bytes(self.paths.secrets),
+            )
             with self._lock:
                 if self._config is None or revision != self._revision:
                     try:
@@ -742,6 +749,13 @@ def _chmod(path: Path, mode: int) -> None:
 def _mtime_ns(path: Path) -> int:
     try:
         return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return -1
+
+
+def _size_bytes(path: Path) -> int:
+    try:
+        return path.stat().st_size
     except FileNotFoundError:
         return -1
 

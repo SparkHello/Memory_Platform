@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sqlite3
 import subprocess
@@ -10,6 +11,7 @@ from threading import Event, Thread
 
 import pytest
 
+import app.memory.evaluation_workspace as evaluation_workspace
 from app.memory.evaluation import (
     EvaluationError,
     _label_validation_issues,
@@ -370,6 +372,129 @@ def test_eval_workspace_stage_is_reversible_before_database_commit(
     assert snapshot.read_bytes() == b"alice-evaluation-copy"
     assert legacy.read_text(encoding="utf-8") == "legacy"
     _assert_owned_trash_is_empty(eval_dir)
+
+
+def test_regular_stage_failure_restores_every_completed_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_dir = tmp_path / "eval"
+    workspace = user_eval_dir(eval_dir, user_id="alice")
+    workspace.mkdir(parents=True)
+    snapshot = workspace / "snapshot.db"
+    snapshot.write_bytes(b"workspace copy")
+    legacy = eval_dir / "labels.jsonl"
+    legacy.write_text("legacy labels", encoding="utf-8")
+    original_replace = Path.replace
+    moves = 0
+
+    def fail_second_move(path: Path, target: Path) -> Path:
+        nonlocal moves
+        if path in {workspace, legacy}:
+            moves += 1
+            if moves == 2:
+                raise OSError("simulated regular stage failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_move)
+    with pytest.raises(OSError, match="regular stage failure"):
+        stage_user_eval_workspace(eval_dir, user_id="alice")
+
+    assert snapshot.read_bytes() == b"workspace copy"
+    assert legacy.read_text(encoding="utf-8") == "legacy labels"
+    _assert_owned_trash_is_empty(eval_dir)
+
+
+def test_discard_reports_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_dir = tmp_path / "eval"
+    workspace = user_eval_dir(eval_dir, user_id="alice")
+    workspace.mkdir(parents=True)
+    (workspace / "labels.jsonl").write_text("labels", encoding="utf-8")
+    staged = stage_user_eval_workspace(
+        eval_dir,
+        user_id="alice",
+        committed_intent=True,
+    )
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("simulated cleanup failure")
+
+    monkeypatch.setattr(
+        evaluation_workspace,
+        "_remove_managed_transaction",
+        fail_cleanup,
+    )
+
+    result = evaluation_workspace.discard_staged_eval_workspace(staged)
+
+    assert result["cleanup_failed"] is True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "identity",
+        "fields",
+        "mapping",
+    ),
+)
+def test_cleanup_rejects_each_independently_corrupt_manifest_field(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    eval_dir = tmp_path / "eval"
+    workspace = user_eval_dir(eval_dir, user_id="alice")
+    workspace.mkdir(parents=True)
+    (workspace / "labels.jsonl").write_text("labels", encoding="utf-8")
+    staged = stage_user_eval_workspace(eval_dir, user_id="alice")
+    assert staged.trash_dir is not None
+    manifest_path = staged.trash_dir / evaluation_workspace.TRASH_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "identity":
+        manifest["schema_version"] = 999
+    elif corruption == "fields":
+        manifest["user_id"] = []
+    else:
+        manifest["mappings"][0]["original"] = "../escape"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(OSError, match="unowned or invalid"):
+        cleanup_abandoned_eval_trash(eval_dir)
+
+
+def test_transaction_directory_validator_rejects_one_bad_attribute(
+    tmp_path: Path,
+) -> None:
+    transaction_dir = tmp_path / "not-a-transaction-id"
+    transaction_dir.mkdir()
+
+    with pytest.raises(OSError, match="directory is unsafe"):
+        evaluation_workspace._validate_transaction_directory_name(transaction_dir)
+
+
+def test_tombstone_cleanup_preserves_invalid_empty_directory(tmp_path: Path) -> None:
+    transaction_dir = tmp_path / "not-a-transaction-id"
+    transaction_dir.mkdir()
+
+    assert (
+        evaluation_workspace._remove_empty_transaction_tombstone(transaction_dir)
+        is False
+    )
+    assert transaction_dir.is_dir()
+
+
+def test_transaction_target_probe_requires_a_database_path() -> None:
+    assert (
+        evaluation_workspace._transaction_targets_exist(
+            None,
+            user_id="alice",
+            target_memory_ids=["memory-id"],
+        )
+        is None
+    )
 
 
 def test_startup_cleanup_removes_abandoned_eval_trash(tmp_path: Path) -> None:

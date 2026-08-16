@@ -6,7 +6,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import ADMIN_CLIENT_TOKEN
+from conftest import ADMIN_CLIENT_TOKEN, config_payload
+from pydantic import ValidationError
 from model_gateway import admin
 from model_gateway.config_store import (
     ConfigConflict,
@@ -18,6 +19,11 @@ from model_gateway.config_store import (
 from model_gateway.control_plane import (
     BundleApplyRequest,
     ControlPlaneService,
+    DeploymentApplyRequest,
+    RouteUpdateRequest,
+    bundle_candidate,
+    deployment_candidate,
+    route_candidate,
 )
 from model_gateway.models import ClientConfig, GatewayConfig
 from model_gateway.service import create_app
@@ -136,3 +142,211 @@ def test_control_plane_module_has_no_adapter_dependency() -> None:
     assert "model_gateway.admin" not in source
     assert "fastapi" not in source.lower()
     assert "argparse" not in source
+
+
+def test_route_candidate_rejects_one_unknown_route() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = RouteUpdateRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "routes": [
+                {"id": "memory.unknown", "targets": ["chat-official"]}
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="未知 route"):
+        route_candidate(config, request)
+
+
+def test_route_candidate_tracks_enabled_only_change() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    current = config.routes["memory.chat"]
+    request = RouteUpdateRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "routes": [
+                {
+                    "id": "memory.chat",
+                    "targets": list(current.targets),
+                    "enabled": not current.enabled,
+                }
+            ],
+        }
+    )
+
+    candidate, changed, warnings = route_candidate(config, request)
+
+    assert changed == ["memory.chat"]
+    assert warnings == []
+    assert candidate.routes["memory.chat"].enabled is not current.enabled
+
+
+def test_route_candidate_does_not_emit_embedding_warning_for_chat_change() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = RouteUpdateRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "routes": [
+                {"id": "memory.chat", "targets": ["chat-reseller"]}
+            ],
+        }
+    )
+
+    _, changed, warnings = route_candidate(config, request)
+
+    assert changed == ["memory.chat"]
+    assert warnings == []
+
+
+def test_deployment_candidate_rejects_unknown_connection() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "missing-connection",
+            "deployments": [
+                {
+                    "upstream_model": "author/chat-new",
+                    "capabilities": {"tools": True, "reasoning": True},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="未知 connection"):
+        deployment_candidate(config, request)
+
+
+def test_deployment_candidate_rejects_embedding_without_dimensions_cleanly() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "official",
+            "deployments": [
+                {"upstream_model": "author/embed-new", "kind": "embedding"}
+            ],
+        }
+    )
+
+    with pytest.raises(ValidationError, match="dimensions"):
+        deployment_candidate(config, request)
+
+
+def test_deployment_candidate_accepts_literal_existing_route_target() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "official",
+            "deployments": [{"upstream_model": "author/chat-new"}],
+            "routes": [
+                {
+                    "id": "memory.chat",
+                    "kind": "chat",
+                    "targets": ["chat-official"],
+                }
+            ],
+        }
+    )
+
+    candidate, _, _, _ = deployment_candidate(config, request)
+
+    assert candidate.routes["memory.chat"].targets == ["chat-official"]
+
+
+def test_deployment_candidate_rejects_placeholder_at_exact_upper_bound() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "official",
+            "deployments": [{"upstream_model": "author/chat-new"}],
+            "routes": [
+                {"id": "memory.chat", "kind": "chat", "targets": ["$1"]}
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="不存在的部署占位"):
+        deployment_candidate(config, request)
+
+
+def test_deployment_candidate_rejects_existing_route_kind_change() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "official",
+            "deployments": [
+                {
+                    "upstream_model": "author/embed-new",
+                    "kind": "embedding",
+                    "dimensions": 4,
+                }
+            ],
+            "routes": [
+                {
+                    "id": "memory.chat",
+                    "kind": "embedding",
+                    "targets": ["$0"],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="不能按 embedding 指派"):
+        deployment_candidate(config, request)
+
+
+def test_deployment_candidate_reports_changed_targets() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = DeploymentApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": "official",
+            "deployments": [
+                {
+                    "upstream_model": "author/chat-new",
+                    "capabilities": {"tools": True, "reasoning": True},
+                }
+            ],
+            "routes": [
+                {"id": "memory.chat", "kind": "chat", "targets": ["$0"]}
+            ],
+        }
+    )
+
+    _, deployment_ids, changed, _ = deployment_candidate(config, request)
+
+    assert len(deployment_ids) == 1
+    assert changed == ["memory.chat"]
+
+
+def test_bundle_candidate_allows_updating_deployment_on_its_connection() -> None:
+    config = GatewayConfig.model_validate(config_payload())
+    request = BundleApplyRequest.model_validate(
+        {
+            "revision": "a" * 64,
+            "connection": {
+                "id": "official",
+                "channel_operator": "official-vendor",
+                "base_url": "https://official.example/v1",
+                "secret": "replacement-secret",
+            },
+            "deployments": [
+                {
+                    "id": "chat-official",
+                    "upstream_model": "author/chat-v2",
+                    "kind": "chat",
+                    "capabilities": {"tools": True, "reasoning": True},
+                }
+            ],
+        }
+    )
+
+    candidate, *_ = bundle_candidate(config, request)
+
+    assert candidate.deployments["chat-official"].connection == "official"
+    assert candidate.deployments["chat-official"].upstream_model == "author/chat-v2"

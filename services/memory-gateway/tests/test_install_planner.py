@@ -61,6 +61,23 @@ def test_fresh_install_is_an_upgrade_without_readiness_regression_gates() -> Non
     assert not plan.accept_host_readiness
 
 
+def test_fresh_install_rejects_even_one_current_image() -> None:
+    planner = _load_planner()
+
+    with pytest.raises(ValueError, match="fresh_current_images"):
+        planner.plan_install(
+            planner.InstallFacts(
+                layout="fresh",
+                candidate_images=DIGESTS,
+                current_images=(DIGESTS[0], None, None),
+                candidate_managed_config=CONFIG,
+                current_managed_config=None,
+                memory_readiness="absent",
+                model_readiness="absent",
+            )
+        )
+
+
 def test_exact_ready_split_stack_is_noop() -> None:
     planner, facts = _split_facts()
 
@@ -150,6 +167,15 @@ def test_invalid_or_unknown_facts_fail_closed(changes: dict) -> None:
     planner, facts = _split_facts(**changes)
 
     with pytest.raises(ValueError):
+        planner.plan_install(facts)
+
+
+def test_split_install_rejects_even_one_invalid_current_digest() -> None:
+    planner, facts = _split_facts(
+        current_images=(DIGESTS[0], "not-a-digest", DIGESTS[2]),
+    )
+
+    with pytest.raises(ValueError, match="current_images"):
         planner.plan_install(facts)
 
 

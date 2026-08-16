@@ -16,7 +16,11 @@ from pydantic import ValidationError
 import model_gateway.models as legacy_models
 import model_gateway_contracts as contracts
 from model_gateway.http_safety import normalize_base_url as legacy_normalize_base_url
-from model_gateway_contracts.urls import normalize_base_url
+from model_gateway_contracts.urls import (
+    normalize_base_url,
+    normalize_endpoint,
+    normalize_private_networks,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -98,6 +102,71 @@ def test_wire_constants_are_stable_strings() -> None:
 def test_old_http_safety_path_reexports_contract_normalizer() -> None:
     assert legacy_normalize_base_url is normalize_base_url
     assert normalize_base_url("https://api.example/v1/") == "https://api.example/v1"
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        " 10.0.0.0/8",
+        "10.0.0.0/8\n",
+    ),
+)
+def test_private_network_contract_rejects_each_whitespace_form(value: str) -> None:
+    with pytest.raises(ValueError, match="空白或控制字符"):
+        normalize_private_networks([value])
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "ftp://api.example/v1",
+        "http:///v1",
+        "https://user@api.example/v1",
+        "https://:password@api.example/v1",
+        "https://api.example:0/v1",
+        "https://valid.-invalid.example/v1",
+    ),
+)
+def test_base_url_contract_rejects_independent_invalid_components(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_base_url(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "http://localhost:2030/v1",
+        "http://127.0.0.1:2030/v1",
+    ),
+)
+def test_base_url_contract_accepts_each_loopback_form(value: str) -> None:
+    assert normalize_base_url(value) == value
+
+
+def test_private_literal_requires_the_matching_allowlisted_network() -> None:
+    with pytest.raises(ValueError, match="必须显式列入"):
+        normalize_base_url(
+            "http://10.0.0.1/v1",
+            allowed_private_networks=["192.168.0.0/16"],
+        )
+
+
+def test_endpoint_contract_rejects_non_string_without_leaking_type_errors() -> None:
+    with pytest.raises(ValueError, match="外围空白"):
+        normalize_endpoint(42)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "/models?limit=1",
+        "/models#fragment",
+        "/./models",
+    ),
+)
+def test_endpoint_contract_rejects_each_structural_suffix(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_endpoint(value)
 
 
 def test_contract_package_has_no_service_or_http_runtime_imports() -> None:

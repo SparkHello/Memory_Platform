@@ -249,6 +249,13 @@ def test_hot_reload_keeps_last_known_good_config(tmp_path: Path) -> None:
     first, _ = manager.snapshot()
 
     paths.config.write_text("{broken", encoding="utf-8")
+    # Bump mtime explicitly: coarse filesystem mtime granularity can stamp the
+    # broken rewrite identically to the original write, skipping hot reload.
+    stat_result = paths.config.stat()
+    os.utime(
+        paths.config,
+        ns=(stat_result.st_atime_ns + 1_000_000, stat_result.st_mtime_ns + 1_000_000),
+    )
     second, _ = manager.snapshot()
 
     assert second == first

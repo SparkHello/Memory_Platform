@@ -225,3 +225,129 @@ def test_fallback_strips_reasoning_from_a_different_origin(
     )
     assert forwarded["messages"][0] == {"role": "assistant", "content": "visible"}
     assert payload["messages"][0]["reasoning_content"] == "official-private-state"
+
+
+def test_adapters_leave_payload_untouched_without_reasoning_intent() -> None:
+    for adapter in ("kimi", "deepseek", "mimo", "dashscope_openai"):
+        payload = {"messages": [], "temperature": 0.3}
+        apply_connection_adapter(
+            payload,
+            connection=connection(adapter),
+            deployment=deployment("some-model", reasoning_default="inherit"),
+        )
+        assert payload == {"messages": [], "temperature": 0.3}, adapter
+
+
+def test_disabled_thinking_is_translated_and_effort_removed() -> None:
+    payload = {"messages": [], "thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("deepseek"),
+        deployment=deployment("deepseek-v4"),
+    )
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+    payload = {"messages": [], "reasoning_effort": "off"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("kimi"),
+        deployment=deployment("kimi-k2.7-code"),
+    )
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+    payload = {"messages": [], "reasoning_effort": "none"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("mimo"),
+        deployment=deployment("mimo-v2.5-pro-ultraspeed"),
+    )
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+
+def test_reasoning_default_flows_through_when_payload_is_silent() -> None:
+    payload = {"messages": []}
+    apply_connection_adapter(
+        payload,
+        connection=connection("dashscope_openai"),
+        deployment=deployment("qwen-plus", reasoning_default="disabled"),
+    )
+    assert payload["enable_thinking"] is False
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload
+
+
+def test_dashscope_v4_explicit_enable_thinking_wins_over_effort() -> None:
+    payload = {"messages": [], "enable_thinking": True, "reasoning_effort": "xhigh"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("generic"),
+        deployment=deployment("deepseek-v4-flash", adapter_profile="dashscope_deepseek_v4"),
+    )
+    assert payload["enable_thinking"] is True
+    assert payload["reasoning_effort"] == "xhigh"
+
+
+def test_dashscope_v4_keeps_only_documented_effort_spellings() -> None:
+    for effort in ("low", "medium", "xhigh"):
+        payload = {"messages": [], "reasoning_effort": effort}
+        apply_connection_adapter(
+            payload,
+            connection=connection("generic"),
+            deployment=deployment("deepseek-v4-flash", adapter_profile="dashscope_deepseek_v4"),
+        )
+        assert payload["enable_thinking"] is True
+        assert payload["reasoning_effort"] == effort
+
+    # Undocumented spellings are left untouched for the provider to reject.
+    payload = {"messages": [], "reasoning_effort": "ultra"}
+    apply_connection_adapter(
+        payload,
+        connection=connection("generic"),
+        deployment=deployment("deepseek-v4-flash", adapter_profile="dashscope_deepseek_v4"),
+    )
+    assert payload["enable_thinking"] is True
+    assert payload["reasoning_effort"] == "ultra"
+
+
+def test_model_names_with_repository_prefix_still_match_adapters() -> None:
+    payload = {"messages": []}
+    apply_connection_adapter(
+        payload,
+        connection=connection("kimi"),
+        deployment=deployment("moonshotai/kimi-k2.7-coding"),
+    )
+    assert payload["temperature"] == 1.0
+    assert payload["thinking"] == {"type": "enabled", "keep": "all"}
+
+
+def test_tool_history_reasoning_passthrough_covers_function_call() -> None:
+    from model_gateway.adapters import _ensure_tool_reasoning_fields
+
+    payload = {
+        "messages": [
+            {"role": "assistant", "function_call": {"name": "f"}, "reasoning": "why"},
+            {"role": "assistant", "tool_calls": [], "reasoning": "no-tools"},
+            {"role": "assistant", "reasoning_content": "kept"},
+        ]
+    }
+    _ensure_tool_reasoning_fields(payload)
+    assert payload["messages"][0]["reasoning_content"] == "why"
+    assert "reasoning_content" not in payload["messages"][1]
+    assert payload["messages"][2]["reasoning_content"] == "kept"
+
+
+def test_reasoning_field_is_stripped_from_assistant_history() -> None:
+    from model_gateway.adapters import strip_reasoning_from_assistant_messages
+
+    payload = {
+        "messages": [
+            {"role": "assistant", "reasoning": "private", "reasoning_content": "also"},
+            {"role": "user", "reasoning": "user-side is untouched"},
+        ]
+    }
+    strip_reasoning_from_assistant_messages(payload)
+    assert payload["messages"][0] == {"role": "assistant"}
+    assert payload["messages"][1]["reasoning"] == "user-side is untouched"

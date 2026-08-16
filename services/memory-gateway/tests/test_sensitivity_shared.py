@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from app.knowledge.store import detect_knowledge_text_sensitivity
-from app.memory.redaction import detect_text_sensitivity
+from app.memory.redaction import detect_text_sensitivity, higher_sensitivity
+from app.sensitivity import SENSITIVITY_RANK
 
 
 @pytest.mark.parametrize(
@@ -21,3 +22,13 @@ def test_memory_and_knowledge_share_sensitivity_floor(
 ) -> None:
     assert detect_text_sensitivity(text) == expected
     assert detect_knowledge_text_sensitivity(text) == expected
+
+
+def test_sensitivity_rank_orders_every_level_pair() -> None:
+    assert SENSITIVITY_RANK == {"normal": 0, "private": 1, "sensitive": 2}
+    assert higher_sensitivity("normal", "private") == "private"
+    assert higher_sensitivity("private", "normal") == "private"
+    assert higher_sensitivity("normal", "sensitive") == "sensitive"
+    assert higher_sensitivity("private", "sensitive") == "sensitive"
+    assert higher_sensitivity("sensitive", "sensitive") == "sensitive"
+    assert higher_sensitivity("normal", "normal") == "normal"

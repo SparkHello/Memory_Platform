@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import model_gateway.upstream_executor as upstream_executor
 from model_gateway.models import GatewayConfig
 from model_gateway.routing import RouteTarget
 from model_gateway.storage import StorageFaultMonitor
@@ -13,6 +14,11 @@ from model_gateway.upstream_executor import (
     ProxyResponseTooLarge,
     UpstreamExecutor,
     UsageLedgerPreflightError,
+    connection_timeouts,
+    enforce_response_limit,
+    http_failure_class,
+    upstream_async_client,
+    upstream_headers,
 )
 from model_gateway.usage import UsageStore
 
@@ -227,3 +233,141 @@ async def test_exact_stream_returns_bounded_raw_lease_after_first_byte(
     assert requests[0].headers["authorization"] == "Bearer provider-secret"
     assert requests[0].headers["accept-encoding"] == "identity"
     assert result.headers["content-encoding"] == "vendor-raw"
+
+
+@pytest.mark.asyncio
+async def test_accounted_post_preflights_exactly_one_attempt(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[int, int]] = []
+
+    def estimate(*, body_bytes: int, attempts: int) -> int:
+        observed.append((body_bytes, attempts))
+        return 0
+
+    monkeypatch.setattr(
+        upstream_executor,
+        "estimated_ledger_write_bytes",
+        estimate,
+    )
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    async with UpstreamExecutor(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"choices": []})
+        )
+    ) as executor:
+        await executor.post_json_accounted(
+            target=_target(gateway_config),
+            payload={"model": "author/chat-v1", "messages": []},
+            secret="provider-secret",
+            usage_store=store,
+            server=gateway_config.server,
+            pricing_catalog=gateway_config.pricing,
+            client_id="executor-test",
+        )
+
+    assert len(observed) == 1
+    assert observed[0][0] > 0
+    assert observed[0][1] == 1
+
+
+@pytest.mark.asyncio
+async def test_http_error_usage_event_is_never_marked_complete(
+    tmp_path: Path,
+    gateway_config: GatewayConfig,
+) -> None:
+    store = UsageStore(tmp_path / "usage.db")
+    store.init_db()
+    async with UpstreamExecutor(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(500, json={"error": {"code": "boom"}})
+        )
+    ) as executor:
+        result = await executor.post_json_accounted(
+            target=_target(gateway_config),
+            payload={"model": "author/chat-v1", "messages": []},
+            secret="provider-secret",
+            usage_store=store,
+            server=gateway_config.server,
+            pricing_catalog=gateway_config.pricing,
+            client_id="executor-test",
+        )
+
+    assert result.status_code == 500
+    with sqlite3.connect(store.path) as connection:
+        complete = connection.execute("SELECT complete FROM usage_events").fetchone()
+    assert complete == (0,)
+
+
+def test_explicit_timeout_caps_every_configured_timeout(
+    gateway_config: GatewayConfig,
+) -> None:
+    assert connection_timeouts(
+        gateway_config.connections["official"],
+        timeout_seconds=5,
+    ) == (5.0, 5.0, 5.0, 5.0)
+
+
+def test_upstream_client_explicitly_ignores_environment_proxy_settings(
+    gateway_config: GatewayConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def build_client(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(upstream_executor.httpx, "AsyncClient", build_client)
+
+    result = upstream_async_client(gateway_config.connections["official"])
+
+    assert result is sentinel
+    assert captured["follow_redirects"] is False
+    assert captured["trust_env"] is False
+
+
+def test_forbidden_header_is_blocked_even_if_connection_state_is_tampered(
+    gateway_config: GatewayConfig,
+) -> None:
+    target = _target(gateway_config)
+    target.connection.forward_headers.append("authorization")
+
+    headers = upstream_headers(
+        target,
+        "provider-secret",
+        {"authorization": "Bearer client-secret"},
+    )
+
+    authorization_headers = [
+        value for name, value in headers.items() if name.lower() == "authorization"
+    ]
+    assert authorization_headers == ["Bearer provider-secret"]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (400, "http_other"),
+        (500, "http_server"),
+    ),
+)
+def test_http_failure_classification_boundaries(status: int, expected: str) -> None:
+    assert http_failure_class(status, b"") == expected
+
+
+def test_response_limit_allows_exact_boundary() -> None:
+    request = httpx.Request("GET", "https://upstream.example/v1")
+    response = httpx.Response(200, request=request)
+
+    enforce_response_limit(3, 3, response)
+
+
+def test_local_os_error_uses_bounded_address_failure_detail() -> None:
+    assert upstream_executor._local_failure_detail(OSError("private detail")) == (
+        "上游地址安全校验失败"
+    )
