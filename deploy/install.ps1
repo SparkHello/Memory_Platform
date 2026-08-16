@@ -2571,9 +2571,31 @@ function Invoke-MemoryPlatformInstall {
         Write-Host "warning: 新栈已验收并发布，committed journal 将在下次安装时清理。"
     }
 
+    # 用宿主 credentials 里的 console token 向本机后端换取一次性登录 code。
+    # 换取失败时保持裸 Web Console URL 输出不变；
+    # token 与 code 只打印到终端，不写入任何日志文件。
+    $consoleLoginUrl = $null
+    try {
+        $consoleToken = ([IO.File]::ReadAllText($gatewayCredential)).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($consoleToken)) {
+            $mintResponse = Invoke-RestMethod -Method Post `
+                -Uri "http://${hostProbe}:$port/auth/console-login-code" `
+                -Headers @{ Authorization = "Bearer $consoleToken" } `
+                -TimeoutSec 15
+            if ("$($mintResponse.code)".StartsWith("mgc_")) {
+                $consoleLoginUrl = "http://127.0.0.1:${port}/ui/#login=$($mintResponse.code)"
+            }
+        }
+    } catch {
+        $consoleLoginUrl = $null
+    }
+
     Write-Host ""
     Write-Host "Memory Platform $release 已启动"
     Write-Host "  Web Console:  http://${hostProbe}:$port/ui/"
+    if ($consoleLoginUrl) {
+        Write-Host "  一次性登录:     $consoleLoginUrl（5 分钟内有效，仅可使用一次）"
+    }
     Write-Host "  Client URL:   http://${hostProbe}:$port/v1"
     Write-Host "  Model:        memory-auto"
     if ($listenHost -ne "127.0.0.1") {

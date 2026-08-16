@@ -12,6 +12,7 @@ from starlette.types import Scope
 
 from app.api.auth_tokens import router as auth_tokens_router
 from app.api.chat_gateway import router as chat_gateway_router
+from app.api.console_login import router as console_login_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memories import router as memories_router
@@ -238,6 +239,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(chat_gateway_router)
     app.include_router(auth_tokens_router)
+    app.include_router(console_login_router)
     app.include_router(memories_router)
     app.include_router(knowledge_router)
     app.include_router(providers_router)

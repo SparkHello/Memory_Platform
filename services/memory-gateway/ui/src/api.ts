@@ -156,6 +156,29 @@ export class MemoryApi {
     return this.request("/auth/tokens", { signal });
   }
 
+  /**
+   * memgw open 的一次性登录链接：code 换 console token 明文（交付一次）。
+   * 端点在中间件中豁免 Bearer，因此必须 auth: false；无效/过期/已用一律 401。
+   */
+  async exchangeConsoleLoginCode(code: string, signal?: AbortSignal): Promise<string> {
+    const payload = await this.request<{ token?: unknown; api_key?: unknown; apiKey?: unknown }>(
+      "/auth/console-login-exchange",
+      { method: "POST", body: { code }, auth: false, signal }
+    );
+    const raw = payload?.token ?? payload?.api_key ?? payload?.apiKey;
+    const token = typeof raw === "string" ? raw.trim() : "";
+    if (!token) {
+      throw new ApiError(
+        502,
+        "登录服务响应格式异常",
+        undefined,
+        undefined,
+        "/auth/console-login-exchange"
+      );
+    }
+    return token;
+  }
+
   async createAuthToken(
     name: string,
     role: "chat" | "mcp",

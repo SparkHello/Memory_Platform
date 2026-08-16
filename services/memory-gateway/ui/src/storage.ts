@@ -6,6 +6,7 @@ const USER_ID_KEY = "memory-console.userId";
 const THEME_KEY = "memory-console.theme";
 const UI_MODE_KEY = "memory-console.uiMode";
 const NAV_COLLAPSED_KEY = "memory-console.navCollapsed";
+const DISMISSED_STATUS_KEY = "memory-console.dismissedStatus";
 
 export type ThemeMode = "dark" | "light";
 export type UiMode = "simple" | "expert";
@@ -41,6 +42,15 @@ export function loadCollapsedNavSections(): string[] {
 
 export function saveCollapsedNavSections(keys: string[]) {
   localStorage.setItem(NAV_COLLAPSED_KEY, JSON.stringify(keys));
+}
+
+/** 顶栏 warning 横幅被用户关闭时记录其消息文本；消息变化后横幅重新出现。 */
+export function loadDismissedStatus(): string {
+  return localStorage.getItem(DISMISSED_STATUS_KEY) || "";
+}
+
+export function saveDismissedStatus(message: string) {
+  localStorage.setItem(DISMISSED_STATUS_KEY, message);
 }
 
 export function normalizeBaseUrl(value: string): string {

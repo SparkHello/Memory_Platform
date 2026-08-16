@@ -91,6 +91,30 @@ button:disabled {
   white-space: nowrap;
 }
 
+.status-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dismiss {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.status-dismiss:hover {
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--text);
+}
+
 .avatar-chip {
   display: grid;
   width: 40px;

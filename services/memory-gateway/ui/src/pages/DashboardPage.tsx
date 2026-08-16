@@ -158,7 +158,8 @@ export function DashboardPage({
   openMemory,
   notify,
   confirm,
-  refreshKey
+  refreshKey,
+  expertMode = false
 }: {
   api: MemoryApi;
   settings: ConnectionSettings;
@@ -167,6 +168,7 @@ export function DashboardPage({
   notify: Notify;
   confirm: ConfirmFn;
   refreshKey: number;
+  expertMode?: boolean;
 }) {
   const [state, setState] = useState<LoadState<DashboardData>>({ loading: true, error: null, data: null });
   const [surfaceLoading, setSurfaceLoading] = useState(false);
@@ -472,6 +474,7 @@ export function DashboardPage({
             <SetupNextStepCard
               setup={data.setup}
               onConfigureModel={() => setPage("providers")}
+              expertMode={expertMode}
             />
           )}
 
@@ -1105,10 +1108,12 @@ function EmotionQuadrant({ valence, arousal }: { valence: number; arousal: numbe
 
 function SetupNextStepCard({
   setup,
-  onConfigureModel
+  onConfigureModel,
+  expertMode
 }: {
   setup: NonNullable<DashboardData["setup"]>;
   onConfigureModel: () => void;
+  expertMode?: boolean;
 }) {
   const isRepair = setup.next_action === "repair_model_gateway" || setup.state === "configuration_error";
   return (
@@ -1126,8 +1131,14 @@ function SetupNextStepCard({
       </p>
       {!isRepair && setup.missing_chat_routes?.length > 0 && (
         <p className="muted">
-          尚未就绪的用途路由：
-          <code>{setup.missing_chat_routes.join(", ")}</code>
+          {expertMode ? (
+            <>
+              尚未就绪的用途路由：
+              <code>{setup.missing_chat_routes.join(", ")}</code>
+            </>
+          ) : (
+            `${setup.missing_chat_routes.length} 项用途尚未就绪`
+          )}
         </p>
       )}
       <div className="provider-wizard-actions">

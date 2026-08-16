@@ -3,6 +3,7 @@ import {
   ClipboardCopy,
   Eye,
   EyeOff,
+  KeyRound,
   PlugZap,
   Save,
   ShieldCheck,
@@ -12,6 +13,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MemoryApi } from "../../api";
 import type { ConfirmFn } from "../../hooks/useConfirm";
+import { PAGE_META } from "../../navigation";
 import { loadSettings } from "../../storage";
 import type {
   ModelGatewayAdapter,
@@ -781,9 +783,9 @@ export function NewChannelWizard({
     }
   };
 
-  const requestClose = async () => {
+  const requestClose = async (): Promise<boolean> => {
     // 原子提交进行中禁止关闭：结果未知时关闭会让用户既拿不到 token 也不知道是否已生效。
-    if (busy === "apply") return;
+    if (busy === "apply") return false;
     if (done) {
       if (clientChatToken && !clientTokenCopied) {
         const confirmed = await confirm({
@@ -794,10 +796,10 @@ export function NewChannelWizard({
           cancelLabel: "返回复制",
           tone: "warning"
         });
-        if (!confirmed) return;
+        if (!confirmed) return false;
       }
       onClose();
-      return;
+      return true;
     }
     if (apiKey.trim()) {
       const confirmed = await confirm({
@@ -807,9 +809,17 @@ export function NewChannelWizard({
         cancelLabel: "继续编辑",
         tone: "warning"
       });
-      if (!confirmed) return;
+      if (!confirmed) return false;
     }
     onClose();
+    return true;
+  };
+
+  // 完成态 CTA：先走与「完成」相同的关闭守卫（一次性 token 未复制时需确认），再跳转接入信息页。
+  const goToIntegration = async () => {
+    if (await requestClose()) {
+      window.location.hash = PAGE_META.developer.hash;
+    }
   };
 
   const embeddingReplacement =
@@ -908,6 +918,13 @@ export function NewChannelWizard({
                 disabled={!clientChatToken}
               >
                 <ClipboardCopy size={16} aria-hidden />复制客户端配置
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void goToIntegration()}
+              >
+                <KeyRound size={16} aria-hidden />生成 chat token
               </button>
               <button type="button" className="primary-button" onClick={() => void requestClose()}>完成</button>
             </div>

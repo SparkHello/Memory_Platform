@@ -373,6 +373,8 @@ export interface MechanismVerdict {
 }
 
 export interface MechanismDiagnosisResult {
+  // 召回评测快照是否已初始化；旧后端可能缺该字段，缺时按未知处理。
+  snapshot_initialized?: boolean;
   database: string;
   user_id?: string | null;
   memory_count: number;

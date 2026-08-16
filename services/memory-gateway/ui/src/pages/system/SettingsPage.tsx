@@ -4,6 +4,7 @@ import { MemoryApi, isAbortError } from "../../api";
 import { normalizeBaseUrl } from "../../storage";
 import type { ConnectionSettings } from "../../types";
 import { PageHeader } from "../../components/PageHeader";
+import { ErrorBlock } from "../../components/StateBlocks";
 import { CONFIG_KEYS, CONFIG_KEY_HINTS } from "../../utils/constants";
 import { errorMessage } from "../../utils/format";
 import type { Notify } from "../pageTypes";
@@ -11,11 +12,14 @@ import type { Notify } from "../pageTypes";
 export function SettingsPage({
   settings,
   onSave,
-  notify
+  notify,
+  loginLinkStatus = null
 }: {
   settings: ConnectionSettings;
   onSave: (settings: ConnectionSettings, message?: string) => void;
   notify: Notify;
+  /** memgw open 一次性登录链接的交换状态；仅首启门槛场景由 App 传入。 */
+  loginLinkStatus?: "pending" | "failed" | null;
 }) {
   const [form, setForm] = useState(settings);
   const [showKey, setShowKey] = useState(false);
@@ -105,6 +109,14 @@ export function SettingsPage({
             <h2>连接设置</h2>
           </div>
         </div>
+        {loginLinkStatus === "pending" && (
+          <div className="notice">
+            <span className="notice-text">正在通过登录链接登录…</span>
+          </div>
+        )}
+        {loginLinkStatus === "failed" && (
+          <ErrorBlock message="登录链接已失效，请重新运行 memgw open" />
+        )}
         {gateMode && (
           <div className="notice">
             {/* 整句包成单个 .notice-text：flex 容器里散落的文本节点会被压成竖条 */}

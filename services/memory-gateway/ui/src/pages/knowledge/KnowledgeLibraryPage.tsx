@@ -23,6 +23,7 @@ import { DataTable } from "../../components/DataTable";
 import { Modal } from "../../components/Modal";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { NextStepHint } from "../../components/NextStepHint";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import { useAsyncData } from "../../hooks/useAsyncData";
 import type {
@@ -32,7 +33,8 @@ import type {
   KnowledgeExport,
   KnowledgeReadResponse,
   KnowledgeVersion,
-  MemorySensitivity
+  MemorySensitivity,
+  ProvidersStatus
 } from "../../types";
 import { copyText, downloadFile } from "../../utils/files";
 import { dateText, displayText, errorMessage, shortId } from "../../utils/format";
@@ -54,7 +56,8 @@ export function KnowledgeLibraryPage({
   maxDocumentBytes,
   onOpenDocument,
   onCloseDocument,
-  onChanged
+  onChanged,
+  setupStatus
 }: {
   api: MemoryApi;
   documentId: string | null;
@@ -64,6 +67,7 @@ export function KnowledgeLibraryPage({
   onOpenDocument: (id: string) => void;
   onCloseDocument: () => void;
   onChanged: () => void;
+  setupStatus?: ProvidersStatus["setup"] | null;
 }) {
   if (documentId) {
     return (
@@ -86,6 +90,7 @@ export function KnowledgeLibraryPage({
       maxDocumentBytes={maxDocumentBytes}
       onOpenDocument={onOpenDocument}
       onChanged={onChanged}
+      setupStatus={setupStatus}
     />
   );
 }
@@ -96,7 +101,8 @@ function KnowledgeListPage({
   confirm,
   maxDocumentBytes,
   onOpenDocument,
-  onChanged
+  onChanged,
+  setupStatus
 }: {
   api: MemoryApi;
   notify: Notify;
@@ -104,6 +110,7 @@ function KnowledgeListPage({
   maxDocumentBytes?: number;
   onOpenDocument: (id: string) => void;
   onChanged: () => void;
+  setupStatus?: ProvidersStatus["setup"] | null;
 }) {
   const [tab, setTab] = useState<KnowledgeDocumentStatus>("active");
   const [query, setQuery] = useState("");
@@ -253,7 +260,9 @@ function KnowledgeListPage({
         {loading && <LoadingBlock label="正在加载知识文档" />}
         {error && <ErrorBlock message={error} onRetry={() => void load()} />}
         {!loading && !error && documents?.length === 0 && (
-          <EmptyBlock
+          <>
+            <NextStepHint setup={setupStatus} />
+            <EmptyBlock
             label={tab === "deleted" ? "回收站为空" : submittedQuery ? "没有匹配的文档" : "知识库还是空的"}
             hint={
               tab === "deleted"
@@ -264,6 +273,7 @@ function KnowledgeListPage({
             }
             action={tab === "active" && !submittedQuery ? { label: "添加第一个文档", onClick: () => setShowUpload(true) } : undefined}
           />
+          </>
         )}
         {!loading && !error && documents && documents.length > 0 && (
           <DataTable>

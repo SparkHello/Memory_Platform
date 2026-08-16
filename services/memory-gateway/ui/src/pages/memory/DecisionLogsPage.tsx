@@ -1,11 +1,12 @@
 import { useMemo, useState } from "react";
 import { ChevronDown, RefreshCcw } from "lucide-react";
 import { MemoryApi } from "../../api";
-import type { DecisionLog, DecisionLogAction } from "../../types";
+import type { DecisionLog, DecisionLogAction, ProvidersStatus } from "../../types";
 import { badge } from "../../components/Badge";
 import { FieldList, FilterSelect } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { NextStepHint } from "../../components/NextStepHint";
 import { Modal } from "../../components/Modal";
 import { useAsyncData } from "../../hooks/useAsyncData";
 import { DECISIONS } from "../../utils/constants";
@@ -13,7 +14,13 @@ import { candidateSummary, dateText, prettyJson } from "../../utils/format";
 
 const PAGE_SIZE = 100;
 
-export function DecisionLogsPage({ api }: { api: MemoryApi }) {
+export function DecisionLogsPage({
+  api,
+  setupStatus
+}: {
+  api: MemoryApi;
+  setupStatus?: ProvidersStatus["setup"] | null;
+}) {
   const [limit, setLimit] = useState(PAGE_SIZE);
   const [decision, setDecision] = useState<"all" | DecisionLogAction>("all");
   const [conversationId, setConversationId] = useState("");
@@ -69,7 +76,9 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
         {state.loading && <LoadingBlock label="正在加载决策日志" />}
         {state.error && <ErrorBlock message={state.error} onRetry={() => void load()} />}
         {!state.loading && !state.error && logs.length === 0 && (
-          <EmptyBlock
+          <>
+            <NextStepHint setup={setupStatus} />
+            <EmptyBlock
             label="暂无决策日志"
             hint="记忆每一次被保存、更新或忽略的决策都会记录在这里。"
             action={
@@ -84,6 +93,7 @@ export function DecisionLogsPage({ api }: { api: MemoryApi }) {
                 : undefined
             }
           />
+          </>
         )}
         {logs.length > 0 && (
           <div className="table-wrap">

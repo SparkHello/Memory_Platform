@@ -105,6 +105,25 @@ def test_installers_share_typed_planner_actions_and_acceptance_fields() -> None:
     assert "--no-deps --force-recreate memory-gateway" in powershell
 
 
+def test_installers_share_one_time_console_login_url_output() -> None:
+    shell = (PLATFORM_ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
+    powershell = (PLATFORM_ROOT / "deploy" / "install.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+
+    # 双实现必须用同一后端端点、同一 URL 形态、同一终端输出行格式。
+    for implementation in (shell, powershell):
+        assert implementation.count("/auth/console-login-code") == 1
+        assert implementation.count("/ui/#login=") == 1
+        assert implementation.count("  一次性登录:     ") == 1
+        assert implementation.count("（5 分钟内有效，仅可使用一次）") == 1
+        # 只接受后端签发的 mgc_ 前缀 code，失败时回退裸 URL。
+        assert "mgc_" in implementation
+    # 优雅回退：现有裸 Web Console URL 输出必须原样保留。
+    assert 'say "  Web Console:  http://$HOST_PROBE:$PORT/ui/"' in shell
+    assert 'Write-Host "  Web Console:  http://${hostProbe}:$port/ui/"' in powershell
+
+
 def test_all_cutover_paths_share_the_authoritative_backup_validator() -> None:
     shell = (PLATFORM_ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
     powershell = (PLATFORM_ROOT / "deploy" / "install.ps1").read_text(

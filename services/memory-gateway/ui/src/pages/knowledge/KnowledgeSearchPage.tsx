@@ -120,7 +120,7 @@ export function KnowledgeSearchPage({
     <div className="page-stack knowledge-search-page">
       <PageHeader
         title="检索调试"
-        subtitle="模拟 AI 通过 MCP 描述需求，检查搜索代理如何选择逐字片段和稳定引用。"
+        subtitle="模拟 AI 通过 MCP 描述需求，检查搜索代理如何选择原文片段和引用位置。"
         action={
           <button className="secondary-button" type="button" onClick={() => void loadDocuments()}>
             <RefreshCcw size={16} />刷新文档范围
@@ -229,7 +229,7 @@ export function KnowledgeSearchPage({
       {loading && <LoadingBlock label="正在运行本地基线与受限搜索代理" />}
       {error && <ErrorBlock message={error} onRetry={() => void runSearch()} />}
       {!loading && !error && !result && (
-        <EmptyBlock label="等待一次检索" hint="输入自然语言需求后，结果会显示逐字片段、稳定引用、代理步骤摘要和 MCP JSON。" />
+        <EmptyBlock label="等待一次检索" hint="输入自然语言需求后，结果会显示原文片段、引用位置、代理步骤摘要和 MCP JSON。" />
       )}
 
       {!loading && result && (

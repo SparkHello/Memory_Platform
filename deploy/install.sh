@@ -1863,9 +1863,30 @@ detect_lan_ip() {
   return 0
 }
 
+mint_console_login_url() {
+  # 用宿主 credentials 里的 console token 向本机后端换取一次性登录 code。
+  # 任何一步失败都返回非零，调用方保持裸 Web Console URL 输出不变；
+  # token 与 code 只打印到终端，不写入任何日志文件。
+  login_cred_path=$(resolve_credential gateway 2>/dev/null || printf '%s\n' "$INSTALL_DIR/credentials/gateway.txt")
+  [ -s "$login_cred_path" ] || return 1
+  login_token=$(tr -d '\r\n' < "$login_cred_path" 2>/dev/null || true)
+  [ -n "$login_token" ] || return 1
+  login_response=$(curl -fsS -X POST \
+    -H "Authorization: Bearer $login_token" \
+    "http://$HOST_PROBE:$PORT/auth/console-login-code" 2>/dev/null) || return 1
+  login_code=$(printf '%s' "$login_response" \
+    | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\(mgc_[^"]*\)".*/\1/p')
+  [ -n "$login_code" ] || return 1
+  printf '%s\n' "http://127.0.0.1:$PORT/ui/#login=$login_code"
+}
+CONSOLE_LOGIN_URL=$(mint_console_login_url 2>/dev/null || true)
+
 say ""
 say "Memory Platform $RELEASE 已启动"
 say "  Web Console:  http://$HOST_PROBE:$PORT/ui/"
+if [ -n "$CONSOLE_LOGIN_URL" ]; then
+  say "  一次性登录:     $CONSOLE_LOGIN_URL（5 分钟内有效，仅可使用一次）"
+fi
 say "  Client URL:   http://$HOST_PROBE:$PORT/v1"
 say "  Model:        memory-auto"
 if [ "$HOST" != 127.0.0.1 ]; then

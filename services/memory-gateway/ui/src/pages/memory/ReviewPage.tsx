@@ -16,6 +16,7 @@ import type {
   DatabaseHealthResult,
   DecisionLog,
   MemoryRecord,
+  ProvidersStatus,
   ReviewRelatedCandidate,
   ReviewRecommendation,
   ReviewRevisionPreview,
@@ -28,6 +29,7 @@ import { FieldList, FilterSelect } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { InfoCard, StatCard } from "../../components/StatCard";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { NextStepHint } from "../../components/NextStepHint";
 import { Modal } from "../../components/Modal";
 import type { ConfirmFn } from "../../hooks/useConfirm";
 import type { LoadState } from "../../hooks/useAsyncData";
@@ -46,12 +48,14 @@ export function ReviewPage({
   api,
   notify,
   confirm,
-  openMemory
+  openMemory,
+  setupStatus
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
   openMemory: (id: string) => void;
+  setupStatus?: ProvidersStatus["setup"] | null;
 }) {
   const [state, setState] = useState<
     LoadState<{ review: ReviewResult; health: DatabaseHealthResult; memories: MemoryRecord[]; logs: DecisionLog[] }>
@@ -539,7 +543,12 @@ export function ReviewPage({
               </button>
             </div>
           )}
-          {state.data.review.recommendations.length === 0 && <EmptyBlock label="暂无体检建议" />}
+          {state.data.review.recommendations.length === 0 && (
+            <>
+              <NextStepHint setup={setupStatus} />
+              <EmptyBlock label="暂无体检建议" />
+            </>
+          )}
           <div className="stats-grid">
             <StatCard label="扫描记忆" value={state.data.review.total} />
             <StatCard label="建议数量" value={state.data.review.recommendations.length} />

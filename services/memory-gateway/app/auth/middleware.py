@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 import hmac
+import ipaddress
 import json
 import math
 import sqlite3
@@ -12,7 +13,7 @@ from typing import Callable
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.tokens import AuthPrincipal, AuthTokenStore
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, is_local_console_login_source
 from app.disk_capacity import DiskCapacityError, is_storage_exhausted
 
 
@@ -24,6 +25,8 @@ _ROLE_LIMITS = {
 _WINDOW_SECONDS = 60.0
 _IRREVERSIBLE_LIMIT = 10
 _AUTH_TOKEN_MAX_LENGTH = 4096
+# 唯一免 Bearer 的入口：浏览器凭一次性 code 换 console token 明文。
+_CONSOLE_LOGIN_EXCHANGE_PATH = "/auth/console-login-exchange"
 
 
 class ProcessAccessGate:
@@ -92,7 +95,12 @@ class EarlyAuthMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        role = _role_for_path(str(scope.get("path") or ""))
+        path = str(scope.get("path") or "")
+        if path == _CONSOLE_LOGIN_EXCHANGE_PATH:
+            # 该路径没有可认证的 Bearer 凭证，改走本机来源检查 + 速率限制。
+            await self._guard_console_login_exchange(scope, receive, send)
+            return
+        role = _role_for_path(path)
         if role is None:
             await self.app(scope, receive, send)
             return
@@ -159,15 +167,10 @@ class EarlyAuthMiddleware:
             irreversible=irreversible,
         )
         if not admitted:
-            details = {
-                "rate": "请求频率超过当前 token 的角色限制",
-                "irreversible": "不可逆管理操作超过每分钟 10 次限制",
-                "concurrency": "并发请求超过当前 token 的角色限制",
-            }
             await _send_auth_error(
                 send,
                 429,
-                details[reason],
+                _GATE_REJECTION_DETAILS[reason],
                 authenticate=False,
                 retry_after=retry_after,
             )
@@ -179,6 +182,42 @@ class EarlyAuthMiddleware:
             await self.app(scope, receive, send)
         finally:
             self.gate.release(identity=identity, role=role)
+
+    async def _guard_console_login_exchange(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        """免 Bearer 路径的唯一防线：本机来源 + 与 console 相同的速率限制。"""
+        client_host = _local_console_login_client_host(scope)
+        if client_host is None:
+            await _send_auth_error(
+                send,
+                403,
+                "一次性登录 code 仅允许本机浏览器交换",
+                authenticate=False,
+            )
+            return
+        identity = f"console-login:{client_host}"
+        admitted, retry_after, reason = self.gate.acquire(
+            identity=identity,
+            role="console",
+            irreversible=False,
+        )
+        if not admitted:
+            await _send_auth_error(
+                send,
+                429,
+                _GATE_REJECTION_DETAILS[reason],
+                authenticate=False,
+                retry_after=retry_after,
+            )
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.gate.release(identity=identity, role="console")
 
 
 def _authenticate(token: str, settings: Settings) -> AuthPrincipal | None:
@@ -239,7 +278,61 @@ def _bind_user(
     )
 
 
+_GATE_REJECTION_DETAILS = {
+    "rate": "请求频率超过当前 token 的角色限制",
+    "irreversible": "不可逆管理操作超过每分钟 10 次限制",
+    "concurrency": "并发请求超过当前 token 的角色限制",
+}
+
+
+def _local_console_login_client_host(scope: Scope) -> str | None:
+    """Return the client host only when the exchange request is demonstrably local.
+
+    保守判定（docker 部署依据）：容器内无法把 docker 网桥地址可靠识别为
+    「宿主机回环用户」，因此同时要求
+
+    1. source 属于回环或 RFC1918/ULA 私网（app/config.py 的既有网段逻辑）；
+    2. 请求目标 Host 为 localhost 或回环地址 —— 经 LAN/公网 IP 访问的远程
+       客户端其 Host 不会是 localhost。
+
+    同一 docker 网桥内可伪造 Host 的容器仍能通过该判定；docker 默认网桥
+    不做容器间隔离，这里把网桥视为本机信任域的一部分。
+    """
+    client = scope.get("client")
+    if (
+        not isinstance(client, (tuple, list))
+        or not client
+        or not isinstance(client[0], str)
+        or not is_local_console_login_source(client[0])
+    ):
+        return None
+    host_values = _header_values(scope.get("headers", []), b"host")
+    if len(host_values) != 1:
+        return None
+    hostname = host_values[0].decode("latin-1").strip().lower()
+    if hostname.startswith("["):
+        closing = hostname.find("]")
+        if closing == -1:
+            return None
+        hostname = hostname[1:closing]
+    else:
+        hostname = hostname.split(":", 1)[0]
+    if hostname == "localhost":
+        return str(client[0])
+    try:
+        if ipaddress.ip_address(hostname).is_loopback:
+            return str(client[0])
+    except ValueError:
+        return None
+    return None
+
+
 def _role_for_path(path: str) -> str | None:
+    if path == _CONSOLE_LOGIN_EXCHANGE_PATH:
+        # Bearer 豁免：浏览器此刻没有任何凭证，正要用一次性 code 换 console
+        # token。真正的防线是 __call__ 中该路径的本机来源检查与速率限制；
+        # 这里返回 None 是防止它被当作普通 console 路由要求 Bearer。
+        return None
     if _path_belongs_to(path, "/v1"):
         return "chat"
     if _path_belongs_to(path, "/mcp"):

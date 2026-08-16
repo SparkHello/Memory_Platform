@@ -34,12 +34,12 @@ export default defineConfig({
   projects: [
     {
       name: "desktop-1440x900",
-      testMatch: /desktop\.setup\.spec\.ts/,
+      testMatch: /desktop\.(setup|resilience|login-link)\.spec\.ts/,
       use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } }
     },
     {
       name: "mobile-390x844",
-      testMatch: /mobile-390\.navigation\.spec\.ts/,
+      testMatch: /mobile-390\.(navigation|resilience)\.spec\.ts/,
       use: {
         ...devices["Pixel 7"],
         viewport: { width: 390, height: 844 },

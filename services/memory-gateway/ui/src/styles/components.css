@@ -1502,6 +1502,15 @@
   color: var(--warning);
 }
 
+/* 空态上方的「下一步」引导：文字占满左侧，跳转按钮固定在右侧 */
+.next-step-hint .notice-text {
+  color: var(--text);
+}
+
+.next-step-hint a {
+  text-decoration: none;
+}
+
 .core-impact-notice {
   justify-content: space-between;
   flex-wrap: wrap;
@@ -2207,4 +2216,92 @@ code {
 
 .drawer-actions.end {
   justify-content: flex-end;
+}
+
+/* ---- 错误边界与角标失败提示 ---- */
+
+.error-boundary-overlay {
+  padding: 16px;
+}
+
+.error-boundary-overlay-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: auto;
+  max-width: 420px;
+  padding: 22px 24px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--glass-panel-bg);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.error-boundary-icon {
+  color: var(--warning, #d97706);
+}
+
+.error-boundary-overlay-body strong {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.error-boundary-overlay-body p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.error-boundary-detail {
+  display: block;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-button);
+  background: var(--code-bg, rgba(127, 127, 127, 0.12));
+  font-size: 12.5px;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.error-boundary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.nav-signals-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 6px 10px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--warning, #d97706) 45%, transparent);
+  border-radius: var(--radius-button);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.nav-signals-error > svg {
+  flex: none;
+  color: var(--warning, #d97706);
+}
+
+.nav-signals-error > span {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 780px) {
+  .error-boundary-overlay {
+    padding: 10px;
+  }
+
+  .error-boundary-overlay-card {
+    padding: 18px;
+  }
 }

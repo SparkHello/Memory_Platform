@@ -78,15 +78,21 @@ def run_diagnosis(
     database: str | Path = "data/memory.db",
     *,
     user_id: str | None = None,
+    eval_dir: str | Path = DEFAULT_EVAL_DIR,
 ) -> dict[str, object]:
     """只读评估各记忆机制是否被真实数据激活。"""
     database_path = Path(database)
+    # snapshot_initialized 让前端区分「未初始化评测快照」与「诊断出错」。
+    # 这里用 eval_workspace_paths 只探测路径存在性，不像
+    # require_eval_workspace 那样抛 FileNotFoundError。
+    _, snapshot_path, _ = workspace.eval_workspace_paths(eval_dir, user_id=user_id)
     result: dict[str, object] = {
         "database": str(database_path),
         "user_id": user_id,
         "memory_count": 0,
         "metrics": {},
         "verdicts": [],
+        "snapshot_initialized": snapshot_path.exists(),
     }
 
     if not database_path.exists():

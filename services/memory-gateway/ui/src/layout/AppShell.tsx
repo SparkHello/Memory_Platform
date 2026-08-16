@@ -17,6 +17,7 @@ import {
   ScanSearch,
   Settings as SettingsIcon,
   Sun,
+  TriangleAlert,
   Wrench,
   X
 } from "lucide-react";
@@ -25,7 +26,9 @@ import { NAV_SECTIONS, PAGE_META, SIMPLE_NAV_SECTIONS, sectionForPage } from "..
 import { useDialogA11y } from "../hooks/useDialogA11y";
 import {
   loadCollapsedNavSections,
+  loadDismissedStatus,
   saveCollapsedNavSections,
+  saveDismissedStatus,
   type ThemeMode,
   type UiMode
 } from "../storage";
@@ -53,6 +56,10 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
 // 接入信息放在主导航：首通后复制 chat token 是最高频步骤之一。
 const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "developer"];
 
+// warning 横幅（待配置模型 / 配置需处理）只在这四个可操作页面出现；
+// bad（服务异常）不受页限且不可关闭，ok / loading 照旧全局显示。
+const WARNING_STATUS_PAGES: PageKey[] = ["dashboard", "providers", "settings", "developer"];
+
 export type NavBadge = {
   text: string;
   tone: "warning" | "info" | "muted";
@@ -68,6 +75,8 @@ export function AppShell({
   uiMode,
   needsCredentialSetup = false,
   signals = {},
+  signalsError = null,
+  onRetrySignals,
   onToggleTheme,
   onToggleUiMode,
   onPageChange,
@@ -86,6 +95,9 @@ export function AppShell({
   /** 无密钥或密钥失效：隐藏主导航，只做连接设置。 */
   needsCredentialSetup?: boolean;
   signals?: NavSignals;
+  /** 角标拉取失败的持久提示文案；为 null 表示正常。 */
+  signalsError?: string | null;
+  onRetrySignals?: () => void;
   onToggleTheme: () => void;
   onToggleUiMode: () => void;
   onPageChange: (page: PageKey) => void;
@@ -93,6 +105,8 @@ export function AppShell({
   children: ReactNode;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
+  // warning 横幅可关闭：记录被关闭的消息文本，消息内容变化时重新出现。
+  const [dismissedStatus, setDismissedStatus] = useState(() => loadDismissedStatus());
   // 专家模式导航有 15 个入口，分组可折叠；折叠偏好跨会话保留。
   const [collapsedSections, setCollapsedSections] = useState<string[]>(() =>
     loadCollapsedNavSections()
@@ -111,6 +125,16 @@ export function AppShell({
       saveCollapsedNavSections(next);
       return next;
     });
+  };
+
+  const isWarningStatus = !serviceStatus.loading && serviceStatus.tone === "warning";
+  const showStatusPill =
+    !isWarningStatus ||
+    (WARNING_STATUS_PAGES.includes(activePage) && serviceStatus.message !== dismissedStatus);
+
+  const dismissWarningStatus = () => {
+    saveDismissedStatus(serviceStatus.message);
+    setDismissedStatus(serviceStatus.message);
   };
 
   const go = (nextPage: PageKey) => {
@@ -193,6 +217,19 @@ export function AppShell({
               );
             })}
           </nav>
+          {signalsError && (
+            <div className="nav-signals-error" role="status">
+              <TriangleAlert size={14} aria-hidden="true" />
+              <span>待办角标暂时无法更新</span>
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => onRetrySignals?.()}
+              >
+                重试
+              </button>
+            </div>
+          )}
           <button
             className="nav-item nav-mode-toggle"
             type="button"
@@ -222,26 +259,41 @@ export function AppShell({
             </div>
           </div>
           <div className="topbar-right">
-            <button
-              className={`status-pill status-${serviceStatus.tone}`}
-              type="button"
-              onClick={onRefreshService}
-              title={
-                !serviceStatus.loading && serviceStatus.tone === "bad"
-                  ? `${serviceStatus.message} · 点击重新检查`
-                  : "重新检查服务和访问密钥"
-              }
-              aria-live="polite"
-            >
-              <span className={`status-dot ${serviceStatus.tone}`} />
-              <span className="status-text">
-                {serviceStatus.loading
-                  ? "检查中"
-                  : serviceStatus.tone === "bad"
-                    ? "服务异常"
-                    : serviceStatus.message}
-              </span>
-            </button>
+            {showStatusPill && (
+              <div className="status-cluster">
+                <button
+                  className={`status-pill status-${serviceStatus.tone}`}
+                  type="button"
+                  onClick={onRefreshService}
+                  title={
+                    !serviceStatus.loading && serviceStatus.tone === "bad"
+                      ? `${serviceStatus.message} · 点击重新检查`
+                      : "重新检查服务和访问密钥"
+                  }
+                  aria-live="polite"
+                >
+                  <span className={`status-dot ${serviceStatus.tone}`} />
+                  <span className="status-text">
+                    {serviceStatus.loading
+                      ? "检查中"
+                      : serviceStatus.tone === "bad"
+                        ? "服务异常"
+                        : serviceStatus.message}
+                  </span>
+                </button>
+                {isWarningStatus && (
+                  <button
+                    className="status-dismiss"
+                    type="button"
+                    onClick={dismissWarningStatus}
+                    title="关闭此提示（内容变化后会重新出现）"
+                    aria-label="关闭状态提示"
+                  >
+                    <X size={14} aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+            )}
             <button
               className="icon-button"
               type="button"
@@ -305,6 +357,8 @@ export function AppShell({
         <MobileMoreSheet
           activePage={activePage}
           uiMode={uiMode}
+          signalsError={signalsError}
+          onRetrySignals={onRetrySignals}
           onClose={() => setMoreOpen(false)}
           onPageChange={go}
           onToggleUiMode={onToggleUiMode}
@@ -317,12 +371,16 @@ export function AppShell({
 function MobileMoreSheet({
   activePage,
   uiMode,
+  signalsError = null,
+  onRetrySignals,
   onClose,
   onPageChange,
   onToggleUiMode
 }: {
   activePage: PageKey;
   uiMode: UiMode;
+  signalsError?: string | null;
+  onRetrySignals?: () => void;
   onClose: () => void;
   onPageChange: (page: PageKey) => void;
   onToggleUiMode: () => void;
@@ -360,6 +418,19 @@ function MobileMoreSheet({
             </div>
           </div>
         ))}
+        {signalsError && (
+          <div className="nav-signals-error" role="status">
+            <TriangleAlert size={14} aria-hidden="true" />
+            <span>待办角标暂时无法更新</span>
+            <button
+              className="ghost-button compact"
+              type="button"
+              onClick={() => onRetrySignals?.()}
+            >
+              重试
+            </button>
+          </div>
+        )}
         <button
           className="secondary-button mobile-mode-toggle"
           type="button"

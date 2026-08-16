@@ -26,7 +26,11 @@ def memory_evaluation_diagnosis(
     user_id: Annotated[str, Depends(get_user_id)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
-    result = run_diagnosis(settings.database_path, user_id=user_id)
+    result = run_diagnosis(
+        settings.database_path,
+        user_id=user_id,
+        eval_dir=settings.eval_dir,
+    )
     if result.get("error"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

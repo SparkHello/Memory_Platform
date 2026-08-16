@@ -991,9 +991,59 @@ def _open_console(*, paths: CliPaths) -> int:
     state = _read_state(paths) or {}
     port = int(state.get("port", 2026))
     url = f"http://localhost:{port}/ui"
+    code = _mint_console_login_code(paths=paths, port=port)
+    if code:
+        url = f"{url}/#login={code}"
+    else:
+        print("提示：未生成一次性登录链接，已打开控制台首页（可在登录页粘贴 credentials 中的 Console token）。")
     if not webbrowser.open(url):
         print(url)
     return 0
+
+
+def _read_console_credential(paths: CliPaths) -> str | None:
+    """读取本地 console token（source 安装为 gateway.key，Docker 为 gateway.txt）。
+
+    缺失或不合规时返回 None，由调用方回退为裸 URL。
+    """
+    for name in ("gateway.txt", "gateway.key"):
+        try:
+            return _read_private_credential(paths.credentials / name)
+        except ValueError:
+            continue
+    return None
+
+
+def _mint_console_login_code(*, paths: CliPaths, port: int) -> str | None:
+    """用本地 console token 换取一次性登录 code；任何失败都返回 None。
+
+    token 与 code 明文只存在于请求头和返回值中，绝不写入日志。
+    """
+    token = _read_console_credential(paths)
+    if not token:
+        return None
+    try:
+        response = httpx.post(
+            f"http://127.0.0.1:{port}/auth/console-login-code",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+            timeout=2,
+            follow_redirects=False,
+            trust_env=False,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 201:
+        return None
+    try:
+        code = response.json().get("code")
+    except ValueError:
+        return None
+    if not isinstance(code, str) or not code:
+        return None
+    return code
 
 
 def _cmd_config_show(args: Any, paths: CliPaths, project_root: Path) -> int:

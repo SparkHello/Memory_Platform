@@ -12,12 +12,13 @@ import {
   X
 } from "lucide-react";
 import { MemoryApi, isAbortError } from "../../api";
-import type { MemoryPurgePreviewResult, MemoryRecord, MemorySpace } from "../../types";
+import type { MemoryPurgePreviewResult, MemoryRecord, MemorySpace, ProvidersStatus } from "../../types";
 import { badge } from "../../components/Badge";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { FilterSelect, RangeFields } from "../../components/FormControls";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { NextStepHint } from "../../components/NextStepHint";
 import type { LoadState } from "../../hooks/useAsyncData";
 import { useConfirm } from "../../hooks/useConfirm";
 import { useDialogA11y } from "../../hooks/useDialogA11y";
@@ -84,12 +85,14 @@ export function MemoriesPage({
   api,
   notify,
   openMemory,
-  refreshKey
+  refreshKey,
+  setupStatus
 }: {
   api: MemoryApi;
   notify: Notify;
   openMemory: (id: string) => void;
   refreshKey: number;
+  setupStatus?: ProvidersStatus["setup"] | null;
 }) {
   const [tab, setTab] = useState<"active" | "deleted">(
     () => tabFromHash(window.location.hash) || "active"
@@ -869,10 +872,13 @@ export function MemoriesPage({
           {state.loading && <LoadingBlock label="正在加载记忆" />}
           {state.error && <ErrorBlock message={state.error} onRetry={() => load(tab)} />}
           {!state.loading && !state.error && memories.length === 0 && (
-            <EmptyBlock
-              label={tab === "deleted" ? "回收站为空" : "没有匹配的记忆"}
-              hint={tab === "deleted" ? "被软删除的记忆会保留在这里，可以恢复或彻底清理。" : "调整搜索词或筛选条件后再试。"}
-            />
+            <>
+              <NextStepHint setup={setupStatus} />
+              <EmptyBlock
+                label={tab === "deleted" ? "回收站为空" : "没有匹配的记忆"}
+                hint={tab === "deleted" ? "被软删除的记忆会保留在这里，可以恢复或彻底清理。" : "调整搜索词或筛选条件后再试。"}
+              />
+            </>
           )}
           {memories.length > 0 && (
             <>

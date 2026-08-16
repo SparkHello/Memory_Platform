@@ -10,8 +10,9 @@ import { type MemoryApi } from "../../api";
 import { DataTable } from "../../components/DataTable";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
+import { NextStepHint } from "../../components/NextStepHint";
 import { useAsyncData } from "../../hooks/useAsyncData";
-import type { CentralModelUsageSummary } from "../../types";
+import type { CentralModelUsageSummary, ProvidersStatus } from "../../types";
 
 type RangeKey = "7" | "30" | "90" | "all";
 
@@ -22,7 +23,13 @@ const RANGES: Array<{ key: RangeKey; label: string }> = [
   { key: "all", label: "全部" }
 ];
 
-export function UsagePage({ api }: { api: MemoryApi }) {
+export function UsagePage({
+  api,
+  setupStatus
+}: {
+  api: MemoryApi;
+  setupStatus?: ProvidersStatus["setup"] | null;
+}) {
   const [range, setRange] = useState<RangeKey>("30");
   const { state, reload: load } = useAsyncData<CentralModelUsageSummary>(
     (signal) => api.modelUsage(range, signal),
@@ -62,12 +69,18 @@ export function UsagePage({ api }: { api: MemoryApi }) {
 
       {loading && !summary && <LoadingBlock label="正在汇总模型用量" />}
       {error && <ErrorBlock message={error} onRetry={() => void load()} />}
-      {summary && <CentralUsageView summary={summary} />}
+      {summary && <CentralUsageView summary={summary} setupStatus={setupStatus} />}
     </div>
   );
 }
 
-function CentralUsageView({ summary }: { summary: CentralModelUsageSummary }) {
+function CentralUsageView({
+  summary,
+  setupStatus
+}: {
+  summary: CentralModelUsageSummary;
+  setupStatus?: ProvidersStatus["setup"] | null;
+}) {
   const incompleteCalls = Math.max(0, summary.calls - summary.complete_calls);
   return (
     <>
@@ -98,12 +111,15 @@ function CentralUsageView({ summary }: { summary: CentralModelUsageSummary }) {
       </section>
 
       {summary.calls === 0 ? (
-        <section className="panel">
-          <EmptyBlock
-            label="当前用户还没有中央模型调用"
-            hint="Model Gateway 按不可逆用户标签隔离统计，不保存提示词或回复正文。"
-          />
-        </section>
+        <>
+          <NextStepHint setup={setupStatus} />
+          <section className="panel">
+            <EmptyBlock
+              label="当前用户还没有中央模型调用"
+              hint="Model Gateway 按不可逆用户标签隔离统计，不保存提示词或回复正文。"
+            />
+          </section>
+        </>
       ) : (
         <>
           <section className="usage-split">

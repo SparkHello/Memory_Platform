@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, MemoryApi } from "./api";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { MemoryDetailDrawer } from "./components/MemoryDetailDrawer";
 import { ToastView } from "./components/Toast";
 import { useConfirm } from "./hooks/useConfirm";
@@ -37,6 +38,24 @@ import { errorMessage } from "./utils/format";
 import { isProviderSetupReady } from "./utils/providerSetup";
 import { scrollWorkspaceToTop } from "./utils/scroll";
 
+// e2e 专用崩溃探针：仅 e2e 构建模式存在，生产构建中被 Vite 消除。
+function E2eCrashProbe() {
+  if (import.meta.env.MODE === "e2e" && (window as { __CONSOLE_CRASH_PAGE__?: boolean }).__CONSOLE_CRASH_PAGE__) {
+    throw new Error("e2e 合成渲染崩溃");
+  }
+  return null;
+}
+
+/**
+ * memgw open 生成的一次性登录链接形态 #login=<code>。
+ * 必须在 hash 路由解析（parseHash）之前单独识别：它不是页面路由，
+ * 若交给路由层会被判成未知 hash 而显示「页面不存在」。
+ */
+function readLoginCodeFromHash(): string | null {
+  const match = window.location.hash.match(/^#login=([^&]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 export function App() {
   const [settings, setSettings] = useState<ConnectionSettings>(() => loadSettings());
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
@@ -63,8 +82,20 @@ export function App() {
     message: string;
   }>({ loading: true, tone: "warning", message: "检查中" });
   const [navSignals, setNavSignals] = useState<NavSignals>({});
+  // 角标刷新失败的持久提示（不发 toast，避免连续失败刷屏）。
+  const [signalsError, setSignalsError] = useState<string | null>(null);
   const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeStatus | null>(null);
   const [setupStatus, setSetupStatus] = useState<ProvidersStatus["setup"] | null>(null);
+  // 非空且 parseHash 失败时记录，用于「页面不存在」提示；合法导航时清除。
+  const [unknownHash, setUnknownHash] = useState<string | null>(() => {
+    const current = window.location.hash;
+    if (!current || current === "#/" || readLoginCodeFromHash()) return null;
+    return parseHash(current) ? null : current;
+  });
+  // null = 无登录链接；pending = 正在交换 code；failed = 交换失败，回退手动填 key。
+  const [loginLinkStatus, setLoginLinkStatus] = useState<"pending" | "failed" | null>(
+    () => (readLoginCodeFromHash() ? "pending" : null)
+  );
 
   const api = useMemo(() => new MemoryApi(settings), [settings]);
   const { toast, notify, clearToast } = useToast();
@@ -117,13 +148,17 @@ export function App() {
       }
       setKnowledgeStatus(knowledge);
       setCredentialsBlocked(false);
+      setSignalsError(null);
     } catch (error) {
       // 角标只是辅助信号；若鉴权失败则强制回到连接设置。
       if (error instanceof ApiError && error.status === 401) {
         setCredentialsBlocked(true);
         setNavSignals({});
+        setSignalsError(null);
         return;
       }
+      // 非 401 失败改为持久提示位，由用户决定是否重试。
+      setSignalsError(errorMessage(error));
     }
     setNavSignals(next);
   }, [api, settings.apiKey, credentialsBlocked]);
@@ -172,6 +207,7 @@ export function App() {
     setPage(nextPage);
     setMemoryId(null);
     setKnowledgeId(null);
+    setUnknownHash(null);
     syncHash(nextPage, null, null);
   }, [syncHash]);
 
@@ -211,9 +247,14 @@ export function App() {
     const onHashChange = () => {
       const route = parseHash(window.location.hash);
       if (route) {
+        setUnknownHash(null);
         setPage(route.page);
         setMemoryId(route.memoryId);
         setKnowledgeId(route.knowledgeId);
+      } else {
+        // 未知 hash 不再静默忽略：空 hash 交给上方的 replaceState 兜底。
+        const current = window.location.hash;
+        setUnknownHash(current && current !== "#/" ? current : null);
       }
     };
     window.addEventListener("hashchange", onHashChange);
@@ -274,6 +315,12 @@ export function App() {
     void pingService();
   }, [pingService]);
 
+  const retrySignals = useCallback(() => {
+    // 绕过 60s 节流：用户显式点击重试应立即生效。
+    lastSignalsRefreshRef.current = 0;
+    void refreshSignals();
+  }, [refreshSignals]);
+
   const applySettings = (next: ConnectionSettings, message = "设置已保存") => {
     const wasBlocked = !settings.apiKey || credentialsBlocked;
     const saved = saveSettings(next);
@@ -298,6 +345,39 @@ export function App() {
     }
   };
 
+  // 一次性登录链接交换：仅在挂载时消费一次 #login=<code>。无论成败都先
+  // 把 code 从 URL 抹掉（replaceState 不触发 hashchange），避免泄露到历史
+  // 记录或被路由层误判。成功后复用 applySettings 的首启路径进入主站；
+  // 失败则落回手动粘贴 gateway.txt 的既有流程。
+  const loginExchangeStartedRef = useRef(false);
+  useEffect(() => {
+    if (loginLinkStatus !== "pending" || loginExchangeStartedRef.current) return;
+    loginExchangeStartedRef.current = true;
+    const code = readLoginCodeFromHash();
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    if (!code) {
+      setLoginLinkStatus(null);
+      return;
+    }
+    void api.exchangeConsoleLoginCode(code)
+      .then((token) => {
+        applySettings({ ...loadSettings(), apiKey: token }, "已通过登录链接登录");
+        setLoginLinkStatus(null);
+      })
+      .catch(() => {
+        setLoginLinkStatus("failed");
+        if (loadSettings().apiKey) {
+          // 已有保存密钥：失效链接不踢出现有会话，仅提示；首启（无密钥）
+          // 才强制落回手动粘贴 gateway.txt 的填 key 页。
+          notify("登录链接已失效，请重新运行 memgw open", "error");
+        } else {
+          setCredentialsBlocked(true);
+        }
+      });
+    // applySettings 每次渲染都会重建，挂载时的一次性交换不需要跟随它重跑。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loginLinkStatus, api]);
+
   return (
     <>
       <AppShell
@@ -308,26 +388,58 @@ export function App() {
         uiMode={uiMode}
         needsCredentialSetup={needsCredentialSetup}
         signals={navSignals}
+        signalsError={signalsError}
+        onRetrySignals={retrySignals}
         onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
         onToggleUiMode={() => setUiMode((current) => (current === "simple" ? "expert" : "simple"))}
         onPageChange={navigateToPage}
         onRefreshService={() => void pingService()}
       >
-        {activePage === "dashboard" && (
-          <DashboardPage
-            api={api}
-            settings={settings}
-            setPage={navigateToPage}
-            openMemory={openMemory}
-            notify={notify}
-            confirm={confirm}
-            refreshKey={memoryRefreshKey}
-          />
+        <ErrorBoundary
+          variant="page"
+          resetKeys={[activePage, knowledgeId]}
+          onGoHome={() => navigateToPage("dashboard")}
+        >
+          <E2eCrashProbe />
+          {!needsCredentialSetup && unknownHash && (
+            <div className="page-stack">
+              <div className="page-header">
+                <div>
+                  <h1>页面不存在</h1>
+                  <p>链接可能有误或内容已移动。</p>
+                </div>
+              </div>
+              <div className="panel">
+                <code className="error-boundary-detail">{unknownHash}</code>
+                <div className="error-boundary-actions">
+                  <button
+                    className="primary-button"
+                    type="button"
+                    autoFocus
+                    onClick={() => navigateToPage("dashboard")}
+                  >
+                    返回工作室
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {!unknownHash && activePage === "dashboard" && (
+            <DashboardPage
+              api={api}
+              settings={settings}
+              setPage={navigateToPage}
+              openMemory={openMemory}
+              notify={notify}
+              confirm={confirm}
+              refreshKey={memoryRefreshKey}
+              expertMode={uiMode === "expert"}
+            />
+          )}
+        {!unknownHash && activePage === "memories" && (
+          <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} setupStatus={setupStatus} />
         )}
-        {activePage === "memories" && (
-          <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} />
-        )}
-        {activePage === "knowledge" && (
+        {!unknownHash && activePage === "knowledge" && (
           <KnowledgeLibraryPage
             api={api}
             documentId={knowledgeId}
@@ -337,28 +449,29 @@ export function App() {
             onOpenDocument={openKnowledge}
             onCloseDocument={closeKnowledge}
             onChanged={() => setKnowledgeRefreshKey((current) => current + 1)}
+            setupStatus={setupStatus}
           />
         )}
-        {activePage === "knowledgeSearch" && (
+        {!unknownHash && activePage === "knowledgeSearch" && (
           <KnowledgeSearchPage api={api} notify={notify} onOpenDocument={openKnowledge} status={knowledgeStatus} />
         )}
-        {activePage === "core" && (
+        {!unknownHash && activePage === "core" && (
           <CoreMemoryPage api={api} notify={notify} confirm={confirm} />
         )}
-        {activePage === "review" && (
-          <ReviewPage api={api} notify={notify} confirm={confirm} openMemory={openMemory} />
+        {!unknownHash && activePage === "review" && (
+          <ReviewPage api={api} notify={notify} confirm={confirm} openMemory={openMemory} setupStatus={setupStatus} />
         )}
-        {activePage === "recall" && <RecallExplainPage api={api} notify={notify} openMemory={openMemory} />}
-        {activePage === "evaluation" && <EvaluationPage api={api} notify={notify} />}
-        {activePage === "recent" && (
+        {!unknownHash && activePage === "recall" && <RecallExplainPage api={api} notify={notify} openMemory={openMemory} />}
+        {!unknownHash && activePage === "evaluation" && <EvaluationPage api={api} notify={notify} />}
+        {!unknownHash && activePage === "recent" && (
           <RecentContextPage api={api} notify={notify} confirm={confirm} />
         )}
-        {activePage === "reports" && (
+        {!unknownHash && activePage === "reports" && (
           <ReportsPage api={api} settings={settings} notify={notify} confirm={confirm} />
         )}
-        {activePage === "logs" && <DecisionLogsPage api={api} />}
-        {activePage === "usage" && <UsagePage api={api} />}
-        {activePage === "providers" && (
+        {!unknownHash && activePage === "logs" && <DecisionLogsPage api={api} setupStatus={setupStatus} />}
+        {!unknownHash && activePage === "usage" && <UsagePage api={api} setupStatus={setupStatus} />}
+        {!unknownHash && activePage === "providers" && (
           <ProvidersPage
             api={api}
             initialSetup={!isProviderSetupReady(setupStatus)}
@@ -366,10 +479,15 @@ export function App() {
             onSetupChanged={() => pingService()}
           />
         )}
-        {activePage === "settings" && (
-          <SettingsPage settings={settings} onSave={applySettings} notify={notify} />
+        {!unknownHash && activePage === "settings" && (
+          <SettingsPage
+            settings={settings}
+            onSave={applySettings}
+            notify={notify}
+            loginLinkStatus={loginLinkStatus}
+          />
         )}
-        {activePage === "developer" && (
+        {!unknownHash && activePage === "developer" && (
           <DeveloperPage
             api={api}
             settings={settings}
@@ -377,20 +495,25 @@ export function App() {
             confirm={confirm}
           />
         )}
+        </ErrorBoundary>
       </AppShell>
       {settings.apiKey && memoryId && (
-        <MemoryDetailDrawer
-          api={api}
-          memoryId={memoryId}
-          notify={notify}
-          confirm={confirm}
-          onClose={closeMemory}
-          onOpenMemory={openMemory}
-          onChanged={() => setMemoryRefreshKey((current) => current + 1)}
-        />
+        <ErrorBoundary variant="overlay" onDismiss={closeMemory}>
+          <MemoryDetailDrawer
+            api={api}
+            memoryId={memoryId}
+            notify={notify}
+            confirm={confirm}
+            onClose={closeMemory}
+            onOpenMemory={openMemory}
+            onChanged={() => setMemoryRefreshKey((current) => current + 1)}
+          />
+        </ErrorBoundary>
       )}
       {toast && <ToastView toast={toast} onDismiss={clearToast} />}
-      <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
+      <ErrorBoundary variant="overlay" onDismiss={() => resolveConfirm(false)}>
+        <ConfirmDialog state={confirmState} onResolve={resolveConfirm} />
+      </ErrorBoundary>
     </>
   );
 }

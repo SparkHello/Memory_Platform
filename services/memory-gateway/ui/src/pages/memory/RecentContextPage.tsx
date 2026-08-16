@@ -240,7 +240,7 @@ export function RecentContextPage({
             />
             <ContextMetric label="当前加载" value={allNodes.length} />
             <ContextMetric label="可见根节点" value={tree.roots.length} />
-            <ContextMetric label="分叉点" value={forkCount} />
+            <ContextMetric label="分支点" value={forkCount} />
           </section>
 
           <section className="panel branch-workspace">
@@ -424,7 +424,7 @@ function BranchNodeView({
           {node.parent_history_fingerprint && !hasKnownParent && (
             <span className="context-chip warning">父节点未加载</span>
           )}
-          {childCount > 1 && <span className="context-chip fork">分叉点 · {childCount}</span>}
+          {childCount > 1 && <span className="context-chip fork">分支点 · {childCount}</span>}
           {childCount === 1 && <span className="context-chip">续接</span>}
           {childCount === 0 && <span className="context-chip leaf">叶节点</span>}
         </span>

@@ -34,6 +34,27 @@ _PRIVATE_MODEL_GATEWAY_NETWORKS = (
 _SETTINGS_FILE_MAX_BYTES = 1024 * 1024
 _SETTINGS_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# 一次性 console 登录 code 交换允许的来源网段：回环 + 既有 RFC1918/ULA 私网。
+# Docker 发布端口（如 -p 127.0.0.1:2026:2026）下，宿主机浏览器的连接经
+# docker 代理进入容器后 source 变为网桥地址（如 172.17.0.1）而非回环，且
+# 无法与同一网桥上的其他容器区分；因此调用方还必须要求请求目标 Host 为
+# localhost/回环（见 app/auth/middleware.py 的本机判定与依据注释）。
+_LOCAL_CONSOLE_LOGIN_SOURCE_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    *_PRIVATE_MODEL_GATEWAY_NETWORKS,
+)
+
+def is_local_console_login_source(source_host: str) -> bool:
+    """Whether a client source address may attempt a console login exchange."""
+    try:
+        address = ipaddress.ip_address(source_host)
+    except ValueError:
+        return False
+    return any(
+        address in network for network in _LOCAL_CONSOLE_LOGIN_SOURCE_NETWORKS
+    )
+
 def _is_safe_private_model_gateway_host(hostname: str) -> bool:
     if hostname == "model-gateway":
         return True

@@ -15,7 +15,15 @@ export type FakeApiState = {
   exportBodies: unknown[];
   purgePreviewBodies: unknown[];
   purgeCommitBodies: unknown[];
+  loginExchangeBodies: unknown[];
+  /** 为 true 时 /memories/report 返回 500，用于角标失败路径 e2e。 */
+  failMemoryReport: boolean;
 };
+
+/** #login=<code> 一次性登录链接 e2e：只有这个 code 能交换成功。 */
+export const VALID_LOGIN_CODE = "mgc_synthetic_login_code_0000000000000000";
+export const LOGIN_EXCHANGED_TOKEN =
+  "mgw_e2eloginexch_synthetic_console_secret_00000000000000";
 
 const revision = "a".repeat(64);
 
@@ -158,7 +166,9 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     unknownApiPaths: [],
     exportBodies: [],
     purgePreviewBodies: [],
-    purgeCommitBodies: []
+    purgeCommitBodies: [],
+    loginExchangeBodies: [],
+    failMemoryReport: false
   };
 
   await page.route("**/*", async (route) => {
@@ -193,6 +203,9 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
       });
     }
     if (url.pathname === "/memories/report") {
+      if (state.failMemoryReport) {
+        return json(route, { detail: "合成角标故障" }, 500);
+      }
       return json(route, {
         user_id: "e2e-user",
         generated_at: "2026-08-09T10:00:00+00:00",
@@ -282,6 +295,15 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
         discovery: { mode: "discovery", summary: { ok: 1 }, connections: [] }
       });
     }
+    if (url.pathname === "/auth/console-login-exchange") {
+      state.loginExchangeBodies.push(call.body);
+      const code = (call.body as { code?: unknown } | null)?.code;
+      // 与后端契约一致：无效/过期/已用一律 401 且响应体一致。
+      if (code !== VALID_LOGIN_CODE) {
+        return json(route, { detail: "登录 code 无效或已过期" }, 401);
+      }
+      return json(route, { token: LOGIN_EXCHANGED_TOKEN });
+    }
     if (url.pathname === "/auth/tokens") {
       return json(route, {
         data: [],
@@ -291,6 +313,8 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
         allowed_create_roles: ["chat", "mcp"]
       });
     }
+    if (url.pathname === "/memories/decision-logs") return json(route, { data: [] });
+    if (url.pathname === "/memories/surface") return json(route, { data: [] });
     if (url.pathname === "/memories/spaces") return json(route, { data: [] });
     if (url.pathname === "/memories/deleted" && request.method() === "GET") {
       return json(route, { data: deletedMemories });

@@ -13,6 +13,7 @@ from app.auth.tokens import (
     AuthTokenStore,
     LastActiveConsoleTokenError,
 )
+from app.schema_versions import AUTH_SCHEMA_VERSION
 
 
 def test_scoped_token_store_hashes_secrets_and_revokes_immediately(tmp_path) -> None:
@@ -142,7 +143,10 @@ def test_auth_schema_initialization_is_idempotent_and_rejects_future_version(
     store.init_db()
     store.init_db()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == AUTH_SCHEMA_VERSION
+        )
         connection.execute("PRAGMA user_version = 99")
 
     with pytest.raises(AuthStoreError, match="更高版本"):

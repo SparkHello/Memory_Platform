@@ -16,7 +16,7 @@ import {
   TriangleAlert,
   XCircle
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
@@ -36,6 +36,11 @@ import type {
   RouteInfo
 } from "../../types";
 import { errorMessage } from "../../utils/format";
+import {
+  clearModelAdminKey,
+  loadModelAdminKey,
+  saveModelAdminKey
+} from "../../utils/adminKeySession";
 import { isProviderSetupReady } from "../../utils/providerSetup";
 import { AddChannelModelPanel } from "./AddChannelModelPanel";
 import { NewChannelWizard } from "./NewChannelWizard";
@@ -58,7 +63,7 @@ export function ProvidersPage({
   const [drafts, setDrafts] = useState<ModelGatewayRouteDraft[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [adminKey, setAdminKey] = useState("");
+  const [adminKey, setAdminKey] = useState(() => loadModelAdminKey());
   const [showAdminKey, setShowAdminKey] = useState(false);
   const [adminCheck, setAdminCheck] = useState<"idle" | "checking" | "valid" | "invalid">("idle");
   const [secretValues, setSecretValues] = useState<Record<string, string>>({});
@@ -126,6 +131,30 @@ export function ProvidersPage({
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  // 同标签页内验证过的 admin key 存在 sessionStorage：切换页面后恢复并静默重验，
+  // 不必重新粘贴；密钥已轮换（重验失败）时丢弃存档，回到手动输入。
+  const restoredAdminKeyRef = useRef(adminKey);
+  useEffect(() => {
+    const restored = restoredAdminKeyRef.current.trim();
+    if (!restored) return;
+    let cancelled = false;
+    setAdminCheck("checking");
+    void (async () => {
+      try {
+        await api.checkProviderAdminKey(restored);
+        await loadAdminControl(restored, false);
+        if (!cancelled) setAdminCheck("valid");
+      } catch (cause) {
+        if (cancelled || isAbortError(cause)) return;
+        clearModelAdminKey();
+        setAdminCheck("idle");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, loadAdminControl]);
 
   const baselineSignature = useMemo(
     () => JSON.stringify(routeDrafts(status?.control || null)),
@@ -292,6 +321,7 @@ export function ProvidersPage({
       await api.checkProviderAdminKey(adminKey.trim());
       const fullControl = await loadAdminControl(adminKey.trim(), false);
       setAdminCheck("valid");
+      saveModelAdminKey(adminKey.trim());
       setFeedback({ tone: "success", message: "管理密钥验证成功，可以继续配置模型。" });
       if (initialSetup && fullControl.connections.length === 0) {
         setWizardOpen(true);
@@ -303,6 +333,15 @@ export function ProvidersPage({
         message: errorMessage(cause, { credential: "admin" })
       });
     }
+  };
+
+  const forgetAdminKey = () => {
+    clearModelAdminKey();
+    restoredAdminKeyRef.current = "";
+    setAdminKey("");
+    setAdminCheck("idle");
+    setValidatedSignature("");
+    setFeedback({ tone: "success", message: "已忘记管理密钥，当前标签页的会话存档已清除。" });
   };
 
   const refreshAll = async (preserveDrafts = false) => {
@@ -490,6 +529,7 @@ export function ProvidersPage({
                 }}
                 onToggleShow={() => setShowAdminKey((current) => !current)}
                 onCheck={() => void checkAdminKey()}
+                onForget={forgetAdminKey}
               />
               <ConnectionsEditor
                 control={status.control}
@@ -567,7 +607,7 @@ export function ProvidersPage({
               ) : (
                 <div className="provider-feedback" role="note">
                   <ShieldCheck size={18} aria-hidden />
-                  <span>故障切换顺序、底层部署对象（deployment）和未引用对象管理已收进本机专家模式；日常添加渠道无需开启。</span>
+                  <span>高级故障切换与对象管理已收进专家模式；日常添加渠道无需开启。</span>
                 </div>
               )}
             </>
@@ -587,7 +627,8 @@ function AdminAccess({
   state,
   onChange,
   onToggleShow,
-  onCheck
+  onCheck,
+  onForget
 }: {
   value: string;
   show: boolean;
@@ -595,6 +636,7 @@ function AdminAccess({
   onChange: (value: string) => void;
   onToggleShow: () => void;
   onCheck: () => void;
+  onForget: () => void;
 }) {
   return (
     <section className="panel provider-admin-access" aria-labelledby="provider-admin-title">
@@ -604,7 +646,7 @@ function AdminAccess({
         </span>
         <div>
           <h2 id="provider-admin-title">解锁本次配置操作</h2>
-          <p>粘贴安装时保存的 admin key。它只保留到本页关闭，不会写入浏览器存储。</p>
+          <p>粘贴安装时保存的 admin key。验证成功后只保存在当前标签页的会话存储里，关闭标签页即失效；不会写入 localStorage。</p>
         </div>
       </div>
       <label className="field-block provider-admin-field">
@@ -641,6 +683,12 @@ function AdminAccess({
         </button>
         {state === "invalid" && <span className="field-error">密钥无效，请重新粘贴。</span>}
         {state === "valid" && <span className="field-success">验证成功</span>}
+        {(value.trim() || state === "valid") && (
+          <button type="button" className="ghost-button compact" onClick={onForget}>
+            <XCircle size={15} aria-hidden />
+            忘记管理密钥
+          </button>
+        )}
       </div>
       <details className="provider-bootstrap-help">
         <summary>还没有 admin 密钥？</summary>

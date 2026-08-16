@@ -103,17 +103,20 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
     setState((current) => ({ ...current, loading: true, error: null }));
     let diagnosisError: string | null = null;
     try {
-      const [diagnosis, workbench] = await Promise.all([
-        api.evaluationDiagnosis(signal).catch((error) => {
-          // 诊断失败不应连累整页：记下错误，仍渲染召回工作台。
-          diagnosisError = errorMessage(error);
-          return null;
-        }),
-        api.recallEvaluationWorkbench({}, signal).catch((error) => {
-          if (String(errorMessage(error)).startsWith("404:")) return null;
-          throw error;
-        })
-      ]);
+      const diagnosis = await api.evaluationDiagnosis(signal).catch((error) => {
+        // 诊断失败不应连累整页：记下错误，仍渲染召回工作台。
+        diagnosisError = errorMessage(error);
+        return null;
+      });
+      // 快照明确未初始化时 workbench 必 404：跳过请求，直接渲染初始化空态；
+      // 诊断失败或字段缺失（旧后端）时保持原行为，由 404 静默逻辑兜底。
+      const snapshotUninitialized = diagnosis !== null && diagnosis.snapshot_initialized === false;
+      const workbench = snapshotUninitialized
+        ? null
+        : await api.recallEvaluationWorkbench({}, signal).catch((error) => {
+            if (String(errorMessage(error)).startsWith("404:")) return null;
+            throw error;
+          });
       setState({ loading: false, error: null, diagnosis, diagnosisError, workbench });
       const nextLabels = workbench?.labels || [];
       setLabels(nextLabels);

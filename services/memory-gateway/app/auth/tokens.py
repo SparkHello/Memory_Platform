@@ -116,10 +116,12 @@ class AuthTokenStore:
                 # A pre-versioned database may already have the table without
                 # the v2 column; CREATE TABLE IF NOT EXISTS skips it silently.
                 self._ensure_memory_access_column(connection)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                connection.commit()
             elif version == 1:
                 self._ensure_memory_access_column(connection)
+            # v3：一次性 console 登录 code 表。只存 code 哈希与绑定 token 的
+            # 非密钥 id，明文永不落盘（见 app/auth/console_login.py）。
+            self._ensure_console_login_codes_table(connection)
+            if version < _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 connection.commit()
             self._validate_schema(connection)
@@ -349,6 +351,23 @@ class AuthTokenStore:
             )
 
     @staticmethod
+    def _ensure_console_login_codes_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS console_login_codes (
+                code_hash TEXT PRIMARY KEY
+                    CHECK(length(code_hash) = 64),
+                user_id TEXT NOT NULL,
+                console_token_id TEXT NOT NULL
+                    CHECK(length(console_token_id) = 16),
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT
+            )
+            """
+        )
+
+    @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         columns = {
             str(row["name"])
@@ -366,6 +385,23 @@ class AuthTokenStore:
         }
         if columns != expected:
             raise AuthStoreError("AUTH_DATABASE_PATH 的 auth_tokens schema 不兼容")
+        code_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(console_login_codes)"
+            ).fetchall()
+        }
+        if code_columns != {
+            "code_hash",
+            "user_id",
+            "console_token_id",
+            "created_at",
+            "expires_at",
+            "used_at",
+        }:
+            raise AuthStoreError(
+                "AUTH_DATABASE_PATH 的 console_login_codes schema 不兼容"
+            )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version != _SCHEMA_VERSION:
             raise AuthStoreError("AUTH_DATABASE_PATH 的 schema 版本与程序不一致")

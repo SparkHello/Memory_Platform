@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 
+from app.auth.console_login import ConsoleLoginCodeStore
 from app.auth.signing import SigningSecretNotConfigured, require_signing_secret
 from app.auth.tokens import AuthPrincipal, AuthTokenStore
 from app.config import Settings, get_settings
@@ -63,6 +64,13 @@ def get_auth_token_store(
 ) -> AuthTokenStore:
     # Schema initialization/migration runs once in the application lifespan.
     return AuthTokenStore(settings.auth_database_path)
+
+
+def get_console_login_code_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ConsoleLoginCodeStore:
+    # Schema initialization/migration runs once in the application lifespan.
+    return ConsoleLoginCodeStore(settings.auth_database_path)
 
 
 def get_signing_secret(
