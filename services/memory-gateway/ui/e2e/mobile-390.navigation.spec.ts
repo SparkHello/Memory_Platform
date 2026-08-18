@@ -21,12 +21,21 @@ test("mobile routes and repeated current destination reset real page scrolling",
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(300);
   const mobileNav = page.getByRole("navigation", { name: "移动端导航" });
+  const mobileNavButtons = mobileNav.getByRole("button");
+  await expect(mobileNavButtons).toHaveCount(6);
+  const buttonTops = await mobileNavButtons.evaluateAll((buttons) =>
+    buttons.map((button) => button.getBoundingClientRect().top)
+  );
+  // 五个主入口 + 更多必须共处一行；若底栏回到 5 列布局，第六个按钮
+  // 会换行，top 值将出现第二组，这里会直接失败。
+  expect(new Set(buttonTops.map((top) => Math.round(top))).size).toBe(1);
+
   await mobileNav.getByRole("button", { name: "记忆库", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
 
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(300);
-  // 移动底栏主导航现在是 工作台/记忆库/知识库/接入信息；「模型」在「更多」抽屉里。
+  // 移动底栏主导航现在是 工作室/记忆库/知识库/模型/接入（含首配需要的模型入口）。
   await mobileNav.getByRole("button", { name: "接入", exact: true }).click();
   await expect(page).toHaveURL(/#\/integration$/);
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);

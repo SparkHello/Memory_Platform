@@ -532,7 +532,7 @@ export function MemoriesPage({
                   <span
                     className="space-color-dot"
                     style={{
-                      background: space.color || "var(--border-strong, #94a3b8)"
+                      background: space.color || "var(--border-strong)"
                     }}
                     aria-hidden
                   />

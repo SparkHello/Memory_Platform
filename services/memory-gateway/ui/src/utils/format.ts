@@ -139,8 +139,8 @@ const CREDENTIAL_401_MESSAGES: Record<Exclude<ErrorCredentialHint, "auto">, stri
   admin:
     "Model Gateway admin 密钥无效。它与登录网页用的 Console token（gateway.txt）不是同一把钥匙；请使用 credentials/admin.txt",
   provider: "供应商 API Key 或渠道凭证无效，请核对渠道密钥后重试",
-  chat: "chat token 无效或已撤销，请到「接入信息」重新创建",
-  mcp: "MCP token 无效或已撤销，请到「接入信息」重新创建"
+  chat: "chat token 无效或已撤销，请到「客户端接入」重新创建",
+  mcp: "MCP token 无效或已撤销，请到「客户端接入」重新创建"
 };
 
 const GENERIC_UNAUTHORIZED = new Set([

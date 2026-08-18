@@ -36,6 +36,9 @@ const emptyControl = {
   pricing: []
 };
 
+/** 合成记忆使用的原始内部空间 ID；回归测试用它验证简洁模式不会回显。 */
+export const SYNTHETIC_EMBEDDING_SPACE_ID = "dashscope.qwen3.7-text-embedding:1024";
+
 function syntheticMemory(index: number, deleted = false) {
   const number = String(index).padStart(2, "0");
   return {
@@ -63,6 +66,7 @@ function syntheticMemory(index: number, deleted = false) {
     temporal_subject: null,
     temporal_predicate: null,
     status: "dynamic",
+    embedding_space_id: SYNTHETIC_EMBEDDING_SPACE_ID,
     revision: 1,
     created_at: "2026-08-09T08:00:00+00:00",
     updated_at: "2026-08-09T08:00:00+00:00",
@@ -72,6 +76,33 @@ function syntheticMemory(index: number, deleted = false) {
 
 const activeMemories = Array.from({ length: 32 }, (_, index) => syntheticMemory(index + 1));
 const deletedMemories = Array.from({ length: 2 }, (_, index) => syntheticMemory(index + 1, true));
+
+const syntheticHealthIssues = [
+  {
+    type: "embedding_missing",
+    severity: "warning",
+    object_id: "memory:active-memory-01",
+    related_id: "active-memory-01",
+    message: "Active memory has no embedding vector.",
+    recommended_action: "Regenerate embeddings if semantic search quality matters."
+  },
+  {
+    type: "embedding_invalid",
+    severity: "warning",
+    object_id: "memory:active-memory-02",
+    related_id: "active-memory-02",
+    message: "Active memory embedding is not valid numeric JSON.",
+    recommended_action: "Regenerate the memory embedding."
+  },
+  {
+    type: "embedding_dimension_mismatch",
+    severity: "warning",
+    object_id: "memory:active-memory-03",
+    related_id: "active-memory-03",
+    message: "Active memory embedding dimension does not match current configuration.",
+    recommended_action: "Regenerate embeddings with the configured embedding dimension."
+  }
+];
 
 const providersStatus = {
   runtime: {
@@ -196,10 +227,10 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     if (url.pathname === "/health") return json(route, { status: "ok" });
     if (url.pathname === "/memories/health") {
       return json(route, {
-        status: "ok",
+        status: "warning",
         checked_at: "2026-08-09T10:00:00+00:00",
-        summary: { errors: 0, warnings: 0, info: 0 },
-        issues: []
+        summary: { errors: 0, warnings: syntheticHealthIssues.length, info: 0 },
+        issues: syntheticHealthIssues
       });
     }
     if (url.pathname === "/memories/report") {
@@ -322,6 +353,16 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     if (url.pathname === "/memories" && request.method() === "GET") {
       return json(route, { data: activeMemories });
     }
+    const memoryDetailMatch = url.pathname.match(/^\/memories\/([^/]+)$/);
+    if (memoryDetailMatch && request.method() === "GET") {
+      const memory = [...activeMemories, ...deletedMemories].find(
+        (item) => item.id === memoryDetailMatch[1]
+      );
+      return memory ? json(route, { memory }) : json(route, { detail: "memory not found" }, 404);
+    }
+    if (url.pathname.match(/^\/memories\/[^/]+\/why$/) && request.method() === "GET") {
+      return json(route, null);
+    }
     if (url.pathname === "/memories/export/selection") {
       state.exportBodies.push(call.body);
       const ids = ((call.body as { memory_ids?: string[] } | null)?.memory_ids || []);
@@ -359,14 +400,21 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
   return state;
 }
 
-export async function seedConsoleSettings(page: Page, apiBaseUrl: string) {
-  await page.addInitScript((baseUrl) => {
-    localStorage.setItem("memory-console.apiBaseUrl", baseUrl);
-    localStorage.setItem(
-      "memory-console.gatewayApiKey",
-      "mgw_e2econsole01_synthetic_console_secret_0000000000000000"
-    );
-    localStorage.setItem("memory-console.userId", "e2e-user");
-    localStorage.setItem("memory-console.uiMode", "simple");
-  }, apiBaseUrl);
+export async function seedConsoleSettings(
+  page: Page,
+  apiBaseUrl: string,
+  uiMode: "simple" | "expert" = "simple"
+) {
+  await page.addInitScript(
+    (args) => {
+      localStorage.setItem("memory-console.apiBaseUrl", args.apiBaseUrl);
+      localStorage.setItem(
+        "memory-console.gatewayApiKey",
+        "mgw_e2econsole01_synthetic_console_secret_0000000000000000"
+      );
+      localStorage.setItem("memory-console.userId", "e2e-user");
+      localStorage.setItem("memory-console.uiMode", args.uiMode);
+    },
+    { apiBaseUrl, uiMode }
+  );
 }
