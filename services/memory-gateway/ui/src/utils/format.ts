@@ -1,10 +1,46 @@
 import { ApiError } from "../api";
 import { normalizeBaseUrl } from "../storage";
-import type { CoreSectionName, ReviewAction } from "../types";
-import { CORE_SECTIONS, DISPLAY_TEXT } from "./constants";
+import type { CoreSectionName, DatabaseHealthIssue, ReviewAction } from "../types";
+import { CORE_SECTIONS, DISPLAY_TEXT, SIMPLE_DISPLAY_TEXT, SIMPLE_HEALTH_ISSUE_COPY } from "./constants";
 
 export function displayText(value: string): string {
   return DISPLAY_TEXT[value] || value;
+}
+
+export function displayTextForMode(value: string, expertMode: boolean): string {
+  if (!expertMode && SIMPLE_DISPLAY_TEXT[value]) {
+    return SIMPLE_DISPLAY_TEXT[value];
+  }
+  return displayText(value);
+}
+
+export function healthIssuePresentation(issue: DatabaseHealthIssue, expertMode: boolean) {
+  if (expertMode) {
+    return {
+      title: displayText(issue.type),
+      message: issue.message,
+      action: issue.recommended_action,
+      objectId: issue.object_id,
+      relatedId: issue.related_id ?? null
+    };
+  }
+  const simple = SIMPLE_HEALTH_ISSUE_COPY[issue.type as keyof typeof SIMPLE_HEALTH_ISSUE_COPY];
+  if (simple) {
+    return {
+      title: simple.title,
+      message: simple.message,
+      action: simple.action,
+      objectId: null,
+      relatedId: null
+    };
+  }
+  return {
+    title: displayTextForMode(issue.type, false),
+    message: issue.message.replace(/embedding/gi, "语义索引"),
+    action: issue.recommended_action.replace(/embedding/gi, "语义索引"),
+    objectId: null,
+    relatedId: null
+  };
 }
 
 export function reviewActionText(action: ReviewAction): string {
@@ -139,8 +175,8 @@ const CREDENTIAL_401_MESSAGES: Record<Exclude<ErrorCredentialHint, "auto">, stri
   admin:
     "Model Gateway admin 密钥无效。它与登录网页用的 Console token（gateway.txt）不是同一把钥匙；请使用 credentials/admin.txt",
   provider: "供应商 API Key 或渠道凭证无效，请核对渠道密钥后重试",
-  chat: "chat token 无效或已撤销，请到「接入信息」重新创建",
-  mcp: "MCP token 无效或已撤销，请到「接入信息」重新创建"
+  chat: "chat token 无效或已撤销，请到「客户端接入」重新创建",
+  mcp: "MCP token 无效或已撤销，请到「客户端接入」重新创建"
 };
 
 const GENERIC_UNAUTHORIZED = new Set([

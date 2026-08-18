@@ -1,9 +1,9 @@
-import { displayText } from "../utils/format";
+import { displayTextForMode } from "../utils/format";
 
-export function Badge({ value }: { value: string }) {
-  return <span className={`badge badge-${value}`}>{displayText(value)}</span>;
+export function Badge({ value, expertMode = true }: { value: string; expertMode?: boolean }) {
+  return <span className={`badge badge-${value}`}>{displayTextForMode(value, expertMode)}</span>;
 }
 
-export function badge(value: string) {
-  return <Badge value={value} />;
+export function badge(value: string, expertMode = true) {
+  return <Badge value={value} expertMode={expertMode} />;
 }

@@ -368,7 +368,7 @@ export function DashboardPage({
       ]
     : [];
 
-  const actions = data ? buildStudioActions(data) : [];
+  const actions = data ? buildStudioActions(data, expertMode) : [];
   const recentIgnores = useMemo(() => {
     if (!data) return [];
     return data.logs
@@ -1260,14 +1260,14 @@ function ConnectClientCard({
       </div>
       {token && (
         <p className="muted">
-          token 明文只显示这一次；丢失后到「接入信息」撤销并重新创建即可。
+          token 明文只显示这一次；丢失后到「客户端接入」撤销并重新创建即可。
         </p>
       )}
     </section>
   );
 }
 
-function buildStudioActions(data: DashboardData): StudioAction[] {
+function buildStudioActions(data: DashboardData, expertMode: boolean): StudioAction[] {
   const list: StudioAction[] = [];
   if (data.setup && !isProviderSetupReady(data.setup)) {
     list.push({
@@ -1287,7 +1287,7 @@ function buildStudioActions(data: DashboardData): StudioAction[] {
         ? "仍在使用旧共享密钥"
         : "旧共享密钥仍启用",
       value: "需迁移",
-      hint: "旧 key 同时拥有聊天、MCP 与 Console 权限；请到接入信息改用 scoped token 后关闭 legacy",
+      hint: "旧 key 同时拥有聊天、MCP 与 Console 权限；请到客户端接入改用 scoped token 后关闭 legacy",
       page: "developer"
     });
   }
@@ -1314,7 +1314,8 @@ function buildStudioActions(data: DashboardData): StudioAction[] {
       });
     }
   }
-  if (data.evalProgress && data.evalProgress.unlabeled > 0) {
+  // 召回标注、核心记忆整理指向评测/核心页（不在简洁导航），仅专家模式展示，避免迷路。
+  if (expertMode && data.evalProgress && data.evalProgress.unlabeled > 0) {
     const graded = data.evalProgress.total - data.evalProgress.unlabeled;
     list.push({
       key: "evaluation",
@@ -1336,7 +1337,7 @@ function buildStudioActions(data: DashboardData): StudioAction[] {
       hash: "#/memories?tab=recycle"
     });
   }
-  if (data.report.counts.core_sections === 0) {
+  if (expertMode && data.report.counts.core_sections === 0) {
     list.push({
       key: "core",
       tone: "primary",

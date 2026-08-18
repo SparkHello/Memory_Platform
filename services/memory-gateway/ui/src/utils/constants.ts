@@ -203,3 +203,31 @@ export const DISPLAY_TEXT: Record<string, string> = {
   success: "成功",
   error: "错误"
 };
+
+/** 简洁模式把内部实现术语改成用户能理解的说法；专家模式继续用 DISPLAY_TEXT。 */
+export const SIMPLE_DISPLAY_TEXT: Record<string, string> = {
+  embedding_missing: "语义索引缺失",
+  embedding_invalid: "语义索引无效",
+  embedding_dimension_mismatch: "语义索引规格不一致"
+};
+
+export const SIMPLE_HEALTH_ISSUE_COPY: Record<
+  "embedding_missing" | "embedding_invalid" | "embedding_dimension_mismatch",
+  { title: string; message: string; action: string }
+> = {
+  embedding_missing: {
+    title: "语义索引缺失",
+    message: "部分记忆还不能用于语义搜索。",
+    action: "到记忆库补齐语义索引"
+  },
+  embedding_invalid: {
+    title: "语义索引无效",
+    message: "部分记忆的语义索引无法使用，语义搜索可能不完整。",
+    action: "重建语义索引"
+  },
+  embedding_dimension_mismatch: {
+    title: "语义索引规格不一致",
+    message: "部分记忆的语义索引与当前模型不匹配，语义搜索可能不准。",
+    action: "按当前模型重建索引"
+  }
+};

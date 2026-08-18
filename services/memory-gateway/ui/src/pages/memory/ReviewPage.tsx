@@ -39,6 +39,7 @@ import {
   dateText,
   displayText,
   errorMessage,
+  healthIssuePresentation,
   sectionTitle,
   shortId
 } from "../../utils/format";
@@ -49,13 +50,16 @@ export function ReviewPage({
   notify,
   confirm,
   openMemory,
-  setupStatus
+  setupStatus,
+  expertMode = true
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
   openMemory: (id: string) => void;
   setupStatus?: ProvidersStatus["setup"] | null;
+  /** 简洁模式折叠「最近 AI 修改」等治理/审计区块，只留体检结论与建议。 */
+  expertMode?: boolean;
 }) {
   const [state, setState] = useState<
     LoadState<{ review: ReviewResult; health: DatabaseHealthResult; memories: MemoryRecord[]; logs: DecisionLog[] }>
@@ -792,7 +796,7 @@ export function ReviewPage({
                 <strong>最近 AI 修改</strong>
                 {recentAiLogs.length === 0 ? (
                   <p className="muted-line">暂无近期 AI 修改记录</p>
-                ) : (
+                ) : expertMode ? (
                   <div className="mini-review-list">
                     {recentAiLogs.map((log) => (
                       <div className="mini-review-item passive" key={log.id}>
@@ -801,6 +805,8 @@ export function ReviewPage({
                       </div>
                     ))}
                   </div>
+                ) : (
+                  <p className="muted-line">{recentAiLogs.length} 条修改记录，切换到专家模式可查看明细</p>
                 )}
               </div>
             </div>
@@ -835,25 +841,32 @@ export function ReviewPage({
               />
             ) : (
               <div className="recommendation-list">
-                {visibleHealthIssues.map((issue) => (
-                  <article className="recommendation-card" key={healthIssueKey(issue)}>
-                    <div className="recommendation-topline">
-                      {badge(issue.type)}
-                      <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
-                        {displayText(issue.severity)}
-                      </span>
-                      <span className="count-pill">{issue.object_id}</span>
-                    </div>
-                    <p>{issue.message}</p>
-                    <FieldList
-                      compact
-                      entries={[
-                        ["关联 ID", issue.related_id],
-                        ["建议动作", issue.recommended_action]
-                      ]}
-                    />
-                  </article>
-                ))}
+                {visibleHealthIssues.map((issue) => {
+                  const copy = healthIssuePresentation(issue, expertMode);
+                  return (
+                    <article className="recommendation-card" key={healthIssueKey(issue)}>
+                      <div className="recommendation-topline">
+                        <span className={`badge badge-${issue.type}`}>{copy.title}</span>
+                        <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
+                          {displayText(issue.severity)}
+                        </span>
+                        {copy.objectId && <span className="count-pill">{copy.objectId}</span>}
+                      </div>
+                      <p>{copy.message}</p>
+                      {expertMode ? (
+                        <FieldList
+                          compact
+                          entries={[
+                            ["关联 ID", copy.relatedId],
+                            ["建议动作", copy.action]
+                          ]}
+                        />
+                      ) : (
+                        copy.action && <p className="muted-line">{copy.action}</p>
+                      )}
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>
