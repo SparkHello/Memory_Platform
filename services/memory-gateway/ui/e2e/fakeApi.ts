@@ -64,6 +64,7 @@ function syntheticMemory(index: number, deleted = false) {
     temporal_predicate: null,
     status: "dynamic",
     revision: 1,
+    embedding_space_id: "synthetic-embedding-space-v1",
     created_at: "2026-08-09T08:00:00+00:00",
     updated_at: "2026-08-09T08:00:00+00:00",
     deleted_at: deleted ? "2026-08-09T09:00:00+00:00" : null
@@ -159,7 +160,30 @@ async function json(route: Route, body: unknown, status = 200) {
   });
 }
 
-export async function installFakeApi(page: Page): Promise<FakeApiState> {
+export type FakeHealthIssue = {
+  type: string;
+  severity: "error" | "warning" | "info";
+  object_id: string;
+  related_id?: string | null;
+  message: string;
+  recommended_action: string;
+};
+
+export type FakeApiOptions = {
+  /** 覆盖 /memories/health 返回的问题列表，用于数据库健康相关 e2e。 */
+  healthIssues?: FakeHealthIssue[];
+};
+
+export async function installFakeApi(
+  page: Page,
+  options: FakeApiOptions = {}
+): Promise<FakeApiState> {
+  const healthIssues = options.healthIssues ?? [];
+  const healthSummary = {
+    errors: healthIssues.filter((issue) => issue.severity === "error").length,
+    warnings: healthIssues.filter((issue) => issue.severity === "warning").length,
+    info: healthIssues.filter((issue) => issue.severity === "info").length
+  };
   const state: FakeApiState = {
     calls: [],
     blockedExternalUrls: [],
@@ -196,10 +220,10 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     if (url.pathname === "/health") return json(route, { status: "ok" });
     if (url.pathname === "/memories/health") {
       return json(route, {
-        status: "ok",
+        status: healthSummary.errors > 0 ? "error" : healthSummary.warnings > 0 ? "warning" : "ok",
         checked_at: "2026-08-09T10:00:00+00:00",
-        summary: { errors: 0, warnings: 0, info: 0 },
-        issues: []
+        summary: healthSummary,
+        issues: healthIssues
       });
     }
     if (url.pathname === "/memories/report") {
@@ -321,6 +345,18 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     }
     if (url.pathname === "/memories" && request.method() === "GET") {
       return json(route, { data: activeMemories });
+    }
+    if (url.pathname.startsWith("/memories/") && request.method() === "GET") {
+      const rest = decodeURIComponent(url.pathname.slice("/memories/".length));
+      if (rest.endsWith("/why")) {
+        // 合成环境没有来源解释；档案抽屉会容忍 404 并隐藏该区块。
+        return json(route, { detail: "合成环境无来源解释" }, 404);
+      }
+      const memory =
+        activeMemories.find((item) => item.id === rest) ||
+        deletedMemories.find((item) => item.id === rest);
+      if (memory) return json(route, { memory });
+      return json(route, { detail: "memory not found" }, 404);
     }
     if (url.pathname === "/memories/export/selection") {
       state.exportBodies.push(call.body);

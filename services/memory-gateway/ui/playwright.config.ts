@@ -39,7 +39,7 @@ export default defineConfig({
     },
     {
       name: "mobile-390x844",
-      testMatch: /mobile-390\.(navigation|resilience)\.spec\.ts/,
+      testMatch: /mobile-390\.(navigation|resilience|simple-mode)\.spec\.ts/,
       use: {
         ...devices["Pixel 7"],
         viewport: { width: 390, height: 844 },

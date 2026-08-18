@@ -49,13 +49,16 @@ export function ReviewPage({
   notify,
   confirm,
   openMemory,
-  setupStatus
+  setupStatus,
+  expertMode = true
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
   openMemory: (id: string) => void;
   setupStatus?: ProvidersStatus["setup"] | null;
+  /** 简洁模式折叠「最近 AI 修改」等治理/审计区块，只留体检结论与建议。 */
+  expertMode?: boolean;
 }) {
   const [state, setState] = useState<
     LoadState<{ review: ReviewResult; health: DatabaseHealthResult; memories: MemoryRecord[]; logs: DecisionLog[] }>
@@ -792,7 +795,7 @@ export function ReviewPage({
                 <strong>最近 AI 修改</strong>
                 {recentAiLogs.length === 0 ? (
                   <p className="muted-line">暂无近期 AI 修改记录</p>
-                ) : (
+                ) : expertMode ? (
                   <div className="mini-review-list">
                     {recentAiLogs.map((log) => (
                       <div className="mini-review-item passive" key={log.id}>
@@ -801,6 +804,8 @@ export function ReviewPage({
                       </div>
                     ))}
                   </div>
+                ) : (
+                  <p className="muted-line">{recentAiLogs.length} 条修改记录，切换到专家模式可查看明细</p>
                 )}
               </div>
             </div>
@@ -835,25 +840,28 @@ export function ReviewPage({
               />
             ) : (
               <div className="recommendation-list">
-                {visibleHealthIssues.map((issue) => (
-                  <article className="recommendation-card" key={healthIssueKey(issue)}>
-                    <div className="recommendation-topline">
-                      {badge(issue.type)}
-                      <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
-                        {displayText(issue.severity)}
-                      </span>
-                      <span className="count-pill">{issue.object_id}</span>
-                    </div>
-                    <p>{issue.message}</p>
-                    <FieldList
-                      compact
-                      entries={[
-                        ["关联 ID", issue.related_id],
-                        ["建议动作", issue.recommended_action]
-                      ]}
-                    />
-                  </article>
-                ))}
+                {visibleHealthIssues.map((issue) => {
+                  const healthText = healthIssueText(issue, expertMode);
+                  return (
+                    <article className="recommendation-card" key={healthIssueKey(issue)}>
+                      <div className="recommendation-topline">
+                        <Badge value={healthText.badge} />
+                        <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
+                          {displayText(issue.severity)}
+                        </span>
+                        <span className="count-pill">{issue.object_id}</span>
+                      </div>
+                      <p>{healthText.message}</p>
+                      <FieldList
+                        compact
+                        entries={[
+                          ["关联 ID", issue.related_id],
+                          ["建议动作", healthText.action]
+                        ]}
+                      />
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>
@@ -1049,6 +1057,51 @@ function reviewDismissKey(recommendation: ReviewRecommendation): string {
 
 function healthIssueKey(issue: DatabaseHealthIssue): string {
   return `health-${issue.type}-${issue.object_id}-${issue.related_id || "none"}`;
+}
+
+/**
+ * 简洁模式把 embedding_* 内部检查翻译成用户能理解的语义索引文案，
+ * 不暴露 embedding 术语和后端英文诊断原文；专家模式保留完整技术细节。
+ */
+const SIMPLE_HEALTH_ISSUE_TEXT: Record<string, { badge: string; message: string; action: string }> = {
+  embedding_missing: {
+    badge: "语义索引缺失",
+    message: "这条记忆还没有建立语义索引，语义搜索暂时找不到它。",
+    action: "重新生成语义索引后恢复"
+  },
+  embedding_invalid: {
+    badge: "语义索引损坏",
+    message: "这条记忆的语义索引数据已损坏，暂时无法用于语义搜索。",
+    action: "重新生成语义索引后恢复"
+  },
+  embedding_dimension_mismatch: {
+    badge: "语义索引过期",
+    message: "这条记忆的语义索引与当前向量配置不一致，需要重新生成后才能参与语义搜索。",
+    action: "重新生成语义索引后恢复"
+  }
+};
+
+const SIMPLE_HEALTH_ISSUE_FALLBACK = {
+  badge: "语义索引待检查",
+  message: "这条记忆的语义索引状态需要检查，语义搜索结果可能暂时不完整。",
+  action: "切换到专家模式查看技术细节"
+};
+
+function healthIssueText(
+  issue: DatabaseHealthIssue,
+  expertMode: boolean
+): { badge: string; message: string; action: string } {
+  if (expertMode) {
+    return { badge: issue.type, message: issue.message, action: issue.recommended_action };
+  }
+  if (SIMPLE_HEALTH_ISSUE_TEXT[issue.type]) {
+    return SIMPLE_HEALTH_ISSUE_TEXT[issue.type];
+  }
+  // 防御：未来新增 embedding 类检查或后端英文诊断时，简洁模式同样不泄露内部术语。
+  if (/embedding/i.test(`${issue.type} ${issue.message} ${issue.recommended_action}`)) {
+    return SIMPLE_HEALTH_ISSUE_FALLBACK;
+  }
+  return { badge: issue.type, message: issue.message, action: issue.recommended_action };
 }
 
 function healthSeverityClass(severity: DatabaseHealthIssue["severity"]): string {

@@ -1545,7 +1545,8 @@ button {
     bottom: max(10px, env(safe-area-inset-bottom));
     left: 10px;
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    /* 5 个主入口 + 「更多」共 6 个按钮，必须保持单行。 */
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 2px;
     padding: 6px;
     border: 1px solid var(--glass-border);

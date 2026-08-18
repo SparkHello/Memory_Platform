@@ -99,7 +99,7 @@ export function SettingsPage({
             ? "这是登录本网页控制台的 Console token，不是聊天用的 chat token，也不是 admin.txt。"
             : reauth
               ? "当前浏览器保存的密钥已失效（常见于重装或轮换 token）。请粘贴新的 gateway.txt（或旧版 gateway.key）。"
-              : "更换登录本网页的 Console token；日常聊天密钥请到「接入信息」管理。"
+              : "更换登录本网页的 Console token；日常聊天密钥请到「客户端接入」管理。"
         }
       />
       <section className="panel settings-panel">
@@ -217,7 +217,7 @@ export function SettingsPage({
         <details className="panel panel--quiet settings-reference settings-reference-details">
           <summary>高级：运维与旧版直连配置参考</summary>
           <div className="notice">
-            日常模型配置请使用「模型与路由」，设备 token 请使用「接入信息」。下面内容仅供源码运维或迁移旧版 direct 配置时排障。
+            日常模型配置请使用「模型与路由」，设备 token 请使用「客户端接入」。下面内容仅供源码运维或迁移旧版 direct 配置时排障。
           </div>
           <h2>服务进程管理</h2>
           <div className="config-grid">

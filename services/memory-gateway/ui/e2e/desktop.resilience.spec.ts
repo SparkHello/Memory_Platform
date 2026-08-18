@@ -52,7 +52,7 @@ test("未知 hash 显示「页面不存在」并引导回工作室", async ({ pa
 });
 
 // 简洁模式（含直达 hash 打开的高级页面）一律不泄露内部实现术语。
-const FORBIDDEN_SIMPLE_TERMS = ["memory.chat", "memory.extract", "deployment", "逐字片段", "分叉点"];
+const FORBIDDEN_SIMPLE_TERMS = ["memory.chat", "memory.extract", "deployment", "Deployment", "逐 Attempt", "record_usage", "embedding", "逐字片段", "分叉点"];
 
 test("简洁模式：遍历全部入口与直达高级页均不出现内部术语", async ({ page }) => {
   await seedConsoleSettings(page, ORIGIN); // uiMode=simple
@@ -63,14 +63,16 @@ test("简洁模式：遍历全部入口与直达高级页均不出现内部术�
     page.locator(".sidebar").getByRole("button", { name: "切换到专家模式" })
   ).toBeVisible();
 
-  // SIMPLE_NAV 的六个入口通过侧栏真实点击遍历。
+  // SIMPLE_NAV 的八个入口通过侧栏真实点击遍历（含体检/用量）。
   const sidebarTour: Array<{ nav: string; hash: string }> = [
     { nav: "记忆工作室", hash: "#/studio" },
     { nav: "记忆库", hash: "#/memories" },
     { nav: "知识库", hash: "#/knowledge" },
+    { nav: "记忆体检", hash: "#/review" },
+    { nav: "用量与费用", hash: "#/usage" },
     { nav: "模型与路由", hash: "#/providers" },
     { nav: "报告与备份", hash: "#/reports" },
-    { nav: "接入信息", hash: "#/integration" }
+    { nav: "客户端接入", hash: "#/integration" }
   ];
   // 侧栏不展示的高级页面用 hash 直达，同样受简洁模式约束。
   const directHashes = ["#/knowledge-search", "#/recent"];
