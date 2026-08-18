@@ -480,7 +480,7 @@ export function EvaluationPage({ api, notify }: { api: MemoryApi; notify: Notify
             <div>
               <h2>基线运行</h2>
               <p className="muted-line">
-                运行前会自动保存当前标注；评测在隔离快照上进行，强制 record_usage=false。语义基线为 embedding+关键词混合检索。
+                运行前会自动保存当前标注；评测在隔离快照上进行、不计入用量。语义基线为语义+关键词混合检索。
               </p>
             </div>
             <div className="button-row end">

@@ -46,3 +46,14 @@ secrets.env
 # Ad-hoc console screenshots captured at the repo root. Scoped to the root so
 # real image assets under ui/ or docs/ stay committable.
 /*.png
+# Generic dependency dirs: a stray root-level npm/vitest run once left a
+# root node_modules behind, so do not limit the rule to ui/.
+node_modules/
+**/node_modules/
+# Local AI/tool state dirs, same convention as .claude/ and .codex/ above.
+.impeccable/
+**/.impeccable/
+.kun-canvas/
+**/.kun-canvas/
+.reasonix/
+**/.reasonix/

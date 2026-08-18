@@ -2170,6 +2170,17 @@ code {
   width: min(480px, 100%);
 }
 
+/* 危险等级视觉一致性：danger 确认卡给标题与边框红色信号，与 danger-button 呼应 */
+.confirm-danger {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+.confirm-danger .drawer-header h2 {
+  color: var(--danger);
+}
+.confirm-warning .drawer-header h2 {
+  color: var(--warning);
+}
+
 .confirm-body {
   margin: 14px 0;
   color: var(--muted-strong);

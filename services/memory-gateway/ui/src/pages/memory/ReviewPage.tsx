@@ -49,13 +49,16 @@ export function ReviewPage({
   notify,
   confirm,
   openMemory,
-  setupStatus
+  setupStatus,
+  expertMode = true
 }: {
   api: MemoryApi;
   notify: Notify;
   confirm: ConfirmFn;
   openMemory: (id: string) => void;
   setupStatus?: ProvidersStatus["setup"] | null;
+  /** 简洁模式折叠「最近 AI 修改」等治理/审计区块，只留体检结论与建议。 */
+  expertMode?: boolean;
 }) {
   const [state, setState] = useState<
     LoadState<{ review: ReviewResult; health: DatabaseHealthResult; memories: MemoryRecord[]; logs: DecisionLog[] }>
@@ -792,7 +795,7 @@ export function ReviewPage({
                 <strong>最近 AI 修改</strong>
                 {recentAiLogs.length === 0 ? (
                   <p className="muted-line">暂无近期 AI 修改记录</p>
-                ) : (
+                ) : expertMode ? (
                   <div className="mini-review-list">
                     {recentAiLogs.map((log) => (
                       <div className="mini-review-item passive" key={log.id}>
@@ -801,6 +804,8 @@ export function ReviewPage({
                       </div>
                     ))}
                   </div>
+                ) : (
+                  <p className="muted-line">{recentAiLogs.length} 条修改记录，切换到专家模式可查看明细</p>
                 )}
               </div>
             </div>
@@ -835,25 +840,32 @@ export function ReviewPage({
               />
             ) : (
               <div className="recommendation-list">
-                {visibleHealthIssues.map((issue) => (
-                  <article className="recommendation-card" key={healthIssueKey(issue)}>
-                    <div className="recommendation-topline">
-                      {badge(issue.type)}
-                      <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
-                        {displayText(issue.severity)}
-                      </span>
-                      <span className="count-pill">{issue.object_id}</span>
-                    </div>
-                    <p>{issue.message}</p>
-                    <FieldList
-                      compact
-                      entries={[
-                        ["关联 ID", issue.related_id],
-                        ["建议动作", issue.recommended_action]
-                      ]}
-                    />
-                  </article>
-                ))}
+                {visibleHealthIssues.map((issue) => {
+                  const presentation = healthIssuePresentation(issue, expertMode);
+                  return (
+                    <article className="recommendation-card" key={healthIssueKey(issue)}>
+                      <div className="recommendation-topline">
+                        <span className={`badge badge-${issue.type}`}>{presentation.title}</span>
+                        <span className={`severity-pill ${healthSeverityClass(issue.severity)}`}>
+                          {displayText(issue.severity)}
+                        </span>
+                        {presentation.objectId && (
+                          <span className="count-pill">{presentation.objectId}</span>
+                        )}
+                      </div>
+                      <p>{presentation.message}</p>
+                      <FieldList
+                        compact
+                        entries={expertMode
+                          ? [
+                              ["关联 ID", presentation.relatedId],
+                              ["建议动作", presentation.action]
+                            ]
+                          : [["建议", presentation.action]]}
+                      />
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>
@@ -1049,6 +1061,61 @@ function reviewDismissKey(recommendation: ReviewRecommendation): string {
 
 function healthIssueKey(issue: DatabaseHealthIssue): string {
   return `health-${issue.type}-${issue.object_id}-${issue.related_id || "none"}`;
+}
+
+type HealthIssuePresentation = {
+  title: string;
+  message: string;
+  action: string;
+  objectId: string | null;
+  relatedId: string | null;
+};
+
+const SIMPLE_HEALTH_ISSUE_COPY: Partial<
+  Record<DatabaseHealthIssue["type"], Omit<HealthIssuePresentation, "objectId" | "relatedId">>
+> = {
+  embedding_missing: {
+    title: "语义索引缺失",
+    message: "部分记忆还没有可用于语义搜索的索引，当前仍可通过关键词正常查找。",
+    action: "需要语义搜索时，可切换到专家模式查看并重建索引。"
+  },
+  embedding_invalid: {
+    title: "语义索引无效",
+    message: "部分记忆的语义索引数据无法使用，当前仍可通过关键词正常查找。",
+    action: "切换到专家模式可查看技术详情并重建索引。"
+  },
+  embedding_dimension_mismatch: {
+    title: "语义索引规格不一致",
+    message: "部分记忆的语义索引与当前配置不一致，当前仍可通过关键词正常查找。",
+    action: "切换到专家模式可查看技术详情并重建索引。"
+  }
+};
+
+function healthIssuePresentation(
+  issue: DatabaseHealthIssue,
+  expertMode: boolean
+): HealthIssuePresentation {
+  if (expertMode) {
+    return {
+      title: displayText(issue.type),
+      message: issue.message,
+      action: issue.recommended_action,
+      objectId: issue.object_id,
+      relatedId: issue.related_id || null
+    };
+  }
+  const simpleCopy = SIMPLE_HEALTH_ISSUE_COPY[issue.type];
+  if (simpleCopy) {
+    return { ...simpleCopy, objectId: null, relatedId: null };
+  }
+  const sanitize = (value: string) => value.replace(/embedding/gi, "语义索引");
+  return {
+    title: sanitize(displayText(issue.type)),
+    message: sanitize(issue.message),
+    action: sanitize(issue.recommended_action),
+    objectId: null,
+    relatedId: null
+  };
 }
 
 function healthSeverityClass(severity: DatabaseHealthIssue["severity"]): string {

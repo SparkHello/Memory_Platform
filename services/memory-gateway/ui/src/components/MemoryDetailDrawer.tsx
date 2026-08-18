@@ -62,6 +62,7 @@ export function MemoryDetailDrawer({
   memoryId,
   notify,
   confirm,
+  expertMode = true,
   onClose,
   onOpenMemory,
   onChanged
@@ -70,6 +71,7 @@ export function MemoryDetailDrawer({
   memoryId: string;
   notify: Notify;
   confirm: ConfirmFn;
+  expertMode?: boolean;
   onClose: () => void;
   onOpenMemory: (id: string) => void;
   onChanged: () => void;
@@ -247,16 +249,7 @@ export function MemoryDetailDrawer({
       setEditError("content 不能为空");
       return;
     }
-    if (
-      !(await confirm({
-        title: "更新记忆",
-        message: "确定要更新这条记忆吗？这会影响后续检索和回答注入。",
-        tone: "warning",
-        confirmLabel: "更新"
-      }))
-    ) {
-      return;
-    }
+    // 编辑是可撤销的低风险操作，直接保存，不再每次弹确认（danger 级删除仍确认）。
     setSavingEdit(true);
     setEditError(null);
     try {
@@ -456,8 +449,14 @@ export function MemoryDetailDrawer({
                 <strong>{dateText(memory.last_used_at) || "-"}</strong>
               </div>
               <div>
-                <span>向量空间</span>
-                <strong>{memory.embedding_space_id || "无向量"}</strong>
+                <span>{expertMode ? "向量空间" : "语义检索"}</span>
+                <strong>
+                  {expertMode
+                    ? memory.embedding_space_id || "无向量"
+                    : memory.embedding_space_id
+                      ? "已启用"
+                      : "未启用"}
+                </strong>
               </div>
             </div>
 
@@ -604,35 +603,37 @@ export function MemoryDetailDrawer({
               </section>
             )}
 
-            <section className="subpanel profile-all-fields">
-              <button
-                className="ghost-button compact"
-                type="button"
-                aria-expanded={allFieldsOpen}
-                onClick={() => setAllFieldsOpen((current) => !current)}
-              >
-                {allFieldsOpen ? "收起全部字段" : "查看全部字段"}
-              </button>
-              {allFieldsOpen && (
-                <FieldList
-                  compact
-                  entries={[
-                    ["id", memory.id],
-                    ["类型", displayText(memory.type)],
-                    ["状态", displayText(memory.status || "dynamic")],
-                    ["敏感级别", displayText(memory.sensitivity)],
-                    ["稳定性", displayText(memory.stability)],
-                    ["已消化", memory.digested ? "是" : "否"],
-                    ["衰减 λ", memory.decay_lambda ?? "-"],
-                    ["复核时间", memory.review_after],
-                    ["证据记忆 ID", memory.evidence_memory_ids],
-                    ["来源对话 ID", memory.source_conversation_id],
-                    ["创建时间", memory.created_at],
-                    ["更新时间", memory.updated_at]
-                  ]}
-                />
-              )}
-            </section>
+            {expertMode && (
+              <section className="subpanel profile-all-fields">
+                <button
+                  className="ghost-button compact"
+                  type="button"
+                  aria-expanded={allFieldsOpen}
+                  onClick={() => setAllFieldsOpen((current) => !current)}
+                >
+                  {allFieldsOpen ? "收起全部字段" : "查看全部字段"}
+                </button>
+                {allFieldsOpen && (
+                  <FieldList
+                    compact
+                    entries={[
+                      ["id", memory.id],
+                      ["类型", displayText(memory.type)],
+                      ["状态", displayText(memory.status || "dynamic")],
+                      ["敏感级别", displayText(memory.sensitivity)],
+                      ["稳定性", displayText(memory.stability)],
+                      ["已消化", memory.digested ? "是" : "否"],
+                      ["衰减 λ", memory.decay_lambda ?? "-"],
+                      ["复核时间", memory.review_after],
+                      ["证据记忆 ID", memory.evidence_memory_ids],
+                      ["来源对话 ID", memory.source_conversation_id],
+                      ["创建时间", memory.created_at],
+                      ["更新时间", memory.updated_at]
+                    ]}
+                  />
+                )}
+              </section>
+            )}
           </>
         )}
 

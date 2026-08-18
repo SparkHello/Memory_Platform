@@ -25,7 +25,36 @@ export const VALID_LOGIN_CODE = "mgc_synthetic_login_code_0000000000000000";
 export const LOGIN_EXCHANGED_TOKEN =
   "mgw_e2eloginexch_synthetic_console_secret_00000000000000";
 
+export const SYNTHETIC_EMBEDDING_SPACE_ID = "dashscope.qwen3.7-text-embedding:1024";
+
 const revision = "a".repeat(64);
+
+const embeddingHealthIssues = [
+  {
+    type: "embedding_missing",
+    severity: "warning",
+    object_id: "memory:active-memory-01",
+    related_id: "active-memory-01",
+    message: "Active memory has no embedding vector.",
+    recommended_action: "Regenerate embeddings"
+  },
+  {
+    type: "embedding_invalid",
+    severity: "warning",
+    object_id: "memory:active-memory-02",
+    related_id: "active-memory-02",
+    message: "Stored embedding is invalid.",
+    recommended_action: "Regenerate embeddings"
+  },
+  {
+    type: "embedding_dimension_mismatch",
+    severity: "warning",
+    object_id: "memory:active-memory-03",
+    related_id: "active-memory-03",
+    message: "embedding dimension mismatch against current space.",
+    recommended_action: "Regenerate embeddings"
+  }
+];
 
 const emptyControl = {
   revision,
@@ -50,6 +79,7 @@ function syntheticMemory(index: number, deleted = false) {
     source_message: null,
     source_conversation_id: null,
     last_used_at: null,
+    embedding_space_id: deleted ? null : SYNTHETIC_EMBEDDING_SPACE_ID,
     usage_count: index,
     stability: "stable",
     valid_from: null,
@@ -196,10 +226,10 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     if (url.pathname === "/health") return json(route, { status: "ok" });
     if (url.pathname === "/memories/health") {
       return json(route, {
-        status: "ok",
+        status: "warning",
         checked_at: "2026-08-09T10:00:00+00:00",
-        summary: { errors: 0, warnings: 0, info: 0 },
-        issues: []
+        summary: { errors: 0, warnings: embeddingHealthIssues.length, info: 0 },
+        issues: embeddingHealthIssues
       });
     }
     if (url.pathname === "/memories/report") {
@@ -322,6 +352,23 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
     if (url.pathname === "/memories" && request.method() === "GET") {
       return json(route, { data: activeMemories });
     }
+    const memoryMatch = url.pathname.match(/^\/memories\/([^/]+)$/);
+    if (memoryMatch && request.method() === "GET") {
+      const memoryId = decodeURIComponent(memoryMatch[1]);
+      const memory = [...activeMemories, ...deletedMemories].find((item) => item.id === memoryId);
+      if (!memory) return json(route, { detail: "not found" }, 404);
+      return json(route, { memory });
+    }
+    const whyMatch = url.pathname.match(/^\/memories\/([^/]+)\/why$/);
+    if (whyMatch && request.method() === "GET") {
+      return json(route, {
+        source_excerpt: "合成记忆来源摘录",
+        source_conversation_id: "synthetic-conversation",
+        saved_at: "2026-08-09T08:00:00+00:00",
+        is_core_memory_evidence: false,
+        core_memory_sections: []
+      });
+    }
     if (url.pathname === "/memories/export/selection") {
       state.exportBodies.push(call.body);
       const ids = ((call.body as { memory_ids?: string[] } | null)?.memory_ids || []);
@@ -359,14 +406,18 @@ export async function installFakeApi(page: Page): Promise<FakeApiState> {
   return state;
 }
 
-export async function seedConsoleSettings(page: Page, apiBaseUrl: string) {
-  await page.addInitScript((baseUrl) => {
+export async function seedConsoleSettings(
+  page: Page,
+  apiBaseUrl: string,
+  uiMode: "simple" | "expert" = "simple"
+) {
+  await page.addInitScript(({ baseUrl, mode }) => {
     localStorage.setItem("memory-console.apiBaseUrl", baseUrl);
     localStorage.setItem(
       "memory-console.gatewayApiKey",
       "mgw_e2econsole01_synthetic_console_secret_0000000000000000"
     );
     localStorage.setItem("memory-console.userId", "e2e-user");
-    localStorage.setItem("memory-console.uiMode", "simple");
-  }, apiBaseUrl);
+    localStorage.setItem("memory-console.uiMode", mode);
+  }, { baseUrl: apiBaseUrl, mode: uiMode });
 }

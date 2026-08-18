@@ -25,10 +25,13 @@ const RANGES: Array<{ key: RangeKey; label: string }> = [
 
 export function UsagePage({
   api,
-  setupStatus
+  setupStatus,
+  expertMode = true
 }: {
   api: MemoryApi;
   setupStatus?: ProvidersStatus["setup"] | null;
+  /** 简洁模式隐藏 Deployment / Attempt 等技术账本，只留结果性指标。 */
+  expertMode?: boolean;
 }) {
   const [range, setRange] = useState<RangeKey>("30");
   const { state, reload: load } = useAsyncData<CentralModelUsageSummary>(
@@ -69,17 +72,19 @@ export function UsagePage({
 
       {loading && !summary && <LoadingBlock label="正在汇总模型用量" />}
       {error && <ErrorBlock message={error} onRetry={() => void load()} />}
-      {summary && <CentralUsageView summary={summary} setupStatus={setupStatus} />}
+      {summary && <CentralUsageView summary={summary} setupStatus={setupStatus} expertMode={expertMode} />}
     </div>
   );
 }
 
 function CentralUsageView({
   summary,
-  setupStatus
+  setupStatus,
+  expertMode
 }: {
   summary: CentralModelUsageSummary;
   setupStatus?: ProvidersStatus["setup"] | null;
+  expertMode: boolean;
 }) {
   const incompleteCalls = Math.max(0, summary.calls - summary.complete_calls);
   return (
@@ -131,6 +136,7 @@ function CentralUsageView({
                 <div><dt>费用信息不完整</dt><dd>{summary.incomplete_cost_calls} 次</dd></div>
               </dl>
             </section>
+            {expertMode && (
             <section className="panel usage-operation-panel">
               <div className="panel-header compact-header"><h2>逐 Attempt 账本</h2></div>
               <dl className="usage-coverage-list">
@@ -142,12 +148,13 @@ function CentralUsageView({
                 fallback 的每次真实请求分别记账；未知费用不会被伪装为零。
               </p>
             </section>
+            )}
           </section>
 
           <section className="panel usage-table-panel">
             <div className="panel-header compact-header">
               <div>
-                <h2>实际 Deployment</h2>
+                <h2>{expertMode ? "实际 Deployment" : "渠道与模型"}</h2>
                 <p className="muted-line">按实际渠道与上游模型归因，不按客户端请求名猜测。</p>
               </div>
             </div>
@@ -155,7 +162,7 @@ function CentralUsageView({
               <thead>
                 <tr>
                   <th>渠道 / 模型</th>
-                  <th>Deployment</th>
+                  {expertMode && <th>Deployment</th>}
                   <th>调用</th>
                   <th>Token</th>
                 </tr>
@@ -170,7 +177,7 @@ function CentralUsageView({
                         <small>作者：{item.model_author || "unknown"}</small>
                       </div>
                     </td>
-                    <td><code>{item.deployment_id}</code></td>
+                    {expertMode && <td><code>{item.deployment_id}</code></td>}
                     <td>{tokenText(item.calls)}</td>
                     <td>{tokenText(item.total_tokens)}</td>
                   </tr>

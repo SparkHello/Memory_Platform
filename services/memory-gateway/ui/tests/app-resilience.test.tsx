@@ -44,7 +44,7 @@ vi.mock("../src/pages/memory/ReviewPage", () => ({
   ReviewPage: () => <h1>记忆体检</h1>
 }));
 vi.mock("../src/pages/system/DeveloperPage", () => ({
-  DeveloperPage: () => <h1>接入信息</h1>
+  DeveloperPage: () => <h1>客户端接入</h1>
 }));
 vi.mock("../src/pages/system/ProvidersPage", () => ({
   ProvidersPage: () => <h1>模型与路由</h1>

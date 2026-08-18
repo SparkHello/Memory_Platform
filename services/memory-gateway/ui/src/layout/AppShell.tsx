@@ -53,8 +53,9 @@ const PAGE_ICONS: Record<PageKey, typeof Gauge> = {
   developer: Wrench
 };
 
-// 接入信息放在主导航：首通后复制 chat token 是最高频步骤之一。
-const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "developer"];
+// 客户端接入放在主导航：首通后复制 chat token 是最高频步骤之一。
+// 底栏放首配与日常最高频入口；providers（模型）必须在，否则首配阶段移动端没有配模型入口。
+const MOBILE_PRIMARY_PAGES: PageKey[] = ["dashboard", "memories", "knowledge", "providers", "developer"];
 
 // warning 横幅（待配置模型 / 配置需处理）只在这四个可操作页面出现；
 // bad（服务异常）不受页限且不可关闭，ok / loading 照旧全局显示。

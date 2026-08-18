@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
-import { installFakeApi, seedConsoleSettings } from "./fakeApi";
+import {
+  installFakeApi,
+  seedConsoleSettings,
+  SYNTHETIC_EMBEDDING_SPACE_ID
+} from "./fakeApi";
 
 declare global {
   interface Window {
@@ -52,7 +56,7 @@ test("未知 hash 显示「页面不存在」并引导回工作室", async ({ pa
 });
 
 // 简洁模式（含直达 hash 打开的高级页面）一律不泄露内部实现术语。
-const FORBIDDEN_SIMPLE_TERMS = ["memory.chat", "memory.extract", "deployment", "逐字片段", "分叉点"];
+const FORBIDDEN_SIMPLE_TERMS = ["memory.chat", "memory.extract", "deployment", "Deployment", "逐 Attempt", "record_usage", "embedding", "逐字片段", "分叉点"];
 
 test("简洁模式：遍历全部入口与直达高级页均不出现内部术语", async ({ page }) => {
   await seedConsoleSettings(page, ORIGIN); // uiMode=simple
@@ -63,14 +67,16 @@ test("简洁模式：遍历全部入口与直达高级页均不出现内部术�
     page.locator(".sidebar").getByRole("button", { name: "切换到专家模式" })
   ).toBeVisible();
 
-  // SIMPLE_NAV 的六个入口通过侧栏真实点击遍历。
+  // SIMPLE_NAV 的八个入口通过侧栏真实点击遍历（含体检/用量）。
   const sidebarTour: Array<{ nav: string; hash: string }> = [
     { nav: "记忆工作室", hash: "#/studio" },
     { nav: "记忆库", hash: "#/memories" },
     { nav: "知识库", hash: "#/knowledge" },
+    { nav: "记忆体检", hash: "#/review" },
+    { nav: "用量与费用", hash: "#/usage" },
     { nav: "模型与路由", hash: "#/providers" },
     { nav: "报告与备份", hash: "#/reports" },
-    { nav: "接入信息", hash: "#/integration" }
+    { nav: "客户端接入", hash: "#/integration" }
   ];
   // 侧栏不展示的高级页面用 hash 直达，同样受简洁模式约束。
   const directHashes = ["#/knowledge-search", "#/recent"];
@@ -98,6 +104,50 @@ test("简洁模式：遍历全部入口与直达高级页均不出现内部术�
     await expect(page).toHaveURL(new RegExp(`${hash.replace("/", "\\/")}$`));
     await assertNoForbiddenTerms(hash);
   }
+});
+
+test("简洁模式：真实打开记忆档案时只展示语义检索状态", async ({ page }) => {
+  await seedConsoleSettings(page, ORIGIN, "simple");
+  await installFakeApi(page);
+
+  await page.goto(`${ORIGIN}/ui/#/memories`);
+  await expect(page.getByRole("heading", { name: "记忆库" })).toBeVisible();
+  await page.locator("tbody tr").first().click();
+
+  const drawer = page.getByRole("dialog", { name: "记忆档案" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByText("合成记忆 01", { exact: false })).toBeVisible();
+  await expect(drawer.getByText("语义检索")).toBeVisible();
+  await expect(drawer.getByText("已启用")).toBeVisible();
+  await expect(drawer).not.toContainText(SYNTHETIC_EMBEDDING_SPACE_ID);
+  await expect(drawer.getByText("向量空间")).toHaveCount(0);
+  await expect(drawer.getByRole("button", { name: "查看全部字段" })).toHaveCount(0);
+  await expect(drawer).not.toContainText("embedding");
+});
+
+test("专家模式：保留数据库健康与记忆档案的技术诊断", async ({ page }) => {
+  await seedConsoleSettings(page, ORIGIN, "expert");
+  await installFakeApi(page);
+
+  await page.goto(`${ORIGIN}/ui/#/review`);
+  await expect(page.getByRole("heading", { name: "记忆体检" })).toBeVisible();
+  await expect(page.locator(".content-area .state-block .spin")).toHaveCount(0);
+  await expect(page.getByText("缺少 embedding")).toBeVisible();
+  await expect(page.getByText("embedding 无效")).toBeVisible();
+  await expect(page.getByText("embedding 维度不匹配")).toBeVisible();
+  await expect(page.getByText("Active memory has no embedding vector.")).toBeVisible();
+  await expect(page.getByText("memory:active-memory-01")).toBeVisible();
+
+  await page.goto(`${ORIGIN}/ui/#/memories`);
+  await expect(page.getByRole("heading", { name: "记忆库" })).toBeVisible();
+  await page.locator("tbody tr").first().click();
+
+  const drawer = page.getByRole("dialog", { name: "记忆档案" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByText("向量空间")).toBeVisible();
+  await expect(drawer.getByText(SYNTHETIC_EMBEDDING_SPACE_ID)).toBeVisible();
+  await drawer.getByRole("button", { name: "查看全部字段" }).click();
+  await expect(drawer.getByText("active-memory-01")).toBeVisible();
 });
 
 test("warning 横幅关闭后写入 localStorage，切换页面与重新载入都不再出现", async ({ page }) => {

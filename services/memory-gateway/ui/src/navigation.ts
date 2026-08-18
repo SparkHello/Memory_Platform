@@ -21,7 +21,7 @@ export const PAGE_META: Record<PageKey, PageMeta> = {
   usage: { label: "用量与费用", shortLabel: "用量", hash: "#/usage" },
   providers: { label: "模型与路由", shortLabel: "模型", hash: "#/providers" },
   settings: { label: "连接设置", shortLabel: "设置", hash: "#/settings" },
-  developer: { label: "接入信息", shortLabel: "接入", hash: "#/integration" }
+  developer: { label: "客户端接入", shortLabel: "接入", hash: "#/integration" }
 };
 
 /**
@@ -52,7 +52,7 @@ export const NAV_SECTIONS: NavSection[] = [
 export const SIMPLE_NAV_SECTIONS: NavSection[] = [
   { key: "studio", label: "开始", items: ["dashboard"] },
   { key: "memory", label: "内容", items: ["memories", "knowledge"] },
-  { key: "system", label: "使用", items: ["providers", "reports", "developer"] }
+  { key: "system", label: "使用", items: ["review", "usage", "providers", "reports", "developer"] }
 ];
 
 export function sectionForPage(page: PageKey): NavSection {

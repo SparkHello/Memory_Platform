@@ -459,7 +459,7 @@ export function App() {
           <CoreMemoryPage api={api} notify={notify} confirm={confirm} />
         )}
         {!unknownHash && activePage === "review" && (
-          <ReviewPage api={api} notify={notify} confirm={confirm} openMemory={openMemory} setupStatus={setupStatus} />
+          <ReviewPage api={api} notify={notify} confirm={confirm} openMemory={openMemory} setupStatus={setupStatus} expertMode={uiMode === "expert"} />
         )}
         {!unknownHash && activePage === "recall" && <RecallExplainPage api={api} notify={notify} openMemory={openMemory} />}
         {!unknownHash && activePage === "evaluation" && <EvaluationPage api={api} notify={notify} />}
@@ -470,7 +470,7 @@ export function App() {
           <ReportsPage api={api} settings={settings} notify={notify} confirm={confirm} />
         )}
         {!unknownHash && activePage === "logs" && <DecisionLogsPage api={api} setupStatus={setupStatus} />}
-        {!unknownHash && activePage === "usage" && <UsagePage api={api} setupStatus={setupStatus} />}
+        {!unknownHash && activePage === "usage" && <UsagePage api={api} setupStatus={setupStatus} expertMode={uiMode === "expert"} />}
         {!unknownHash && activePage === "providers" && (
           <ProvidersPage
             api={api}
@@ -504,6 +504,7 @@ export function App() {
             memoryId={memoryId}
             notify={notify}
             confirm={confirm}
+            expertMode={uiMode === "expert"}
             onClose={closeMemory}
             onOpenMemory={openMemory}
             onChanged={() => setMemoryRefreshKey((current) => current + 1)}

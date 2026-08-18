@@ -410,7 +410,7 @@ describe("first-run setup", () => {
     expect(createAuthToken).not.toHaveBeenCalled();
     expect(reEmbedMemories).toHaveBeenCalledWith({ scan: true });
     expect(screen.getByText(/已为 2 条缺少当前空间向量的记忆补齐向量/)).toBeInTheDocument();
-    expect(screen.getByText(/请到「接入信息」使用已有 chat token/)).toBeInTheDocument();
+    expect(screen.getByText(/请到「客户端接入」使用已有 chat token/)).toBeInTheDocument();
   });
 
   it("defaults the embedding access point to the chat URL and only sends it when different", async () => {

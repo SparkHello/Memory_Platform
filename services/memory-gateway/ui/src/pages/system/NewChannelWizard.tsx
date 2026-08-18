@@ -728,20 +728,20 @@ export function NewChannelWizard({
         setFeedback({
           tone: "warning",
           message:
-            "渠道配置已生效，但自动创建 chat token 失败。请打开「接入信息」手动创建设备 token，切勿把 Console 密钥填进聊天客户端。"
+            "渠道配置已生效，但自动创建 chat token 失败。请打开「客户端接入」手动创建设备 token，切勿把 Console 密钥填进聊天客户端。"
         });
       } else if (reusedExisting) {
         setFeedback({
           tone: "success",
           message:
-            "渠道已生效。已有可用的 chat token，请到「接入信息」使用现有客户端配置，不要把 Console 或 admin 密钥填进聊天应用。"
+            "渠道已生效。已有可用的 chat token，请到「客户端接入」使用现有客户端配置，不要把 Console 或 admin 密钥填进聊天应用。"
         });
       } else {
         setFeedback({
           tone: "success",
           message:
             "渠道已生效，并已创建仅用于聊天的 chat token（明文只显示一次）。请复制下方客户端配置，不要使用 Console 或 admin 密钥。" +
-            "若之前为该渠道创建过 token，可在「接入信息」页撤销不再使用的旧 token。"
+            "若之前为该渠道创建过 token，可在「客户端接入」页撤销不再使用的旧 token。"
         });
       }
     } catch (cause) {
@@ -760,7 +760,7 @@ export function NewChannelWizard({
       setFeedback({
         tone: "error",
         message:
-          "还没有 chat token 可复制。请到「接入信息」为该设备创建 chat token；不会用 Console 密钥冒充客户端密钥。"
+          "还没有 chat token 可复制。请到「客户端接入」为该设备创建 chat token；不会用 Console 密钥冒充客户端密钥。"
       });
       return;
     }
@@ -815,7 +815,7 @@ export function NewChannelWizard({
     return true;
   };
 
-  // 完成态 CTA：先走与「完成」相同的关闭守卫（一次性 token 未复制时需确认），再跳转接入信息页。
+  // 完成态 CTA：先走与「完成」相同的关闭守卫（一次性 token 未复制时需确认），再跳转客户端接入页。
   const goToIntegration = async () => {
     if (await requestClose()) {
       window.location.hash = PAGE_META.developer.hash;
@@ -870,7 +870,7 @@ export function NewChannelWizard({
             <p className="provider-wizard-hint">
               已保存 {appliedSummary.deployments} 个模型，变更 {appliedSummary.routes} 条用途路由。
               {clientTokenReused
-                ? "已有可用的 chat token，请到「接入信息」查看客户端三项填写。"
+                ? "已有可用的 chat token，请到「客户端接入」查看客户端三项填写。"
                 : "请用下方 chat token 连接 OpenAI 兼容客户端。"}
               Console / admin 密钥不能填进 Chatbox 等聊天应用。
             </p>
@@ -888,9 +888,9 @@ export function NewChannelWizard({
                       : `${clientChatToken.slice(0, 12)}…${clientChatToken.slice(-4)}`}
                   </code>
                 ) : clientTokenReused ? (
-                  <strong>请到「接入信息」使用已有 chat token</strong>
+                  <strong>请到「客户端接入」使用已有 chat token</strong>
                 ) : (
-                  <strong className="text-warning">未创建 — 请到「接入信息」手动创建</strong>
+                  <strong className="text-warning">未创建 — 请到「客户端接入」手动创建</strong>
                 )}
               </span>
             </div>
