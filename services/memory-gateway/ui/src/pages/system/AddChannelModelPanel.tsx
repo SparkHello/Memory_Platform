@@ -8,8 +8,9 @@ import type {
   ModelGatewayRouteAssignmentInput
 } from "../../types";
 import { filterDiscoveredChatModels } from "../../utils/discoveredModels";
+import { CLIENT_MODEL_ID } from "../../utils/constants";
 import { errorMessage } from "../../utils/format";
-import { CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./providerShared";
+import { channelOperatorLabel, CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./providerShared";
 
 export function AddChannelModelPanel({
   api,
@@ -41,7 +42,7 @@ export function AddChannelModelPanel({
   const [adapterProfile, setAdapterProfile] = useState<"inherit" | "dashscope_deepseek_v4">("inherit");
   const [capabilities, setCapabilities] = useState<ModelGatewayCapabilities>({});
   const [validated, setValidated] = useState(false);
-  const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply">("");
+  const [busy, setBusy] = useState<"" | "discover" | "validate" | "apply" | "probe">("");
   const [feedback, setFeedback] = useState<ProviderFeedback | null>(null);
   const [done, setDone] = useState(false);
 
@@ -125,6 +126,40 @@ export function AddChannelModelPanel({
     routes: buildRoutes()
   });
 
+  const detectCapabilities = async () => {
+    if (!chatModel.trim() || busy) return;
+    setBusy("probe");
+    setFeedback(null);
+    try {
+      const result = await api.probeProviderChannelCapabilities(
+        {
+          revision: control.revision,
+          connection_id: connection.id,
+          upstream_model: chatModel.trim(),
+          probes: ["chat", "streaming", "tools", "reasoning", "json_object"]
+        },
+        adminKey
+      );
+      if (!result.details?.chat?.ok) {
+        setFeedback({ tone: "error", message: `基础聊天探测失败：${result.details?.chat?.detail || "未知错误"}。请确认模型 ID 正确。` });
+        return;
+      }
+      setCapabilities({
+        tools: Boolean(result.capabilities.tools),
+        parallel_tools: Boolean(result.capabilities.parallel_tools),
+        reasoning: Boolean(result.capabilities.reasoning),
+        json_object: Boolean(result.capabilities.json_object),
+        json_schema: Boolean(result.capabilities.json_schema)
+      });
+      setValidated(false);
+      setFeedback({ tone: "success", message: "已按实际探测结果勾选能力（消耗少量额度）。多模态输入需手动勾选。" });
+    } catch (cause) {
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
+    } finally {
+      setBusy("");
+    }
+  };
+
   const validate = async () => {
     if (!chatModel.trim() || busy) return;
     setBusy("validate");
@@ -157,7 +192,7 @@ export function AddChannelModelPanel({
       setDone(true);
       setFeedback({
         tone: "success",
-        message: `已添加 ${result.deployments[0]?.upstream_model || chatModel}，并追加到 ${result.changed_routes.length} 条用途的备用顺序。客户端仍使用 memory-auto。`
+        message: `已添加 ${result.deployments[0]?.upstream_model || chatModel}，并追加到 ${result.changed_routes.length} 条用途的备用顺序。客户端仍使用 ${CLIENT_MODEL_ID}。`
       });
     } catch (cause) {
       setValidated(false);
@@ -174,7 +209,7 @@ export function AddChannelModelPanel({
     <section className="panel provider-editor-section provider-wizard" aria-labelledby="add-model-title">
       <div className="panel-header provider-section-header">
         <div>
-          <h2 id="add-model-title">给「{connection.channel_operator}」添加模型</h2>
+          <h2 id="add-model-title">给「{channelOperatorLabel(connection.channel_operator)}」添加模型</h2>
           <p>复用已保存的渠道密钥和 {connection.base_url}。新模型默认排在现有模型后面作备用。</p>
         </div>
         <button
@@ -244,23 +279,19 @@ export function AddChannelModelPanel({
               />
             )}
           </label>
-          <label className="field-block">
-            <span>适配 profile</span>
-            <select
-              value={adapterProfile}
-              aria-label="适配 profile"
-              disabled={Boolean(busy)}
-              onChange={(event) => {
-                setAdapterProfile(event.target.value as "inherit" | "dashscope_deepseek_v4");
-                setValidated(false);
-              }}
-            >
-              <option value="inherit">继承渠道适配器</option>
-              <option value="dashscope_deepseek_v4">DashScope DeepSeek V4 Flash/Pro</option>
-            </select>
-          </label>
           <fieldset className="provider-capability-field" disabled={Boolean(busy)}>
-            <legend>声明此模型支持的能力</legend>
+            <legend>支持的能力</legend>
+            <div className="provider-wizard-actions provider-detect-row">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void detectCapabilities()}
+                disabled={!chatModel.trim() || Boolean(busy)}
+              >
+                {busy === "probe" ? "正在探测…" : "自动检测能力"}
+              </button>
+              <span className="muted">不确定就点这里，会对模型发几条极短请求来判断。</span>
+            </div>
             <div className="provider-capability-grid">
               {CAPABILITY_OPTIONS.map((option) => (
                 <label key={option.key}>
@@ -278,8 +309,26 @@ export function AddChannelModelPanel({
             </div>
           </fieldset>
           <p className="provider-wizard-hint">
-            未勾选的能力会被路由视为不支持。此步骤不会再创建 chat token，也不会改向量路由。
+            未勾选的能力会被路由视为不支持，之后可以在模型胶囊里修改。
           </p>
+          <details className="provider-advanced-inline">
+            <summary>高级：请求格式兼容（适配 profile）</summary>
+            <label className="field-block">
+              <span>只在这家供应商对该模型有特殊请求格式时才需要改，默认继承渠道设置即可。</span>
+              <select
+                value={adapterProfile}
+                aria-label="适配 profile"
+                disabled={Boolean(busy)}
+                onChange={(event) => {
+                  setAdapterProfile(event.target.value as "inherit" | "dashscope_deepseek_v4");
+                  setValidated(false);
+                }}
+              >
+                <option value="inherit">默认（继承渠道设置）</option>
+                <option value="dashscope_deepseek_v4">DashScope 上的 DeepSeek V4 Flash/Pro</option>
+              </select>
+            </label>
+          </details>
           <div className="provider-wizard-actions">
             <button type="button" className="secondary-button" onClick={() => void validate()} disabled={!chatModel.trim() || Boolean(busy)}>
               <ShieldCheck size={16} aria-hidden />

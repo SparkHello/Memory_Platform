@@ -15,7 +15,7 @@ Memory stays on your own device, where you can inspect, edit, delete, and back i
 
 [中文](README.md) · **[English](README.en.md)**
 
-[🔀 How it works](#-two-gateway-layers-automatic-ordinary-chat) · [🧭 Why Memory Platform](#-why-memory-platform) · [🚀 Get started](#-quick-start) · [🔌 Connect a client](#-connecting-clients) · [📚 Docs](#-documentation)
+[🔀 How it works](#-two-gateway-layers-automatic-ordinary-chat) · [🧭 Why Memory Platform](#-why-memory-platform) · [🚀 Get started](#-quick-start) · [🔌 Connect a client](#-connecting-clients) · [📱 Android app](#-on-your-phone-the-android-app) · [📚 Docs](#-documentation)
 
 </div>
 
@@ -150,6 +150,18 @@ The setup script prepares the environment, builds the Web Console, starts the st
 
 An AI or agent can instead follow [Installing with an AI assistant](docs/ai-install.md) (Chinese), create a non-secret recipe, and call `scripts/setup.sh --config <file> --json`. The provider API key is passed only through standard input.
 
+### 📱 On your phone: the Android app
+
+No computer required. The Android build packs Memory Gateway, Model Gateway and the Web Console into one app that runs as a foreground service bound to `127.0.0.1`. Chat apps on the same phone point at `http://127.0.0.1:2026/v1`; the console opens in the phone browser at `http://127.0.0.1:2026/` with exactly the desktop feature set. Memories and keys stay in the app's private storage.
+
+1. Download `memory-platform-android-*.apk` (arm64, Android 8.0+) from [Releases](https://github.com/SparkHello/Memory_Platform/releases) and allow installs from unknown sources.
+2. Open the app, tap **Start service**, allow notifications, and once it shows **Running** tap **Disable battery optimization**. Chinese OEM systems (Xiaomi, Huawei, OPPO, vivo, ...) additionally need auto-start permission, an unrestricted power policy and locking the app in recents, or the background service gets killed.
+3. Tap **Copy first login token**, then **Open console** and paste it; use **Copy Model Gateway admin key** when configuring models.
+4. Create a chat token in the console and enter it in your chat app. For search/MCP tools, enable the *tools* ability for `memory-auto` in the client and tick *tools* (or use *Auto-detect capabilities*) for the model in the console.
+5. If something goes wrong, **Export diagnostics** produces a zip with logs, redacted config, a memory database snapshot and the extraction decision log.
+
+Under the hood it embeds Python 3.14 via Chaquopy and runs the same server code, with an FTS5-enabled SQLite and the two Rust dependencies compiled on-device. Build steps, known limits and troubleshooting: [Android client guide](docs/android.md) (Chinese).
+
 ## 🔌 Connecting clients
 
 Add a new “OpenAI-compatible” provider in Chatbox, RikkaHub, FLIT, or another client:
@@ -160,11 +172,11 @@ API Key:  a per-device chat token created in the Web Console or CLI
 Model:    memory-auto
 ```
 
-After one complete message, open `http://127.0.0.1:2026/ui/` to check whether a memory was created. When you later change providers or models, only the server configuration changes; the client keeps using `memory-auto`.
+After one complete message, open `http://127.0.0.1:2026/ui/` to check whether a memory was created. When you later change providers or models, only the server configuration changes; the client keeps using `memory-auto`. The model list also offers `memory-read` (recall only, never writes new memory) and `memory-off` (plain transparent proxy, no reads or writes): switch the model name for a conversation that should leave no memory, with no custom-header support required.
 
 Ordinary chat does not require MCP or a system prompt telling the model when to save memory. In the default `read-write` mode, Memory Gateway handles relevant-memory recall, context injection, and post-answer extraction automatically.
 
-On a phone, `localhost` and `127.0.0.1` point to the phone itself. LAN or Tailscale devices must use the address of the computer running Memory Platform; Docker deployments also need `MEMORY_HOST=0.0.0.0` in a `.env` file next to the Compose file, plus a restart, to listen on the LAN. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
+On a phone, `localhost` and `127.0.0.1` point to the phone itself: with the [Android app](#-on-your-phone-the-android-app) installed that is exactly the address to use. To reach a computer instead, LAN or Tailscale devices must use that computer's address; Docker deployments also need `MEMORY_HOST=0.0.0.0` in a `.env` file next to the Compose file, plus a restart, to listen on the LAN. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
 
 ### Optional MCP: let the model use memory and knowledge explicitly
 
@@ -197,9 +209,11 @@ The knowledge base never enters chat context automatically. It requires an expli
 
 ![Four-step memory flow: chat normally, verify before saving, recall on demand, then inspect, edit, or delete](docs/images/memory-flow.en.svg)
 
-The system waits for a complete answer, checks the original wording, subject, negation, and sensitivity, and only then decides whether to save. Truncated, filtered, or unfinished tool-call responses do not create memory.
+The system waits for a complete answer, checks the original wording, subject, negation, and sensitivity, and only then decides whether to save. Truncated, filtered, or unfinished tool-call responses do not create memory; turns that are only greetings, questions, or code are skipped by a local prefilter without calling the extraction model.
 
-You do not need to append “remember this” to each message. The system conservatively extracts durable information only from content the user actually expressed.
+You do not need to append “remember this” to each message. The system conservatively extracts durable information only from content the user actually expressed. Private facts such as health, address, contact details, and income are saved automatically and injected into chat only when clearly relevant to the current question; passwords, government IDs, and bank/account numbers still require an explicit request to remember and are never injected into chat.
+
+Sensitivity filtering is per sentence: by default (`ALLOW_SENSITIVE_EGRESS=false`) only sentences containing passwords, IDs, or account numbers are withheld from the extraction model while the rest of the turn is extracted normally; such a sentence next to “remember” is saved locally verbatim without any model call.
 
 ### Search and govern the whole memory library
 
@@ -213,7 +227,7 @@ You do not need to append “remember this” to each message. The system conser
 - **Long-term memory and governance:** verifiable source text, lifecycles, timelines, topic links, recall explanations, edit, merge, soft delete, restore, permanent deletion, and export.
 - **Isolated knowledge base:** text, Markdown, PDF, DOCX, and EPUB with full-text/vector hybrid retrieval, immutable document versions, and exact passage citations.
 - **Models, failover, and usage:** purpose-based model selection and fallback, with channel, model, token, latency, and price snapshots but no prompts, replies, tool arguments, or knowledge content in usage logs.
-- **Optional, strict vector capability:** a missing or disabled `memory.embedding` route uses keyword retrieval. Enabling it opts into semantic vectors; a blank space setting automatically adopts the route contract, while an invalid, unavailable, or pin-mismatched contract makes `/readyz` fail instead of mixing old vector spaces. Sensitive content is excluded from remote extraction, embeddings, AI review, and the knowledge agent by default.
+- **Optional, strict vector capability:** a missing or disabled `memory.embedding` route uses keyword retrieval. Enabling it opts into semantic vectors; a blank space setting automatically adopts the route contract, while an invalid, unavailable, or pin-mismatched contract makes `/readyz` fail instead of mixing old vector spaces. Sentences containing passwords, IDs, or account numbers are excluded from remote extraction and embeddings by default (filtered per sentence; the rest of the text still goes out); the egress ceiling for private content such as health, address, contact details, and income is set by `MEMORY_EGRESS_CEILING`; context compaction, AI review, and the knowledge agent still keep all non-normal content local by default.
 
 The complete interface and behavior contracts are documented in [Memory Gateway](services/memory-gateway/README.md) and [Model Gateway](services/model-gateway/README.md).
 
@@ -233,6 +247,7 @@ Memory behavior and model-provider configuration have different change rates and
 - Topic, entity, and temporal links are lightweight and are not a substitute for full entity resolution, a bitemporal knowledge graph, or deep multi-hop reasoning.
 - The OpenAI-compatible entry point focuses on Chat Completions; it is not a complete proxy for Responses, audio, files, or image generation.
 - Backups exclude keys but still contain complete private memory and knowledge content, so they remain sensitive files.
+- The Android build ships arm64 only and targets single-user use on one phone; it depends on the OS letting the service stay in the background (battery optimization off, auto-start allowed).
 
 Key boundaries, sensitive-data egress, backup and restore, and advanced model configuration are covered in the [stack operations guide](docs/stack-operations.en.md).
 

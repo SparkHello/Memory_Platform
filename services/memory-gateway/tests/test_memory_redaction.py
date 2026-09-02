@@ -28,8 +28,14 @@ class TestDetectTextSensitivity:
         assert detect_text_sensitivity("银行卡密码是 123456") == "sensitive"
         assert detect_text_sensitivity("API key 是 sk-abc123def456") == "sensitive"
 
-    def test_health_facts_are_sensitive(self) -> None:
-        assert detect_text_sensitivity("需要持续控制血糖") == "sensitive"
+    def test_health_facts_are_private(self) -> None:
+        # Health is personal-but-useful: stored automatically, masked by default,
+        # recallable in chat only when relevant. Secrets/IDs stay "sensitive".
+        assert detect_text_sensitivity("需要持续控制血糖") == "private"
+        assert detect_text_sensitivity("I am allergic to peanuts") == "private"
+
+    def test_precise_address_is_private(self) -> None:
+        assert detect_text_sensitivity("我的家庭住址是北京市朝阳区某路 12 号") == "private"
 
     def test_sensitive_wins_over_private(self) -> None:
         text = "我的银行卡号 6222020200001234567，邮箱 user@example.com"

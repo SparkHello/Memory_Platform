@@ -90,6 +90,8 @@ async def commit_conversation_import(
         embedding_client=embedding_client,
         llm_client=llm_client,
         allow_sensitive_egress=settings.allow_sensitive_egress,
+        egress_ceiling=settings.memory_egress_ceiling,
+        auto_supersede=settings.memory_auto_supersede,
     )
     turn_results: list[dict] = []
     created_total = 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import json
 import sqlite3
 from threading import Barrier
 from types import SimpleNamespace
@@ -55,7 +56,10 @@ def _settings() -> SimpleNamespace:
         chat_gateway_turn_ttl_seconds=600.0,
         chat_gateway_extraction_context_turns=4,
         chat_gateway_extraction_context_max_chars=4000,
+        chat_gateway_extraction_prefilter=True,
         allow_sensitive_egress=False,
+        memory_egress_ceiling="private",
+        memory_auto_supersede=True,
     )
 
 
@@ -372,6 +376,89 @@ async def test_enqueue_failure_calls_pure_ingest_exactly_once(
         assert connection.execute(
             "SELECT COUNT(*) FROM chat_finalize_jobs"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_oversized_user_text_skip_is_logged_without_outbox_row(
+    memory_store: MemoryStore,
+    stub_ingest,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_gateway,
+        "_completed_branch_history_fingerprint",
+        lambda **kwargs: "",
+    )
+
+    await chat_gateway._finalize_turn(
+        key="turn-key",
+        assistant_text="好的",
+        memory_mode="read-write",
+        user_id="alice",
+        user_text="x" * (64 * 1024 + 1),
+        extraction_context_messages=[],
+        conversation_id=None,
+        previous_context=None,
+        branch_state="root",
+        parent_history_fingerprint="",
+        branch_messages=[],
+        turn_fingerprint="turn",
+        memory_ids=[],
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=None,
+        settings=_settings(),
+    )
+
+    assert stub_ingest.calls == 0
+    logs = memory_store.list_decision_logs(user_id="alice")
+    assert len(logs) == 1
+    assert logs[0].decision == "ignore"
+    assert "64 KiB" in logs[0].reason
+    payload = json.loads(logs[0].candidate_json)
+    assert payload["prefilter"] == "oversized"
+    assert payload["user_text_length"] == 64 * 1024 + 1
+    with sqlite3.connect(memory_store.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM chat_finalize_jobs"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_greeting_turn_is_prefiltered_before_outbox(
+    memory_store: MemoryStore,
+    stub_ingest,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_gateway,
+        "_completed_branch_history_fingerprint",
+        lambda **kwargs: "",
+    )
+
+    await chat_gateway._finalize_turn(
+        key="turn-key",
+        assistant_text="你好！有什么可以帮你？",
+        memory_mode="read-write",
+        user_id="alice",
+        user_text="谢谢",
+        extraction_context_messages=[],
+        conversation_id=None,
+        previous_context=None,
+        branch_state="root",
+        parent_history_fingerprint="",
+        branch_messages=[],
+        turn_fingerprint="turn",
+        memory_ids=[],
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=None,
+        settings=_settings(),
+    )
+
+    assert stub_ingest.calls == 0
+    payload = json.loads(memory_store.list_decision_logs(user_id="alice")[0].candidate_json)
+    assert payload["prefilter"] == "greeting"
 
 
 @pytest.mark.asyncio

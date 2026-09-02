@@ -721,6 +721,23 @@ def _temporal_verdict(temporal: dict[str, int]) -> Verdict:
     supersession = int(temporal.get("supersession_link_count", 0))
     active_edges = int(temporal.get("active_supersession_edge_count", supersession))
     dangling = int(temporal.get("dangling_supersession_reference_count", 0))
+    keyless_edges = int(temporal.get("keyless_supersession_edge_count", 0))
+    if key_count == 0 and keyless_edges:
+        if dangling:
+            return Verdict(
+                "temporal_kg",
+                "degenerate",
+                f"检测到 {dangling} 个活跃但不互为反向引用或指向回收站的替代引用，"
+                "自动替换链需要修复。",
+                temporal,
+            )
+        return Verdict(
+            "temporal_kg",
+            "active",
+            f"没有记忆携带时间键，但已有 {keyless_edges} 条自动替换链（无键 supersede）"
+            "保持双向一致。",
+            temporal,
+        )
     if key_count == 0:
         return Verdict(
             "temporal_kg",
@@ -1153,13 +1170,22 @@ def _temporal_metrics(
         valid_active_ids: set[str] = set()
         dangling_references = 0
 
-        def same_temporal_key(left: sqlite3.Row, right: sqlite3.Row) -> bool:
-            return bool(
-                left["temporal_subject"]
-                and left["temporal_predicate"]
-                and left["temporal_subject"] == right["temporal_subject"]
-                and left["temporal_predicate"] == right["temporal_predicate"]
+        def _chain_key(row: sqlite3.Row) -> tuple[str | None, str | None]:
+            return (
+                str(row["temporal_subject"]) if row["temporal_subject"] else None,
+                str(row["temporal_predicate"]) if row["temporal_predicate"] else None,
             )
+
+        def same_temporal_key(left: sqlite3.Row, right: sqlite3.Row) -> bool:
+            # Keyed chains must share the full key; keyless chains (automatic
+            # supersede) must be keyless on both ends. Half keys never match.
+            left_key = _chain_key(left)
+            right_key = _chain_key(right)
+            if left_key != right_key:
+                return False
+            return all(left_key) or not any(left_key)
+
+        keyless_edges: set[tuple[str, str]] = set()
 
         for row in active_rows:
             memory_id = str(row["id"])
@@ -1184,6 +1210,8 @@ def _temporal_metrics(
                 edge = tuple(sorted((memory_id, target_id)))
                 valid_edges.add(edge)
                 valid_active_ids.update(edge)
+                if not any(_chain_key(row)):
+                    keyless_edges.add(edge)
 
         metrics.update(
             {
@@ -1194,6 +1222,7 @@ def _temporal_metrics(
                     1 for row in linked_rows if int(row["archived"] or 0)
                 ),
                 "dangling_supersession_reference_count": dangling_references,
+                "keyless_supersession_edge_count": len(keyless_edges),
             }
         )
     if "valid_from" in columns:

@@ -433,11 +433,21 @@ class CandidateMemory(BaseModel):
         return self
 
 
+class AutoSupersedeDecision(BaseModel):
+    """A live memory the resolver decided the new candidate replaces."""
+
+    target: MemoryRecord
+    relation: MemoryRelation
+    reason: str
+
+
 class ResolveResult(BaseModel):
     action: MemoryAction
     memory: MemoryRecord | None = None
     relation: MemoryRelation = "none"
     reason: str
+    # Set when action == "update": the older memory that was closed in place.
+    superseded_memory_id: str | None = None
 
 
 class DecisionLog(BaseModel):
@@ -553,6 +563,7 @@ class MemoryIngestItemResult(BaseModel):
     reason: str
     memory_id: str | None = None
     content: str | None = None
+    superseded_memory_id: str | None = None
 
 
 class MemoryIngestResult(BaseModel):

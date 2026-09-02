@@ -19,7 +19,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 ## 主要能力
 
 - MCP Streamable HTTP 入口 `/mcp`，同时提供长期记忆的检索、浮现、保存与消化，以及独立知识库的浏览、检索、精读、上传和文档管理工具。
-- OpenAI-compatible `/v1/chat/completions` 透明记忆代理：服务端自动混合检索、注入安全核心/长期记忆、流式转发，并只在最终文本回答后执行幂等激活与记忆提取。
+- OpenAI-compatible `/v1/chat/completions` 透明记忆代理：服务端自动混合检索、注入安全核心/长期记忆、流式转发，并只在最终文本回答后执行幂等激活与记忆提取；模型别名 `memory-auto`/`memory-read`/`memory-off` 只决定记忆模式，寒暄致谢、纯提问或纯代码的轮次由本地预过滤跳过提取调用。
 - REST 管理接口 `/memories/*`，覆盖记忆列表、搜索、保存、编辑、软删除、恢复、永久删除、合并、报告、导出、恢复导入、网络图、时间线、体检和评估。
 - Web 控制台 `/ui`，用于日常查看、治理、评估、备份、接入配置，以及按实际 provider/model 汇总 Token 与公开 API 原价。
 - SQLite 本地存储；Bearer 凭证默认绑定 `GATEWAY_USER_ID`（默认 `default`），不能由调用者用 `X-User-Id` 改写。
@@ -31,8 +31,9 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - 敏感内容响应期遮罩：`redact_sensitive=true` 只影响响应，不改写 SQLite 原文。
 - 决策日志不会复制完整 `source_quote`；敏感候选正文只保留长度、SHA-256、敏感级别和关联 memory ID。
 - 提取模型返回空候选时，自由文本理由仍只保留长度和 SHA-256，但会额外保存受控 `model_reason_code`，用于区分临时事项、假设、非用户陈述、敏感授权不足或无长期价值。
-- 保存门槛会先验证逐字 `source_quote`，再检查候选与引用的事实锚点、否定一致性、敏感级别下限和子句级“记住”授权。
-- 敏感内容默认不进入远程提取、embedding、AI 体检、普通搜索或自然浮现；远程处理需显式配置。
+- 保存门槛会先验证逐字 `source_quote`，再检查候选与引用的事实锚点、否定一致性和敏感级别下限：`private`（健康/医疗、精确住址、联系方式、收入/负债）由提取模型直接保存，要求 importance≥7、confidence≥0.85，不需要用户说“记住”；`sensitive`（密码/密钥、证件号、银行卡/账号）要求 importance≥8、confidence≥0.9，且必须有子句级“记住”授权。
+- 出站过滤按句子进行：`sensitive` 句子默认永不进入远程提取和 embedding（同一段其余句子照常），紧邻“记住”的被扣留句子不经模型原句本地保存；`private` 句子是否出站由 `MEMORY_EGRESS_CEILING` 决定。上下文压缩、AI 体检和知识代理仍对所有非 `normal` 文本默认不出站。
+- 聊天召回可按相关性注入 `private` 记忆，`sensitive` 永不注入；REST/MCP 搜索、自然浮现和核心整理默认只含 `normal`。
 - 回收站永久删除：批量操作先在单一 SQLite 快照中预览实际 evidence 删除闭包与 Core 影响，再用短期签名 token 原子提交；提交时任一相关状态漂移都会拒绝，不会部分删除。
 - 数据库健康检查：只读报告孤立证据、空间链接、embedding、导出一致性和历史引用问题。
 - 历史分类回填：对旧库一次性补齐主题、实体和空间，执行前自动 SQLite backup，并写决策日志。
@@ -189,7 +190,7 @@ memgw stop
 
 macOS 的 My_Memory 用户配置默认位于 `~/Library/Application Support/memory-gateway/`；Model Gateway 使用自己独立的用户配置目录。两个程序的密钥文件都在仓库外且权限受限，项目 `.env` 只作为兼容输入。
 
-旧的项目内 `memgw model`、`memgw route`、`memgw pricing` 与 `LLM_*` / `UPSTREAM_*` direct-provider 路径已移除：这些命令（含任意子参数）和 `memgw secret set/delete mimo|kimi|deepseek|upstream|embedding` 只打印迁移提示并以退出码 2 结束。`MODEL_GATEWAY_BASE_URL` 与 `MODEL_GATEWAY_API_KEY` 必须成对配置，是唯一模型路径；聊天、后台记忆任务和知识代理只调用独立网关，模型、路由与价格用 `modelgw` 或 Web 控制台「模型与路由」页管理。对客户端开放的 `/v1/chat/completions` 只接受 `memory-auto` 和 `MODEL_GATEWAY_CHAT_MODEL` 配置的聊天 route；`memory.extract`、`knowledge.pro`、`memory.embedding` 等内部 route 不会通过公共聊天代理转发。从 direct-provider 升级见 [迁移到 Model Gateway](../../docs/migrate-to-model-gateway.md)。
+旧的项目内 `memgw model`、`memgw route`、`memgw pricing` 与 `LLM_*` / `UPSTREAM_*` direct-provider 路径已移除：这些命令（含任意子参数）和 `memgw secret set/delete mimo|kimi|deepseek|upstream|embedding` 只打印迁移提示并以退出码 2 结束。`MODEL_GATEWAY_BASE_URL` 与 `MODEL_GATEWAY_API_KEY` 必须成对配置，是唯一模型路径；聊天、后台记忆任务和知识代理只调用独立网关，模型、路由与价格用 `modelgw` 或 Web 控制台「模型与路由」页管理。对客户端开放的 `/v1/chat/completions` 只接受 `memory-auto`/`memory-read`/`memory-off` 等记忆模式别名（都解析到同一聊天 route，只决定记忆模式）和 `MODEL_GATEWAY_CHAT_MODEL` 配置的聊天 route；`memory.extract`、`knowledge.pro`、`memory.embedding` 等内部 route 不会通过公共聊天代理转发。从 direct-provider 升级见 [迁移到 Model Gateway](../../docs/migrate-to-model-gateway.md)。
 
 下面是仍然支持的手工安装与启动方式：
 
@@ -316,7 +317,7 @@ curl \
 | `GATEWAY_SIGNING_SECRET` | 空 | 独立签名 cursor、review/purge preview 等短期状态；缺失时相关能力 503，绝不回退访问 token。 |
 | `AUTH_DATABASE_PATH` | `data/auth.db` | 只保存 token ID、SHA-256、固定 user/role、使用与撤销时间，不保存 token 明文。 |
 | `CHAT_GATEWAY_ENABLED` | `true` | 是否启用 `/v1/models` 和 `/v1/chat/completions`。 |
-| `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | `read-write` | 默认记忆模式：`off` 仅透明代理，`read` 只召回/注入，`read-write` 还会在完整最终回答后自动提取新记忆。可由请求头 `X-Memory-Mode` 覆盖。 |
+| `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | `read-write` | 默认记忆模式（即 `memory-auto` 的模式）：`off` 仅透明代理，`read` 只召回/注入，`read-write` 还会在完整最终回答后自动提取新记忆。可由模型别名 `memory-read`/`memory-off` 或请求头 `X-Memory-Mode` 覆盖，请求头优先。 |
 | `CHAT_GATEWAY_SEARCH_LIMIT` | `8` | 每轮自动召回的长期记忆上限，范围 1–20。 |
 | `CHAT_GATEWAY_CONTEXT_MAX_CHARS` | `12000` | 自动注入记忆上下文的字符预算。 |
 | `CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS` | `4` | 混合召回的首 token 前预算；超时后回退本地关键词检索，不阻断聊天。 |
@@ -329,6 +330,7 @@ curl \
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS` | `8` | 未压缩轮次达到该数量时，在聊天结束后的后台任务中压缩较早普通上下文。 |
 | `CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS` | `6000` | 较早普通上下文与已有摘要达到该字符数时触发后台压缩。 |
 | `CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS` | `4000` | 滚动压缩摘要的最大字符数。 |
+| `CHAT_GATEWAY_EXTRACTION_PREFILTER` | `true` | 跳过仅为寒暄致谢、纯提问或纯代码轮次的 `memory.extract` 调用；明确的「记住/remember」请求和助手提问后的短回答永不跳过；跳过会写入以「本地预过滤：」开头的 ignore 决策日志（只记长度与 SHA-256）。不影响 `memory.compact` 压缩和请求侧召回。 |
 | `MODEL_GATEWAY_BASE_URL` | 空 | 推荐的独立 Model Gateway `/v1` 地址；只允许 HTTPS，或 `localhost`/回环地址上的 HTTP。必须与客户端 key 同时配置。 |
 | `MODEL_GATEWAY_ALLOW_PRIVATE_HTTP` | `false` | 仅供隔离 Docker 网络或明确 LAN 私网接线使用。开启后 HTTP 仍只接受 RFC1918/ULA 地址或精确服务名 `model-gateway`，公网地址和任意 DNS 名继续拒绝。 |
 | `MODEL_GATEWAY_API_KEY` | 空 | My_Memory 调用独立 Model Gateway 的 backend client key。可用 `memgw secret set model-gateway` 保存到仓库外。必须与 `MODEL_GATEWAY_BASE_URL` 成对配置，是唯一模型路径；旧的项目内 `LLM_*` / `UPSTREAM_*` 直连字段已删除。 |
@@ -337,7 +339,9 @@ curl \
 | `MODEL_GATEWAY_KNOWLEDGE_*_MODEL` | 见 `.env.example` | 知识代理 fast/pro 阶段的两个独立 route。每个多轮阶段会锁定首次实际 deployment。 |
 | `MODEL_GATEWAY_EMBEDDING_MODEL` | `memory.embedding` | 记忆与知识向量化 route。创建并启用该 route 表示明确开启语义向量；缺失或关闭表示 `off`，继续使用关键词/FTS 且不阻断 `/readyz`。所有 fallback 必须使用同一向量空间和维度。 |
 | `MODEL_GATEWAY_EMBEDDING_SPACE_ID` | 空 | 空值为 `auto`，完全采用启用 route 声明的 immutable space 与 dimensions；非空为 `pinned`，space 与 `EMBEDDING_DIMENSIONS` 共同组成严格期望契约。启用 route 若畸形、不可用或不匹配会令 `/readyz` 返回 503，绝不混用旧空间。 |
-| `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 private/sensitive 的文本发送给远程提取、embedding、AI 体检或知识代理服务。仅在所有相关 provider 均获准处理敏感数据时开启。 |
+| `ALLOW_SENSITIVE_EGRESS` | `false` | 是否允许把本地检测为 `sensitive`（密码/密钥、证件号、银行卡/账号）的文本发送给远程提取、embedding、AI 体检或知识代理服务。`false` 时记忆提取/embedding 按句子扣留（上限见 `MEMORY_EGRESS_CEILING`），压缩、体检和知识代理则扣留全部非 `normal` 文本。仅在所有相关 provider 均获准处理敏感数据时开启。 |
+| `MEMORY_EGRESS_CEILING` | `private` | `ALLOW_SENSITIVE_EGRESS=false` 时记忆提取和 embedding 仍可出站的最高本地敏感级别，取 `normal` 或 `private`。`private` 让健康/住址/联系方式/收入句子与聊天其余内容一样送给提取模型；`normal` 恢复严格行为，同样按句子扣留。 |
+| `MEMORY_AUTO_SUPERSEDE` | `true` | 无键自动替换：带明确转变标记（现在/已经/改成/改为/改用/换成/换为/不再/取代，或整词 `instead`/`switched`/`now`/`no longer`）的新 `semantic`/`emotional`/`procedural` 记忆，与同类型、同敏感级别、同主体、同一可替换属性的活跃 `user_asserted` 旧记忆向量余弦≥0.80 时，把旧记忆原地关闭为历史（`status=resolved`、`valid_until`、`superseded_by`）。需要 `memory.embedding` route；`false` 回到仅体检建议模式。 |
 | `EMBEDDING_DIMENSIONS` | `1024` | 仅在 `MODEL_GATEWAY_EMBEDDING_SPACE_ID` 非空（`pinned`）时参与严格期望契约；`auto` 模式忽略此本地值，完全采用 route 解析出的唯一维度。 |
 | `DATABASE_PATH` | `data/memory.db` | SQLite 数据库路径。 |
 | `KNOWLEDGE_DATABASE_PATH` | `data/knowledge.db` | 独立知识库 SQLite 路径；不得与 `DATABASE_PATH` 相同。 |
@@ -369,7 +373,7 @@ FLIT（原 LastChat Plus）使用下面的 Provider 配置：
 | Base URL | `http://<memory-gateway 主机>:2026/v1` |
 | API 路径 | `/chat/completions` |
 | API Key | `.env` 中的 `GATEWAY_API_KEY` |
-| Model | 推荐 `memory-auto`，也可从 `/v1/models` 选择具体上游模型 |
+| Model | 推荐 `memory-auto`；`memory-read`/`memory-off` 用于只读或不留记忆的对话；也可从 `/v1/models` 选择显式聊天 route |
 | Responses API | 关闭 |
 | 流式输出（助手的模型设置） | 开启（FLIT 默认） |
 
@@ -379,7 +383,15 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 
 ### 记忆模式与写入时机
 
-默认 `X-Memory-Mode` 为 `read-write`，可在单次请求 Header 中覆盖：
+记忆模式默认取 `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`（`read-write`），可用模型别名或请求头 `X-Memory-Mode` 覆盖。`/v1/models` 依次列出 `memory-auto`、`memory-read`、`memory-off` 和配置的聊天 route：
+
+| 模型名 | 记忆模式 | 说明 |
+| --- | --- | --- |
+| `memory-auto` | `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` | 默认；服务端按用途路由选择模型 |
+| `memory-read` | `read` | 只召回/注入，不提取、不写入 |
+| `memory-off` | `off` | 纯透明代理，不读不写 |
+
+所有 `memory-*` 别名都解析到同一聊天 route，只决定记忆模式，不能到达 `memory.extract`、`knowledge.pro`、`memory.embedding` 等内部 route；别名大小写不敏感，显式 route 名需精确匹配。旧写法 `auto`/`default`/`memory-gateway` 继续接受但不列出。别名面向发不出自定义 Header 的客户端（Chatbox、RikkaHub、FLIT 的模型选择器），客户端需重新同步模型列表才能看到新名字；请求头 `X-Memory-Mode` 仍是按请求覆盖的方式。优先级：只读 chat token 限制 > 请求头 `X-Memory-Mode` > 模型别名 > `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`。各模式的行为：
 
 | 模式 | 自动召回/注入 | 更新激活度 | 保存分支上下文 | 自动提取长期记忆 |
 | --- | --- | --- | --- | --- |
@@ -389,6 +401,10 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 
 分支上下文、激活记录和长期记忆 ingest 只在收到无 tool call 的完整最终文本后执行，并作为响应后的后台任务运行。工具中间响应、上游错误、断流、缺少 `[DONE]`、`length` 截断和内容过滤都不会写入；因此客户端刚看到最终文字时，管理台中的新记忆可能还需要短暂等待才出现。
 
+`read-write` 下，`CHAT_GATEWAY_EXTRACTION_PREFILTER=true`（默认）会在调用提取模型前本地判断本轮：仅为寒暄致谢、纯提问或纯代码的轮次跳过 `memory.extract`（省去一次 max_tokens 8192 的调用、逐候选 embedding 和一条 finalize outbox 记录），并写入以「本地预过滤：」开头的 ignore 决策日志（只记长度与 SHA-256）；超过 64 KiB 的轮次也记为本地预过滤跳过（此前静默）。明确的「记住/remember」请求和助手提问后的短回答永不跳过；不使用单纯的长度阈值（“不吃辣”“我姓王”仍会送给模型）；预过滤内部任何异常都回退到正常提取。它不影响 `memory.compact` 上下文压缩和请求侧召回/注入。
+
+送给提取模型的文本按句子做出站过滤：只有级别超过 `MEMORY_EGRESS_CEILING` 的句子被扣留（默认只扣留 `sensitive`），同一轮其余句子照常提取；被扣留且紧邻「记住」的句子不经模型、不生成向量地原句保存为本地记忆，详见「自动召回与保存边界」。
+
 ### 自动召回与保存边界
 
 - 最后一条用户消息的纯文本部分是检索词，也是新事实的唯一权威来源；图片 URL、音频 base64 不进入记忆 embedding。
@@ -396,11 +412,12 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 - 自动提取还会逐命题绑定主语、关系、对象和局部否定：朋友/宠物/第三人的事实不能降成用户事实，申请岗位不能变成已经任职，旅游住宿不能变成当前常住地；候选若保留“用户的猫/朋友”这一真实主语则仍可保存。
 - 去重会直接忽略完全相同、被旧文本逐字包含的候选；对于措辞不同的笼统改写，只有在同类型有效旧记忆同时满足向量相似、实体全覆盖、主题重合、无新增结构化值且没有冲突/时序变化时，才视为“已有更完整的语义等价记忆”。同主题的新细节仍会创建并交给体检确认。
 - 关键词回退不是把分类标签直接拼进正文：正文、主题和实体分字段打分，低频标签按查询内 IDF 加权；只有可审计的小型类别层级（如宠物、数码设备、电脑、拍照）能够单独扩展候选，并继续经过用户/宠物主语与“饮食偏好、拍照设备”等关系门控，避免宽泛标签制造无答案误召。
-- 自动注入只包含本地复核为普通级别的长期记忆、安全核心记忆和已匹配的普通级别分支摘要。物理隔离的知识库永不自动注入。
+- 自动注入包含本地复核为 `normal` 级别的长期记忆、与当前问题相关的 `private` 记忆（排序压低，提示词标注“敏感级别：private（私密），仅在与用户当前问题明确相关时使用，不要主动复述”）、安全核心记忆和已匹配的普通级别分支摘要；`sensitive` 记忆永不注入。物理隔离的知识库永不自动注入。
 - 动态记忆块插在客户端已有的稳定 system/developer 前缀之后，以尽量保留上游 prompt-prefix cache；记忆内容仍按每轮检索结果重新生成。
 - 原始多模态消息、`tools`、`tool_calls`、工具结果、上游 `reasoning_content`、`stream_options`、usage chunk 和未知厂商字段继续透明转发；上游兼容性差异由 Model Gateway 渠道适配层处理。
 - `memory-auto` 会在实际 provider 确定后处理推理配置。工具中间调用和最终回答的推理状态按用户、轮次和 tool-call 在当前进程短期缓存；跨 provider 故障切换或无法证明来源时会删除不可信的旧推理原文。
-- `ALLOW_SENSITIVE_EGRESS=false` 会阻止敏感旧上下文进入远程提取、压缩、embedding、体检和知识代理，但不会拦截用户主动通过 `/v1` 发给聊天上游的当前消息。使用 `/v1` 即表示该聊天上游获准处理当前对话。
+- `ALLOW_SENSITIVE_EGRESS=false` 时，记忆提取和 embedding 的出站过滤按句子进行，`/v1` 聊天、REST `/memories/ingest`、MCP `submit_memory_text` 和历史对话导入一致：只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子（默认 `private`，即只扣留含密码/密钥、证件号、银行卡/账号的 `sensitive` 句子），其余句子照常提取，被扣留的文本不会出站；不再因一个敏感词丢掉整条消息。压缩、体检和知识代理仍扣留全部非 `normal` 文本。该开关不会拦截用户主动通过 `/v1` 发给聊天上游的当前消息；使用 `/v1` 即表示该聊天上游获准处理当前对话。
+- 被扣留且紧邻「记住/remember」的句子不调用任何模型，直接以第一人称原句（去掉“记住”措辞）保存：`type=semantic`、importance 8、confidence 0.9、检测到的敏感级别、无 embedding、`topics`/`entities` 为空、绑定「私密信息」空间，并照常去重；决策日志记「敏感句子未出站，用户明确要求记住，已本地保存」。没有「记住」的被扣留句子直接丢弃，日志只记录句子数量和每句的 SHA-256/长度/级别/类别（不含正文），理由为「敏感句子未出站且未明确要求记住」。
 
 ### 对话分支、编辑与重新生成
 
@@ -430,7 +447,7 @@ FLIT 同步出 `memory-auto` 后，还要进入“设置 → 提供商 → 当�
 
 | 缓存 | Key 要点 | TTL | 容量 | 典型命中场景 |
 | --- | --- | --- | --- | --- |
-| 召回结果 L2 | 用户、规范化后的完整查询、limit、敏感选项 | 120 秒 | 256 | FLIT 同一轮 tools 多次请求相同用户消息 |
+| 召回结果 L2 | 用户、规范化后的完整查询、limit、敏感级别上限（`normal`/`private`/`sensitive`） | 120 秒 | 256 | FLIT 同一轮 tools 多次请求相同用户消息 |
 | Query embedding L1 | 用户、规范化后的完整查询 | 300 秒 | 512 | 相同问题以大小写/多余空白差异重复请求 |
 
 L2 命中时仍会校验当前用户的记忆更新时间和活跃数量，并从 SQLite 重新读取记录；删除、归档或敏感度变化不会通过旧正文缓存泄露。若存在即将到来的 `valid_from` / `valid_until`，缓存会在该时间边界提前失效，避免继续遗漏刚生效的事实。空召回结果不写入 L2，因此重复的无结果查询仍显示 L2 miss，但 query embedding 可能命中。普通连续聊天的措辞通常不同，命中率自然会低于同一工具轮次。
@@ -466,7 +483,7 @@ curl \
 | --- | --- |
 | `search_memory(query, limit=8, include_sensitive=false)` | 按问题检索相关长期记忆，并更新活跃度。敏感记忆需用户本轮明确要求后显式开启。 |
 | `surface_memories(limit=8, mode="balanced", include_archived=false, include_sensitive=false)` | 无 query 浮现当前值得想起的记忆；默认排除敏感和 agent-derived 记忆。 |
-| `submit_memory_text(text, conversation_id="")` | 提交用户原文，由服务端提取、校验、去重并保存长期记忆。 |
+| `submit_memory_text(text, conversation_id="")` | 提交用户原文，由服务端提取、校验、去重并保存长期记忆；返回项含 `superseded_memory_id`（发生无键自动替换时为被关闭的旧记忆 ID，`action` 为 `update`，否则为 null）。 |
 | `get_core_memory()` | 读取稳定核心记忆分区。 |
 | `get_recent_context_summary(conversation_id="")` | 读取近期会话摘要。 |
 | `update_recent_context_summary(conversation_id="", summary="")` | 提交或替换近期会话摘要；它只作为短期上下文，不进入长期记忆或核心记忆。 |
@@ -497,7 +514,7 @@ curl \
 - 不要自行传 `space_ids`；服务端会根据提取出的主题、实体和代码规则，保守绑定记忆空间。
 - 用户明确说“记住”“别忘了”“以后记得”时，优先调用 submit_memory_text。
 - 检索旧记忆和提交新记忆是两个独立判断；同一轮都需要时，先 search_memory，再 submit_memory_text。
-- 当前情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。敏感信息只有在用户明确希望保留且未来明显有用时才提交。
+- 当前情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。密码、证件号、银行卡/账号等敏感信息只有在用户明确要求记住时才提交；健康、住址、联系方式、收入等私密信息由服务端按 private 级别保守保存，不需要用户额外说“记住”。
 - submit_memory_text 返回 retryable=true 时表示上游暂时失败，可稍后重试一次；规则拒绝不可重试。
 - 搜索/浮现结果里的 activation_count 表示活跃度，不是精确搜索次数。Time Ripple 是默认关闭的实验能力，普通客户端不需要启用。
 - 用户要求忘记、删除或管理记忆时，MCP 没有删除或遗忘工具；引导用户在 Web 控制台 `/ui` 操作。
@@ -529,7 +546,7 @@ curl \
 | 页面 | 作用 |
 | --- | --- |
 | 记忆工作室 | 今日待办、浮现记忆、今日精选、情绪分布、空间概览、记忆网络和实验性图遍历入口。 |
-| 记忆库 | 搜索、过滤、查看、编辑、软删除、恢复、永久删除、标签/实体/空间管理。 |
+| 记忆库 | 搜索、过滤、查看、编辑、软删除、恢复、永久删除、标签/实体/空间管理；详情抽屉的「时间事实」块显示被替换的历史版本，并对无键自动替换关闭的旧版本提供「恢复此版本」。 |
 | 核心记忆 | 查看核心记忆、历史版本并触发重新整理。 |
 | 知识库 | 上传文本/Markdown/PDF/DOCX/EPUB 或粘贴正文，管理标签、元数据、不可变版本、索引状态、回收站和独立备份。 |
 | 知识检索调试 | 用 MCP 同类自然语言需求测试 FTS/向量通道、标签/元数据范围、多 provider 编排、精确引用和本地回退。 |
@@ -540,7 +557,7 @@ curl \
 | 用量与费用 | 展示 Model Gateway 汇总的 `/v1` 聊天、后台任务和 embedding 用量，按实际 provider/model、Token 与渠道价格归账，以 `modelgw usage summary` 为权威。 |
 | 模型与路由 | 查看实际 Model Gateway 渠道、deployment 和用途顺序；输入仅在当前页面内存保留的 admin 客户端密钥后，可单向替换已有渠道密钥、免费检查 `/models`，并通过“草稿 → 校验 → 应用”调整已有路由。 |
 | 报告与备份 | 导出 JSON/Markdown/Obsidian zip，或从 JSON 恢复。 |
-| 决策日志 | 查看创建、更新、忽略、永久删除、召回反馈等审计记录；空候选会显示受控的模型原因码，同时继续隐藏自由文本理由。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
+| 决策日志 | 查看创建、更新、忽略、本地预过滤跳过、自动替换（`auto_supersede`/`auto_supersede_undo`）、永久删除、召回反馈等审计记录；空候选会显示受控的模型原因码，同时继续隐藏自由文本理由。每个用户只保留最近 5000 条，超出后自动从旧到新裁剪。 |
 | 设置/接入信息 | 管理连接配置，查看 MCP/REST 接入信息。 |
 
 ### 模型用量与费用
@@ -575,8 +592,8 @@ Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `POST` | `/memories/ingest` | 从用户原文提取并保存记忆；服务端会自动补 `topics`、`entities` 和 `space_ids`。 |
-| `POST` | `/memories` | 直接保存一条结构化记忆；显式传入的 `topics`/`entities` 会优先保留，否则自动分类。 |
+| `POST` | `/memories/ingest` | 从用户原文提取并保存记忆；服务端会自动补 `topics`、`entities` 和 `space_ids`。出站按句子过滤；响应项含 `superseded_memory_id`（发生无键自动替换时为被关闭的旧记忆 ID，`action` 为 `update`，否则为 null）。 |
+| `POST` | `/memories` | 直接保存一条结构化记忆；显式传入的 `topics`/`entities` 会优先保留，否则自动分类。响应同样含 `superseded_memory_id`。 |
 | `PATCH` | `/memories/{memory_id}` | 更新记忆内容、类型、重要度、情绪、时间、状态、主题和实体等。 |
 | `PATCH` | `/memories/{memory_id}/spaces` | 替换记忆空间绑定，可按名称创建新空间。 |
 | `POST` | `/memories/forget` | 按自然语言查询批量软删除。 |
@@ -585,7 +602,7 @@ Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与
 | `POST` | `/memories/deleted/purge/preview` | 预览 1–1000 条回收站记忆的实际 evidence 删除闭包、Core/历史/审计影响和 fingerprint，返回绑定当前用户的短期签名 token；部分 ID 缺失时整体拒绝。 |
 | `POST` | `/memories/deleted/purge/commit` | 使用原 ID 集、fingerprint 与 preview token 在单个 `BEGIN IMMEDIATE` 内重新校验并永久删除；任一漂移返回 409，成功只写一条批量审计。 |
 | `DELETE` | `/memories/deleted/{memory_id}/purge` | 单条永久删除的一个版本兼容入口，响应带 `compatibility_mode=legacy_single_purge_v1`；新客户端应使用 preview → commit。 |
-| `POST` | `/memories/merge` | 合并 2–100 条记忆；可选合并正文上限 20,000 字符。 |
+| `POST` | `/memories/merge` | 合并 2–100 条记忆；可选合并正文上限 20,000 字符。仍拒绝把时间版本链成员与独立记忆混合合并（422「不同时间版本不能合并」）。 |
 | `POST` | `/memories/re-embed` | 对指定记忆或扫描出的缺失/无效 embedding 重新生成向量。 |
 | `POST` | `/memories/archive-expired` | 归档过期记忆。 |
 
@@ -598,7 +615,7 @@ Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与
 | `POST` | `/memories/network` | 构建记忆网络图，可按空间、类型、敏感度、情绪范围过滤；边包含相似度、evidence、temporal 与核心证据关系。 |
 | `POST` | `/memories/network/traverse` | 实验性：从种子记忆做 bounded-depth Personalized PageRank 遍历。 |
 | `GET` | `/memories/timeline` | 按 `subject` 和可选 `predicate` 查询时间线。 |
-| `POST` | `/memories/{memory_id}/temporal/restore` | 恢复被 Temporal 失效的记忆，并写审计日志。 |
+| `POST` | `/memories/{memory_id}/temporal/restore` | 恢复被 Temporal 失效或被无键自动替换关闭的记忆，并写审计日志。有 temporal key 的链保持复制并关闭的恢复方式；无键链原地重开同一 ID（`status=dynamic`，清除合成的 `valid_until`、`superseded_by` 和后继的 `supersedes`，之后两条都是当前记忆），日志 `source=auto_supersede_undo`。 |
 
 普通检索默认只返回当前有效版本；以前/曾经/过去时问法进入 history，未来问法进入 future，显式年份、前年/后年和上月/下月会生成日历窗口。软删除、恢复、PATCH 和覆盖导入都在即时写事务中重建受影响的双向版本链；服务初始化还会幂等修复旧版本遗留的 active→recycle-bin 引用。
 
@@ -615,13 +632,13 @@ Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与
 | `DELETE` | `/memories/conversation-branches/{node_id}` | 软删除指定分支节点及全部活跃后代，使其停止参与自动上下文匹配；不删除长期记忆或客户端聊天。 |
 | `POST` | `/memories/conversation-branches/{node_id}/restore` | 恢复已清理的分支节点及其全部已清理后代。 |
 | `GET` | `/memories/decision-logs` | 列出决策和审计日志，支持 `conversation_id`、`memory_id` 和 `limit` 过滤。 |
-| `POST` | `/memories/review` | 生成治理体检建议。 |
+| `POST` | `/memories/review` | 生成治理体检建议；已被新版本（时态链或无键自动替换）关闭的记忆不再作为重复/冲突/过期建议重复出现，核心证据与敏感检查仍覆盖它们。 |
 | `POST` | `/memories/review/actions` | 应用手动治理动作，如确认、延后、降权、移入回收站、合并。 |
 | `POST` | `/memories/review/revise/related` | AI 修订前查找相关记忆。 |
 | `POST` | `/memories/review/revise/preview` | 生成有范围约束的 AI 修订预览。 |
 | `POST` | `/memories/review/revise/apply` | 使用 preview token 应用 AI 修订。 |
 | `GET` | `/memories/health` | 只读数据库健康检查。 |
-| `GET` | `/memories/evaluation/diagnosis` | 机制激活诊断。 |
+| `GET` | `/memories/evaluation/diagnosis` | 机制激活诊断；含 `keyless_supersession_edge_count`，无键自动替换链计为有效边（判定 `active` 而非 `degenerate`）。 |
 | `POST` | `/memories/evaluation/recall/init` | 从真实数据库只读生成召回评估快照和标注文件。 |
 | `GET` | `/memories/evaluation/recall/workbench` | 读取召回评估工作台数据。 |
 | `PUT` | `/memories/evaluation/recall/labels` | 原子保存 `unlabeled/relevant/no_answer` 三态人工标注。 |
@@ -652,23 +669,24 @@ Memory Gateway 不再本地记录用量事件；`/usage/summary` 与「用量与
 
 | Method | Path | 用途 |
 | --- | --- | --- |
-| `GET` | `/v1/models` | 列出 `memory-auto` 和当前已配置的上游模型。 |
+| `GET` | `/v1/models` | 依次列出 `memory-auto`、`memory-read`、`memory-off` 和 `MODEL_GATEWAY_CHAT_MODEL` 配置的聊天 route。 |
 | `POST` | `/v1/chat/completions` | 透明转发 Chat Completions；支持非流式、SSE、tools、多模态和未知扩展字段。 |
 
-`memory-auto` 使用 `MODEL_GATEWAY_CHAT_MODEL` 指定的聊天 route，故障切换由 Model Gateway 的 route 配置控制；请求 `/v1/models` 返回的显式 route 模型名时只使用该 route，并保留、透传客户端自带的 `reasoning_content`，而 `memory-auto` 仍会剥离无法证明来源的旧推理原文。成功响应附带 `X-Memory-Mode`、`X-Memory-Hit-Count`、两层缓存状态和分支状态 Header，不会把“记忆命中”文字插进助手正文。
+`memory-auto`、`memory-read`、`memory-off` 都使用 `MODEL_GATEWAY_CHAT_MODEL` 指定的聊天 route，只决定记忆模式（别名大小写不敏感；旧写法 `auto`/`default`/`memory-gateway` 继续接受但不列出），故障切换由 Model Gateway 的 route 配置控制；请求 `/v1/models` 返回的显式 route 模型名（精确匹配）时只使用该 route，并保留、透传客户端自带的 `reasoning_content`，而 `memory-*` 别名仍会剥离无法证明来源的旧推理原文。成功响应附带 `X-Memory-Mode`、`X-Memory-Hit-Count`、两层缓存状态和分支状态 Header，不会把“记忆命中”文字插进助手正文。
 
 ## 数据模型要点
 
 - `usage_count` 是底层列名；对外文案建议使用 `activation_count`，表示活跃度，不是精确搜索次数。
-- `sensitivity=private|sensitive` 的记忆默认不参与搜索/浮现；管理请求显式 `include_sensitive=true` 后仍可结合 `redact_sensitive=true` 返回遮罩结果。
+- `sensitivity` 分两档：`private`（健康/医疗、精确住址、联系方式、收入/负债）由提取模型直接保存，`/v1` 聊天召回可在与当前问题相关时注入；`sensitive`（密码/密钥、证件号、银行卡/账号）还需子句级“记住”授权，永不注入聊天。两者默认都不参与 REST/MCP 搜索、浮现和核心整理；管理请求显式 `include_sensitive=true` 后仍可结合 `redact_sensitive=true` 返回遮罩结果。旧库中已标为 `sensitive` 的健康记忆不会自动迁移，编辑或重新保存前继续不注入聊天。
 - `origin=user_asserted|agent_derived` 区分用户事实和模型派生内容；agent-derived 默认不进入普通召回和核心整理。
 - `valid_from`、`temporal_subject`、`temporal_predicate` 用于可替换的当前状态事实，例如当前城市、当前雇主、首选称呼。普通 MCP 客户端不要自行填写这些字段。
+- `supersedes`/`superseded_by` 也可出现在没有 temporal key 的记忆上（无键自动替换，`MEMORY_AUTO_SUPERSEDE`）：旧记忆被原地关闭（`status=resolved`，`valid_until` 为新记忆生效时间），不再进入当前召回、注入和核心整理，但仍可被以前/曾经类历史问法查到，并显示在记忆详情的「时间事实」块；决策日志 `source=auto_supersede`（`decision=update`，含 before/after 快照、`target_memory_id`、`memory_id`）与写入同一事务。对这类旧记忆调用 `POST /memories/{id}/temporal/restore` 会原地重开同一 ID 并解除双向链接；软删除链成员会解链并桥接邻居，从回收站恢复后是普通的独立记忆。
 - `topics`、`entities`、`space_ids` 是轻量组织结构，不代表系统自动判断事实真伪。
 - `embedding_space_id` 标识记忆向量所属的精确向量空间。只有查询和记忆都声明同一个非空空间时才会计算向量相似度；经 Model Gateway 调用时会同时核对空间 Header、维度 Header 与实际向量长度，任一不匹配都安全回退关键词/FTS。升级前的旧向量保持未知空间，不会按当前模型猜测，需通过 re-embed 进入当前空间。
 - `conversation_branch_nodes` 是 `/v1` 的本地运行上下文：保存不可逆历史指纹、滚动摘要和最近原始轮次，按用户隔离并限制为最近 5000 个节点；它不是长期记忆，也不进入核心记忆或衰减。
 - `surface_score`、`life_score`、`review_signals` 是运行时解释信号，默认不持久化为权威事实。
 - 知识文档有标题、版本、来源、敏感度、标签、结构化元数据和索引状态，但没有 memory type、importance、usage、生命周期或衰减字段。
-- 知识导入优先采用用户选择的敏感级别；若本地规则判断更高，首次请求不会写入，并要求用户在 Web 控制台明确点击确认。确认结果会随文档保存并可审计；MCP 不能代替用户绕过确认。
+- 知识导入优先采用用户选择的敏感级别；若本地规则判断更高，首次请求不会写入，并要求用户在 Web 控制台明确点击确认。确认结果会随文档保存并可审计；MCP 不能代替用户绕过确认。健康/住址文本的 `detected_sensitivity` 现为 `private`；标为 `normal` 的文档中仅提及健康/住址词汇的分块会与文档其余部分一同 embedding（此前静默跳过），标为 `private`/`sensitive` 的文档行为不变。
 - 知识引用绑定具体版本与字符范围；代理只能选择引用，响应正文始终来自本地版本原文。
 - PDF、DOCX 和 EPUB 会在本机解析成规范化文本后建立不可变版本；原文件内容不会进入记忆数据库。知识 chunk embedding 是可重建派生数据，备份恢复和重建索引会重新生成。
 - 记忆 JSON 导出当前为 version 3；会包含可恢复的空间、活跃/回收站记忆、近期摘要和对话分支节点，但不包含可重建 embedding。核心记忆当前快照、核心历史和决策日志随导出保留用于审计，restore 不写回这些分区。
@@ -772,7 +790,7 @@ Windows 服务辅助脚本：
 - 永久删除不可恢复，只作用于回收站记忆，并会沿 evidence 依赖闭包清理所有依赖记忆（包括保留 `user_asserted` 来源的合并结果）、脱敏相关核心历史和旧决策日志、删除该用户评测工作区。若数据库删除提交后 eval 文件清理失败，接口会返回成功和显式 warning，避免把已完成的不可逆删除伪装成整体失败。
 - 永久删除一条长期记忆不会删除客户端自身的聊天记录，也不会自动搜索并改写近期摘要或 `conversation_branch_nodes` 中可能重复出现的原始对话。Web Console 的“对话上下文”页可按分支节点软删除该节点及其后代，并从“已清理”状态恢复；当前仍没有按长期 memory ID 自动定位并清理重复对话原文的能力。需要彻底清除时，还应处理客户端聊天、相关摘要和导出副本。
 - 永久删除无法控制已经复制到工作区外的 JSON/Markdown/Obsidian 导出或第三方备份；这些副本必须按各自保留策略删除。
-- `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、体检和知识代理的默认安全边界；它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。
+- `ALLOW_SENSITIVE_EGRESS=false` 是记忆提取、embedding、压缩、体检和知识代理的默认安全边界：`sensitive`（密码/密钥、证件号、银行卡/账号）句子永不出站；记忆提取和 embedding 按句子过滤并受 `MEMORY_EGRESS_CEILING` 控制（默认 `private` 句子可出站），压缩、体检和知识代理扣留全部非 `normal` 文本。它不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。响应遮罩不能替代出站策略。
 - 知识文档的“按用户选择导入”确认只决定该文档保存后的敏感标签，不会修改全局 `ALLOW_SENSITIVE_EGRESS`；保存为 private/sensitive 时，默认仍禁止远程 embedding/代理出站。
 - 历史分类回填会直接更新 SQLite；务必先跑 `--dry-run`。正式执行会自动备份，但备份文件仍包含完整记忆正文。
 - chat token 只允许 `/v1`，MCP token 只允许 `/mcp`，Console token 才能访问管理 REST；每枚都固定 user、可单独撤销。legacy all-scope key 仅保留一个版本迁移期。
@@ -781,7 +799,9 @@ Windows 服务辅助脚本：
 
 ## 当前边界与后续方向
 
-- 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础和评估闭环。
+- 已完成的主线包括治理体检、召回解释、自然浮现、记忆网络、实验性图遍历、记忆空间、自动主题/实体/空间分类、历史分类回填、Obsidian 单向镜像、敏感遮罩、回收站永久删除、数据库健康检查、五类记忆、生命周期状态、两阶段 digest、Temporal KG 基础、无键自动替换和评估闭环。
+- 无键自动替换依赖 `memory.embedding` route：没有向量的部署和没有 embedding 的记忆永不自动替换，只走创建 + 体检建议。纯极性翻转（喜欢↔不喜欢）、`supplement` 关系、episodic/reflective 记忆和 pinned/resolved 行同样只交给体检。`POST /memories/merge` 仍拒绝把链成员与独立记忆混合合并。
+- 出站过滤只有记忆提取和 embedding 改为按句子并受 `MEMORY_EGRESS_CEILING` 控制；上下文压缩、AI 体检和知识代理的出站守卫未改，`ALLOW_SENSITIVE_EGRESS=false` 时仍扣留全部非 `normal` 文本。
 - OpenAI-compatible 入口只实现 `/v1/models` 与 `/v1/chat/completions`；不提供 Responses API、文件、音频或图片生成等其他 OpenAI API。
 - `/v1` 的记忆激活和近期上下文通过 SQLite TTL claim 跨 worker/重启去重；长期 ingest 先写入带 lease 的 durable outbox，`done`/`failed` 都是清空正文的终态，崩溃或 lease 过期后由 drainer 以 at-least-once 语义重放。工具推理回放和缓存统计仍是单进程短 TTL 状态。当前个人部署仍建议单 worker。
 - FLIT 不提供动态 conversation ID，但网关会根据它回传的可见历史匹配本地分支节点；无 ID 节点通常不生成摘要。编辑旧消息或重新生成回答会分叉；如果客户端同时截断了历史且没有动态 `X-Conversation-Id`，只能从当前请求自带历史重新建立上下文。

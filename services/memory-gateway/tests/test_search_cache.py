@@ -242,7 +242,7 @@ class TestSearchCache:
         )
         assert old.id in {hit.memory.id for hit in before}
         assert stable.id in {hit.memory.id for hit in before}
-        key = ("default", _normalize_query("user city coffee"), 8, False, "")
+        key = ("default", _normalize_query("user city coffee"), 8, "normal", "")
         assert SEARCH_CACHE[key][0] <= future_start.timestamp()
 
         time.sleep(max(0.0, future_start.timestamp() - time.time()) + 0.05)
@@ -304,7 +304,7 @@ class TestEvalCacheBypass:
 
         # 投毒：手工塞入一个对该 (user, query, limit) 校验有效、但指向无关记忆的缓存条目，
         # 模拟另一种模式（或线上检索）先跑过、把结果留在了共享缓存里。
-        key = ("default", _normalize_query("咖啡"), 8, False, "")
+        key = ("default", _normalize_query("咖啡"), 8, "normal", "")
         SEARCH_CACHE[key] = (
             _now() + 999,
             memory_store.get_memories_max_updated_at(user_id="default"),

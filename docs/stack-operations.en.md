@@ -190,11 +190,14 @@ It reads only `/models`. Use `--live` only when you explicitly accept a real inf
 
 ## Sensitive-data egress and deployment boundary
 
-- `ALLOW_SENSITIVE_EGRESS=false` blocks locally classified private or sensitive content from remote memory extraction, embeddings, AI review, and the knowledge agent by default.
-- It does not intercept the current message a user deliberately sends to the chat provider through `/v1`.
+- There are two sensitivity tiers: `private` covers health/medical facts, precise addresses, contact details (phone/email), and income/salary/debt; `sensitive` covers credentials/passwords/keys, government IDs, and bank card or account numbers.
+- With `ALLOW_SENSITIVE_EGRESS=false` (default), `sensitive` text never reaches remote memory extraction, embeddings, AI review, or the knowledge agent. For memory extraction and embeddings the filter is sentence-level: only sentences whose tier exceeds `MEMORY_EGRESS_CEILING` are withheld and the remaining sentences go out as usual. The default `MEMORY_EGRESS_CEILING=private` lets private sentences reach the extraction model like the rest of the chat; `normal` withholds private sentences as well, still sentence by sentence.
+- A withheld sentence next to an explicit 记住/remember directive is saved locally verbatim without any model call or embedding (in the 「私密信息」 space); withheld sentences without a directive are dropped, and the decision log records only hash, length, and tier.
+- The egress guards for context compaction, AI review, and the knowledge agent are unchanged: all non-`normal` text still stays local by default.
+- The gate does not intercept the current message a user deliberately sends to the chat provider through `/v1`.
 - `redact_sensitive=true` masks only the current response. It does not rewrite SQLite content or make backups redacted.
 - A blank `MODEL_GATEWAY_EMBEDDING_SPACE_ID` means automatically adopting the immutable space and dimensions declared by the `memory.embedding` route; a nonblank value strictly pins that contract.
-- Creating and enabling `memory.embedding` is explicit consent to turn on semantic vectors. A missing or disabled route is `off`: keyword/FTS remains available and `/readyz` is not blocked. If an enabled route is unavailable, declares an invalid space or dimensions, or conflicts with a pin, `/readyz` returns 503 rather than guessing that old vectors belong to the current space. Sensitive-text egress remains separately controlled by `ALLOW_SENSITIVE_EGRESS`.
+- Creating and enabling `memory.embedding` is explicit consent to turn on semantic vectors. A missing or disabled route is `off`: keyword/FTS remains available and `/readyz` is not blocked. If an enabled route is unavailable, declares an invalid space or dimensions, or conflicts with a pin, `/readyz` returns 503 rather than guessing that old vectors belong to the current space. Sensitive-text egress remains separately controlled by `ALLOW_SENSITIVE_EGRESS` and `MEMORY_EGRESS_CEILING`.
 - The knowledge agent orchestrates the local index and selects citations; it does not execute instructions found inside documents.
 
 The default deployment target is a personal computer or trusted home network:

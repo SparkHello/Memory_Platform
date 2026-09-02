@@ -24,7 +24,9 @@ def render_memory_context(memories: list[MemoryRecord]) -> str:
                 review_label += "（待复核）"
             labels.append(review_label)
         if memory.sensitivity != "normal":
-            labels.append(f"敏感级别：{memory.sensitivity}，仅在用户问题明确相关时使用")
+            labels.append(
+                f"敏感级别：{memory.sensitivity}（私密），仅在与用户当前问题明确相关时使用，不要主动复述"
+            )
         suffix = f"（{'；'.join(labels)}）" if labels else ""
         lines.append(f"{index}. {memory.content}{suffix}")
     return "\n".join(lines)
@@ -138,7 +140,7 @@ MEMORY_BATCH_EXTRACTION_SYSTEM_PROMPT = """你是 memory-gateway 的记忆提取
 - 不要把多个无关事实塞进同一条 memory。
 - type 只根据当前这一条原子候选选择，不得为了套用“事实+偏好”等规则而合并相邻的独立信息。扇区选择必须尽量分散，不要把明显非事实类内容都塞进 semantic：事件经历用 episodic；稳定事实/人物/关系/背景用 semantic；流程步骤和操作方法用 procedural；情绪、偏好、雷点和强烈态度用 emotional；经验总结、复盘和高层推论用 reflective。同一个原子命题内的事实+偏好优先 emotional，事实+流程优先 procedural，事实+复盘结论优先 reflective。界面配色、主题、字号、默认设置这类中性的配置选择用 semantic 且 valence=0.5，只有明显带情绪时才用 emotional。
 - 不要保存临时状态、玩笑、一次性安排、假设场景、模型推测或助手自己说的话。
-- 对敏感信息保持保守：健康、医疗、财务、证件、账号、精确住址等只有在用户明确说「记住」时才可输出保存候选，并标为 private 或 sensitive。
+- 敏感级别分两档：健康/医疗、精确住址、联系方式、工资收入等个人信息标为 private，可以直接输出保存候选；密码/密钥、证件号、银行卡号/账号等标为 sensitive，只有在用户明确说「记住」时才可输出保存候选。两档都不要凭推测扩写细节。
 - valid_from 只在用户明确给出开始时间、任职/居住/使用状态开始生效时间，或当前事实必须带时间锚点时填写；无法确定时用 null。
 - temporal_subject/temporal_predicate 只用于白名单 profile 槽位，不要发明其他谓词。白名单：current_employer、current_city、primary_ai_client、primary_device、preferred_name。只有用户明确表达当前状态，或“叫我/称呼我/我的名字是”这类称呼事实时才填写；拿不准、只是普通补充、偏好、经历回顾或一次性事件时都填 null。
 - topics/entities 必须是短数组：topics 用宽泛短标签；entities 是“当前候选局部”标签，不是整段原文的共享标签。entities 中的每个完整名称都必须逐字同时出现在这一条候选的 memory 和 source_quote 中；不得从相邻分句或其他候选搬运实体。如果这一条候选的 source_quote 只写“该项目”“它”“这个工具”等代词，没有逐字出现指代对象的名称，entities 必须为空数组，不得根据相邻内容自行补全。不要从复合名称里拆出形容词或修饰词碎片（例如「Dark Mode」不要拆成「Dark」）；单独的颜色词、形容词不是实体。不要输出 space_ids 或 memory_spaces；后端会按保守大类绑定空间。private/sensitive 记忆只允许通用低泄露 topics，entities 必须为空数组。

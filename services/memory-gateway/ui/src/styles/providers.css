@@ -122,6 +122,13 @@
   gap: 16px 24px;
 }
 
+.provider-admin-access-compact {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
 .provider-admin-copy {
   display: flex;
   align-items: flex-start;
@@ -306,6 +313,31 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.provider-deployment-chip-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.provider-deployment-chip-button:hover,
+.provider-deployment-chip-button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.provider-deployment-chip-button small {
+  color: var(--warning, #b45309);
+  font-size: 11px;
 }
 
 .provider-deployment-chips span,
@@ -1087,4 +1119,23 @@
   .provider-object-actions > button {
     width: 100%;
   }
+}
+
+.provider-detect-row {
+  align-items: center;
+  margin: 6px 0 10px;
+}
+
+.provider-detect-row .muted {
+  font-size: var(--text-caption);
+}
+
+.provider-advanced-inline {
+  margin-top: 10px;
+}
+
+.provider-advanced-inline summary {
+  cursor: pointer;
+  color: var(--muted-strong);
+  font-size: var(--text-caption);
 }

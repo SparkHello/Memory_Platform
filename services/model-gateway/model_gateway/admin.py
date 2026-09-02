@@ -23,7 +23,7 @@ from model_gateway.control_plane import (
     deployment_candidate,
     route_candidate,
 )
-from model_gateway_contracts import AdapterName, GatewayConfig, StrictModel, validate_id
+from model_gateway_contracts import AdapterName, Capabilities, GatewayConfig, StrictModel, validate_id
 
 
 def _valid_revision(value: str) -> str:
@@ -99,10 +99,19 @@ class CandidateDiscoverRequest(StrictModel):
 
 
 class CapabilityProbeRequest(StrictModel):
+    """Live capability probe for a candidate channel, or for an existing one.
+
+    Either describe a candidate (``candidate_key`` + ``channel_operator`` +
+    ``base_url``) or name a saved connection (``connection_id``); the latter
+    reuses the stored provider secret so the console can auto-detect the flags
+    of a model that is already configured without asking for the key again.
+    """
+
     revision: str
-    candidate_key: str = Field(min_length=1, max_length=65536)
-    channel_operator: str
-    base_url: str
+    connection_id: str | None = None
+    candidate_key: str | None = Field(default=None, min_length=1, max_length=65536)
+    channel_operator: str | None = None
+    base_url: str | None = None
     adapter: AdapterName = "generic"
     auth_type: Literal["bearer", "x-api-key"] = "bearer"
     allowed_private_networks: list[str] = Field(default_factory=list)
@@ -153,6 +162,26 @@ class CapabilityProbeRequest(StrictModel):
             raise ValueError("probes 不得重复")
         return values
 
+    @model_validator(mode="after")
+    def candidate_or_existing(self) -> "CapabilityProbeRequest":
+        if self.connection_id:
+            if self.candidate_key or self.channel_operator or self.base_url:
+                raise ValueError("connection_id 与候选渠道字段不能同时提供")
+            validate_id(self.connection_id, "connection")
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("candidate_key", self.candidate_key),
+                ("channel_operator", self.channel_operator),
+                ("base_url", self.base_url),
+            )
+            if not (value or "").strip()
+        ]
+        if missing:
+            raise ValueError("缺少候选渠道字段：" + ", ".join(missing) + "（或改用 connection_id）")
+        return self
+
 
 class RevisionRequest(StrictModel):
     revision: str
@@ -165,6 +194,35 @@ class RevisionRequest(StrictModel):
 
 class EnabledUpdateRequest(RevisionRequest):
     enabled: bool
+
+
+class DeploymentUpdateRequest(RevisionRequest):
+    """PATCH /admin/deployments/{id}: toggle enabled and/or edit capability flags.
+
+    ``capabilities`` is a partial update: only the listed flags change. This is
+    how a model added without ``tools`` gets it later, instead of delete+recreate.
+    """
+
+    enabled: bool | None = None
+    capabilities: dict[str, bool] | None = None
+
+    @field_validator("capabilities")
+    @classmethod
+    def known_capabilities(cls, value: dict[str, bool] | None) -> dict[str, bool] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("capabilities 不能为空对象")
+        unknown = sorted(set(value) - set(Capabilities.model_fields))
+        if unknown:
+            raise ValueError("未知 capability：" + ", ".join(unknown))
+        return value
+
+    @model_validator(mode="after")
+    def requires_a_change(self) -> "DeploymentUpdateRequest":
+        if self.enabled is None and self.capabilities is None:
+            raise ValueError("必须提供 enabled 或 capabilities 之一")
+        return self
 
 
 # This module is the backwards-compatible HTTP/body import boundary.  The

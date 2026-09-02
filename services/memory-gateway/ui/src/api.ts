@@ -21,6 +21,8 @@ import type {
   ModelGatewayControlSnapshot,
   ModelGatewayDeploymentApplyBody,
   ModelGatewayDeploymentApplyResult,
+  CoreMemoryConsolidationResult,
+  ModelGatewayCapabilities,
   ModelGatewayObjectMutationResult,
   ModelGatewayRouteChangeResult,
   ModelGatewayRouteDraft,
@@ -325,6 +327,21 @@ export class MemoryApi {
     return this.request(`/providers/${collection}/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: { revision, enabled },
+      headers: { "X-Model-Gateway-Admin-Key": adminKey },
+      signal
+    });
+  }
+
+  async updateProviderDeploymentCapabilities(
+    id: string,
+    revision: string,
+    capabilities: ModelGatewayCapabilities,
+    adminKey: string,
+    signal?: AbortSignal
+  ): Promise<ModelGatewayObjectMutationResult> {
+    return this.request(`/providers/deployments/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { revision, capabilities },
       headers: { "X-Model-Gateway-Admin-Key": adminKey },
       signal
     });
@@ -931,6 +948,17 @@ export class MemoryApi {
     });
   }
 
+  /** 把被新事实取代的旧版本恢复为当前事实；无键自动替换链会原地重开并解链。 */
+  async restoreTemporalMemory(
+    memoryId: string,
+    signal?: AbortSignal
+  ): Promise<{ restored: boolean; memory: MemoryRecord }> {
+    return this.request(`/memories/${encodeURIComponent(memoryId)}/temporal/restore`, {
+      method: "POST",
+      signal
+    });
+  }
+
   async purgeDeletedMemory(memoryId: string, signal?: AbortSignal): Promise<MemoryPurgeResult> {
     return this.request(`/memories/deleted/${encodeURIComponent(memoryId)}/purge`, {
       method: "DELETE",
@@ -1179,7 +1207,7 @@ export class MemoryApi {
     return payload.data || [];
   }
 
-  async consolidateCoreMemory(signal?: AbortSignal): Promise<unknown> {
+  async consolidateCoreMemory(signal?: AbortSignal): Promise<CoreMemoryConsolidationResult> {
     return this.request("/memories/core/consolidate", {
       method: "POST",
       signal

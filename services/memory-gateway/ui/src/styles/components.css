@@ -1824,9 +1824,15 @@ code {
   font-size: 15px;
 }
 
-.integration-guide-card .field-list {
+.integration-guide-card .field-list,
+.integration-guide-card > p {
   grid-column: 1 / -1;
   margin-top: 5px;
+}
+
+/* 桌面默认隐藏手机用的下拉 */
+.surfaced-mode-select {
+  display: none;
 }
 
 .device-token-list {
@@ -2315,4 +2321,15 @@ code {
   .error-boundary-overlay-card {
     padding: 18px;
   }
+}
+
+/* 面板标题里的图标和文字垂直居中 */
+.panel-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-header h2 > svg {
+  flex: none;
 }

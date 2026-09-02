@@ -191,11 +191,14 @@ modelgw discover --preset <id> --non-interactive --json
 
 ## 敏感数据出站与部署边界
 
-- `ALLOW_SENSITIVE_EGRESS=false` 默认阻止本地识别为 private/sensitive 的内容进入远程记忆提取、embedding、AI 体检和知识代理。
+- 敏感级别分两档：`private` 指健康/医疗、精确住址、联系方式（电话/邮箱）、收入/负债；`sensitive` 指密码/密钥、证件号、银行卡/账号。
+- `ALLOW_SENSITIVE_EGRESS=false`（默认）时，`sensitive` 文本永不进入远程记忆提取、embedding、AI 体检和知识代理。记忆提取与 embedding 的过滤按句子进行：只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子，同一段其余句子照常出站；默认 `MEMORY_EGRESS_CEILING=private` 让私密句子与聊天其余内容一样送给提取模型，设为 `normal` 则连私密句子也逐句扣留。
+- 被扣留且紧邻「记住/remember」的句子会不经任何模型调用、不生成向量地原句保存在本地（归入「私密信息」空间）；没有「记住」的被扣留句子直接丢弃，决策日志只记录哈希、长度和级别。
+- 上下文压缩、AI 体检和知识代理的出站守卫未改：所有非 `normal` 文本仍默认不出站。
 - 该开关不拦截用户主动通过 `/v1` 发给聊天上游的当前消息。
 - `redact_sensitive=true` 只遮罩本次响应，不会改写 SQLite 原文，也不会让备份自动脱敏。
 - `MODEL_GATEWAY_EMBEDDING_SPACE_ID` 留空表示自动采用 `memory.embedding` route 声明的 immutable space 与维度；非空表示严格固定该契约。
-- 创建并启用 `memory.embedding` route 表示明确开启语义向量能力；route 缺失或关闭则是 `off`，继续使用关键词/FTS，且不阻断 `/readyz`。已启用 route 若目标不可用、空间/维度声明畸形，或与固定值不匹配，则 `/readyz` 返回 503，绝不猜测旧向量属于当前空间。敏感文本出站仍另外受 `ALLOW_SENSITIVE_EGRESS` 控制。
+- 创建并启用 `memory.embedding` route 表示明确开启语义向量能力；route 缺失或关闭则是 `off`，继续使用关键词/FTS，且不阻断 `/readyz`。已启用 route 若目标不可用、空间/维度声明畸形，或与固定值不匹配，则 `/readyz` 返回 503，绝不猜测旧向量属于当前空间。敏感文本出站仍另外受 `ALLOW_SENSITIVE_EGRESS` 与 `MEMORY_EGRESS_CEILING` 控制。
 - 知识代理只编排本地索引并选择引用，不执行文档中的指令。
 
 当前默认部署目标是个人电脑或可信家庭网络：

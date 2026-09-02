@@ -86,13 +86,15 @@ export function MemoriesPage({
   notify,
   openMemory,
   refreshKey,
-  setupStatus
+  setupStatus,
+  expertMode = false
 }: {
   api: MemoryApi;
   notify: Notify;
   openMemory: (id: string) => void;
   refreshKey: number;
   setupStatus?: ProvidersStatus["setup"] | null;
+  expertMode?: boolean;
 }) {
   const [tab, setTab] = useState<"active" | "deleted">(
     () => tabFromHash(window.location.hash) || "active"
@@ -428,11 +430,6 @@ export function MemoriesPage({
         </button>
       </div>
 
-      <div className="notice">
-        <ShieldAlert size={16} />
-        当前为遮罩视图，私密和敏感正文只在档案里显式查看后显示。
-      </div>
-
       {tab === "active" && embeddingReady && missingVectorCount > 0 && (
         <div className="notice warning" role="status">
           <ShieldAlert size={16} />
@@ -468,6 +465,7 @@ export function MemoriesPage({
         </div>
       )}
 
+      {expertMode && (
       <section className="panel space-manager-panel">
         <div className="panel-header">
           <h2>空间管理</h2>
@@ -630,6 +628,7 @@ export function MemoriesPage({
           </div>
         )}
       </section>
+      )}
 
       <div className="memory-layout">
         {filtersOpen && (

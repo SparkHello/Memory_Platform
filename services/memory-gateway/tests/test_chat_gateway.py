@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -76,6 +77,8 @@ def test_v1_gateway_requires_auth_and_lists_models(
     assert response.json()["object"] == "list"
     assert [item["id"] for item in response.json()["data"]] == [
         "memory-auto",
+        "memory-read",
+        "memory-off",
         "test-upstream",
     ]
 
@@ -330,6 +333,254 @@ def test_memory_mode_off_is_a_transparent_no_side_effect_proxy(
     assert response.headers["x-memory-hit-count"] == "0"
     assert _usage_count(memory_store, memory.id) == 0
     assert fake_llm.extraction_calls == 0
+
+
+def test_memory_off_alias_is_transparent_no_side_effect_proxy(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+    fake_llm,
+) -> None:
+    """Clients that cannot set headers pick ``memory-off`` from the model list."""
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        type="preference",
+        importance=8,
+    )
+    body = {**_chat_body(), "model": "memory-off"}
+
+    response = client.post("/v1/chat/completions", headers=auth_headers, json=body)
+
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "off"
+    assert fake_gateway.payloads[-1]["messages"] == body["messages"]
+    assert response.headers["x-memory-hit-count"] == "0"
+    assert _usage_count(memory_store, memory.id) == 0
+    assert fake_llm.extraction_calls == 0
+
+
+def test_memory_read_alias_selects_read_mode_without_header(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+    fake_llm,
+) -> None:
+    memory = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢黑咖啡。",
+        type="semantic",
+        importance=8,
+        confidence=0.9,
+        source_message="我喜欢黑咖啡",
+    )
+    body = {**_chat_body(), "model": "memory-read"}
+
+    response = client.post("/v1/chat/completions", headers=auth_headers, json=body)
+
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "read"
+    # Recall still happens: the memory is injected as a system message.
+    assert response.headers["x-memory-hit-count"] == "1"
+    assert "用户喜欢黑咖啡" in json.dumps(
+        fake_gateway.payloads[-1]["messages"], ensure_ascii=False
+    )
+    # ...but nothing is written back.
+    assert _usage_count(memory_store, memory.id) == 0
+    assert fake_llm.extraction_calls == 0
+
+
+def test_explicit_header_overrides_model_alias(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_gateway,
+    fake_llm,
+) -> None:
+    """The documented X-Memory-Mode header wins over the model alias."""
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Memory-Mode": "read-write"},
+        json={**_chat_body(), "model": "memory-off"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "read-write"
+    assert fake_llm.extraction_calls == 1
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Memory-Mode": "read"},
+        json={**_chat_body(), "model": "memory-auto"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "read"
+    assert fake_llm.extraction_calls == 1
+
+
+def test_read_only_token_clamps_memory_auto_alias(
+    client: TestClient,
+    memory_store: MemoryStore,
+    fake_gateway,
+    fake_llm,
+) -> None:
+    from app.auth.tokens import AuthTokenStore
+    from app.config import get_settings
+
+    store = AuthTokenStore(get_settings().auth_database_path)
+    store.init_db()
+    created = store.create_token(
+        name="read only tablet",
+        user_id="default",
+        role="chat",
+        memory_access="read",
+    )
+    headers = {"Authorization": f"Bearer {created.token}"}
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={**_chat_body(), "model": "memory-auto"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "read"
+    assert fake_llm.extraction_calls == 0
+
+    # The clamp only downgrades read-write; an explicit off alias stays off.
+    response = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={**_chat_body(), "model": "memory-off"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-mode"] == "off"
+
+
+def _single_user_body(content: str) -> dict:
+    return {
+        "model": "memory-auto",
+        "messages": [{"role": "user", "content": content}],
+        "stream": False,
+    }
+
+
+def test_prefilter_skips_greeting_turn_and_logs_decision(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions", headers=auth_headers, json=_single_user_body("你好")
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 0
+    logs = memory_store.list_decision_logs(user_id="default")
+    assert len(logs) == 1
+    log = logs[0]
+    assert log.decision == "ignore"
+    assert log.reason.startswith("本地预过滤：")
+    payload = json.loads(log.candidate_json)
+    assert payload["source"] == "chat_gateway"
+    assert payload["prefilter"] == "greeting"
+    assert payload["user_text_length"] == 2
+    assert len(payload["user_text_sha256"]) == 64
+    assert "你好" not in log.candidate_json
+    # The skip happens before the durable outbox row is written.
+    with sqlite3.connect(memory_store.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM chat_finalize_jobs"
+        ).fetchone()[0] == 0
+
+
+def test_prefilter_skips_question_only_turn(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("我的咖啡偏好是什么？"),
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 0
+    log = memory_store.list_decision_logs(user_id="default")[0]
+    assert json.loads(log.candidate_json)["prefilter"] == "question_only"
+
+
+def test_prefilter_keeps_fact_plus_question_turn(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("我养了猫，我哪天运动？"),
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 1
+
+
+def test_prefilter_never_skips_explicit_memory_directive(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("记住我哪天运动？"),
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 1
+
+
+def test_prefilter_keeps_short_answer_after_assistant_question(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "memory-auto",
+            "messages": [
+                {"role": "user", "content": "你觉得我平时喝什么咖啡？"},
+                {"role": "assistant", "content": "美式吗？"},
+                {"role": "user", "content": "好的"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    # "好的" is a lexicon acknowledgement, but it answers an assistant question.
+    assert fake_llm.extraction_calls == 1
+
+
+def test_prefilter_can_be_disabled_by_setting(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    patched = get_settings().model_copy(
+        update={"chat_gateway_extraction_prefilter": False}
+    )
+    client.app.dependency_overrides[get_settings] = lambda: patched
+
+    response = client.post(
+        "/v1/chat/completions", headers=auth_headers, json=_single_user_body("你好")
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 1
 
 
 def test_gateway_never_auto_injects_sensitive_memory(
@@ -837,7 +1088,8 @@ def test_gateway_compacts_only_dynamic_conversation_fallback(
     assert state is not None
     assert state.turn_count == 8
     assert state.compressed_summary == "较早对话的测试压缩摘要。"
-    assert len(state.recent_turns) == 2
+    # the newest CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS (default 4) turns stay verbatim
+    assert len(state.recent_turns) == 4
     assert fake_llm.context_compaction_calls == 1
 
 
@@ -982,12 +1234,15 @@ def test_gateway_omits_sensitive_prior_dialogue_from_extraction(
                     "content": f"我的身份证号是 {sensitive_value}",
                 },
                 {"role": "assistant", "content": "收到。"},
-                {"role": "user", "content": "继续"},
+                # A bare "继续" would be skipped by the local prefilter and make
+                # the assertion below vacuous; keep a real statement instead.
+                {"role": "user", "content": "继续，再推荐一款早餐搭配"},
             ],
         },
     )
 
     assert response.status_code == 200
+    assert fake_llm.extraction_calls == 1
     extraction_payload = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
     assert sensitive_value not in extraction_payload
 
@@ -1932,3 +2187,111 @@ def test_auto_alias_drops_unproven_reasoning_from_normal_history() -> None:
 
     assert preferred is None
     assert "reasoning_content" not in messages[1]
+
+
+# ---------------------------------------------------------------------------
+# Private memories may be injected when relevant; sensitive never are.
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_injects_relevant_private_memory(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户对花生过敏。",
+        type="semantic",
+        importance=9,
+        confidence=0.9,
+        source_message="我对花生过敏",
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("我能吃花生酱吗？"),
+    )
+
+    assert response.status_code == 200
+    forwarded = json.dumps(fake_gateway.payloads[-1]["messages"], ensure_ascii=False)
+    assert "花生过敏" in forwarded
+    assert "敏感级别：private" in forwarded
+    assert response.headers["x-memory-hit-count"] == "1"
+
+
+def test_gateway_does_not_inject_private_memory_without_overlap(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户对花生过敏。",
+        type="semantic",
+        importance=9,
+        confidence=0.9,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("帮我推荐一本科幻小说"),
+    )
+
+    assert response.status_code == 200
+    forwarded = json.dumps(fake_gateway.payloads[-1]["messages"], ensure_ascii=False)
+    assert "花生" not in forwarded
+    assert response.headers["x-memory-hit-count"] == "0"
+
+
+def test_gateway_never_injects_sensitive_memory_even_when_relevant(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    memory_store.create_memory(
+        user_id="default",
+        content="用户的银行卡密码是 123456。",
+        type="semantic",
+        importance=10,
+        confidence=0.9,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("我的银行卡密码是多少？"),
+    )
+
+    assert response.status_code == 200
+    forwarded = json.dumps(fake_gateway.payloads[-1]["messages"], ensure_ascii=False)
+    assert "123456" not in forwarded
+    assert response.headers["x-memory-hit-count"] == "0"
+
+
+def test_v1_mixed_message_withholds_sensitive_sentence_and_saves_directive_locally(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_single_user_body("我喜欢黑咖啡。记住我的银行卡密码是 123456。"),
+    )
+
+    assert response.status_code == 200
+    assert fake_llm.extraction_calls == 1
+    sent = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
+    assert "我喜欢黑咖啡" in sent
+    assert "银行卡密码" not in sent
+    memories = memory_store.list_memories(user_id="default")
+    assert [memory.content for memory in memories] == ["我的银行卡密码是 123456。"]
+    assert memories[0].sensitivity == "sensitive"
+    assert memories[0].embedding_json is None

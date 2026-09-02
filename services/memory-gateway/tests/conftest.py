@@ -531,7 +531,7 @@ class FakeChatGatewayClient:
         )
 
     def list_models(self) -> list[str]:
-        return ["memory-auto", self.provider.model]
+        return ["memory-auto", "memory-read", "memory-off", self.provider.model]
 
     async def complete(
         self,

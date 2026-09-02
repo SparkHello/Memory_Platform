@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import ValidationError
 
 from app.api.deps import get_embedding_client, get_memory_store, get_user_id
+from app.config import Settings, get_settings
 from app.api.memories.common import (
     PUBLIC_ID_MAX_CHARS,
     MemorySaveRequest,
@@ -256,6 +257,7 @@ async def save_memory(
     user_id: Annotated[str, Depends(get_user_id)],
     store: Annotated[MemoryStore, Depends(get_memory_store)],
     embedding_client: Annotated[EmbeddingClient, Depends(get_embedding_client)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
     """直接保存一条结构化记忆，跳过 LLM 提取。对齐 MCP save_memory。"""
     try:
@@ -292,7 +294,11 @@ async def save_memory(
     if rejection:
         return {"action": "ignore", "reason": rejection}
 
-    resolver = MemoryResolver(store=store, embedding_client=embedding_client)
+    resolver = MemoryResolver(
+        store=store,
+        embedding_client=embedding_client,
+        auto_supersede=settings.memory_auto_supersede,
+    )
     fields_set = getattr(body, "model_fields_set", None)
     if fields_set is None:
         fields_set = getattr(body, "__fields_set__", set())
@@ -309,4 +315,5 @@ async def save_memory(
         "relation": result.relation,
         "reason": result.reason,
         "memory_id": result.memory.id if result.memory else None,
+        "superseded_memory_id": result.superseded_memory_id,
     }

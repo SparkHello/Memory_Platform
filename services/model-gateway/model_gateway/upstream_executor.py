@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import socket
 import time
 from typing import Any, AsyncIterator, Mapping
 
@@ -884,8 +885,13 @@ def _json_body_size(payload: dict[str, Any]) -> int:
 
 
 def _local_failure_detail(exc: BaseException) -> str:
+    if isinstance(exc, socket.gaierror):
+        # DNS failed before any safety decision was made; say so instead of
+        # blaming the safety check (common on phones with a flaky VPN/DNS).
+        return "上游域名解析失败，请检查网络、VPN 或 DNS 后重试"
     if isinstance(exc, OSError):
-        return "上游地址安全校验失败"
+        # Bounded on purpose: never echo addresses or OS strings to clients.
+        return "连接上游失败（本地网络错误）"
     message = str(exc).strip()
     if "密钥" in message:
         return "上游密钥格式无效"

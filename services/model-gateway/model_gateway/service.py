@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from model_gateway.admin import (
     CandidateDiscoverRequest,
     CapabilityProbeRequest,
+    DeploymentUpdateRequest,
     EnabledUpdateRequest,
     RevisionRequest,
     SecretUpdateRequest,
@@ -697,51 +698,67 @@ def create_app(
         snapshot = control_plane.from_loaded(config=config, secrets=secrets)
         if payload.revision != snapshot.revision:
             return _config_stale_error()
-        try:
-            connection = build_probe_connection(
-                channel_operator=payload.channel_operator,
-                base_url=payload.base_url,
-                adapter=payload.adapter,
-                auth_type=payload.auth_type,
-                allowed_private_networks=list(payload.allowed_private_networks),
-            )
+        if payload.connection_id:
+            # Existing channel: reuse its stored secret, nothing is written.
+            connection = config.connections.get(payload.connection_id)
+            if connection is None:
+                return _error(404, "找不到指定渠道")
+            probe_secret = (secrets.get(connection.auth.secret_ref) or "").strip()
+            if not probe_secret:
+                return _error(400, "该渠道尚未配置密钥，无法探测")
             deployment = build_probe_deployment(
-                connection_id="capability-probe",
+                connection_id=payload.connection_id,
                 upstream_model=payload.upstream_model,
             )
-            graph = config.model_dump(mode="python", exclude_none=False)
-            graph["connections"] = {
-                **graph["connections"],
-                "capability-probe": connection.model_dump(
-                    mode="python", exclude_none=False
-                ),
-            }
-            probe_config = GatewayConfig.model_validate(graph)
-            candidate = control_plane.prepare(
-                snapshot,
-                expected_revision=payload.revision,
-                config=probe_config,
-                secret_updates={connection.auth.secret_ref: payload.candidate_key},
-            )
-        except ControlPlaneValidationError as exc:
-            return _candidate_validation_error(exc)
-        except (ValueError, ValidationError) as exc:
-            return _error(
-                400,
-                "能力探测草稿未通过安全校验：" + _safe_validation_message(exc),
-                error_type=GatewayErrorCode.CONFIG_INVALID.value,
-            )
+            effective_config = config
+        else:
+            probe_secret = payload.candidate_key or ""
+            try:
+                connection = build_probe_connection(
+                    channel_operator=payload.channel_operator or "",
+                    base_url=payload.base_url or "",
+                    adapter=payload.adapter,
+                    auth_type=payload.auth_type,
+                    allowed_private_networks=list(payload.allowed_private_networks),
+                )
+                deployment = build_probe_deployment(
+                    connection_id="capability-probe",
+                    upstream_model=payload.upstream_model,
+                )
+                graph = config.model_dump(mode="python", exclude_none=False)
+                graph["connections"] = {
+                    **graph["connections"],
+                    "capability-probe": connection.model_dump(
+                        mode="python", exclude_none=False
+                    ),
+                }
+                probe_config = GatewayConfig.model_validate(graph)
+                candidate = control_plane.prepare(
+                    snapshot,
+                    expected_revision=payload.revision,
+                    config=probe_config,
+                    secret_updates={connection.auth.secret_ref: probe_secret},
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
+            except (ValueError, ValidationError) as exc:
+                return _error(
+                    400,
+                    "能力探测草稿未通过安全校验：" + _safe_validation_message(exc),
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
+                )
+            effective_config = candidate.effective_config
         try:
             result = await probe_chat_capabilities(
                 connection=connection,
                 deployment=deployment,
-                secret=payload.candidate_key,
+                secret=probe_secret,
                 probes=tuple(payload.probes),  # type: ignore[arg-type]
                 timeout_seconds=25.0,
                 transport=transport,
                 usage_store=usage_store,
-                usage_server=candidate.effective_config.server,
-                pricing_catalog=candidate.effective_config.pricing,
+                usage_server=effective_config.server,
+                pricing_catalog=effective_config.pricing,
                 storage_monitor=storage_monitor,
             )
         except UsageLedgerPreflightError:
@@ -850,9 +867,51 @@ def create_app(
     async def update_admin_deployment(
         deployment_id: str, request: Request
     ) -> Response:
-        return await _set_admin_object_enabled(
-            request, collection="deployments", item_id=deployment_id
-        )
+        async with admin_write_lock:
+            context = await _admin_context(request)
+            if isinstance(context, JSONResponse):
+                return context
+            config, secrets, client = context
+            body = await _validated_admin_body(
+                request,
+                limit=config.server.body_limit_bytes,
+                model=DeploymentUpdateRequest,
+                label="部署修改",
+            )
+            if isinstance(body, Response):
+                return body
+            if deployment_id not in config.deployments:
+                return _error(404, "找不到指定对象")
+            snapshot = control_plane.from_loaded(config=config, secrets=secrets)
+            try:
+                candidate = control_plane.update_deployment(
+                    snapshot,
+                    deployment_id=deployment_id,
+                    enabled=body.enabled,
+                    capabilities=body.capabilities,
+                    expected_revision=body.revision,
+                )
+            except ControlPlaneValidationError as exc:
+                return _candidate_validation_error(exc)
+            except (ValueError, ValidationError) as exc:
+                return _error(
+                    400,
+                    f"对象修改未通过完整配置校验：{_safe_validation_message(exc)}",
+                    error_type=GatewayErrorCode.CONFIG_INVALID.value,
+                )
+            commit = _commit_admin_change(candidate)
+            if isinstance(commit, JSONResponse):
+                return commit
+            updated = candidate.effective_config.deployments[deployment_id]
+            return JSONResponse(
+                {
+                    "updated": True,
+                    "id": deployment_id,
+                    "enabled": updated.enabled,
+                    "capabilities": updated.capabilities.model_dump(mode="json"),
+                    "revision": commit.revision,
+                }
+            )
 
     async def _set_admin_object_enabled(
         request: Request, *, collection: str, item_id: str

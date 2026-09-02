@@ -47,6 +47,18 @@ describe("friendlyIngestSkipReason", () => {
     ).toBe("模型没有说明原因，这轮未保存记忆");
   });
 
+  it("explains local prefilter skips without exposing the mechanism", () => {
+    expect(friendlyIngestSkipReason("本地预过滤：本轮仅为寒暄或确认，未调用提取模型")).toMatch(
+      /寒暄、提问或代码片段/
+    );
+    expect(friendlyIngestSkipReason("本地预过滤：本轮仅为提问，未调用提取模型")).toMatch(
+      /没有调用提取模型/
+    );
+    expect(friendlyIngestSkipReason("本地预过滤：用户文本超过 64 KiB，未调用提取模型")).toMatch(
+      /64 KiB/
+    );
+  });
+
   it("passes through already-plain reasons and empty input", () => {
     expect(friendlyIngestSkipReason("已有相同记忆")).toBe("已有相同记忆");
     expect(friendlyIngestSkipReason("提交文本为空")).toBe("提交文本为空");

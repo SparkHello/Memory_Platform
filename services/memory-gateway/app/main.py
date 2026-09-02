@@ -101,8 +101,19 @@ class UIStaticFiles(StaticFiles):
         if not is_static_file:
             if PurePosixPath(normalized).suffix:
                 raise StarletteHTTPException(status_code=404)
-            return await super().get_response("index.html", scope)
-        return await super().get_response(normalized, scope)
+            response = await super().get_response("index.html", scope)
+            # Entry document: always revalidate, so a redeployed console is
+            # picked up on the next load instead of a heuristically cached copy
+            # pointing at bundles that no longer exist.
+            response.headers["Cache-Control"] = "no-cache"
+            return response
+        response = await super().get_response(normalized, scope)
+        if normalized.startswith("assets/"):
+            # Vite emits content-hashed filenames under assets/.
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app() -> FastAPI:

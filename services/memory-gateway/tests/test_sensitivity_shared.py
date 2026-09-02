@@ -14,6 +14,8 @@ from app.sensitivity import SENSITIVITY_RANK
         ("邮箱 user@example.com", "private"),
         ("refresh_token=abcdefghijklmnop", "sensitive"),
         ("银行卡号 6222 0202 0000 1234 567", "sensitive"),
+        ("需要持续控制血糖", "private"),
+        ("my home address is 12 Main Street", "private"),
     ),
 )
 def test_memory_and_knowledge_share_sensitivity_floor(

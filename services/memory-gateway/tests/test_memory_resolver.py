@@ -600,3 +600,377 @@ def _candidate(content: str, *, type: str = "fact", **overrides) -> CandidateMem
     }
     payload.update(overrides)
     return CandidateMemory(**payload)
+
+
+# ---------------------------------------------------------------------------
+# Automatic supersede: a committed transition closes the matching live fact.
+# ---------------------------------------------------------------------------
+
+import sqlite3
+
+from app.memory.temporal import is_current_temporal_memory
+
+
+def _old_fact(memory_store: MemoryStore, content: str, **overrides):
+    payload = {
+        "user_id": "default",
+        "content": content,
+        "type": "semantic",
+        "importance": 8,
+        "embedding_json": json.dumps([1.0, 0.0]),
+        "embedding_space_id": "test-space",
+    }
+    payload.update(overrides)
+    return memory_store.create_memory(**payload)
+
+
+def _resolver(memory_store: MemoryStore, *, auto_supersede: bool = True, vector=(1.0, 0.0)):
+    return MemoryResolver(
+        store=memory_store,
+        embedding_client=StaticEmbeddingClient(list(vector) if vector is not None else None),
+        auto_supersede=auto_supersede,
+    )
+
+
+def _auto_supersede_logs(memory_store: MemoryStore, user_id: str = "default") -> list[dict]:
+    return [
+        json.loads(log.candidate_json)
+        for log in memory_store.list_decision_logs(user_id=user_id)
+        if '"auto_supersede"' in log.candidate_json
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersedes_same_attribute_with_transition_marker(
+    memory_store: MemoryStore,
+) -> None:
+    old = _old_fact(memory_store, "用户平时用 iPhone 手机。")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "update"
+    assert result.relation == "supersede"
+    assert result.superseded_memory_id == old.id
+    assert result.memory is not None
+    assert result.memory.supersedes == old.id
+    assert "已自动替换" in result.reason
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.status == "resolved"
+    assert old_after.superseded_by == result.memory.id
+    assert old_after.valid_until == result.memory.created_at
+    assert is_current_temporal_memory(old_after) is False
+    assert is_current_temporal_memory(result.memory) is True
+    assert len(memory_store.list_memories(user_id="default")) == 2
+
+    logs = _auto_supersede_logs(memory_store)
+    assert len(logs) == 1
+    assert logs[0]["source"] == "auto_supersede"
+    assert logs[0]["target_memory_id"] == old.id
+    assert logs[0]["memory_id"] == result.memory.id
+    assert logs[0]["relation"] == "supersede"
+    assert logs[0]["after"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersede_disabled_keeps_review_path(memory_store: MemoryStore) -> None:
+    old = _old_fact(memory_store, "用户平时用 iPhone 手机。")
+
+    result = await _resolver(memory_store, auto_supersede=False).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "create"
+    assert "暂不自动合并" in result.reason
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.superseded_by is None
+    assert old_after.status == "dynamic"
+    assert _auto_supersede_logs(memory_store) == []
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_without_transition_marker(
+    memory_store: MemoryStore,
+) -> None:
+    _old_fact(memory_store, "用户平时用 iPhone 手机。")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户平时用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "create"
+    assert result.superseded_memory_id is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_pure_polarity_flip(memory_store: MemoryStore) -> None:
+    old = _old_fact(memory_store, "用户喜欢喝咖啡。", type="emotional")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户不喜欢喝咖啡。", type="emotional"),
+    )
+
+    assert result.action == "create"
+    assert result.relation == "conflict"
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersedes_conflict_with_transition_marker(
+    memory_store: MemoryStore,
+) -> None:
+    old = _old_fact(memory_store, "用户喜欢喝咖啡。")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在不再喝咖啡了。", type="semantic"),
+    )
+
+    assert result.action == "update"
+    assert result.relation == "conflict"
+    assert result.superseded_memory_id == old.id
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_additive_preference_without_conflict(
+    memory_store: MemoryStore,
+) -> None:
+    """Liking tea now does not end liking coffee."""
+    old = _old_fact(memory_store, "用户喜欢黑咖啡。", topics=["饮食偏好"])
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在更喜欢喝茶。", type="semantic", topics=["饮食偏好"]),
+    )
+
+    assert result.action == "create"
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersedes_with_shared_topic_when_no_relation_family(
+    memory_store: MemoryStore,
+) -> None:
+    old = _old_fact(memory_store, "用户的猫叫小白。", topics=["宠物"])
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户的猫现在改名叫小黑。", type="semantic", topics=["宠物"]),
+        auto_classify=False,
+    )
+
+    assert result.action == "update"
+    assert result.superseded_memory_id == old.id
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["pinned", "resolved", "agent_derived", "past_marker", "other_type", "other_sensitivity", "episodic"],
+)
+@pytest.mark.asyncio
+async def test_resolver_never_auto_supersedes_ineligible_target(
+    memory_store: MemoryStore,
+    variant: str,
+) -> None:
+    content = "用户平时用 iPhone 手机。"
+    candidate_type = "semantic"
+    overrides: dict = {}
+    if variant == "agent_derived":
+        overrides["origin"] = "agent_derived"
+    elif variant == "past_marker":
+        content = "用户曾经平时用 iPhone 手机。"
+    elif variant == "other_type":
+        overrides["type"] = "emotional"
+    elif variant == "other_sensitivity":
+        overrides["sensitivity"] = "private"
+    elif variant == "episodic":
+        overrides["type"] = "episodic"
+        candidate_type = "episodic"
+    old = _old_fact(memory_store, content, **overrides)
+    if variant in {"pinned", "resolved"}:
+        with sqlite3.connect(memory_store.database_path) as connection:
+            connection.execute(
+                "UPDATE memories SET status = ? WHERE id = ?", (variant, old.id)
+            )
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type=candidate_type),
+    )
+
+    assert result.action == "create", variant
+    assert result.superseded_memory_id is None
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersede_requires_embedding_vector(memory_store: MemoryStore) -> None:
+    _old_fact(memory_store, "用户平时用 iPhone 手机。")
+
+    result = await _resolver(memory_store, vector=None).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "create"
+    assert result.superseded_memory_id is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_third_party_subject(memory_store: MemoryStore) -> None:
+    _old_fact(memory_store, "用户的朋友用 iPhone 手机。")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "create"
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_future_dated_or_uncommitted_candidate(
+    memory_store: MemoryStore,
+) -> None:
+    old = _old_fact(memory_store, "用户平时用 iPhone 手机。")
+
+    future = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic", valid_from="2999-01-01"),
+    )
+    uncommitted = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户可能现在改用安卓手机。", type="semantic"),
+    )
+
+    assert future.action == "create"
+    assert uncommitted.action == "create"
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_auto_supersede_english_word_boundaries(memory_store: MemoryStore) -> None:
+    cat = _old_fact(memory_store, "User's cat is named Tom.")
+    # A different vector keeps the two live facts distinguishable by cosine.
+    python = _old_fact(memory_store, "User uses Python.", embedding_json=json.dumps([0.0, 1.0]))
+
+    renamed = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("User's cat is now named Jerry.", type="semantic"),
+    )
+    knows = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("User knows Python well.", type="semantic"),
+    )
+
+    assert renamed.action == "update"
+    assert renamed.superseded_memory_id == cat.id
+    # "knows" must not fire the "now" marker; and "knows" is not a transition.
+    assert knows.action == "create"
+    python_after = memory_store.get_memory(memory_id=python.id, user_id="default")
+    assert python_after is not None and python_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_auto_supersede_does_not_cross_users(memory_store: MemoryStore) -> None:
+    alice_fact = _old_fact(memory_store, "用户平时用 iPhone 手机。", user_id="alice")
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+
+    assert result.action == "create"
+    alice_after = memory_store.get_memory(memory_id=alice_fact.id, user_id="alice")
+    assert alice_after is not None and alice_after.superseded_by is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_allows_keyless_value_to_return_after_auto_supersede(
+    memory_store: MemoryStore,
+) -> None:
+    first = _old_fact(memory_store, "用户平时用 iPhone 手机。")
+    resolver = _resolver(memory_store)
+
+    second = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+    )
+    third = await resolver.resolve(
+        user_id="default",
+        candidate=_candidate("用户现在改用 iPhone 手机。", type="semantic"),
+    )
+
+    assert second.action == "update" and second.superseded_memory_id == first.id
+    assert third.action == "update"
+    assert second.memory is not None and third.memory is not None
+    # The historical first value is never re-selected; the live second one is.
+    assert third.superseded_memory_id == second.memory.id
+    first_after = memory_store.get_memory(memory_id=first.id, user_id="default")
+    second_after = memory_store.get_memory(memory_id=second.memory.id, user_id="default")
+    assert first_after is not None and first_after.superseded_by == second.memory.id
+    assert second_after is not None and second_after.superseded_by == third.memory.id
+    current = [
+        memory
+        for memory in memory_store.list_memories(user_id="default")
+        if is_current_temporal_memory(memory)
+    ]
+    assert [memory.id for memory in current] == [third.memory.id]
+
+
+class _CoordinatedStaticEmbeddingClient:
+    """Two concurrent resolvers both finish embedding before either writes."""
+
+    def __init__(self) -> None:
+        self.embedding_space_id = "test-space"
+        self.calls = 0
+        self.both_started = asyncio.Event()
+
+    async def embed(self, text: str) -> list[float] | None:
+        self.calls += 1
+        if self.calls == 2:
+            self.both_started.set()
+        await self.both_started.wait()
+        return [1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_superseding_candidates_close_target_once(memory_store: MemoryStore) -> None:
+    old = _old_fact(memory_store, "用户平时用 iPhone 手机。")
+    client = _CoordinatedStaticEmbeddingClient()
+    left = MemoryResolver(store=memory_store, embedding_client=client)
+    right = MemoryResolver(store=memory_store, embedding_client=client)
+
+    # auto_classify=False keeps the pre-existing space-upsert race out of
+    # this test; the write lock under test is create_memory's BEGIN IMMEDIATE.
+    results = await asyncio.gather(
+        left.resolve(
+            user_id="default",
+            candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+            auto_classify=False,
+        ),
+        right.resolve(
+            user_id="default",
+            candidate=_candidate("用户现在改用安卓手机。", type="semantic"),
+            auto_classify=False,
+        ),
+    )
+
+    actions = sorted(result.action for result in results)
+    assert actions == ["ignore", "update"]
+    assert len(_auto_supersede_logs(memory_store)) == 1
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is not None
+    assert len(memory_store.list_memories(user_id="default")) == 2

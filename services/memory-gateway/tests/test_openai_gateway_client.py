@@ -20,8 +20,12 @@ from app.llm.model_gateway import (
     MODEL_GATEWAY_UPSTREAM_MODEL_HEADER,
 )
 from app.openai_compat.gateway_client import (
+    PUBLIC_MODEL_IDS,
     GatewayUpstreamHTTPError,
     OpenAIChatGatewayClient,
+    is_auto_model_id,
+    memory_mode_for_model,
+    resolve_public_model,
 )
 from app.usage.attribution import (
     MODEL_GATEWAY_CORRELATION_HEADER,
@@ -190,7 +194,12 @@ async def test_central_gateway_preserves_unknown_chat_json_and_validates_attribu
         }
     )
 
-    assert client.list_models() == ["memory-auto", "memory.chat.custom"]
+    assert client.list_models() == [
+        "memory-auto",
+        "memory-read",
+        "memory-off",
+        "memory.chat.custom",
+    ]
     assert len(calls) == 1
     request, payload = calls[0]
     assert str(request.url) == "http://127.0.0.1:2030/v1/chat/completions"
@@ -219,6 +228,93 @@ async def test_central_gateway_preserves_unknown_chat_json_and_validates_attribu
     assert result.headers["x-model-gateway-usage-event-id"] == "usage-synthetic-1"
     assert result.headers["x-model-gateway-correlation-id"] == "mgc_synthetic"
     assert result.headers["x-model-gateway-usage-ledger-status"] == "recorded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested",
+    [
+        "memory-read",
+        "memory-off",
+        "Memory-Auto",
+        " auto ",
+        "default",
+        "memory-gateway",
+        "memory.chat.custom",
+    ],
+)
+async def test_public_model_aliases_resolve_to_chat_route(requested: str) -> None:
+    """Every public alias is normalized to the configured chat route upstream."""
+    payloads: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-alias",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+            headers=_central_headers(),
+        )
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.complete(
+        {"model": requested, "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert payloads[-1]["model"] == "memory.chat.custom"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested",
+    ["memory.extract", "memory.embedding", "knowledge.pro", "gpt-4o", "MEMORY.CHAT.CUSTOM"],
+)
+async def test_unknown_or_internal_models_are_rejected_before_upstream(requested: str) -> None:
+    """Internal routes must never be reachable through the public chat proxy."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("rejected models must not reach the Model Gateway")
+
+    client = OpenAIChatGatewayClient(
+        _central_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await client.complete(
+            {"model": requested, "messages": [{"role": "user", "content": "hi"}]}
+        )
+
+    assert excinfo.value.status_code == 404
+    assert requested in str(excinfo.value.detail)
+
+
+def test_resolve_public_model_and_mode_helpers() -> None:
+    assert PUBLIC_MODEL_IDS == ("memory-auto", "memory-read", "memory-off")
+
+    assert memory_mode_for_model("memory-auto") is None
+    assert memory_mode_for_model("MEMORY-READ") == "read"
+    assert memory_mode_for_model(" memory-off ") == "off"
+    assert memory_mode_for_model("memory.chat.custom") is None
+    assert memory_mode_for_model("gpt-4o") is None
+
+    for alias in (*PUBLIC_MODEL_IDS, "auto", "default", "memory-gateway"):
+        assert is_auto_model_id(alias) is True
+    assert is_auto_model_id("memory.chat.custom") is False
+
+    explicit = resolve_public_model("memory.chat.custom", route="memory.chat.custom")
+    assert explicit is not None
+    assert explicit.is_alias is False
+    assert explicit.memory_mode is None
+    # The explicit route is exact-match only; aliases are case-insensitive.
+    assert resolve_public_model("MEMORY.CHAT.CUSTOM", route="memory.chat.custom") is None
+    assert resolve_public_model("gpt-4o", route="memory.chat.custom") is None
 
 
 @pytest.mark.asyncio

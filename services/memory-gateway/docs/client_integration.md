@@ -18,6 +18,12 @@ Responses API: disabled
 Assistant model setting "Streaming output": enabled (FLIT default)
 ```
 
+`memory-auto` uses the server's default memory mode (`CHAT_GATEWAY_DEFAULT_MEMORY_MODE`).
+`/v1/models` also lists `memory-read` (recall/inject only, never extracts or writes) and
+`memory-off` (transparent proxy, no recall, no write); pick one of them as the model for a
+chat that should stay read-only or leave no memory. All `memory-*` aliases resolve to the
+same chat route and only select the memory mode; they never reach internal routes.
+
 After FLIT discovers `memory-auto`, edit that model under the current
 OpenAI-compatible provider. Set input modalities to `Text + Image`, output modality
 to `Text`, and enable both `Tools` and `Reasoning`. These are FLIT-side switches that
@@ -41,7 +47,10 @@ use either `X-Conversation-Id` or the local `conversation_id` request-body exten
 especially when they send only incremental messages. Both forms accept at most 200
 characters; the gateway rejects longer values with HTTP 400 instead of truncating them.
 
-The default memory behavior is `read-write`. It can be overridden per request:
+The default memory behavior comes from `CHAT_GATEWAY_DEFAULT_MEMORY_MODE` (`read-write`).
+Clients that cannot send custom headers select the mode through the model alias
+(`memory-auto` = server default, `memory-read` = `read`, `memory-off` = `off`); clients
+that can may still override it per request:
 
 ```http
 X-Memory-Mode: off | read | read-write
@@ -52,6 +61,11 @@ X-Memory-Mode: off | read | read-write
 - `read-write` additionally runs the existing validated ingest pipeline, including
   extraction, quote/grounding checks, deduplication, classification, and memory
   embedding.
+
+Precedence: a read-only chat token clamp > explicit `X-Memory-Mode` > model alias >
+`CHAT_GATEWAY_DEFAULT_MEMORY_MODE`. Aliases are case-insensitive; the explicit route name
+is exact-match. Legacy spellings `auto` / `default` / `memory-gateway` remain accepted but
+are not listed. Re-sync the client's model list after upgrading to see the new names.
 
 For each tool-call leg, the gateway finds the last user message and re-injects recall
 reused through the DB-validated search cache. Deleted or newly-sensitive memories are
@@ -98,11 +112,18 @@ is non-authoritative: it may help interpretation, but only a retained verbatim t
 supply `context_quote`.
 
 Automatic context is limited to locally verified normal-sensitivity user memories,
-safe core memory, and a normal-sensitivity branch/recent summary when one is matched.
-The physically separate knowledge library is never auto-injected.
+`private` memories (health, address, contact details, income) that are relevant to the
+current question — ranked lower and labelled so the model uses them only when clearly
+relevant — safe core memory, and a normal-sensitivity branch/recent summary when one is
+matched. `sensitive` memories (credentials, government IDs, bank/account numbers) are
+never injected. The physically separate knowledge library is never auto-injected.
 `ALLOW_SENSITIVE_EGRESS` protects remote memory extraction, context compression,
-embedding, review, and knowledge-agent calls. Sensitive prior turns remain local and
-are omitted from separate extraction/compaction prompts; it does not stop the current chat message from reaching the
+embedding, review, and knowledge-agent calls. For extraction and embedding the filter is
+sentence-level: only sentences whose tier exceeds `MEMORY_EGRESS_CEILING` (default
+`private`, i.e. only `sensitive` sentences) are withheld, the rest of the turn is
+extracted normally, and a withheld sentence next to an explicit 记住/remember directive
+is saved locally verbatim without any model call. Compaction, review, and the knowledge
+agent still withhold all non-normal text; it does not stop the current chat message from reaching the
 chat upstream selected by the user. When the assistant's final text is locally detected
 as sensitive, it is omitted from the separate extraction-provider prompt while the
 normal user source can still be evaluated.
@@ -131,10 +152,10 @@ Recommended system-prompt policy:
 - 不要拆分、改写、总结用户原文，也不要自行猜 type、importance、confidence、valid_from、temporal_subject 或 temporal_predicate。服务端会自动提取、去重和保存。
 - 用户明确说“记住”“别忘了”“以后记得”时，优先调用 submit_memory_text。
 - 检索旧记忆和提交新记忆是两个独立判断；同一轮都需要时，先 search_memory，再 submit_memory_text。
-- 当下情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。敏感信息只有在用户明确希望保留且未来明显有用时才提交。
+- 当下情绪、玩笑、一次性安排、假设场景、无长期价值的信息不要提交记忆。密码、证件号、银行卡/账号等敏感信息只有在用户明确要求记住时才提交；健康、住址、联系方式、收入等私密信息由服务端按 private 级别保守保存，不需要用户额外说“记住”。
 - 只有用户本轮明确要求读取相关敏感信息时，才可给 search_memory/surface_memories 传 include_sensitive=true。
 - submit_memory_text 返回 retryable=true 时说明上游暂时失败，可稍后重试一次；规则拒绝或无长期价值不应重试。
-- 服务端默认 `ALLOW_SENSITIVE_EGRESS=false`，本地检测到敏感原文时不会发送给远程提取或 embedding provider。
+- 服务端默认 `ALLOW_SENSITIVE_EGRESS=false`，按句子过滤：含密码、证件号、银行卡/账号的句子不会发送给远程提取或 embedding provider（紧邻“记住”时在本地原句保存），其余句子照常提取；健康、住址、联系方式、收入等私密句子默认可出站（`MEMORY_EGRESS_CEILING=private`）。
 - 服务端会验证候选的逐字引用、事实锚点和否定一致性；敏感保存授权只作用于敏感事实所在句子或子句。
 - 搜索/浮现结果里的 activation_count 只表示活跃度，不是精确搜索次数；Time Ripple 是默认关闭的实验能力，普通客户端不需要启用。
 - 用户要求忘记、删除或管理记忆时，你没有删除或遗忘的工具；引导用户在 Web 管理台（/ui/）操作。
@@ -193,6 +214,17 @@ through `submit_memory_text`; the server-side extraction prompt decides whether 
 temporal key is safe. The server also applies a small whitelist post-processor so
 obvious profile facts can activate Temporal KG without letting the model invent
 arbitrary predicates.
+
+Changes outside that whitelist are also handled server-side. When a new keyless
+`semantic`/`emotional`/`procedural` memory carries an explicit transition marker
+(现在/已经/改成/换成/不再/取代, or `instead`/`switched`/`now`/`no longer` as whole words)
+and its embedding is close (cosine ≥ 0.80) to a live, current, user-asserted memory about
+the same replaceable attribute of the same actor, the server closes the old memory in
+place (`status=resolved`, `valid_until`, `superseded_by`) and links the new one through
+`supersedes` (`MEMORY_AUTO_SUPERSEDE`, default on; requires the `memory.embedding` route).
+Pure polarity flips, supplements, episodic/reflective memories, and pinned rows still go
+to the review page instead. `submit_memory_text` items report `superseded_memory_id` when
+this happened. Clients still must not set temporal keys to trigger it.
 
 Only direct REST saves or upstream structured-save integrations should fill these fields:
 

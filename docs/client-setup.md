@@ -32,7 +32,7 @@ API Key:  为这台设备创建的 chat token
 - **聊天、MCP、Console 权限分开**。聊天客户端只拿 chat token；MCP 客户端只拿 MCP token；Model Gateway admin key 仅在电脑浏览器中临时解锁渠道配置，绝不能填进聊天或 MCP 客户端。
 - **丢一台设备只撤销这一枚 token**。在 Console 撤销，或运行 `scripts/memgw token revoke <token-id>`；其他设备不用重配。不要为了好记而自定义低熵密码，也不要经聊天软件或跨设备剪贴板传递 token。
 - **Docker 初始密钥不在日志或环境变量里**。安装器只报告宿主机 `credentials/gateway.txt` 与 `credentials/admin.txt` 路径（旧安装兼容 `.key`）；文件应保持仅当前用户可读。不要再用 `GATEWAY_API_KEY=...` 环境变量运行安装器。
-- **模型名固定填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」。以后换渠道、换模型只改服务端，客户端不用动。
+- **模型名默认填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」，记忆模式取服务端默认值。以后换渠道、换模型只改服务端，客户端不用动。模型列表里还有 `memory-read`（只召回不写入）和 `memory-off`（不读不写，纯代理），见下文「记忆模式」。
 - **关闭 Responses API / 使用 Chat Completions**。如果客户端有「API 类型」选项，选 `Chat Completions`（大多数客户端默认就是）。
 
 ### 手机或局域网设备
@@ -64,11 +64,15 @@ API Key:  为这台设备创建的 chat token
 
 ### 记忆模式（一般不用管）
 
-默认 `read-write`：自动召回 + 自动提取。需要在某个请求里改变行为时，客户端可以加自定义请求头：
+默认 `read-write`：自动召回 + 自动提取。想让某个对话只读或完全不碰记忆时，最简单的办法是在客户端里切换模型名（`/v1/models` 会列出这三个名字，大小写不敏感；升级后需要重新同步模型列表才能看到）：
 
-- `X-Memory-Mode: off`：只做透明代理，不读不写记忆；
-- `X-Memory-Mode: read`：注入记忆但不提取新记忆；
-- `X-Memory-Mode: read-write`：默认行为。
+| 模型名 | 行为 |
+| --- | --- |
+| `memory-auto` | 使用服务端默认记忆模式（默认 `read-write`：自动召回 + 自动提取） |
+| `memory-read` | 只召回并注入已有记忆，不提取、不写入新记忆 |
+| `memory-off` | 纯透明代理，不读不写记忆 |
+
+三个名字都走同一个聊天模型路由，只决定记忆模式。能发自定义请求头的客户端也可以按请求加 `X-Memory-Mode: off | read | read-write`；请求头优先于模型名，只读 chat token 的限制又优先于两者。
 
 ## 可选路径：MCP（知识库和模型自助管理记忆）
 
@@ -103,12 +107,14 @@ token 会固定绑定创建时的用户，调用方不能改写命名空间；�
 | 现象 | 原因和做法 |
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
+| 聊天客户端的搜索、MCP 等工具用不了，或提示「当前模型未开启工具调用」 | 两处都要开：客户端里给 `memory-auto` 这个模型打开「工具」能力（FLIT/RikkaHub 类客户端默认不给自定义渠道的模型发工具）；控制台「模型渠道」里点击该模型的胶囊，点「自动检测能力」或手动勾选「工具调用 tools」。网关只会把带工具的请求派给声明了该能力的模型 |
 | 设备 token 找不回了 | 明文只显示一次；撤销该 token 并为这台设备新建一枚，其他设备不受影响 |
 | 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.txt`（旧版为 `admin.key`）；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
-| 模型名不知道填什么 | 固定 `memory-auto`；以后换渠道换模型只改服务端，客户端不动 |
+| 模型名不知道填什么 | 默认 `memory-auto`；只读或不留记忆的对话改填 `memory-read` / `memory-off`。以后换渠道换模型只改服务端，客户端不动 |
 | 聊了但什么都没记住 | 记忆只在**完整**最终回答后写入；中途断开、被截断、内容被过滤都不会写 |
+| 决策日志显示「本地预过滤」 | 预期行为：本轮只是寒暄致谢、纯提问或纯代码，没有调用提取模型；明确说「记住」的消息和回答助手提问的短句不会被跳过 |
 | 担心渠道 key 被发给客户端 | 不会。供应商 key 只存在 Model Gateway 的隔离 secret volume，客户端只拿固定角色的设备 token |
-| 私密内容会不会发给提取/embedding 模型 | 默认不会（`ALLOW_SENSITIVE_EGRESS=false`），本地识别为敏感的内容不出站 |
+| 私密内容会不会发给提取/embedding 模型 | 按句子判断。健康、住址、联系方式、收入等私密句子默认和聊天其余内容一样送给提取模型（`MEMORY_EGRESS_CEILING=private`，改为 `normal` 可扣留）；密码、证件号、银行卡/账号所在的句子默认永不出站（除非 `ALLOW_SENSITIVE_EGRESS=true`），同一轮其余句子照常提取。被扣留的句子若紧邻「记住」，会不经模型直接原句保存在本地 |
 | 导入的文档没出现在聊天里 | 知识库设计为不自动进入聊天上下文；用 MCP 工具、REST 或 Web Console 显式检索 |
 | 想删除某条记忆 | 客户端没有这个工具；打开 `http://127.0.0.1:2026/ui/` 在 Web Console 里操作 |
 | 关闭终端后还能用吗 | 能，服务以后台进程运行；但**重启电脑后**源码安装要在仓库目录重新运行 `scripts/memgw stack start`，Docker 用户启动 Docker Desktop 即可（设置里勾选「登录时启动」可免手动） |

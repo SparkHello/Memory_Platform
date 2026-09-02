@@ -11,6 +11,18 @@ import type {
   SurfaceMode
 } from "../types";
 
+/** 客户端默认填写的模型名：由网关按设置默认的记忆模式处理。 */
+export const CLIENT_MODEL_ID = "memory-auto";
+
+/**
+ * 记忆模式模型别名：发不出自定义 Header 的客户端（Chatbox、RikkaHub 等）
+ * 通过在模型选择器里换模型名来选择记忆模式；全部解析到同一聊天 route。
+ */
+export const CLIENT_MODEL_MODE_ALIASES = [
+  { id: "memory-read", label: "只召回、不写入" },
+  { id: "memory-off", label: "纯透明代理，不读不写" }
+] as const;
+
 export const MEMORY_TYPES: MemoryType[] = [
   "episodic",
   "semantic",

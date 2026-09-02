@@ -4,7 +4,34 @@
 
 ## Unreleased
 
+### Added
+
+- 安卓 App（`apps/android`）：用 Chaquopy 内嵌 Python 3.14，在手机前台服务里以单进程运行 Model Gateway 与 Memory Gateway（仅监听 `127.0.0.1`），复用现有 Web Console；状态页提供启动/停止、复制首次登录令牌与模型网关管理密钥、复制接入地址、导出诊断包（日志、脱敏配置、memory.db 快照、决策与落库任务报告）、关闭电池优化。自带 FTS5 的 SQLite 替换 Chaquopy 内置版本；pydantic-core 与 rpds-py 由 Termux 在手机上编译后导出。构建、验证与导出脚本见 `scripts/android/`，方案与限制见 `docs/android.md`。
+- 嵌入式单进程入口 `embedded_stack.py`：不依赖 `memgw`/`modelgw` CLI 与子进程完成两网关接线、首次凭据与 settings.env 生成；uvicorn 使用纯 asyncio/h11，不再需要 uvloop、httptools、websockets、watchfiles。
+- Model Gateway `PATCH /admin/deployments/{id}` 支持部分更新 `capabilities`（仍受路由 `required_capabilities` 约束）；`POST /admin/channels/probe-capabilities` 新增 `connection_id`，用已保存渠道的密钥探测已有模型的能力，不再要求重新输入供应商密钥。
+- Console：模型胶囊可点开修改能力并「自动检测能力」；新增模型面板同样支持自动检测，适配 profile 收进「高级」。
+- 记忆抽取：`source_quote`/`context_quote` 逐字核对改为格式容错（忽略 markdown 标记、空白、emoji、全半角），`context_quote` 核对失败不再整条否决而是丢弃引用；新增「肯定确认」规则，用户仅回答「对了/是的」时可把紧邻的助手原话作为事实锚点，关系仍须在可见上下文中有证据；新增 `education` 关系族。
+- Console 静态资源缓存头：`index.html` 为 `no-cache`，`assets/` 带 hash 文件为一年 immutable。
+
+- `/v1/models` 新增记忆模式模型别名 `memory-read`（只召回不写入）与 `memory-off`（纯透明代理）：发不出自定义 Header 的客户端（Chatbox、RikkaHub 等）改模型名即可切换模式。所有 `memory-*` 别名都解析到同一聊天 route，只决定记忆模式；优先级为只读 token 限制 > `X-Memory-Mode` > 别名 > `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`。旧别名 `auto`/`default`/`memory-gateway` 继续接受但不列出。客户端需重新同步模型列表。
+- 提取前置过滤（`CHAT_GATEWAY_EXTRACTION_PREFILTER`，默认开启）：仅为寒暄致谢、纯提问或纯代码的轮次不再调用 `memory.extract`，也不写 finalize outbox；跳过原因以「本地预过滤：」开头写入决策日志（只记长度与 SHA-256）。明确的「记住/remember」请求与助手提问后的短回答永不跳过。不影响 `memory.compact` 压缩与请求侧召回。
+- 敏感句子的本地直存：`ALLOW_SENSITIVE_EGRESS=false` 时，含密码/证件号/账号且紧邻「记住」的句子不再丢弃，而是不经模型、不生成向量地原句保存为 `sensitive` 记忆并归入「私密信息」空间；无「记住」的敏感句子只在决策日志留下哈希（理由「敏感句子未出站且未明确要求记住」）。
+- `MEMORY_EGRESS_CEILING`（默认 `private`）：`ALLOW_SENSITIVE_EGRESS=false` 时仍允许出站到提取/embedding 模型的最高本地敏感级别；设为 `normal` 可恢复严格模式（同样按句子过滤）。
+- 自动替换旧记忆（`MEMORY_AUTO_SUPERSEDE`，默认开启）：带明确转变标记（换成/改成/现在/不再/取代/switched/now）的新记忆，与某条同类型、同主体、同一可替换属性的活跃旧记忆向量高度相似时，自动把旧记忆关闭为历史（`status=resolved`、`valid_until`、`superseded_by`），不再留一对重复给体检。偏好类（喜欢/常喝）只有带否定冲突才替换；纯否定翻转、事件与反思类仍交给体检。需要已配置 `memory.embedding`。`POST /memories/{id}/temporal/restore` 对这类无键链原地重开旧记忆并解链；软删除链成员会自动解链。REST `/memories/ingest`、`POST /memories` 与 MCP 结果新增 `superseded_memory_id`；决策日志新增 `auto_supersede` / `auto_supersede_undo`；Console 记忆详情的历史版本提供「恢复此版本」。设 `MEMORY_AUTO_SUPERSEDE=false` 可回到仅体检建议模式。
+
 ### Changed
+
+- `CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS` 默认值 2 → 4，几轮问答式确认落在抽取视野内。
+- 手机端 Console：文档不再整体滚动而由内容区滚动（修复 fixed 底栏随浏览器工具栏跑位），底栏与顶栏改为近实色；记忆档案与核心记忆历史在手机上为底部抽屉；浮现模式改为下拉；空间管理仅专家模式显示；渠道名显示中文（dashscope → 阿里云百炼），模型胶囊只显示模型名；运行信息折叠、去掉「内部接线」；移除工作室「最近未写入记忆」面板与记忆库遮罩提示；顶栏用户首字母改为设置图标。
+- 管理密钥验证后卡片收成一行；模型页移除专家模式提示条。
+- 上游本地失败提示区分「域名解析失败」与「连接上游失败」，不再一律报「安全校验失败」；核心记忆整理未写入时显示原因而非「已重新整理」。
+- 新建渠道自动创建的 chat token 命名为「聊天 App · 日期」。
+- 敏感级别重新分档：健康/医疗与精确住址从 `sensitive` 降为 `private`，与联系方式、收入同档；`sensitive` 只保留密码/密钥、证件号、银行卡/账号。`private` 记忆由提取模型直接保存（importance≥7、confidence≥0.85，不再要求说「记住」），`sensitive` 仍需 importance≥8、confidence≥0.9 且紧邻「记住」。旧库中已标为 `sensitive` 的健康记忆不自动迁移。
+- 出站过滤从整条消息改为按句子：一句话里出现敏感词不再丢掉整轮的其余内容；只有级别超过 `MEMORY_EGRESS_CEILING` 的句子被扣留，其余句子照常提取。压缩摘要、体检与知识代理的出站守卫本轮未改，仍是「非 normal 一律不出站」。
+- 聊天召回可按相关性注入 `private` 记忆（排序压低，提示词标注「仅在与用户当前问题明确相关时使用」）；`sensitive` 永不注入；核心记忆整理、自然浮现与 REST 默认搜索仍只含 `normal`。检索缓存键第 4 位由布尔改为级别上限字符串。
+- 标为 `normal` 的知识文档中仅提及健康/住址词汇的分块现在会与文档其余部分一同 embedding；标为 `private`/`sensitive` 的文档行为不变。
+- 体检不再对已被新版本取代的记忆重复提出重复/冲突/过期建议；评测新增 `keyless_supersession_edge_count`，无键自动替换链不再被判为退化。
+- `_looks_superseding` 的英文标记改为词边界匹配，`know`/`snow` 不再误判为 `now`。
 
 - 旧单卷（legacy all-in-one）布局迁移从 Docker 一键安装器拆分为独立一次性工具 `deploy/legacy_cutover.py`；`install.sh` / `install.ps1` 检测到 legacy 布局时 fail-closed 并指向该工具，split 布局的 journal 状态机语义不变。删除未使用的 `stack-maintenance` Dockerfile target 与开发 compose 中的对应 service（发布路径 `docker-compose.user.yml` 的 maintenance 服务继续复用 init 镜像）。
 

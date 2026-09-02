@@ -1,5 +1,6 @@
 import json
 import re
+import unicodedata
 from datetime import datetime
 from typing import Literal
 
@@ -72,8 +73,14 @@ _PREFERENCE_MARKERS = (
     "i do not like",
 )
 
+# ``sensitive`` (secrets / IDs / account numbers) keeps the strictest floors and
+# additionally needs an explicit, clause-adjacent 记住 directive.
 SENSITIVE_MIN_IMPORTANCE = 8
 SENSITIVE_MIN_CONFIDENCE = 0.9
+# ``private`` (health, address, contact, income) is personal-but-useful: it is
+# saved automatically with raised floors but without a directive.
+PRIVATE_MIN_IMPORTANCE = 7
+PRIVATE_MIN_CONFIDENCE = 0.85
 
 ExtractionReasonCode = Literal[
     "has_candidates",
@@ -270,6 +277,12 @@ _GROUNDING_RELATION_PATTERNS: dict[str, tuple[str, ...]] = {
         r"拥有|我有|用户有|本人有|没有|"
         r"(?:用户|我|本人)无(?:任何)?|养了|养着",
         r"\b(?:have|has|had|own|owns|owned|owning)\b",
+    ),
+    "education": (
+        r"就读|在读|上大学|读大学|上学|读书|念书|专业|学生|毕业|学校|大学是|"
+        r"本科|硕士|博士|研究生|学历",
+        r"\b(?:attend|attends|attended|enrolled|enrol|study|studies|studying|studied|"
+        r"major|majors|majored|university|college|graduate|graduated|student|degree)\b",
     ),
     "identity": (
         r"名字|姓名|叫我|称呼我|身份证|护照|证件",
@@ -520,6 +533,7 @@ class LLMMemoryExtractor:
                 user_message=source_text,
                 require_quote_in_user_message=True,
                 conversation_context=context_quote_source,
+                relation_hint_context=conversation_context,
             )
             if source_rejection:
                 outcomes.append(
@@ -800,6 +814,7 @@ def _raw_candidate_source_gate_reason(
     user_message: str | None,
     require_quote_in_user_message: bool,
     conversation_context: str | None = None,
+    relation_hint_context: str | None = None,
 ) -> str | None:
     """Validate model evidence before any post-extraction mutation."""
     if candidate.action == "ignore":
@@ -819,17 +834,35 @@ def _raw_candidate_source_gate_reason(
     if context_rejection:
         return context_rejection
     _apply_sensitivity_floor(candidate)
+    context_quote = candidate.context_quote.strip()
+    grounding_quote = quote
+    relation_context = context_quote
+    if (
+        context_quote
+        and _is_pure_affirmation(user_message)
+        and _quote_matches_source(context_quote, _last_assistant_turn(conversation_context))
+    ):
+        # "那我押青海大学？" / "对了": the user adds no words of their own, so
+        # the verified assistant sentence they confirm is the only place the
+        # object can be anchored. Restricted to the immediately preceding
+        # assistant turn; entity/value checks below still run against it. The
+        # asserted relation (就读/喜欢/住在…) must still be evidenced, and for
+        # that the whole available context (summary + recent turns) may speak:
+        # the question the assistant was answering usually lives there.
+        grounding_quote = f"{quote}\n{context_quote}"
+        relation_context = "\n".join(
+            part for part in (context_quote, conversation_context, relation_hint_context) if part
+        )
+        _append_reason(candidate, "用户仅作肯定确认，事实锚定于紧邻的助手原话（context_quote 已核验）")
     grounding_candidate = _candidate_for_raw_grounding(
         candidate,
         quote=quote,
-        context_quote_verified=bool(candidate.context_quote.strip()),
+        context_quote_verified=bool(context_quote),
     )
     return _grounding_gate_reason(
         grounding_candidate,
-        quote=quote,
-        relation_context=(
-            candidate.context_quote.strip() if candidate.context_quote.strip() else ""
-        ),
+        quote=grounding_quote,
+        relation_context=relation_context,
     )
 
 
@@ -887,21 +920,104 @@ def _matched_age(match: re.Match[str] | None) -> int | None:
     return age if 0 < age < 130 else None
 
 
+_MARKDOWN_MARKS = frozenset("*_~`>#")
+_INTERJECTION_PREFIX_RE = re.compile(r"^(?:哈+|嗯+|呃+|啊+|噢+|哦+|嘿+|哇+|欸+|lol|haha+|hhh+)+")
+_AFFIRMATION_SUFFIX_RE = re.compile(r"(?:呀|啊|呢|哦|哟|啦|嘞|嘛|哒|哈+|呗|咯)+$")
+# Whole-message affirmations after normalisation; the user adds no fact of their own.
+_AFFIRMATIONS = frozenset(
+    {
+        "对", "对了", "对的", "对对", "对对对", "没错", "是", "是的", "是这样", "正确",
+        "答对了", "猜对了", "猜中了", "中了", "被你猜对了", "被你猜到了", "被你逮到了",
+        "恭喜猜对了", "你猜对了", "你说对了", "对头", "嗯对", "确实", "确实如此",
+        "bingo", "yes", "yep", "yeah", "correct", "right", "exactly", "thatsright",
+        "youreright", "youareright", "spoton", "youguessedit", "gotit",
+    }
+)
+
+
+def _normalized_for_quote_match(text: str) -> str:
+    """Formatting-insensitive form for quote containment checks.
+
+    Extraction models routinely drop markdown emphasis, emoji and line breaks
+    when they copy a sentence; those never change what was said, so neither
+    side keeps them. Letters, digits and punctuation stay verbatim.
+    """
+
+    pieces: list[str] = []
+    for char in unicodedata.normalize("NFKC", text):
+        if char.isspace() or char in _MARKDOWN_MARKS:
+            continue
+        if "\ufe00" <= char <= "\ufe0f":  # variation selectors (emoji presentation)
+            continue
+        if unicodedata.category(char) in {"So", "Sk", "Cf"}:  # emoji, modifiers, ZWJ
+            continue
+        pieces.append(char)
+    return "".join(pieces).casefold()
+
+
+def _quote_matches_source(quote: str, source: str | None) -> bool:
+    if not quote or not source:
+        return False
+    if quote in source:
+        return True
+    normalized_quote = _normalized_for_quote_match(quote)
+    return bool(normalized_quote) and normalized_quote in _normalized_for_quote_match(source)
+
+
+def _last_assistant_turn(conversation_context: str | None) -> str:
+    """The most recent 助手 block of a rendered 用户：/助手： dialogue."""
+
+    if not conversation_context:
+        return ""
+    text = conversation_context
+    start = text.rfind("\n助手：")
+    if start == -1:
+        if not text.startswith("助手："):
+            return ""
+        start = 0
+    block = text[start:].lstrip("\n")[len("助手："):]
+    end = block.find("\n用户：")
+    return block if end == -1 else block[:end]
+
+
+def _is_pure_affirmation(user_message: str | None) -> bool:
+    if not user_message:
+        return False
+    text = _normalized_for_quote_match(user_message)
+    text = re.sub(r"[^\w\u4e00-\u9fff]", "", text)
+    text = _INTERJECTION_PREFIX_RE.sub("", text)
+    text = _AFFIRMATION_SUFFIX_RE.sub("", text) or text
+    return 0 < len(text) <= 12 and text in _AFFIRMATIONS
+
+
+def _append_reason(candidate: CandidateMemory, note: str) -> None:
+    candidate.reason = f"{candidate.reason}；{note}" if candidate.reason else note
+
+
 def _context_quote_gate_reason(
     candidate: CandidateMemory,
     *,
     conversation_context: str | None,
 ) -> str | None:
     context_quote = candidate.context_quote.strip()
+    unverified_reason: str | None = None
     if context_quote:
         if not conversation_context:
-            return "candidate.context_quote 缺少较早对话上下文支撑"
-        if context_quote not in conversation_context:
-            return "context_quote 不是较早对话原文，疑似模型自行编造"
+            unverified_reason = "candidate.context_quote 缺少较早对话上下文支撑"
+        elif not _quote_matches_source(context_quote, conversation_context):
+            unverified_reason = "context_quote 不是较早对话原文，疑似模型自行编造"
+        if unverified_reason:
+            # The context quote only disambiguates. A memory whose facts are
+            # already anchored in the user's own source_quote keeps going
+            # without it; candidates that need the context (bare age answers
+            # below) are still rejected, with the original reason.
+            candidate.context_quote = ""
+            context_quote = ""
+            _append_reason(candidate, f"{unverified_reason}，已忽略该引用")
 
     if _bare_age_answer(candidate.source_quote, candidate.memory) is not None:
         if not context_quote:
-            return "仅凭数字无法判断年龄语义，缺少 context_quote"
+            return unverified_reason or "仅凭数字无法判断年龄语义，缺少 context_quote"
         if not AGE_CONTEXT_PATTERN.search(context_quote):
             return "context_quote 未明确询问年龄，无法解释本轮数字回答"
     return None
@@ -928,7 +1044,7 @@ def _source_quote_gate_reason(
         if require_quote_in_user_message:
             return "缺少 source_quote"
         return "缺少 source_quote（必须提供用户原话的逐字片段）"
-    if require_quote_in_user_message and quote not in (user_message or ""):
+    if require_quote_in_user_message and not _quote_matches_source(quote, user_message or ""):
         return "source_quote 不是用户原话，疑似模型自行编造"
     return None
 
@@ -1249,6 +1365,36 @@ def _structured_value_present(value: str, quote: str) -> bool:
     return bool(compact_value) and compact_value in compact_quote
 
 
+# Public facade for the resolver's automatic supersede. These wrap the private
+# grounding heuristics so resolver.py does not depend on underscore names.
+
+
+def grounding_subjects_compatible_both_ways(new_text: str, old_text: str) -> bool:
+    """The two statements talk about the same actor (用户 vs 用户的猫/朋友 never pair)."""
+    return _grounding_subjects_compatible(new_text, old_text) and _grounding_subjects_compatible(
+        old_text, new_text
+    )
+
+
+def grounding_terms_overlap(new_text: str, old_text: str) -> bool:
+    """The two statements share at least one non-generic grounded term."""
+    return bool(_grounding_terms(new_text) & _grounding_terms(old_text))
+
+
+def shared_relation_families(new_text: str, old_text: str) -> set[str]:
+    """Relation families (employment, residence, usage, preference, …) both assert."""
+    return _grounding_relation_families(new_text) & _grounding_relation_families(old_text)
+
+
+def structured_value_kind_changed(new_text: str, old_text: str) -> bool:
+    """Both carry the same kind of structured value (number, e-mail, …) with different values."""
+    new_values = _structured_values(new_text)
+    old_values = _structured_values(old_text)
+    new_kinds = {kind for kind, _ in new_values}
+    old_kinds = {kind for kind, _ in old_values}
+    return bool(new_kinds & old_kinds) and new_values != old_values
+
+
 def _sensitive_gate_reason(
     candidate: CandidateMemory,
     *,
@@ -1257,22 +1403,30 @@ def _sensitive_gate_reason(
 ) -> str | None:
     if candidate.sensitivity == "normal":
         return None
-    if candidate.importance < SENSITIVE_MIN_IMPORTANCE:
+    if candidate.sensitivity == "private":
+        min_importance, min_confidence = PRIVATE_MIN_IMPORTANCE, PRIVATE_MIN_CONFIDENCE
+    else:
+        min_importance, min_confidence = SENSITIVE_MIN_IMPORTANCE, SENSITIVE_MIN_CONFIDENCE
+    if candidate.importance < min_importance:
         return (
             f"{candidate.sensitivity} 记忆 importance {candidate.importance} "
-            f"低于敏感信息保存阈值 {SENSITIVE_MIN_IMPORTANCE}"
+            f"低于敏感信息保存阈值 {min_importance}"
         )
-    if candidate.confidence < SENSITIVE_MIN_CONFIDENCE:
+    if candidate.confidence < min_confidence:
         return (
             f"{candidate.sensitivity} 记忆 confidence {candidate.confidence} "
-            f"低于敏感信息保存阈值 {SENSITIVE_MIN_CONFIDENCE}"
+            f"低于敏感信息保存阈值 {min_confidence}"
         )
+    if candidate.sensitivity == "private":
+        # Personal-but-useful facts (health, address, contact, income) save
+        # without a directive; only secrets / IDs / account numbers need one.
+        return None
     evidence_quotes = _sensitive_evidence_quotes(candidate, quote)
     if not all(
         _has_scoped_explicit_memory_marker(user_message or quote, evidence_quote)
         for evidence_quote in evidence_quotes
     ):
-        return "隐私或敏感信息只有在用户明确要求记住时才保存"
+        return "密码、证件号或账号等敏感信息只有在用户明确要求记住时才保存"
     return None
 
 

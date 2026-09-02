@@ -57,3 +57,16 @@ node_modules/
 **/.kun-canvas/
 .reasonix/
 **/.reasonix/
+
+# Android client (apps/android): local wheels and Gradle outputs
+apps/android/wheels/
+apps/android/native/
+apps/android/build/
+apps/android/**/build/
+apps/android/.gradle/
+apps/android/local.properties
+apps/android/.idea/
+apps/android/keystore.properties
+*.keystore
+*.jks
+.jspace/

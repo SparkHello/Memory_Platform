@@ -1,0 +1,41 @@
+# Runtime dependencies for the embedded (Android / Termux) single-process stack.
+# Deliberately *not* uvicorn[standard]: uvloop, httptools, websockets and
+# watchfiles are native extras that have no Android wheels and are not needed
+# with loop="asyncio", http="h11", ws="none".
+#
+# Versions track requirements-runtime.lock at the repo root, minus packages the
+# services never import (cryptography/cffi/pycparser are only pyjwt's optional
+# RSA extra, pyyaml is unused) - verified by running the stack without them.
+# Everything left is pure Python except the two packages marked "rust", which
+# have no Android wheels anywhere; apps/android/wheels/ holds the copies built
+# on the phone by Termux (scripts/android/termux-export-wheels.sh).
+fastapi==0.141.1
+starlette==1.3.1
+uvicorn==0.52.1
+h11==0.16.0
+httpx==0.28.1
+httpcore==1.0.9
+httpx-sse==0.4.3
+anyio==4.14.2
+sniffio>=1.3
+mcp==1.29.0
+sse-starlette==3.4.6
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.6.3          # rust
+pydantic==2.13.4
+pydantic-core==2.46.4      # rust
+pydantic-settings==2.14.2
+annotated-types==0.8.0
+annotated-doc==0.0.5
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+python-dotenv==1.2.2
+python-multipart==0.0.32
+pypdf==6.15.0
+pyjwt==2.13.0
+attrs==26.1.0
+idna==3.18
+certifi==2026.7.22
+click==8.4.2

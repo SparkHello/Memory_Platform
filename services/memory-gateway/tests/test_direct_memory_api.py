@@ -1138,3 +1138,78 @@ class TestArchiveExpiredEndpoint:
     def test_requires_auth(self, client):
         response = client.post("/memories/archive-expired")
         assert response.status_code == 401
+
+
+class _StaticSpaceEmbeddingClient:
+    embedding_space_id = "test-space"
+
+    async def embed(self, text: str) -> list[float] | None:
+        return [1.0, 0.0]
+
+
+def _save_body(content: str) -> dict:
+    return {
+        "content": content,
+        "type": "semantic",
+        "importance": 8,
+        "confidence": 0.95,
+        "stability": "stable",
+        "sensitivity": "normal",
+        "source_quote": content,
+    }
+
+
+class TestAutoSupersedeViaDirectSave:
+    def test_direct_save_auto_supersedes_and_keyless_restore_reopens_in_place(
+        self, client, auth_headers, memory_store: MemoryStore
+    ):
+        from app.api import deps
+
+        client.app.dependency_overrides[deps.get_embedding_client] = (
+            lambda: _StaticSpaceEmbeddingClient()
+        )
+
+        first = client.post("/memories", json=_save_body("用户平时用 iPhone 手机。"), headers=auth_headers)
+        assert first.status_code == 200
+        old_id = first.json()["memory_id"]
+
+        second = client.post("/memories", json=_save_body("用户现在改用安卓手机。"), headers=auth_headers)
+        assert second.status_code == 200
+        data = second.json()
+        assert data["action"] == "update"
+        assert data["relation"] == "supersede"
+        assert data["superseded_memory_id"] == old_id
+        new_id = data["memory_id"]
+
+        old_after = memory_store.get_memory(memory_id=old_id, user_id="default")
+        assert old_after is not None and old_after.superseded_by == new_id
+
+        restored = client.post(f"/memories/{old_id}/temporal/restore", headers=auth_headers)
+        assert restored.status_code == 200
+        memory = restored.json()["memory"]
+        assert memory["id"] == old_id
+        assert memory["status"] == "dynamic"
+        assert memory["superseded_by"] is None
+        assert memory["valid_until"] is None
+        new_after = memory_store.get_memory(memory_id=new_id, user_id="default")
+        assert new_after is not None and new_after.supersedes is None
+
+    def test_direct_save_respects_auto_supersede_setting(
+        self, client, auth_headers, memory_store: MemoryStore
+    ):
+        from app.api import deps
+
+        client.app.dependency_overrides[deps.get_embedding_client] = (
+            lambda: _StaticSpaceEmbeddingClient()
+        )
+        patched = get_settings().model_copy(update={"memory_auto_supersede": False})
+        client.app.dependency_overrides[get_settings] = lambda: patched
+
+        first = client.post("/memories", json=_save_body("用户平时用 iPhone 手机。"), headers=auth_headers)
+        old_id = first.json()["memory_id"]
+        second = client.post("/memories", json=_save_body("用户现在改用安卓手机。"), headers=auth_headers)
+
+        assert second.json()["action"] == "create"
+        assert second.json()["superseded_memory_id"] is None
+        old_after = memory_store.get_memory(memory_id=old_id, user_id="default")
+        assert old_after is not None and old_after.superseded_by is None

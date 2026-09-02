@@ -216,4 +216,64 @@ describe("provider object management", () => {
       "admin-key"
     );
   });
+
+  it("lets an admin edit the capabilities of an existing deployment", async () => {
+    const user = userEvent.setup();
+    const updateProviderDeploymentCapabilities = vi.fn().mockResolvedValue({
+      updated: true,
+      id: "orphan-chat",
+      capabilities: { tools: true },
+      revision: "b".repeat(64)
+    });
+    const probeProviderChannelCapabilities = vi.fn().mockResolvedValue({
+      persisted: false,
+      revision: "a".repeat(64),
+      upstream_model: "author/orphan-v1",
+      ok: true,
+      capabilities: { streaming: true, tools: true, reasoning: true },
+      details: { chat: { ok: true } }
+    });
+    const api = {
+      providersStatus: vi.fn().mockResolvedValue(status),
+      checkProviderAdminKey: vi.fn().mockResolvedValue({ valid: true }),
+      providerAdminConfiguration: vi.fn().mockResolvedValue({
+        ...adminControl,
+        deployments: adminControl.deployments.map((deployment) =>
+          deployment.id === "orphan-chat" ? { ...deployment, capabilities: {} } : deployment
+        )
+      }),
+      updateProviderDeploymentCapabilities,
+      probeProviderChannelCapabilities,
+      setProviderObjectEnabled: vi.fn()
+    } as unknown as MemoryApi;
+
+    // an earlier test in this file may have left a validated key in session storage
+    sessionStorage.clear();
+    render(<ProvidersPage api={api} expertMode />);
+    await screen.findByText("official");
+    await user.type(screen.getByLabelText("Model Gateway admin 密钥"), "admin-key");
+    await user.click(screen.getByRole("button", { name: "验证管理密钥" }));
+
+    const chip = await screen.findByRole("button", { name: "修改模型 orphan-chat 的能力" });
+    expect(chip).toHaveTextContent("无工具调用");
+    await user.click(chip);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("模型能力：author/orphan-v1");
+    // auto-detect reuses the saved channel secret: no key is typed here
+    await user.click(within(dialog).getByRole("button", { name: "自动检测能力" }));
+    expect(probeProviderChannelCapabilities).toHaveBeenCalledWith(
+      expect.objectContaining({ connection_id: "active-channel", upstream_model: "author/orphan-v1" }),
+      "admin-key"
+    );
+    expect(await within(dialog).findByLabelText("工具调用 tools")).toBeChecked();
+    expect(within(dialog).getByLabelText("推理 reasoning")).toBeChecked();
+    await user.click(within(dialog).getByRole("button", { name: "保存能力" }));
+
+    expect(updateProviderDeploymentCapabilities).toHaveBeenCalledWith(
+      "orphan-chat",
+      "a".repeat(64),
+      expect.objectContaining({ tools: true, reasoning: true }),
+      "admin-key"
+    );
+  });
 });

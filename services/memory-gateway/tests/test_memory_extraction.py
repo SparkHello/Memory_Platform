@@ -77,10 +77,11 @@ def _project_preference_extraction_json(*, preference_entities: list[str]) -> st
 
 
 @pytest.mark.asyncio
-async def test_sensitive_ingest_is_blocked_before_remote_extraction(
+async def test_directive_sensitive_sentence_is_saved_locally_without_egress(
     memory_store: MemoryStore,
     fake_llm,
 ) -> None:
+    """A 记住 sentence with an ID number never leaves the host but is still kept."""
     service = MemoryIngestService(
         store=memory_store,
         embedding_client=NullEmbeddingClient(),
@@ -92,12 +93,64 @@ async def test_sensitive_ingest_is_blocked_before_remote_extraction(
         text="记住，我的身份证号是 123456789012345678。",
     )
 
-    assert result.ignored == 1
-    assert result.created == 0
+    assert result.created == 1
+    assert result.ignored == 0
+    assert result.status == "completed"
     assert fake_llm.extraction_messages == []
-    assert memory_store.list_memories(user_id="default") == []
-    audit = json.loads(memory_store.list_decision_logs(user_id="default")[0].candidate_json)
+    assert fake_llm.extraction_calls == 0
+    memories = memory_store.list_memories(user_id="default")
+    assert len(memories) == 1
+    saved = memories[0]
+    assert saved.content == "我的身份证号是 123456789012345678。"
+    assert saved.sensitivity == "sensitive"
+    assert saved.origin == "user_asserted"
+    assert saved.embedding_json is None
+    assert saved.topics == ["私密信息"]
+    assert saved.entities == []
+    assert saved.importance == 8
+    assert saved.confidence == 0.9
+    logs = memory_store.list_decision_logs(user_id="default")
+    assert len(logs) == 1
+    audit = json.loads(logs[0].candidate_json)
     assert audit["sensitive_egress_blocked"] is True
+    assert audit["local_directive_save"] is True
+    assert audit["sensitivity"] == "sensitive"
+    assert "government_id" in audit["categories"]
+    assert "123456789012345678" not in json.dumps(audit, ensure_ascii=False)
+    assert logs[0].reason.startswith("敏感句子未出站，用户明确要求记住，已本地保存")
+
+
+@pytest.mark.asyncio
+async def test_sensitive_sentence_without_directive_is_dropped_with_hashes_only(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(
+        user_id="default",
+        text="我的身份证号是 123456789012345678。",
+    )
+
+    assert result.created == 0
+    assert result.ignored == 1
+    assert result.status == "rejected"
+    assert result.reason == "敏感句子未出站且未明确要求记住"
+    assert fake_llm.extraction_calls == 0
+    assert memory_store.list_memories(user_id="default") == []
+    logs = memory_store.list_decision_logs(user_id="default")
+    assert len(logs) == 1
+    audit = json.loads(logs[0].candidate_json)
+    assert audit["sensitive_egress_blocked"] is True
+    assert audit["withheld_sentence_count"] == 1
+    assert audit["kept_sentence_count"] == 0
+    assert audit["withheld_sentences"][0]["level"] == "sensitive"
+    assert audit["withheld_sentences"][0]["directive"] is False
+    assert len(audit["withheld_sentences"][0]["sha256"]) == 64
     assert "123456789012345678" not in json.dumps(audit, ensure_ascii=False)
 
 
@@ -1154,7 +1207,7 @@ def test_detect_text_sensitivity_is_reusable_without_llm() -> None:
     assert detect_text_sensitivity("我喜欢黑咖啡") == "normal"
     assert detect_text_sensitivity("我的邮箱是 user@example.com") == "private"
     assert detect_text_sensitivity("银行卡密码是 123456") == "sensitive"
-    assert detect_text_sensitivity("需要持续控制血糖") == "sensitive"
+    assert detect_text_sensitivity("需要持续控制血糖") == "private"
 
 
 @pytest.mark.asyncio
@@ -2373,3 +2426,289 @@ def test_candidate_entities_drop_compound_fragments_and_duplicates() -> None:
     )
 
     assert candidate.entities == ["Dark Mode", "Kelivo"]
+
+
+# ---------------------------------------------------------------------------
+# Sentence-level egress: private travels with the chat, sensitive stays local.
+# ---------------------------------------------------------------------------
+
+
+def _ingest_service(memory_store: MemoryStore, fake_llm, **overrides) -> MemoryIngestService:
+    return MemoryIngestService(
+        store=memory_store,
+        embedding_client=NullEmbeddingClient(),
+        llm_client=fake_llm,
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_message_extracts_normal_and_private_but_withholds_sensitive(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    import hashlib
+
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户喜欢黑咖啡。",
+        source_quote="我喜欢黑咖啡",
+    )
+    service = _ingest_service(memory_store, fake_llm)
+
+    result = await service.ingest(
+        user_id="default",
+        text="我喜欢黑咖啡。我有糖尿病。我的银行卡密码是 123456。",
+    )
+
+    sent = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
+    assert fake_llm.extraction_calls == 1
+    assert "我喜欢黑咖啡" in sent
+    # private (health) reaches the extraction model like the rest of the chat did
+    assert "我有糖尿病" in sent
+    # sensitive (credential / account) never leaves the host
+    assert "银行卡密码" not in sent
+    assert "123456" not in sent
+    assert result.created == 1
+    assert result.ignored == 1
+
+    logs = memory_store.list_decision_logs(user_id="default")
+    aggregate = next(
+        json.loads(log.candidate_json)
+        for log in logs
+        if "withheld_sentence_count" in log.candidate_json
+    )
+    assert aggregate["withheld_sentence_count"] == 1
+    assert aggregate["kept_sentence_count"] == 2
+    withheld = aggregate["withheld_sentences"][0]
+    assert withheld["level"] == "sensitive"
+    assert withheld["directive"] is False
+    assert withheld["sha256"] == hashlib.sha256("我的银行卡密码是 123456。".encode("utf-8")).hexdigest()
+    assert "银行卡密码" not in json.dumps(aggregate, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_private_health_fact_saves_without_directive(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户对花生过敏。",
+        importance=8,
+        confidence=0.9,
+        sensitivity="private",
+        source_quote="我对花生过敏",
+    )
+    service = _ingest_service(memory_store, fake_llm)
+
+    result = await service.ingest(user_id="default", text="我对花生过敏。")
+
+    assert result.created == 1
+    saved = memory_store.list_memories(user_id="default")[0]
+    assert saved.sensitivity == "private"
+    assert saved.topics == ["私密信息"]
+    assert saved.entities == []
+
+
+@pytest.mark.asyncio
+async def test_private_candidate_below_raised_floor_is_rejected(fake_llm) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户对花生过敏。",
+        importance=6,
+        confidence=0.9,
+        sensitivity="private",
+        source_quote="我对花生过敏",
+    )
+
+    batch = await LLMMemoryExtractor(llm_client=fake_llm).extract_many(
+        source_text="我对花生过敏。",
+    )
+
+    assert batch.outcomes[0].accepted is False
+    assert "低于敏感信息保存阈值 7" in batch.outcomes[0].reason
+
+
+@pytest.mark.asyncio
+async def test_local_directive_save_is_deduplicated_on_repeat(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = _ingest_service(memory_store, fake_llm)
+    text = "记住，我的银行卡密码是 123456。"
+
+    first = await service.ingest(user_id="default", text=text)
+    second = await service.ingest(user_id="default", text=text)
+
+    assert first.created == 1
+    assert second.created == 0
+    assert second.ignored == 1
+    assert "已有相同记忆" in second.items[0].reason
+    assert len(memory_store.list_memories(user_id="default")) == 1
+    assert fake_llm.extraction_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_local_directive_save_rejects_assumption_marker(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = _ingest_service(memory_store, fake_llm)
+
+    result = await service.ingest(
+        user_id="default",
+        text="如果我的银行卡密码是 123456，记住这件事。",
+    )
+
+    assert result.created == 0
+    assert result.ignored == 1
+    assert "假设场景" in result.items[0].reason
+    assert memory_store.list_memories(user_id="default") == []
+
+
+@pytest.mark.asyncio
+async def test_quote_spanning_into_withheld_sentence_is_rejected(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户喜欢黑咖啡且银行卡密码是 123456。",
+        source_quote="我喜欢黑咖啡。我的银行卡密码是 123456",
+    )
+    service = _ingest_service(memory_store, fake_llm)
+
+    result = await service.ingest(
+        user_id="default",
+        text="我喜欢黑咖啡。我的银行卡密码是 123456。",
+    )
+
+    assert result.created == 0
+    assert memory_store.list_memories(user_id="default") == []
+    assert any("source_quote" in (item.reason or "") for item in result.items)
+
+
+@pytest.mark.asyncio
+async def test_egress_enabled_sends_the_whole_message(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = _ingest_service(memory_store, fake_llm, allow_sensitive_egress=True)
+
+    await service.ingest(
+        user_id="default",
+        text="我喜欢黑咖啡。我的银行卡密码是 123456。",
+    )
+
+    sent = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
+    assert "银行卡密码是 123456" in sent
+    assert all(
+        "withheld_sentence_count" not in log.candidate_json
+        for log in memory_store.list_decision_logs(user_id="default")
+    )
+
+
+@pytest.mark.asyncio
+async def test_egress_ceiling_normal_withholds_private_sentences(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    service = _ingest_service(memory_store, fake_llm, egress_ceiling="normal")
+
+    await service.ingest(user_id="default", text="我喜欢黑咖啡。我有糖尿病。")
+
+    sent = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
+    assert "我喜欢黑咖啡" in sent
+    assert "糖尿病" not in sent
+    aggregate = next(
+        json.loads(log.candidate_json)
+        for log in memory_store.list_decision_logs(user_id="default")
+        if "withheld_sentence_count" in log.candidate_json
+    )
+    assert aggregate["withheld_sentences"][0]["level"] == "private"
+    assert aggregate["withheld_sentences"][0]["categories"] == ["health"]
+
+
+class _StaticSpaceEmbeddingClient:
+    embedding_space_id = "test-space"
+
+    async def embed(self, text: str) -> list[float] | None:
+        return [1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_ingest_reports_update_and_target_memory_id_on_auto_supersede(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户的猫叫小白。",
+        type="semantic",
+        importance=8,
+        topics=["宠物"],
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
+    )
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户的猫现在改名叫小黑。",
+        topics=["宠物"],
+        source_quote="我的猫现在改名叫小黑",
+    )
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=_StaticSpaceEmbeddingClient(),
+        llm_client=fake_llm,
+    )
+
+    result = await service.ingest(user_id="default", text="我的猫现在改名叫小黑。")
+
+    assert result.updated == 1
+    assert result.created == 0
+    assert result.status == "completed"
+    item = result.items[0]
+    assert item.action == "update"
+    assert item.relation == "supersede"
+    assert item.superseded_memory_id == old.id
+    ingest_log = next(
+        log
+        for log in memory_store.list_decision_logs(user_id="default")
+        if '"source": "ingest"' in log.candidate_json
+    )
+    assert ingest_log.decision == "update"
+    payload = json.loads(ingest_log.candidate_json)
+    assert payload["target_memory_id"] == old.id
+    assert payload["relation"] == "supersede"
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by == item.memory_id
+
+
+@pytest.mark.asyncio
+async def test_ingest_auto_supersede_can_be_disabled(
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    old = memory_store.create_memory(
+        user_id="default",
+        content="用户的猫叫小白。",
+        type="semantic",
+        importance=8,
+        topics=["宠物"],
+        embedding_json=json.dumps([1.0, 0.0]),
+        embedding_space_id="test-space",
+    )
+    fake_llm.extraction_content = _extraction_json(
+        memory="用户的猫现在改名叫小黑。",
+        topics=["宠物"],
+        source_quote="我的猫现在改名叫小黑",
+    )
+    service = MemoryIngestService(
+        store=memory_store,
+        embedding_client=_StaticSpaceEmbeddingClient(),
+        llm_client=fake_llm,
+        auto_supersede=False,
+    )
+
+    result = await service.ingest(user_id="default", text="我的猫现在改名叫小黑。")
+
+    assert result.created == 1
+    assert result.updated == 0
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by is None

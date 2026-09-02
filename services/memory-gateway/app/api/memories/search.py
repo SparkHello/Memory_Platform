@@ -93,6 +93,8 @@ async def ingest_memory_text(
         embedding_client=embedding_client,
         llm_client=llm_client,
         allow_sensitive_egress=settings.allow_sensitive_egress,
+        egress_ceiling=settings.memory_egress_ceiling,
+        auto_supersede=settings.memory_auto_supersede,
     )
     result = await ingester.ingest(
         user_id=user_id,

@@ -14,6 +14,7 @@ from app.memory.classification import (
     normalize_classification_names,
 )
 from app.memory.models import (
+    AutoSupersedeDecision,
     MemoryAction,
     MemoryOrigin,
     MemoryRecord,
@@ -53,9 +54,11 @@ from app.memory.store.spaces import (
     _validate_space_ids,
 )
 from app.memory.store.temporal import (
+    _apply_auto_supersede,
     _apply_temporal_invalidation,
     _detach_temporal_position,
     _rebuild_temporal_key,
+    _unlink_keyless_chain_member,
 )
 from app.memory.utils import _parse_iso_datetime
 
@@ -87,6 +90,7 @@ def create_memory(
     space_ids: list[str] | None = None,
     decay_lambda: float | None = None,
     final_matcher: Callable[[list[MemoryRecord]], MemoryRecord | None] | None = None,
+    supersede_matcher: Callable[[list[MemoryRecord]], AutoSupersedeDecision | None] | None = None,
 ) -> MemoryRecord:
     now = utc_now_iso()
     evidence_memory_ids = evidence_memory_ids or []
@@ -137,7 +141,8 @@ def create_memory(
         archived=0,
     )
     with store._connect() as connection:
-        if final_matcher is not None:
+        supersede_decision: AutoSupersedeDecision | None = None
+        if final_matcher is not None or supersede_matcher is not None:
             connection.execute("BEGIN IMMEDIATE")
             latest_rows = connection.execute(
                 """
@@ -148,14 +153,18 @@ def create_memory(
                 """,
                 (user_id,),
             ).fetchall()
-            matched = final_matcher(
-                _rows_to_memories_on_connection(
-                    connection=connection,
-                    rows=latest_rows,
-                )
+            latest = _rows_to_memories_on_connection(
+                connection=connection,
+                rows=latest_rows,
             )
-            if matched is not None:
-                return matched
+            if final_matcher is not None:
+                matched = final_matcher(latest)
+                if matched is not None:
+                    return matched
+            # Keyed facts are owned by the temporal whitelist; only keyless
+            # candidates may close an older row through automatic supersede.
+            if supersede_matcher is not None and not (temporal_subject and temporal_predicate):
+                supersede_decision = supersede_matcher(latest)
         _validate_space_ids(
             connection=connection,
             user_id=user_id,
@@ -174,6 +183,15 @@ def create_memory(
             user_id=user_id,
             new_memory=memory,
         )
+        if supersede_decision is not None:
+            _apply_auto_supersede(
+                connection=connection,
+                user_id=user_id,
+                new_memory=memory,
+                target_id=supersede_decision.target.id,
+                relation=supersede_decision.relation,
+                reason=supersede_decision.reason,
+            )
     return memory
 
 def update_memory(
@@ -760,6 +778,12 @@ def archive_memory(
                 user_id=user_id,
                 temporal_subject=source.temporal_subject,
                 temporal_predicate=source.temporal_predicate,
+            )
+        elif source.supersedes or source.superseded_by:
+            _unlink_keyless_chain_member(
+                connection=connection,
+                user_id=user_id,
+                memory=source,
             )
         return current_revision + 1 if return_revision else True
 

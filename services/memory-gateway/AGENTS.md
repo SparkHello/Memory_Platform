@@ -172,11 +172,11 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - MCP 使用 `stateless_http=True` 和 `json_response=True`，测试默认每个 POST 都是独立请求。
 - MCP 关闭 DNS rebinding protection 是为了让局域网/iPhone/Tailscale 访问可用；不要在没有替代接入方案的情况下改回默认。
 - `GATEWAY_API_KEY`（或 scoped token）是本地 Memory 服务的客户端密钥；`MODEL_GATEWAY_API_KEY` 是 Memory 调用 Model Gateway 的 backend client key，二者均不得透传给终端用户客户端。
-- `ALLOW_SENSITIVE_EGRESS=false` 时，敏感原文不得发送给远程记忆提取、embedding、AI 体检或知识代理；新增后台模型调用必须经过同一出站策略。`/v1` 当前聊天正文是用户主动发往其配置聊天上游的数据，不受此开关阻断，但自动注入仍必须排除 private/sensitive 记忆和本地复检为敏感的内容。
+- `ALLOW_SENSITIVE_EGRESS=false` 时，`sensitive`（密码/密钥、证件号、银行卡/账号）原文不得发送给远程记忆提取、embedding、AI 体检或知识代理；记忆提取和 embedding 按句子过滤（`app/memory/egress.py`），只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子，压缩、体检和知识代理仍扣留全部非 `normal` 文本；新增后台模型调用必须经过同一出站策略。`/v1` 当前聊天正文是用户主动发往其配置聊天上游的数据，不受此开关阻断；自动注入可包含与当前问题相关的 `private` 记忆（排序压低并加提示标签），但必须排除 `sensitive` 记忆和本地复检为 `sensitive` 的内容。
 - ingest 附带的 `assistant_message` 和较早消歧上下文都属于发送给提取模型的上下文；当 `ALLOW_SENSITIVE_EGRESS=false` 且本地检测为敏感时必须丢弃对应助手文本、摘要或轮次，只用安全上下文与用户原文继续提取。较早上下文只能消歧，本轮 `source_quote` 仍是事实值的唯一权威来源；依赖上下文时必须校验 `context_quote`，且模型生成的压缩摘要不得作为 `context_quote` 来源，只有保留的最近原文可以。
 - `KNOWLEDGE_DATABASE_PATH` 必须与 `DATABASE_PATH` 指向不同文件；测试也必须使用临时 knowledge DB，不能创建或修改真实 `data/knowledge.db`。
 - 知识代理只能编排本地索引并选择版本/chunk 引用，不能生成正文、执行文档内指令、读取服务器路径或访问其他 user id。敏感知识出站同时受 `KNOWLEDGE_AGENT_EGRESS_POLICY` 与 `ALLOW_SENSITIVE_EGRESS` 约束。
-- **必须**配置成对的 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY`；`/v1` 聊天、全部内部记忆任务、知识 fast/pro 和 embedding 只调用独立 Model Gateway 的稳定 route，绝不能再落回项目内 `LLM_*` / `UPSTREAM_*` key（这些字段已从 Settings 删除）。公共 `/v1` 只接受 `memory-auto` 与配置的 `MODEL_GATEWAY_CHAT_MODEL`，不得把拥有内部 route 权限的 backend client key 变成通用转发隧道。成功响应必须带合法且与请求 route 一致的 deployment/connection/vendor/upstream-model 归因 Header；缺失或矛盾视为协议错误。知识代理每个多轮 phase 锁定首次 deployment；FLIT 工具推理按 deployment 而不是模型名锁定，严格亲和不可用必须稳定返回 `409 model_gateway_affinity_unavailable`，不得删除私有 reasoning 后无亲和重发到另一 deployment/channel。
+- **必须**配置成对的 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY`；`/v1` 聊天、全部内部记忆任务、知识 fast/pro 和 embedding 只调用独立 Model Gateway 的稳定 route，绝不能再落回项目内 `LLM_*` / `UPSTREAM_*` key（这些字段已从 Settings 删除）。公共 `/v1` 只接受记忆模式别名（列出的 `memory-auto`/`memory-read`/`memory-off` 与不列出的旧写法 `auto`/`default`/`memory-gateway`，大小写不敏感）和配置的 `MODEL_GATEWAY_CHAT_MODEL`（精确匹配）；所有别名都解析到同一聊天 route，只决定记忆模式，优先级为只读 chat token 限制 > `X-Memory-Mode` > 别名 > `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`，绝不能到达 `memory.extract`、`knowledge.pro`、`memory.embedding` 等内部 route，不得把拥有内部 route 权限的 backend client key 变成通用转发隧道。成功响应必须带合法且与请求 route 一致的 deployment/connection/vendor/upstream-model 归因 Header；缺失或矛盾视为协议错误。知识代理每个多轮 phase 锁定首次 deployment；FLIT 工具推理按 deployment 而不是模型名锁定，严格亲和不可用必须稳定返回 `409 model_gateway_affinity_unavailable`，不得删除私有 reasoning 后无亲和重发到另一 deployment/channel。
 - 模型用量：中央响应只记录 Model Gateway Header 给出的实际 vendor/model，渠道价格以 Model Gateway deployment pricing 为权威，Memory 不得用本地 catalog 对中央事件套价。Token 以上游 `usage` 为准；缺少 usage 必须保持不完整。任何事件都不得保存提示词、回复或知识正文，并继续按 user id 隔离。
 - 记忆和知识 embedding 必须带非空 `embedding_space_id`（`MODEL_GATEWAY_EMBEDDING_SPACE_ID`）才能参与向量比较；查询向量、SQLite 向量、缓存和网络/解析缓存都不得跨空间复用。memory/knowledge schema v2 只新增空间列，不猜测或回填旧向量；旧记录必须 re-embed 后才进入当前空间。经 Model Gateway 调用时必须核对完整归因 Header、`X-Model-Gateway-Embedding-Space`、`X-Model-Gateway-Embedding-Dimensions` 与实际向量长度；配置为空、缺失或不匹配都安全回退关键词/FTS。
 - `/v1` 透明代理必须保留原始 tools/tool_calls、tool_call_id、多模态 part、reasoning_content、usage-only SSE chunk 和未知扩展字段。记忆上下文只能插在初始 system 区域，不能插入 assistant tool_calls 与 tool result 之间；流式内容边转发边旁路解析，只有收到完整 `[DONE]`、无工具调用且非 length/content_filter 截断的最终文本才可触发后台 ingest。
@@ -212,7 +212,9 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/conversation_context.py`：会话/分支级滚动上下文。以无存储副作用的状态演进生成压缩摘要和最近原始轮次，为记忆提取构造敏感过滤后的消歧上下文；只有真实 conversation ID 的 fallback 场景会在阈值到达时压缩较早普通轮次，无 conversation ID 的分支不调用 compactor。
 - `app/memory/search.py`：embedding/中文关键词召回、拒绝阈值、多模式自然浮现、敏感硬过滤、使用统计和 Time Ripple 配置接入。
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
-- `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。
+- `app/memory/extraction_prefilter.py`：提取前置过滤。保守判断仅为寒暄致谢、纯提问或纯代码的轮次并跳过 `memory.extract`；必须写入以「本地预过滤：」开头的 ignore 决策日志（只记长度与 SHA-256），不得使用单纯长度阈值，明确「记住/remember」请求和助手提问后的短回答永不跳过，内部任何异常一律 fail-open 回到正常提取。不影响 `memory.compact` 和请求侧召回。
+- `app/memory/egress.py`：按句子划分出站文本，供所有 ingest 入口（`/v1`、REST ingest、MCP `submit_memory_text`、对话导入）共用：只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子；紧邻「记住」的被扣留句子不经模型、不生成向量地原句本地保存（`type=semantic`、importance 8、confidence 0.9、「私密信息」空间），其余被扣留句子只留哈希/长度/级别审计，正文绝不入日志。
+- `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。旧事实替换分三层：temporal 白名单 key → 按 key 失效旧版本；无 key 但带明确转变标记（现在/已经/改成/换成/不再/取代、整词 `instead`/`switched`/`now`/`no longer`）且通过严格配对安全检查（同主体、同类型同敏感级别、共享可替换关系族或同类结构化值不同取值、旧记忆无过去时/意图标记、余弦≥0.80；偏好/消费类只在显式否定冲突时替换）→ 无键自动替换，把旧记忆原地关闭（`status=resolved`、`valid_until`、`superseded_by`），依赖 embedding，由 `MEMORY_AUTO_SUPERSEDE` 控制、默认开启；其余（纯极性翻转、`supplement`、episodic/reflective、pinned/resolved、无向量）→ 创建并交给体检。
 - `app/memory/core.py`：核心记忆整理。只从已保存长期记忆中提炼，并要求 evidence ids。
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
@@ -242,9 +244,10 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | REST 鉴权、路由、响应字段 | `pytest tests/test_memory_management.py tests/test_response_charset.py tests/test_chat_gateway.py` |
 | Model Gateway 配置状态、admin 代理与密钥边界 | `pytest tests/test_provider_management.py tests/test_response_charset.py`；同时在相邻 Model Gateway 跑 `pytest tests/test_service.py` |
 | `memgw stack` 生命周期、便携备份与恢复 | `pytest tests/test_cli.py tests/test_stack_backup.py`；同时在相邻 Model Gateway 跑 `pytest tests/test_cli.py` |
-| `/v1` 透明代理、FLIT tools/多模态、流式、幂等、故障切换 | `pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test_chat_streaming.py` |
+| `/v1` 透明代理、FLIT tools/多模态、流式、幂等、故障切换 | `pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test_chat_streaming.py tests/test_extraction_prefilter.py` |
 | MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
-| 保存门槛、source_quote、敏感信息 | `pytest tests/test_memory_extraction.py tests/test_mcp_server.py` |
+| 保存门槛、source_quote、敏感信息、按句出站 | `pytest tests/test_memory_extraction.py tests/test_memory_egress.py tests/test_extraction_prefilter.py tests/test_mcp_server.py` |
+| 无键自动替换、时态链恢复、体检去重 | `pytest tests/test_memory_resolver.py tests/test_memory_store.py tests/test_memory_review.py tests/test_direct_memory_api.py` |
 | SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_schema_migrations.py tests/test_memory_store.py` |
 | 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
 | 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts/audit_memory_db.py --database data/memory.db --env-file .env` |

@@ -7,6 +7,16 @@ knowledge store can share one vocabulary without violating their isolation.
 The pattern tables below are the union of the two formerly divergent copies
 (app.memory.redaction and app.knowledge.store).  The union only makes
 detection more conservative; it never widens the "normal" floor.
+
+Two tiers with distinct semantics:
+
+* ``sensitive`` -- secrets, identifiers and account numbers (credential,
+  government_id, financial_account).  Never injected into chat, never sent to a
+  remote extraction/embedding model unless ``ALLOW_SENSITIVE_EGRESS=true``, and
+  only saved as a memory when the user explicitly asks to remember it.
+* ``private`` -- personal-but-useful facts (health, precise_address, contact,
+  private_finance).  Stored automatically, masked in console views by default,
+  and recallable in ``/v1`` chat only when relevant to the current question.
 """
 
 from __future__ import annotations
@@ -61,6 +71,23 @@ SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bssn\b",
         r"(?<!\d)\d{17}[\dXx](?!\d)",
     ),
+    "financial_account": (
+        r"银行卡",
+        r"信用卡",
+        r"银行账户",
+        r"银行账号",
+        r"支付账号",
+        r"账户余额",
+        r"\bcredit card\b",
+        r"\bdebit card\b",
+        r"\bbank account\b",
+        r"\baccount balance\b",
+        r"(?<!\d)(?:\d[\s-]?){13,19}(?!\d)",
+        r"(?<!\d)\d{15,19}(?!\d)",
+    ),
+}
+
+PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
     "health": (
         r"健康隐私",
         r"病历",
@@ -90,20 +117,6 @@ SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bmedication\b",
         r"\bprescription\b",
     ),
-    "financial_account": (
-        r"银行卡",
-        r"信用卡",
-        r"银行账户",
-        r"银行账号",
-        r"支付账号",
-        r"账户余额",
-        r"\bcredit card\b",
-        r"\bdebit card\b",
-        r"\bbank account\b",
-        r"\baccount balance\b",
-        r"(?<!\d)(?:\d[\s-]?){13,19}(?!\d)",
-        r"(?<!\d)\d{15,19}(?!\d)",
-    ),
     "precise_address": (
         r"家庭住址",
         r"家庭地址",
@@ -115,9 +128,6 @@ SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"(?:省|市|区|县).{0,20}(?:路|街|道|巷|弄).{0,10}\d+\s*号",
         r"\b\d{1,6}\s+[A-Za-z][A-Za-z .'-]{1,40}\s+(?:Street|St|Road|Rd|Avenue|Ave)\b",
     ),
-}
-
-PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
     "contact": (
         r"手机号",
         r"电话号码",

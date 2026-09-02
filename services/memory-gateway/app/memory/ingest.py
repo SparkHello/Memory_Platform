@@ -2,9 +2,21 @@ import hashlib
 import json
 
 from app.llm.client import OpenAICompatibleClient
+from app.memory.egress import (
+    REASON_WITHHELD_ASSUMPTION_PREFIX,
+    REASON_WITHHELD_LOCAL_SAVE_PREFIX,
+    REASON_WITHHELD_NO_DIRECTIVE,
+    SentenceSpan,
+    local_directive_candidate,
+    partition_for_egress,
+    sentence_audit_fields,
+    withheld_sentence_has_scoped_directive,
+)
 from app.memory.extractor import (
     ExtractionOutcome,
     LLMMemoryExtractor,
+    _apply_sensitivity_floor,
+    find_assumption_marker,
 )
 from app.memory.models import MemoryIngestItemResult, MemoryIngestResult
 from app.memory.redaction import detect_text_sensitivity, higher_sensitivity
@@ -38,11 +50,17 @@ class MemoryIngestService:
         embedding_client: EmbeddingClient,
         llm_client: OpenAICompatibleClient,
         allow_sensitive_egress: bool = False,
+        egress_ceiling: str = "private",
+        auto_supersede: bool = True,
     ):
         self.store = store
         self.embedding_client = embedding_client
         self.llm_client = llm_client
         self.allow_sensitive_egress = allow_sensitive_egress
+        # Highest local tier that may still reach the extraction model while
+        # allow_sensitive_egress is False; sentences above it stay local.
+        self.egress_ceiling = egress_ceiling
+        self.auto_supersede = auto_supersede
 
     async def ingest(
         self,
@@ -69,23 +87,54 @@ class MemoryIngestService:
                 status="rejected",
             )
 
-        if not self.allow_sensitive_egress and detect_text_sensitivity(source_text) != "normal":
-            reason = "敏感原文未发送给远程提取模型；如确需处理，请显式启用 ALLOW_SENSITIVE_EGRESS"
-            self.store.create_decision_log(
+        # Sentence-level egress: only sentences above the ceiling stay local;
+        # the rest of the message is still extracted. The filtered text is both
+        # the model input and the grounding superset for source_quote checks.
+        withheld: list[SentenceSpan] = []
+        kept_count = 0
+        extraction_source_text = source_text
+        if not self.allow_sensitive_egress:
+            partition = partition_for_egress(source_text, ceiling=self.egress_ceiling)
+            withheld = partition.withheld
+            kept_count = len(partition.kept)
+            extraction_source_text = partition.egress_text
+
+        resolver = MemoryResolver(
+            store=self.store,
+            embedding_client=self.embedding_client,
+            auto_supersede=self.auto_supersede,
+        )
+        items: list[MemoryIngestItemResult] = []
+        created = updated = ignored = 0
+
+        if withheld:
+            local_items, local_counts = await self._save_withheld_sentences(
                 user_id=user_id,
                 conversation_id=conversation_id,
-                candidate_json=_decision_log_json(
-                    source=source,
-                    payload={"action": "ignore", "sensitive_egress_blocked": True},
-                ),
-                decision="ignore",
-                reason=reason,
+                source=source,
+                withheld=withheld,
+                kept_count=kept_count,
+                resolver=resolver,
             )
+            items.extend(local_items)
+            created += local_counts[0]
+            updated += local_counts[1]
+            ignored += local_counts[2]
+
+        if not extraction_source_text:
+            # Every sentence was withheld: nothing may reach the model.
+            saved_locally = bool(created or updated)
             return MemoryIngestResult(
-                ignored=1,
-                items=[MemoryIngestItemResult(action="ignore", reason=reason)],
-                reason=reason,
-                status="rejected",
+                created=created,
+                updated=updated,
+                ignored=ignored,
+                items=items,
+                reason=(
+                    REASON_WITHHELD_LOCAL_SAVE_PREFIX
+                    if saved_locally
+                    else REASON_WITHHELD_NO_DIRECTIVE
+                ),
+                status="completed" if saved_locally else "rejected",
             )
 
         extraction_assistant_message = assistant_message
@@ -121,7 +170,7 @@ class MemoryIngestService:
             user_id=user_id,
         )
         batch = await extractor.extract_many(
-            source_text=source_text,
+            source_text=extraction_source_text,
             assistant_message=extraction_assistant_message,
             conversation_context=extraction_conversation_context,
             context_quote_source=extraction_context_quote_source,
@@ -141,7 +190,13 @@ class MemoryIngestService:
                 decision="ignore",
                 reason=batch.reason,
             )
+            # Local directive saves (if any) are already persisted; a retry
+            # re-runs them idempotently through the resolver's dedup.
             return MemoryIngestResult(
+                created=created,
+                updated=updated,
+                ignored=ignored,
+                items=items,
                 reason=batch.reason,
                 status="retryable_error",
                 retryable=True,
@@ -169,16 +224,15 @@ class MemoryIngestService:
                     "模型理由已脱敏"
                 ),
             )
+            items.append(item)
             return MemoryIngestResult(
-                ignored=1,
-                items=[item],
+                created=created,
+                updated=updated,
+                ignored=ignored + 1,
+                items=items,
                 reason=batch.reason,
-                status="no_memory",
+                status="completed" if created or updated else "no_memory",
             )
-
-        resolver = MemoryResolver(store=self.store, embedding_client=self.embedding_client)
-        items: list[MemoryIngestItemResult] = []
-        created = updated = ignored = 0
 
         for outcome in batch.outcomes:
             candidate_log_payload = _candidate_audit_payload(outcome)
@@ -218,6 +272,11 @@ class MemoryIngestService:
 
             if result.memory is not None:
                 candidate_log_payload["memory_id"] = result.memory.id
+            if result.superseded_memory_id:
+                # target_memory_id is a known decision-log reference key, so
+                # purge scrubbing and health checks follow the closed row too.
+                candidate_log_payload["target_memory_id"] = result.superseded_memory_id
+                candidate_log_payload["relation"] = result.relation
             self.store.create_decision_log(
                 user_id=user_id,
                 conversation_id=conversation_id,
@@ -235,6 +294,7 @@ class MemoryIngestService:
                     reason=result.reason,
                     memory_id=result.memory.id if result.memory else None,
                     content=result.memory.content if result.memory else outcome.candidate.memory,
+                    superseded_memory_id=result.superseded_memory_id,
                 )
             )
 
@@ -246,6 +306,109 @@ class MemoryIngestService:
             reason=batch.reason,
             status="completed" if created or updated else "rejected",
         )
+
+    async def _save_withheld_sentences(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        source: str,
+        withheld: list[SentenceSpan],
+        kept_count: int,
+        resolver: MemoryResolver,
+    ) -> tuple[list[MemoryIngestItemResult], tuple[int, int, int]]:
+        """Handle sentences that must not leave the host.
+
+        A sentence with an explicit, clause-adjacent 记住 directive is saved
+        verbatim through the resolver (dedup, store floor, private space, no
+        remote embedding). Everything else is dropped and recorded as hashes.
+        """
+        items: list[MemoryIngestItemResult] = []
+        created = updated = ignored = 0
+        dropped: list[dict[str, object]] = []
+
+        for span in withheld:
+            audit = sentence_audit_fields(span)
+            if not withheld_sentence_has_scoped_directive(span.text):
+                ignored += 1
+                items.append(
+                    MemoryIngestItemResult(action="ignore", reason=REASON_WITHHELD_NO_DIRECTIVE)
+                )
+                dropped.append({**audit, "directive": False})
+                continue
+
+            marker = find_assumption_marker(span.text)
+            if marker:
+                ignored += 1
+                reason = f"{REASON_WITHHELD_ASSUMPTION_PREFIX}（命中「{marker}」），不保存"
+                items.append(MemoryIngestItemResult(action="ignore", reason=reason))
+                dropped.append({**audit, "directive": True, "assumption": True})
+                continue
+
+            candidate = local_directive_candidate(span)
+            _apply_sensitivity_floor(candidate)
+            result = await resolver.resolve(
+                user_id=user_id,
+                candidate=candidate,
+                source_message=span.stripped,
+                conversation_id=conversation_id,
+            )
+            if result.action == "create":
+                created += 1
+            elif result.action == "update":
+                updated += 1
+            else:
+                ignored += 1
+
+            payload: dict[str, object] = {
+                "action": result.action,
+                "sensitive_egress_blocked": True,
+                "local_directive_save": True,
+                "sensitivity": candidate.sensitivity,
+                "categories": span.categories,
+                **_text_audit_fields("memory", candidate.memory),
+                **_text_audit_fields("source_quote", span.stripped),
+                "redacted": True,
+            }
+            if result.memory is not None:
+                payload["memory_id"] = result.memory.id
+            reason = f"{REASON_WITHHELD_LOCAL_SAVE_PREFIX}；{result.reason}"
+            self.store.create_decision_log(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                candidate_json=_decision_log_json(source=source, payload=payload),
+                decision=result.action,
+                reason=reason,
+            )
+            items.append(
+                MemoryIngestItemResult(
+                    action=result.action,
+                    relation=result.relation,
+                    reason=reason,
+                    memory_id=result.memory.id if result.memory else None,
+                    content=result.memory.content if result.memory else candidate.memory,
+                )
+            )
+
+        if dropped:
+            self.store.create_decision_log(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                candidate_json=_decision_log_json(
+                    source=source,
+                    payload={
+                        "action": "ignore",
+                        "sensitive_egress_blocked": True,
+                        "withheld_sentence_count": len(withheld),
+                        "kept_sentence_count": kept_count,
+                        "withheld_sentences": dropped,
+                        "redacted": True,
+                    },
+                ),
+                decision="ignore",
+                reason=REASON_WITHHELD_NO_DIRECTIVE,
+            )
+        return items, (created, updated, ignored)
 
 
 def _json_payload(raw_json: str) -> dict:

@@ -19,7 +19,8 @@ import {
   Sun,
   TriangleAlert,
   Wrench,
-  X
+  X,
+  Settings2
 } from "lucide-react";
 import { useId, useState, type ReactNode } from "react";
 import { NAV_SECTIONS, PAGE_META, SIMPLE_NAV_SECTIONS, sectionForPage } from "../navigation";
@@ -316,7 +317,7 @@ export function AppShell({
                 }
                 aria-label={`连接设置 · 用户 ${userId}`}
               >
-                {userId.slice(0, 1).toUpperCase()}
+                <Settings2 size={17} aria-hidden="true" />
               </button>
             )}
           </div>

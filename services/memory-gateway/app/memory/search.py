@@ -9,6 +9,7 @@ import math
 import re
 import threading
 import time
+from typing import Literal
 
 import anyio
 import httpx
@@ -21,7 +22,11 @@ from app.llm.model_gateway import (
 )
 from app.memory.decay import MemoryDecayScore, life_score, score_memory
 from app.memory.models import MemoryRecord, MemorySurfaceMode, MemorySurfaceSignal
-from app.memory.redaction import detect_local_sensitivity, detect_text_sensitivity
+from app.memory.redaction import (
+    detect_local_sensitivity,
+    detect_text_sensitivity,
+    higher_sensitivity,
+)
 from app.memory.review_signals import (
     is_emotion_uncertain,
     is_expired,
@@ -37,6 +42,7 @@ from app.memory.temporal import (
     temporal_query_window,
 )
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
+from app.sensitivity import SENSITIVITY_RANK
 from app.usage.context import current_usage_context, model_usage_scope
 from app.usage.attribution import model_gateway_usage_headers
 from app.vector_util import cosine_similarity
@@ -317,6 +323,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         model_gateway_mode: bool = False,
         timeout_seconds: float = 60.0,
         allow_sensitive_egress: bool = False,
+        egress_ceiling: str = "normal",
         usage_hmac_secret: str = "",
     ):
         self.base_url = base_url
@@ -328,10 +335,22 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         self.model_gateway_mode = bool(model_gateway_mode)
         self.timeout_seconds = timeout_seconds
         self.allow_sensitive_egress = allow_sensitive_egress
+        # Highest local tier that may still be embedded remotely while
+        # allow_sensitive_egress is False. Memory uses MEMORY_EGRESS_CEILING;
+        # knowledge keeps the strict "normal" default.
+        self.egress_ceiling = (
+            egress_ceiling if egress_ceiling in SENSITIVITY_RANK else "normal"
+        )
         self.usage_hmac_secret = usage_hmac_secret
 
+    def _egress_allowed(self, text: str) -> bool:
+        if self.allow_sensitive_egress:
+            return True
+        level = detect_text_sensitivity(text)
+        return SENSITIVITY_RANK.get(level, 2) <= SENSITIVITY_RANK[self.egress_ceiling]
+
     async def embed(self, text: str) -> list[float] | None:
-        if not self.allow_sensitive_egress and detect_text_sensitivity(text) != "normal":
+        if not self._egress_allowed(text):
             return None
         vectors = await self._request_embeddings(text)
         return vectors[0] if vectors else None
@@ -348,11 +367,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
         allowed_texts: list[str] = []
         results: list[list[float] | None] = [None for _ in texts]
         for index, text in enumerate(texts):
-            if (
-                self.allow_sensitive_egress
-                or not screen_sensitivity
-                or detect_text_sensitivity(text) == "normal"
-            ):
+            if not screen_sensitivity or self._egress_allowed(text):
                 allowed_indices.append(index)
                 allowed_texts.append(text)
         if not allowed_texts:
@@ -443,6 +458,26 @@ def embedding_space_id_for(client: object) -> str:
     return " ".join(str(value).strip().split()) if value else ""
 
 
+SensitivityCeiling = Literal["normal", "private", "sensitive"]
+
+
+def _resolve_sensitivity_ceiling(
+    *,
+    include_sensitive: bool,
+    sensitivity_ceiling: str | None,
+) -> str:
+    """Map the legacy boolean and the explicit ceiling onto one tier name.
+
+    ``include_sensitive=True`` keeps meaning "everything" for REST/MCP callers;
+    the default stays ``normal`` so only the chat proxy opts into ``private``.
+    """
+    if sensitivity_ceiling is None:
+        return "sensitive" if include_sensitive else "normal"
+    if sensitivity_ceiling not in SENSITIVITY_RANK:
+        raise ValueError(f"未知的敏感级别上限：{sensitivity_ceiling}")
+    return sensitivity_ceiling
+
+
 class MemorySearchService:
     def __init__(
         self,
@@ -454,7 +489,7 @@ class MemorySearchService:
         self.store = store
         self.embedding_client = embedding_client
         # 评测等隔离场景关闭进程级缓存：缓存 key 只含
-        # (user, query, limit, include_sensitive, embedding_space_id)，
+        # (user, query, limit, sensitivity_ceiling, embedding_space_id)，
         # 不区分数据源/检索模式，复用会让 keyword 与 embedding 基线互相污染。
         self.enable_cache = enable_cache
         self.last_cache_status = "bypass"
@@ -468,6 +503,7 @@ class MemorySearchService:
         limit: int = 8,
         record_usage: bool = True,
         include_sensitive: bool = False,
+        sensitivity_ceiling: SensitivityCeiling | None = None,
     ) -> list[MemoryRecord]:
         hits = await self.search_hits(
             query=query,
@@ -475,6 +511,7 @@ class MemorySearchService:
             limit=limit,
             record_usage=record_usage,
             include_sensitive=include_sensitive,
+            sensitivity_ceiling=sensitivity_ceiling,
         )
         return [hit.memory for hit in hits]
 
@@ -486,6 +523,7 @@ class MemorySearchService:
         limit: int = 8,
         record_usage: bool = True,
         include_sensitive: bool = False,
+        sensitivity_ceiling: SensitivityCeiling | None = None,
     ) -> list[MemorySearchHit]:
         normalized = _normalize_query(query)
         if not normalized:
@@ -495,12 +533,16 @@ class MemorySearchService:
         capped_limit = max(1, min(limit, 20))
         now = _now()
         embedding_space_id = embedding_space_id_for(self.embedding_client)
+        ceiling = _resolve_sensitivity_ceiling(
+            include_sensitive=include_sensitive,
+            sensitivity_ceiling=sensitivity_ceiling,
+        )
 
         l2_key = (
             user_id,
             normalized,
             capped_limit,
-            bool(include_sensitive),
+            ceiling,
             embedding_space_id,
         )
         if self.enable_cache:
@@ -548,7 +590,7 @@ class MemorySearchService:
                 sentence_embeddings=sentence_embeddings,
                 embedding_space_id=embedding_space_id,
                 limit=candidate_limit,
-                include_sensitive=include_sensitive,
+                sensitivity_ceiling=ceiling,
             )
         )
         if not hits:
@@ -596,7 +638,7 @@ class MemorySearchService:
         query_embedding: list[float] | None,
         embedding_space_id: str,
         limit: int,
-        include_sensitive: bool,
+        sensitivity_ceiling: str = "normal",
         sentence_queries: list[str] | None = None,
         sentence_embeddings: list[list[float]] | None = None,
     ) -> list[MemorySearchHit]:
@@ -622,7 +664,7 @@ class MemorySearchService:
                 memory
                 for memory in memories
                 if memory.origin == "user_asserted"
-                and (include_sensitive or not _memory_is_locally_sensitive(memory))
+                and _memory_within_sensitivity_ceiling(memory, sensitivity_ceiling)
                 and memory_matches_temporal_mode(
                     memory,
                     mode=temporal_mode,
@@ -917,7 +959,7 @@ class MemorySearchService:
             _discard_search_cache_entry(key, cached_entry)
             return None
 
-        include_sensitive = bool(key[3])
+        ceiling = str(key[3]) if str(key[3]) in SENSITIVITY_RANK else "normal"
         temporal_mode = temporal_query_mode(query)
         temporal_window = temporal_query_window(query)
         hits: list[MemorySearchHit] = []
@@ -930,7 +972,7 @@ class MemorySearchService:
                 continue
             if memory.origin != "user_asserted" or memory.status == "archived":
                 continue
-            if not include_sensitive and _memory_is_locally_sensitive(memory):
+            if not _memory_within_sensitivity_ceiling(memory, ceiling):
                 continue
             if not memory_matches_temporal_mode(
                 memory,
@@ -1633,17 +1675,26 @@ def _metadata_penalty(memory: MemoryRecord, now: datetime) -> float:
     )
 
 
-def _memory_is_locally_sensitive(memory: MemoryRecord) -> bool:
-    if memory.sensitivity != "normal":
-        return True
-    return (
+def _memory_local_sensitivity(memory: MemoryRecord) -> str:
+    """Effective tier: the stored label raised by local re-detection, never lowered."""
+    return higher_sensitivity(
+        memory.sensitivity,
         detect_local_sensitivity(
             memory.content,
             memory.source_message,
             memory.entities,
-        )
-        != "normal"
+        ),
     )
+
+
+def _memory_within_sensitivity_ceiling(memory: MemoryRecord, ceiling: str) -> bool:
+    return SENSITIVITY_RANK[_memory_local_sensitivity(memory)] <= SENSITIVITY_RANK.get(
+        ceiling, 0
+    )
+
+
+def _memory_is_locally_sensitive(memory: MemoryRecord) -> bool:
+    return not _memory_within_sensitivity_ceiling(memory, "normal")
 
 
 def _float_payload(value: object) -> float:

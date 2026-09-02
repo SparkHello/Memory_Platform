@@ -42,7 +42,15 @@ from app.memory.conversation_context import (
     safe_context_quote_source,
     safe_extraction_context,
 )
-from app.memory.ingest import MemoryIngestService
+from app.memory.extraction_prefilter import (
+    PrefilterDecision,
+    prefilter_extraction_turn,
+)
+from app.memory.ingest import (
+    MemoryIngestService,
+    _decision_log_json,
+    _text_audit_fields,
+)
 from app.memory.models import MemoryIngestResult, MemoryRecord, RecentContextSummary
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.search import (
@@ -56,6 +64,7 @@ from app.openai_compat.gateway_client import (
     GatewayUpstreamHTTPError,
     OpenAIChatGatewayClient,
     is_auto_model_id,
+    memory_mode_for_model,
     openai_error_payload,
 )
 from app.openai_compat.schemas import ChatCompletionRequest
@@ -281,9 +290,16 @@ async def chat_completions(
     try:
         _require_gateway_enabled(settings)
         validated = _validate_chat_request(body)
+        # Precedence: read-only token clamp > explicit X-Memory-Mode header >
+        # memory-* model alias > CHAT_GATEWAY_DEFAULT_MEMORY_MODE. The header
+        # is the documented per-request override; the alias exists for clients
+        # that cannot send custom headers.
         memory_mode = _memory_mode(
             request.headers.get("X-Memory-Mode"),
-            default=settings.chat_gateway_default_memory_mode,
+            default=(
+                memory_mode_for_model(validated.model)
+                or settings.chat_gateway_default_memory_mode
+            ),
         )
         memory_mode = _clamp_memory_mode_to_token(
             memory_mode,
@@ -1228,7 +1244,10 @@ async def _safe_memory_search(
                 user_id=user_id,
                 limit=settings.chat_gateway_search_limit,
                 record_usage=False,
-                include_sensitive=False,
+                # Chat may recall private (health/address/contact/income)
+                # memories when they are relevant; sensitive (secrets, IDs,
+                # account numbers) never reach the upstream model.
+                sensitivity_ceiling="private",
             ),
             timeout=settings.chat_gateway_recall_timeout_seconds,
         )
@@ -1251,7 +1270,7 @@ async def _safe_memory_search(
             user_id=user_id,
             limit=settings.chat_gateway_search_limit,
             record_usage=False,
-            include_sensitive=False,
+            sensitivity_ceiling="private",
         )
     except Exception:
         logger.exception("聊天网关本地关键词记忆搜索失败；本轮继续直连上游。")
@@ -1546,11 +1565,36 @@ async def _finalize_turn(
         except Exception:
             logger.exception("聊天网关读取已存在分支编号失败；继续提取长期记忆。")
 
-    if (
-        not user_text.strip()
-        or len(user_text) > _MAX_AUTO_INGEST_USER_CHARS
-    ):
+    if not user_text.strip():
+        # Image-only or empty turns carry nothing to extract; stay silent so a
+        # multimodal client does not flood the decision log.
         return
+    if len(user_text) > _MAX_AUTO_INGEST_USER_CHARS:
+        await _log_extraction_skip(
+            store=store,
+            user_id=user_id,
+            conversation_id=source_conversation_id,
+            user_text=user_text,
+            rule="oversized",
+            reason="本地预过滤：用户文本超过 64 KiB，未调用提取模型",
+        )
+        return
+    if settings.chat_gateway_extraction_prefilter:
+        decision = _prefilter_decision(
+            user_text=user_text,
+            extraction_context_messages=extraction_context_messages,
+            fallback_context=fallback_context,
+        )
+        if decision.skip and decision.rule is not None:
+            await _log_extraction_skip(
+                store=store,
+                user_id=user_id,
+                conversation_id=source_conversation_id,
+                user_text=user_text,
+                rule=decision.rule,
+                reason=decision.reason,
+            )
+            return
     ingest_key = f"{key}\0{assistant_digest}"
     job_id = hashlib.sha256(
         f"ingest\0{user_id}\0{ingest_key}".encode("utf-8")
@@ -1602,6 +1646,70 @@ async def _finalize_turn(
     )
 
 
+def _prefilter_decision(
+    *,
+    user_text: str,
+    extraction_context_messages: list[dict[str, str]],
+    fallback_context: RecentContextSummary | None,
+) -> PrefilterDecision:
+    """Run the local extraction pre-filter; any failure falls open to extraction."""
+    try:
+        last_assistant: str | None = None
+        for message in reversed(extraction_context_messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                last_assistant = str(message["content"])
+                break
+        stored_turns = (
+            list(getattr(fallback_context, "recent_turns", None) or [])
+            if fallback_context is not None
+            else []
+        )
+        if last_assistant is None and stored_turns:
+            last_assistant = getattr(stored_turns[-1], "assistant", None) or None
+        return prefilter_extraction_turn(
+            user_text=user_text,
+            last_assistant_text=last_assistant,
+            has_context=bool(extraction_context_messages) or bool(stored_turns),
+        )
+    except Exception:
+        logger.exception("聊天网关提取前置过滤失败；本轮照常调用提取模型。")
+        return PrefilterDecision(skip=False)
+
+
+async def _log_extraction_skip(
+    *,
+    store: MemoryStore,
+    user_id: str,
+    conversation_id: str | None,
+    user_text: str,
+    rule: str,
+    reason: str,
+) -> None:
+    """Record a skipped extraction as an ``ignore`` decision without the text."""
+    payload = {
+        "action": "ignore",
+        "prefilter": rule,
+        **_text_audit_fields("user_text", user_text),
+        "reason": reason,
+    }
+    try:
+        await anyio.to_thread.run_sync(
+            partial(
+                store.create_decision_log,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                candidate_json=_decision_log_json(
+                    source="chat_gateway",
+                    payload=payload,
+                ),
+                decision="ignore",
+                reason=reason,
+            )
+        )
+    except Exception:
+        logger.exception("聊天网关记录提取跳过决策失败；不影响聊天响应。")
+
+
 async def _execute_ingest_payload(
     *,
     store: MemoryStore,
@@ -1622,6 +1730,8 @@ async def _execute_ingest_payload(
         embedding_client=embedding_client,
         llm_client=llm_client,
         allow_sensitive_egress=settings.allow_sensitive_egress,
+        egress_ceiling=settings.memory_egress_ceiling,
+        auto_supersede=settings.memory_auto_supersede,
     ).ingest(
         user_id=user_id,
         text=str(payload.get("user_text") or ""),

@@ -8,7 +8,7 @@
 | --- | --- |
 | Memory REST 与 Web Console | 现有路径、方法、认证 scope 和响应结构继续可用；实验性 graph/review 调用改为用户主动触发，并未删除。 |
 | MCP | 现有工具名称、参数和响应结构继续可用。 |
-| OpenAI-compatible API | `/v1/models` 与 `/v1/chat/completions` 继续作为透明兼容接口，包括 SSE 原始字节和未知 provider 字段。 |
+| OpenAI-compatible API | `/v1/models` 与 `/v1/chat/completions` 继续作为透明兼容接口，包括 SSE 原始字节和未知 provider 字段。`/v1/models` 可以新增 `memory-*` 记忆模式别名（如 `memory-read`、`memory-off`），属于向后兼容的增量；`X-Memory-Mode` 的取值 `off`/`read`/`read-write` 不变。 |
 | Model 管理接口 | 现有 HTTP endpoint、请求字段及 CLI 别名继续由兼容适配层接受，并转换为规范的 control-plane DTO。 |
 | Python Store | `from app.memory.store import MemoryStore` 与 `from app.knowledge.store import KnowledgeStore` 继续有效，公共方法集合和签名保持兼容。 |
 | Model 配置类型 | `model_gateway.models` 继续是受支持的导入路径；portable config/backup 仍使用同一份 `GatewayConfig` schema 验证。 |

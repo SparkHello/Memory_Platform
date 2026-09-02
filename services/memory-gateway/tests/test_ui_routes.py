@@ -108,3 +108,25 @@ def test_configured_ui_dist_dir_must_be_a_vite_build(tmp_path):
     assert main._resolve_ui_dist_dir(
         SimpleNamespace(ui_dist_dir=str(invalid))
     ) == invalid.resolve()
+
+
+def test_ui_entry_document_revalidates_and_hashed_assets_are_immutable(tmp_path, monkeypatch):
+    """A redeployed console must not keep serving a heuristically cached index.html."""
+    ui_dist = tmp_path / "dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<!doctype html><title>Memory Studio</title>", encoding="utf-8")
+    assets = ui_dist / "assets"
+    assets.mkdir()
+    (assets / "index-abc123.css").write_text("body{}", encoding="utf-8")
+    monkeypatch.setattr(main, "UI_DIST_DIR", ui_dist)
+    monkeypatch.setenv("UI_DIST_DIR", "")
+    get_settings.cache_clear()
+
+    with TestClient(main.create_app()) as client:
+        for path in ("/ui/", "/ui/index.html", "/ui/memories"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert response.headers["cache-control"] == "no-cache", path
+        asset = client.get("/ui/assets/index-abc123.css")
+        assert asset.status_code == 200
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"

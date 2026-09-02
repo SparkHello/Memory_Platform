@@ -525,7 +525,24 @@ export function MemoryDetailDrawer({
               </section>
             )}
 
-            <TemporalFacts memory={memory} />
+            <TemporalFacts
+              memory={memory}
+              onRestoreVersion={
+                state.deleted
+                  ? undefined
+                  : () => {
+                      void (async () => {
+                        try {
+                          await api.restoreTemporalMemory(memory.id);
+                          notify("已恢复此版本为当前事实；新旧两条现在都有效，可按需清理另一条。", "success");
+                          onChanged();
+                        } catch (error) {
+                          notify(errorMessage(error), "error");
+                        }
+                      })();
+                    }
+              }
+            />
 
             {!state.deleted && (
               <section className="subpanel profile-related">
@@ -909,7 +926,13 @@ export function MemoryDetailDrawer({
   );
 }
 
-function TemporalFacts({ memory }: { memory: MemoryRecord }) {
+function TemporalFacts({
+  memory,
+  onRestoreVersion
+}: {
+  memory: MemoryRecord;
+  onRestoreVersion?: () => void;
+}) {
   const hasDetails = Boolean(
     memory.valid_from ||
       memory.valid_until ||
@@ -919,6 +942,7 @@ function TemporalFacts({ memory }: { memory: MemoryRecord }) {
       memory.superseded_by
   );
   const isHistorical = (memory.status || "dynamic") === "resolved" && Boolean(memory.superseded_by);
+  const isAutoChain = !memory.temporal_subject && !memory.temporal_predicate;
   if (!hasDetails && !isHistorical) return null;
   return (
     <section className="subpanel temporal-fact-panel">
@@ -926,7 +950,20 @@ function TemporalFacts({ memory }: { memory: MemoryRecord }) {
       {isHistorical && (
         <div className="notice warning temporal-fact-notice">
           <ShieldAlert size={16} />
-          历史事实，已被新事实取代。
+          <span>
+            {isAutoChain
+              ? "历史事实，已被带明确转变标记的新事实自动取代。如果这其实是两件独立的事，可以恢复此版本；恢复后新旧两条都会保持有效。"
+              : "历史事实，已被新事实取代。"}
+          </span>
+          {onRestoreVersion && (
+            <button
+              className="secondary-button compact"
+              type="button"
+              onClick={onRestoreVersion}
+            >
+              恢复此版本
+            </button>
+          )}
         </div>
       )}
       <FieldList

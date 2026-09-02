@@ -14,16 +14,17 @@ import {
   ShieldCheck,
   Trash2,
   TriangleAlert,
-  XCircle
-} from "lucide-react";
+  XCircle, Pencil, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { isAbortError, type MemoryApi } from "../../api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { PageHeader } from "../../components/PageHeader";
 import { EmptyBlock, ErrorBlock, LoadingBlock } from "../../components/StateBlocks";
 import { useConfirm } from "../../hooks/useConfirm";
+import { Modal } from "../../components/Modal";
 import { useUnsavedChangesGuard } from "../../hooks/useUnsavedChangesGuard";
 import type {
+  ModelGatewayCapabilities,
   ModelGatewayConnectionCheck,
   ModelGatewayConnectionInfo,
   ModelGatewayControlSnapshot,
@@ -35,6 +36,7 @@ import type {
   ProvidersStatus,
   RouteInfo
 } from "../../types";
+import { CLIENT_MODEL_ID } from "../../utils/constants";
 import { errorMessage } from "../../utils/format";
 import {
   clearModelAdminKey,
@@ -44,7 +46,7 @@ import {
 import { isProviderSetupReady } from "../../utils/providerSetup";
 import { AddChannelModelPanel } from "./AddChannelModelPanel";
 import { NewChannelWizard } from "./NewChannelWizard";
-import { ROUTE_LABELS, type ProviderFeedback } from "./providerShared";
+import { channelOperatorLabel, CAPABILITY_OPTIONS, ROUTE_LABELS, type ProviderFeedback } from "./providerShared";
 
 type ConnectionCheckState = "checking" | ModelGatewayConnectionCheck;
 
@@ -351,6 +353,32 @@ export function ProvidersPage({
     }
   };
 
+  const [editingDeployment, setEditingDeployment] = useState<ModelGatewayDeploymentInfo | null>(null);
+
+  const saveDeploymentCapabilities = async (
+    deployment: ModelGatewayDeploymentInfo,
+    capabilities: ModelGatewayCapabilities
+  ) => {
+    if (!status?.control || !hasAdminKey || busyAction) return;
+    setBusyAction(`capabilities:deployments:${deployment.id}`);
+    setFeedback(null);
+    try {
+      await api.updateProviderDeploymentCapabilities(
+        deployment.id,
+        status.control.revision,
+        capabilities,
+        adminKey.trim()
+      );
+      setEditingDeployment(null);
+      await refreshAll(false);
+      setFeedback({ tone: "success", message: `${deployment.id} 的能力已更新，配置已热加载。` });
+    } catch (cause) {
+      setFeedback({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
+    } finally {
+      setBusyAction("");
+    }
+  };
+
   const setObjectEnabled = async (
     collection: "connections" | "deployments",
     id: string,
@@ -554,7 +582,19 @@ export function ProvidersPage({
                   setWizardOpen(false);
                   setAddModelConnectionId(connection.id);
                 }}
+                onEditDeployment={hasAdminKey ? (deployment) => setEditingDeployment(deployment) : undefined}
               />
+              {editingDeployment && (
+                <DeploymentCapabilitiesDialog
+                  api={api}
+                  adminKey={adminKey.trim()}
+                  revision={status.control.revision}
+                  deployment={editingDeployment}
+                  busy={busyAction === `capabilities:deployments:${editingDeployment.id}`}
+                  onClose={() => setEditingDeployment(null)}
+                  onSave={(capabilities) => void saveDeploymentCapabilities(editingDeployment, capabilities)}
+                />
+              )}
               {wizardOpen && (
                 <NewChannelWizard
                   api={api}
@@ -604,12 +644,7 @@ export function ProvidersPage({
                     />
                   )}
                 </>
-              ) : (
-                <div className="provider-feedback" role="note">
-                  <ShieldCheck size={18} aria-hidden />
-                  <span>高级故障切换与对象管理已收进专家模式；日常添加渠道无需开启。</span>
-                </div>
-              )}
+              ) : null}
             </>
           ) : (
             <ReadOnlyDirectStatus status={status} />
@@ -638,6 +673,27 @@ function AdminAccess({
   onCheck: () => void;
   onForget: () => void;
 }) {
+  if (state === "valid") {
+    return (
+      <section className="panel provider-admin-access provider-admin-access-compact" aria-labelledby="provider-admin-title">
+        <div className="provider-admin-copy">
+          <span className="provider-admin-icon" aria-hidden>
+            <LockKeyhole size={18} />
+          </span>
+          <div>
+            <h2 id="provider-admin-title">管理密钥已验证</h2>
+            <p>只在当前标签页有效，关闭标签页后需要重新粘贴。</p>
+          </div>
+        </div>
+        <div className="provider-admin-actions">
+          <button type="button" className="ghost-button compact" onClick={onForget}>
+            <XCircle size={15} aria-hidden />
+            忘记管理密钥
+          </button>
+        </div>
+      </section>
+    );
+  }
   return (
     <section className="panel provider-admin-access" aria-labelledby="provider-admin-title">
       <div className="provider-admin-copy">
@@ -645,8 +701,8 @@ function AdminAccess({
           <LockKeyhole size={18} />
         </span>
         <div>
-          <h2 id="provider-admin-title">解锁本次配置操作</h2>
-          <p>粘贴安装时保存的 admin key。验证成功后只保存在当前标签页的会话存储里，关闭标签页即失效；不会写入 localStorage。</p>
+          <h2 id="provider-admin-title">解锁配置操作</h2>
+          <p>粘贴安装时保存的 admin key 才能新建渠道、添加模型或修改能力。只保存在当前标签页。</p>
         </div>
       </div>
       <label className="field-block provider-admin-field">
@@ -679,11 +735,10 @@ function AdminAccess({
           disabled={!value.trim() || state === "checking"}
         >
           <KeyRound size={16} aria-hidden />
-          {state === "checking" ? "正在验证" : state === "valid" ? "已验证" : "验证管理密钥"}
+          {state === "checking" ? "正在验证" : "验证管理密钥"}
         </button>
         {state === "invalid" && <span className="field-error">密钥无效，请重新粘贴。</span>}
-        {state === "valid" && <span className="field-success">验证成功</span>}
-        {(value.trim() || state === "valid") && (
+        {value.trim() && (
           <button type="button" className="ghost-button compact" onClick={onForget}>
             <XCircle size={15} aria-hidden />
             忘记管理密钥
@@ -748,7 +803,8 @@ function ConnectionsEditor({
   onSaveSecret,
   onCheck,
   onCreateChannel,
-  onAddModel
+  onAddModel,
+  onEditDeployment
 }: {
   control: ModelGatewayControlSnapshot;
   adminReady: boolean;
@@ -762,6 +818,7 @@ function ConnectionsEditor({
   onCheck: (connection: ModelGatewayConnectionInfo) => void;
   onCreateChannel: () => void;
   onAddModel: (connection: ModelGatewayConnectionInfo) => void;
+  onEditDeployment?: (deployment: ModelGatewayDeploymentInfo) => void;
 }) {
   const deploymentsByConnection = useMemo(() => {
     const grouped: Record<string, ModelGatewayDeploymentInfo[]> = {};
@@ -805,7 +862,7 @@ function ConnectionsEditor({
             <article className="provider-connection-row" key={connection.id}>
               <div className="provider-connection-summary">
                 <div className="provider-connection-title">
-                  <h3>{connection.channel_operator}</h3>
+                  <h3 title={connection.id}>{channelOperatorLabel(connection.channel_operator)}</h3>
                   <StatusPill
                     ok={connection.configured}
                     okText="密钥已配置"
@@ -814,9 +871,31 @@ function ConnectionsEditor({
                 </div>
                 <p>{connection.base_url}</p>
                 <div className="provider-deployment-chips" aria-label="关联部署">
-                  {(deploymentsByConnection[connection.id] || []).map((deployment) => (
-                    <span key={deployment.id}>{deployment.id}</span>
-                  ))}
+                  {(deploymentsByConnection[connection.id] || []).map((deployment) =>
+                    // Capability flags only steer chat routing; an embedding model
+                    // has nothing to edit here, so it stays a plain label.
+                    onEditDeployment && deployment.kind === "chat" ? (
+                      <button
+                        type="button"
+                        key={deployment.id}
+                        className="provider-deployment-chip-button"
+                        onClick={() => onEditDeployment(deployment)}
+                        title={`${deployment.id} · 修改这个模型的能力（工具调用、推理等）`}
+                        aria-label={`修改模型 ${deployment.id} 的能力`}
+                      >
+                        <Pencil size={12} aria-hidden />
+                        {deployment.upstream_model}
+                        {deployment.kind === "chat" && !deployment.capabilities?.tools && (
+                          <small>无工具调用</small>
+                        )}
+                      </button>
+                    ) : (
+                      <span key={deployment.id} title={deployment.id}>
+                        {deployment.upstream_model}
+                        {deployment.kind === "embedding" && <small> · 向量</small>}
+                      </span>
+                    )
+                  )}
                 </div>
               </div>
               <div className="provider-secret-actions">
@@ -886,6 +965,112 @@ function ConnectionsEditor({
         })}
       </div>
     </section>
+  );
+}
+
+function DeploymentCapabilitiesDialog({
+  api,
+  adminKey,
+  revision,
+  deployment,
+  busy,
+  onClose,
+  onSave
+}: {
+  api: MemoryApi;
+  adminKey: string;
+  revision: string;
+  deployment: ModelGatewayDeploymentInfo;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (capabilities: ModelGatewayCapabilities) => void;
+}) {
+  const [capabilities, setCapabilities] = useState<ModelGatewayCapabilities>({
+    ...deployment.capabilities
+  });
+  const [probing, setProbing] = useState(false);
+  const [probeNote, setProbeNote] = useState<ProviderFeedback | null>(null);
+  const detect = async () => {
+    if (probing || busy) return;
+    setProbing(true);
+    setProbeNote(null);
+    try {
+      const result = await api.probeProviderChannelCapabilities(
+        {
+          revision,
+          connection_id: deployment.connection,
+          upstream_model: deployment.upstream_model,
+          probes: ["chat", "streaming", "tools", "reasoning", "json_object"]
+        },
+        adminKey
+      );
+      const chatOk = result.details?.chat?.ok;
+      if (!chatOk) {
+        setProbeNote({ tone: "error", message: `基础聊天探测失败：${result.details?.chat?.detail || "未知错误"}。勾选未改动。` });
+        return;
+      }
+      setCapabilities((current) => ({
+        ...current,
+        tools: Boolean(result.capabilities.tools),
+        parallel_tools: Boolean(result.capabilities.parallel_tools),
+        reasoning: Boolean(result.capabilities.reasoning),
+        json_object: Boolean(result.capabilities.json_object),
+        json_schema: Boolean(result.capabilities.json_schema)
+      }));
+      setProbeNote({ tone: "success", message: "已按实际探测结果勾选（消耗少量额度）。多模态输入无法自动探测，需要时手动勾选。确认后点保存。" });
+    } catch (cause) {
+      setProbeNote({ tone: "error", message: errorMessage(cause, { credential: "admin" }) });
+    } finally {
+      setProbing(false);
+    }
+  };
+  return (
+    <Modal title={`模型能力：${deployment.upstream_model}`} onClose={onClose} closeDisabled={busy}>
+      <p className="muted">
+        能力决定路由会不会把某类请求派给这个模型，例如带搜索或 MCP 工具的对话只会派给勾了「工具调用」的模型。不确定就点自动检测。
+      </p>
+      <div className="provider-wizard-actions provider-detect-row">
+        <button type="button" className="secondary-button" onClick={() => void detect()} disabled={probing || busy}>
+          <Sparkles size={15} aria-hidden />
+          {probing ? "正在探测…" : "自动检测能力"}
+        </button>
+      </div>
+      {probeNote && (
+        <div className={`provider-feedback ${probeNote.tone}`} role="status">
+          <span>{probeNote.message}</span>
+        </div>
+      )}
+      <fieldset className="provider-capability-field" disabled={busy || probing}>
+        <legend>支持的能力</legend>
+        <div className="provider-capability-grid">
+          {CAPABILITY_OPTIONS.map((option) => (
+            <label key={option.key}>
+              <input
+                type="checkbox"
+                checked={Boolean(capabilities[option.key])}
+                onChange={(event) =>
+                  setCapabilities((current) => ({ ...current, [option.key]: event.target.checked }))
+                }
+              />
+              <span>{option.label}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <div className="provider-wizard-actions">
+        <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>
+          取消
+        </button>
+        <button
+          type="button"
+          className="primary-button"
+          onClick={() => onSave(capabilities)}
+          disabled={busy}
+        >
+          {busy ? "保存中…" : "保存能力"}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -1276,22 +1461,19 @@ function RuntimeBanner({
     );
   }
   return (
+    <details className="panel provider-advanced-panel runtime-banner-details">
+      <summary>
+        运行信息 · 向量{embeddingState}
+        {validated ? " · 草稿已校验" : dirty ? " · 有未应用草稿" : ""}
+      </summary>
     <div className="runtime-banner">
       <div>
-        <strong>配置权威</strong>
+        <strong>配置来源</strong>
         <span>{runtime.model_gateway_enabled ? "独立 Model Gateway" : "本项目兼容配置"}</span>
       </div>
       <div>
-        <strong>内部接线</strong>
-        <span>
-          {runtime.model_gateway_base_url
-            ? `${runtime.model_gateway_base_url}（仅服务间通信，不用填进客户端）`
-            : "直连各供应商"}
-        </span>
-      </div>
-      <div>
         <strong>客户端接入</strong>
-        <span>{window.location.origin}/v1 · 模型 memory-auto</span>
+        <span>{window.location.origin}/v1 · 模型 {CLIENT_MODEL_ID}</span>
       </div>
       <div>
         <strong>向量模型</strong>
@@ -1329,6 +1511,7 @@ function RuntimeBanner({
         )}
       </div>
     </div>
+    </details>
   );
 }
 

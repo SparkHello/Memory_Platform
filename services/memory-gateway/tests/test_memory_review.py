@@ -341,3 +341,37 @@ def _set_updated_at(memory_store: MemoryStore, memory_id: str, updated_at: str) 
             (updated_at, memory_id),
         )
 
+
+
+def test_review_skips_rows_closed_by_auto_supersede(memory_store: MemoryStore) -> None:
+    from app.memory.models import AutoSupersedeDecision
+
+    old = memory_store.create_memory(
+        user_id="default", content="用户平时用 iPhone 手机。", type="semantic", importance=7
+    )
+    new = memory_store.create_memory(
+        user_id="default",
+        content="用户现在改用安卓手机。",
+        type="semantic",
+        importance=7,
+        supersede_matcher=lambda latest: AutoSupersedeDecision(
+            target=old, relation="supersede", reason="test"
+        ),
+    )
+
+    result = MemoryReviewer(store=memory_store).review(user_id="default")
+
+    assert result.total == 2
+    mentioning_old = [
+        recommendation
+        for recommendation in result.recommendations
+        if old.id in recommendation.memory_ids
+    ]
+    assert mentioning_old == []
+    # The live head may still get unrelated single-row suggestions (e.g. the
+    # "现在" time-uncertain heuristic), but never a pair suggestion with the
+    # row it just closed.
+    assert not any(
+        {old.id, new.id} <= set(recommendation.memory_ids)
+        for recommendation in result.recommendations
+    )

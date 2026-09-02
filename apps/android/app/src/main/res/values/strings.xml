@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Memory Platform</string>
+    <string name="notification_channel">后台服务</string>
+    <string name="notification_title">Memory Platform 正在运行</string>
+    <string name="state_stopped">已停止</string>
+    <string name="state_starting">启动中…</string>
+    <string name="state_running">运行中</string>
+    <string name="state_failed">启动失败</string>
+    <string name="action_start">启动服务</string>
+    <string name="action_stop">停止服务</string>
+    <string name="action_open_console">打开控制台</string>
+    <string name="action_copy_token">复制首次登录令牌</string>
+    <string name="action_copy_admin_key">复制模型网关管理密钥</string>
+    <string name="action_battery">关闭电池优化</string>
+    <string name="action_export">导出诊断包</string>
+    <string name="export_running">正在打包日志、配置和记忆库快照…</string>
+    <string name="export_failed">导出失败：%1$s</string>
+    <string name="hint_clients">怎么用：1. 复制首次登录令牌，打开控制台粘贴登录；2. 在控制台配置模型时粘贴管理密钥；3. 聊天 App 里填上面的 OpenAI 兼容地址，令牌在控制台「接入」页创建。</string>
+    <string name="label_console_url">控制台</string>
+    <string name="label_openai_url">聊天 App 用的 OpenAI 兼容地址</string>
+    <string name="label_mcp_url">MCP 地址</string>
+    <string name="action_copy">复制</string>
+    <string name="copied">已复制</string>
+    <string name="token_copied">令牌已复制，30 秒后请从剪贴板清除</string>
+    <string name="admin_key_copied">管理密钥已复制。控制台配置模型连接时粘贴到「模型网关管理密钥」</string>
+    <string name="token_missing">未找到凭据文件；服务尚未完成初始化</string>
+</resources>

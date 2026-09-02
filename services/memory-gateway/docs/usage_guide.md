@@ -44,11 +44,13 @@ CHAT_GATEWAY_RECALL_TIMEOUT_SECONDS=4
 CHAT_GATEWAY_STREAM_READ_TIMEOUT_SECONDS=600
 CHAT_GATEWAY_STREAM_WRITE_TIMEOUT_SECONDS=120
 CHAT_GATEWAY_TURN_TTL_SECONDS=3600
-CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS=2
+CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS=4
 CHAT_GATEWAY_EXTRACTION_CONTEXT_MAX_CHARS=8000
 CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_TURNS=8
 CHAT_GATEWAY_CONTEXT_COMPACT_AFTER_CHARS=6000
 CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS=4000
+# 寒暄致谢、纯提问或纯代码的轮次不调用提取模型；跳过会写「本地预过滤：」决策日志。
+CHAT_GATEWAY_EXTRACTION_PREFILTER=true
 
 # 【必填】中央 Model Gateway。/v1 对话代理、记忆提取、核心记忆整理、AI 体检、
 # 知识代理与 embedding 都只调用它的稳定 route；两项必须成对配置。
@@ -57,9 +59,14 @@ CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS=4000
 MODEL_GATEWAY_BASE_URL=http://127.0.0.1:2030/v1
 MODEL_GATEWAY_API_KEY=your-local-model-gateway-client-key
 
-# 【安全边界】是否允许把本地判定为 private/sensitive 的文本发给远程模型。
+# 【安全边界】是否允许把本地判定为 sensitive（密码/密钥、证件号、银行卡/账号）的句子发给远程模型。
 # 默认 false，只有确认 provider 获准处理敏感数据时才改 true。
 ALLOW_SENSITIVE_EGRESS=false
+# ALLOW_SENSITIVE_EGRESS=false 时记忆提取/embedding 仍可出站的最高级别：private（默认，
+# 健康/住址/联系方式/收入句子照常提取）或 normal（连私密句子也逐句扣留）。
+MEMORY_EGRESS_CEILING=private
+# 带明确转变标记（换成/改成/现在/不再…）的新记忆自动把同一属性的旧记忆关闭为历史；需要 embedding。
+MEMORY_AUTO_SUPERSEDE=true
 
 # 【可选】向量检索。在 Model Gateway 配好 memory.embedding route 后，填写它声明的
 # 精确空间 ID 与维度；留空或与空间/维度 Header、实际向量长度不匹配时安全回退关键词/FTS。
@@ -187,7 +194,7 @@ PDF 必须自带可提取文本层，扫描件需先 OCR。导入时可填写标
 - Base URL：`http://<主机地址>:2026/v1`
 - API 路径：`/chat/completions`
 - API Key：`GATEWAY_API_KEY`
-- 模型：`memory-auto`
+- 模型：`memory-auto`（服务端默认记忆模式；`memory-read` 只读不写，`memory-off` 不读不写，可按对话切换）
 - Provider 中关闭 Responses API；在助手的模型设置中保持“流式输出”开启（默认已开启）
 - 自定义 Header：`X-User-Id: default`
 
@@ -202,7 +209,7 @@ PDF 必须自带可提取文本层，扫描件需先 OCR。导入时可填写标
 
 默认 `read-write` 会自动检索/注入安全记忆，并在完整最终回复后提取、去重和嵌入新长期记忆。提取时以最后一条用户文本为唯一事实来源，同时附带最近两轮可见对话消歧；system、工具内容和 reasoning 不会进入提取上下文。依赖上下文的候选必须同时通过本轮 `source_quote` 和较早 `context_quote` 校验，所以“前文问年龄、本轮回答 18”可保存，孤立的“18”会忽略。每个完整回答会保存本地分支节点；较早对话在后台压缩成滚动摘要，节点保留“摘要 + 最近两轮”。压缩摘要只能辅助理解，不能作为 `context_quote` 授权保存。如果客户端既没有动态 `conversation_id` 又截断了用于指纹匹配的旧历史，本轮会从请求自带上下文保守重建，而不会猜测其他分支。
 
-可用静态或按请求 Header `X-Memory-Mode: read` 关闭自动写入，或用 `off` 作为纯代理。多模态、tools、上游 reasoning 响应和 SSE 会透明转发，`stream_options` 也原样保留（上游兼容性由 Model Gateway 渠道适配层负责）；图片与音频数据不会送入记忆 embedding。在进程内短暂缓存、恢复 FLIT 使用 `memory-auto` 时省略的工具推理状态；历史 reasoning 无法证明属于当前 provider 时会在转发上游前清除，避免故障切换时跨 provider 泄露。`ALLOW_SENSITIVE_EGRESS=false` 时，敏感历史只保存在本地，不会发送给记忆提取或上下文压缩 provider。
+可把模型切换为 `memory-read` 关闭自动写入，或 `memory-off` 作为纯代理；能发自定义 Header 的客户端也可按请求用 `X-Memory-Mode: read|off`（Header 优先于模型别名）。多模态、tools、上游 reasoning 响应和 SSE 会透明转发，`stream_options` 也原样保留（上游兼容性由 Model Gateway 渠道适配层负责）；图片与音频数据不会送入记忆 embedding。在进程内短暂缓存、恢复 FLIT 使用 `memory-auto` 时省略的工具推理状态；历史 reasoning 无法证明属于当前 provider 时会在转发上游前清除，避免故障切换时跨 provider 泄露。`ALLOW_SENSITIVE_EGRESS=false` 时，含密码/证件号/账号的句子不会发送给记忆提取或 embedding provider（按句子扣留，同一轮其余句子照常提取；紧邻「记住」时在本地原句保存），上下文压缩仍扣留全部非 normal 文本。
 
 ## 4. 终端命令速查
 
@@ -297,12 +304,12 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1   # 卸�
 ## 5. 常见问题
 
 - **接口返回 500 / 401**：检查 `.env` 是否配置了 `GATEWAY_API_KEY`，以及请求头 `Authorization: Bearer ...` 是否一致。
-- **记忆没有被自动提取**：确认 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY` 成对配置且 `memory.extract` route 可用（可用 `memgw doctor` 检查），并到“决策日志”查看 `model_reason_code`；空候选会显示临时事项、假设、非用户陈述、敏感授权不足、无长期价值或未分类等受控原因码，自由文本理由仍保持脱敏。敏感文本在 `ALLOW_SENSITIVE_EGRESS=false` 时不会发给远程提取，属预期行为。
+- **记忆没有被自动提取**：确认 `MODEL_GATEWAY_BASE_URL` / `MODEL_GATEWAY_API_KEY` 成对配置且 `memory.extract` route 可用（可用 `memgw doctor` 检查），并到“决策日志”查看 `model_reason_code`；空候选会显示临时事项、假设、非用户陈述、敏感授权不足、无长期价值或未分类等受控原因码，自由文本理由仍保持脱敏。以「本地预过滤：」开头的忽略记录也是预期行为：本轮只是寒暄致谢、纯提问或纯代码，未调用提取模型；明确「记住」的消息和回答助手提问的短句不会被跳过，设 `CHAT_GATEWAY_EXTRACTION_PREFILTER=false` 可完全关闭。含密码/证件号/账号的句子在 `ALLOW_SENSITIVE_EGRESS=false` 时不会发给远程提取（其余句子照常），属预期行为。
 - **搜索只有关键词效果**：`MODEL_GATEWAY_EMBEDDING_SPACE_ID` 未配置，或与 Model Gateway 返回的空间/维度 Header、实际向量长度不匹配时，记忆与知识库都会安全回退关键词/FTS 检索，属预期行为；知识状态接口会显示 embedding 是否启用。
 - **扫描 PDF 无法导入**：当前只读取 PDF 自带文本层，请先用 OCR 工具生成可搜索 PDF。
 - **AI 客户端连不上 `/mcp`**：确认服务用 `--host 0.0.0.0` 启动、端口 2026 未被防火墙拦截，且客户端带了 Bearer token。
 - **FLIT 连不上或不流式**：Base URL 应以 `/v1` 结尾，API 路径使用 `/chat/completions`，Responses API 必须关闭；API Key 填本地 `GATEWAY_API_KEY`，助手模型的“流式输出”保持开启。
 - **FLIT 看不到工具、推理或原图能力**：编辑 `memory-auto`，把输入模态设为“文本 + 图片”、输出模态设为“文本”，并开启“工具 + 推理”；这些能力不会由标准模型列表自动识别。
-- **FLIT 能聊天但没有语义记忆**：确认 `X-Memory-Mode` 不是 `off`，并在 Model Gateway 配好 `memory.embedding` route 后填写 `MODEL_GATEWAY_EMBEDDING_SPACE_ID`；未配置时仍会使用关键词召回，自动保存也仍可工作。
+- **FLIT 能聊天但没有语义记忆**：确认模型名不是 `memory-off`、`X-Memory-Mode` 不是 `off`，并在 Model Gateway 配好 `memory.embedding` route 后填写 `MODEL_GATEWAY_EMBEDDING_SPACE_ID`；未配置时仍会使用关键词召回，自动保存也仍可工作。
 - **“用量与费用”金额少于 provider 账单**：页面只累加同时具有上游 `usage` 和明确官方单价的调用，并且不含历史调用、套餐、赠金、折扣或账户优惠。先查看“计费完整度”和最近调用中的“缺少 usage / 待定价”状态。
 - **`data/memory.db` 是真实数据**：不要手工编辑或删除；测试和脚本用的是临时库，不会污染它。

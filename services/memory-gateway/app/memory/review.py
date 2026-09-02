@@ -43,8 +43,13 @@ class MemoryReviewer:
         memories = self.store.list_memories(user_id=user_id, limit=max(1, min(limit, 500)))
         core_map = _core_evidence_map(self.store, user_id=user_id)
         recommendations: list[MemoryReviewRecommendation] = []
+        # Rows already closed by a newer version (temporal chains and automatic
+        # supersede) are history: never re-suggest them as duplicates/conflicts
+        # or flag their synthesized expiry. Core-evidence and sensitivity checks
+        # still see them because those concern the whole store.
+        live = [memory for memory in memories if not memory.superseded_by]
         relationship_recommendations = _relationship_recommendations(
-            memories,
+            live,
             core_map=core_map,
         )
         relationship_memory_ids = {
@@ -53,21 +58,21 @@ class MemoryReviewer:
             for memory_id in recommendation.memory_ids
         }
 
-        recommendations.extend(_review_after_recommendations(memories, core_map=core_map))
-        recommendations.extend(_validity_recommendations(memories, core_map=core_map))
-        recommendations.extend(_time_uncertain_recommendations(memories, core_map=core_map))
+        recommendations.extend(_review_after_recommendations(live, core_map=core_map))
+        recommendations.extend(_validity_recommendations(live, core_map=core_map))
+        recommendations.extend(_time_uncertain_recommendations(live, core_map=core_map))
         recommendations.extend(_sensitivity_recommendations(memories, core_map=core_map))
-        recommendations.extend(_emotion_uncertain_recommendations(memories, core_map=core_map))
+        recommendations.extend(_emotion_uncertain_recommendations(live, core_map=core_map))
         recommendations.extend(
             _stale_recommendations(
-                memories,
+                live,
                 core_map=core_map,
                 excluded_memory_ids=relationship_memory_ids,
             )
         )
         recommendations.extend(
             _low_life_recommendations(
-                memories,
+                live,
                 core_map=core_map,
                 excluded_memory_ids=relationship_memory_ids,
             )

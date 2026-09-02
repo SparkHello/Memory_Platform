@@ -1394,9 +1394,19 @@ button {
     display: none;
   }
 
+  /* 手机：文档本身不滚动，内容区内部滚动。这样浏览器地址栏/工具栏不会因为
+     滚动而收起，视口高度稳定，fixed 底栏不会出现「跟着内容往上跑、下面露出
+     一截页面」的问题（Chromium 系浏览器把 fixed 元素挂在最小布局视口上）。 */
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
   .workspace {
-    height: auto;
-    min-height: 100dvh;
+    height: 100dvh;
+    min-height: 0;
     margin-left: 0;
   }
 
@@ -1406,7 +1416,7 @@ button {
     min-height: 60px;
     padding: 8px 12px;
     border-bottom: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    background: color-mix(in srgb, var(--solid-bg) 92%, transparent);
   }
 
   .topbar-title > span {
@@ -1431,9 +1441,13 @@ button {
   }
 
   .content-area {
-    min-height: calc(100dvh - 60px);
-    padding: 14px 13px calc(104px + env(safe-area-inset-bottom));
-    overflow: visible;
+    flex: 1;
+    min-height: 0;
+    padding: 14px 16px calc(104px + env(safe-area-inset-bottom));
+    overflow-x: clip;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
   .page-stack {
@@ -1469,9 +1483,40 @@ button {
     flex-direction: column;
   }
 
+  /* 图标按钮靠右并排，不再一左一右撑满整行 */
   .studio-head-side {
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .studio-head-row {
+    flex-wrap: nowrap;
+    align-items: flex-start;
+  }
+
+  /* 浮现模式：手机上用原生下拉代替五个分段标签 */
+  .surfaced-mode-tabs {
+    display: none;
+  }
+
+  .surfaced-mode-select {
+    display: block;
+    margin-top: 12px;
+  }
+
+  .surfaced-mode-select select {
     width: 100%;
-    justify-content: space-between;
+  }
+
+  /* 表格列选择是桌面功能 */
+  .column-picker-wrap {
+    display: none;
+  }
+
+  .integration-guide-grid {
+    grid-template-columns: 1fr;
   }
 
   .hero-note {
@@ -1548,9 +1593,10 @@ button {
     grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 2px;
     padding: 6px;
-    border: 1px solid var(--glass-border);
+    border: 1px solid var(--border);
     border-radius: 22px;
-    background: var(--glass-bg);
+    /* 小屏上底栏压在正文上，玻璃太透会看不清，用接近实色的底 */
+    background: color-mix(in srgb, var(--solid-bg) 94%, transparent);
     box-shadow: var(--glass-shadow);
     backdrop-filter: var(--glass-blur);
     -webkit-backdrop-filter: var(--glass-blur);
@@ -1581,14 +1627,51 @@ button {
     animation: sheet-up 0.45s var(--ease-out-expo);
   }
 
+  /* 记忆档案 / 核心记忆历史：手机上不再塞进正文末尾，而是浮在底栏之上的底部抽屉 */
+  .detail-drawer-scrim {
+    position: fixed;
+    z-index: var(--z-scrim);
+  }
+
+  .memory-detail-drawer {
+    position: fixed !important;
+    z-index: var(--z-drawer);
+    right: 10px;
+    bottom: calc(84px + env(safe-area-inset-bottom));
+    left: 10px;
+    max-height: calc(100dvh - 120px - env(safe-area-inset-bottom)) !important;
+    overflow: auto;
+    border-radius: 18px;
+    background: color-mix(in srgb, var(--solid-bg) 96%, transparent);
+    box-shadow: var(--glass-shadow);
+    animation: sheet-up 0.4s var(--ease-out-expo);
+  }
+
+  /* 顶栏状态点：手机上只剩一个点，居中 */
+  .topbar .status-pill {
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  .topbar .status-pill .status-dot {
+    margin: 0;
+  }
+
+  /* 弹窗底部留出底栏高度，按钮不会被底栏盖住 */
   .modal-backdrop {
-    padding: 10px;
+    padding: 10px 10px calc(84px + env(safe-area-inset-bottom));
+    align-items: start;
   }
 
   .modal-card,
   .drawer-card {
-    max-height: calc(100dvh - 20px);
+    max-height: calc(100dvh - 94px - env(safe-area-inset-bottom));
     border-radius: 18px;
+  }
+
+  .modal-card .provider-capability-grid label {
+    flex: 1 1 100%;
   }
 
   .toast {

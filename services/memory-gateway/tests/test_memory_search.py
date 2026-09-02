@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import json
+import sqlite3
 
 import pytest
 
@@ -222,7 +223,7 @@ def test_concurrent_expired_cache_reads_do_not_raise(memory_store: MemoryStore) 
         store=memory_store,
         embedding_client=NullEmbeddingClient(),
     )
-    key = ("default", "咖啡", 8, False, "")
+    key = ("default", "咖啡", 8, "normal", "")
     SEARCH_CACHE[key] = (0.0, "unused", 0, [])
 
     def read(_: int):
@@ -1343,3 +1344,162 @@ def _set_memory_times(
             """,
             (created_at, updated_at, memory_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity ceiling: chat may see private, never sensitive.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_private_ceiling_returns_private_but_not_sensitive(memory_store: MemoryStore) -> None:
+    normal = memory_store.create_memory(
+        user_id="default",
+        content="用户喜欢咖啡。",
+        type="emotional",
+        importance=6,
+    )
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户对咖啡因过敏。",
+        type="semantic",
+        importance=9,
+        sensitivity="private",
+    )
+    sensitive = memory_store.create_memory(
+        user_id="default",
+        content="用户的咖啡店会员卡密码是 123456。",
+        type="semantic",
+        importance=10,
+        sensitivity="sensitive",
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    default_hits = await service.search(query="咖啡", user_id="default", limit=5, record_usage=False)
+    private_hits = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+        sensitivity_ceiling="private",
+    )
+    everything = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+        include_sensitive=True,
+    )
+
+    assert {memory.id for memory in default_hits} == {normal.id}
+    assert {memory.id for memory in private_hits} == {normal.id, private.id}
+    assert {memory.id for memory in everything} == {normal.id, private.id, sensitive.id}
+
+
+@pytest.mark.asyncio
+async def test_private_memory_ranks_below_equally_relevant_normal(memory_store: MemoryStore) -> None:
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户每天喝咖啡。",
+        type="semantic",
+        importance=8,
+        sensitivity="private",
+    )
+    normal = memory_store.create_memory(
+        user_id="default",
+        content="用户每天喝咖啡。",
+        type="semantic",
+        importance=8,
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    hits = await service.search_hits(
+        query="用户每天喝咖啡",
+        user_id="default",
+        limit=5,
+        record_usage=False,
+        sensitivity_ceiling="private",
+    )
+
+    assert [hit.memory.id for hit in hits] == [normal.id, private.id]
+
+
+@pytest.mark.asyncio
+async def test_cache_key_includes_sensitivity_ceiling(memory_store: MemoryStore) -> None:
+    memory_store.create_memory(user_id="default", content="用户喜欢咖啡。")
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    await service.search(query="咖啡", user_id="default", limit=8, record_usage=False)
+    await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=8,
+        record_usage=False,
+        sensitivity_ceiling="private",
+    )
+
+    assert ("default", "咖啡", 8, "normal", "") in SEARCH_CACHE
+    assert ("default", "咖啡", 8, "private", "") in SEARCH_CACHE
+
+
+@pytest.mark.asyncio
+async def test_cached_replay_refilters_by_ceiling(memory_store: MemoryStore) -> None:
+    private = memory_store.create_memory(
+        user_id="default",
+        content="用户对咖啡因过敏。",
+        type="semantic",
+        importance=9,
+        sensitivity="private",
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    first = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=8,
+        record_usage=False,
+        sensitivity_ceiling="private",
+    )
+    assert [memory.id for memory in first] == [private.id]
+
+    # Escalate the stored label without touching updated_at so the cache entry
+    # stays valid: the replay path must re-filter against the ceiling.
+    with sqlite3.connect(memory_store.database_path) as connection:
+        connection.execute(
+            "UPDATE memories SET sensitivity = 'sensitive' WHERE id = ?",
+            (private.id,),
+        )
+
+    replayed = await service.search(
+        query="咖啡",
+        user_id="default",
+        limit=8,
+        record_usage=False,
+        sensitivity_ceiling="private",
+    )
+    assert replayed == []
+
+
+@pytest.mark.asyncio
+async def test_keyless_supersede_chain_hidden_from_current_recall_and_visible_in_history(
+    memory_store: MemoryStore,
+) -> None:
+    from app.memory.models import AutoSupersedeDecision
+
+    old = memory_store.create_memory(user_id="default", content="用户平时用 iPhone 手机。")
+    new = memory_store.create_memory(
+        user_id="default",
+        content="用户现在改用安卓手机。",
+        supersede_matcher=lambda latest: AutoSupersedeDecision(
+            target=old, relation="supersede", reason="test"
+        ),
+    )
+    service = MemorySearchService(store=memory_store, embedding_client=NullEmbeddingClient())
+
+    current = await service.search(query="用户用什么手机", user_id="default", limit=5, record_usage=False)
+    history = await service.search(
+        query="用户以前用什么手机", user_id="default", limit=5, record_usage=False
+    )
+
+    assert [memory.id for memory in current] == [new.id]
+    assert [memory.id for memory in history] == [old.id]

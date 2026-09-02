@@ -1270,3 +1270,142 @@ def test_admin_deployments_create_and_repoint_routes(gateway_home) -> None:
     assert deployment.model_author == "unknown"
     assert config.routes["memory.chat"].targets == ["official-author-chat-v2"]
     assert config.routes["knowledge.fast"].max_attempts == 1
+
+
+def test_admin_can_edit_capabilities_of_an_existing_deployment(gateway_home) -> None:
+    """Flags of an existing deployment are editable in place; a partial body
+    merges over the current flags, and a flag a route still requires cannot be
+    switched off."""
+    app = create_app(
+        paths=gateway_home,
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    admin = {"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"}
+    with TestClient(app) as client:
+        revision = client.get("/admin/configuration", headers=admin).json()["revision"]
+        before = load_config(gateway_home.config).deployments["chat-reseller"]
+
+        unknown = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": revision, "capabilities": {"telepathy": True}},
+        )
+        assert unknown.status_code == 400
+
+        empty = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": revision},
+        )
+        assert empty.status_code == 400
+
+        # memory.chat requires tools on this target: switching it off is refused.
+        required = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": revision, "capabilities": {"tools": False}},
+        )
+        assert required.status_code == 400
+        assert load_config(gateway_home.config).deployments["chat-reseller"].capabilities.tools is True
+
+        off = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": revision, "capabilities": {"json_schema": False, "multimodal_input": False}},
+        )
+        assert off.status_code == 200, off.text
+        assert off.json()["capabilities"]["json_schema"] is False
+        assert off.json()["capabilities"]["multimodal_input"] is False
+        # untouched flags keep their previous value
+        assert off.json()["capabilities"]["tools"] is True
+        assert off.json()["capabilities"]["streaming"] == before.capabilities.streaming
+
+        stale = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": revision, "capabilities": {"json_schema": True}},
+        )
+        assert stale.status_code == 409
+
+        on = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": off.json()["revision"], "capabilities": {"json_schema": True}},
+        )
+        assert on.status_code == 200, on.text
+        assert on.json()["capabilities"]["json_schema"] is True
+        assert on.json()["capabilities"]["multimodal_input"] is False
+
+        # the legacy enabled-only body still works and does not disturb capabilities
+        disabled = client.patch(
+            "/admin/deployments/chat-reseller",
+            headers=admin,
+            json={"revision": on.json()["revision"], "enabled": False},
+        )
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json()["enabled"] is False
+        assert disabled.json()["capabilities"]["json_schema"] is True
+
+    after = load_config(gateway_home.config).deployments["chat-reseller"]
+    assert after.capabilities.json_schema is True
+    assert after.capabilities.multimodal_input is False
+    assert after.enabled is False
+
+
+def test_capability_probe_can_reuse_an_existing_connection_secret(gateway_home) -> None:
+    """The console auto-detects flags of a configured model without re-entering the provider key."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization", ""))
+        return httpx.Response(
+            200,
+            json={
+                "id": "probe",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    admin = {"authorization": f"Bearer {ADMIN_CLIENT_TOKEN}"}
+    with TestClient(app) as client:
+        revision = client.get("/admin/configuration", headers=admin).json()["revision"]
+
+        both = client.post(
+            "/admin/channels/probe-capabilities",
+            headers=admin,
+            json={"revision": revision, "connection_id": "official", "candidate_key": "x", "upstream_model": "author/chat-v1"},
+        )
+        assert both.status_code == 400
+
+        neither = client.post(
+            "/admin/channels/probe-capabilities",
+            headers=admin,
+            json={"revision": revision, "upstream_model": "author/chat-v1"},
+        )
+        assert neither.status_code == 400
+
+        unknown = client.post(
+            "/admin/channels/probe-capabilities",
+            headers=admin,
+            json={"revision": revision, "connection_id": "nope", "upstream_model": "author/chat-v1", "probes": ["chat"]},
+        )
+        assert unknown.status_code == 404
+
+        response = client.post(
+            "/admin/channels/probe-capabilities",
+            headers=admin,
+            json={"revision": revision, "connection_id": "official", "upstream_model": "author/chat-v1", "probes": ["chat"]},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["persisted"] is False
+        assert payload["upstream_model"] == "author/chat-v1"
+        assert "capabilities" in payload
+
+    # the probe went out with the connection's stored provider secret
+    assert seen and seen[0] == "Bearer official-secret"
+    assert "official-secret" not in response.text
+    assert load_config(gateway_home.config).connections.keys() >= {"official"}

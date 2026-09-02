@@ -54,61 +54,294 @@ def restore_temporal_memory(
         ):
             return source
 
-        restored = MemoryRecord(
-            **{
-                **source.model_dump(),
-                "id": new_memory_id(),
-                "last_used_at": None,
-                "usage_count": 0.0,
-                "valid_from": now,
-                "valid_until": None,
-                "status": "pinned" if source.status == "pinned" else "dynamic",
-                "supersedes": None,
-                "superseded_by": None,
-                "created_at": now,
-                "updated_at": now,
-                "archived_at": None,
-                "archived": 0,
-            }
-        )
-        _insert_memory_row(connection=connection, memory=restored)
-        _replace_memory_space_links(
-            connection=connection,
-            user_id=user_id,
-            memory_id=restored.id,
-            space_ids=space_ids,
-            created_at=now,
-        )
-        _apply_temporal_invalidation(
-            connection=connection,
-            user_id=user_id,
-            new_memory=restored,
-        )
+        has_temporal_key = bool(source.temporal_subject and source.temporal_predicate)
+        if not has_temporal_key and source.superseded_by:
+            # Keyless chains come from automatic supersede. A false supersede
+            # almost always means the two rows were independent facts, so undo
+            # reopens the old row in place and unlinks it; nothing else closes.
+            restored_id = _reopen_superseded_memory(
+                connection=connection,
+                user_id=user_id,
+                row=row,
+                source=source,
+                now=now,
+            )
+            return_id = restored_id
+        else:
+            restored = MemoryRecord(
+                **{
+                    **source.model_dump(),
+                    "id": new_memory_id(),
+                    "last_used_at": None,
+                    "usage_count": 0.0,
+                    "valid_from": now,
+                    "valid_until": None,
+                    "status": "pinned" if source.status == "pinned" else "dynamic",
+                    "supersedes": None,
+                    "superseded_by": None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "archived_at": None,
+                    "archived": 0,
+                }
+            )
+            _insert_memory_row(connection=connection, memory=restored)
+            _replace_memory_space_links(
+                connection=connection,
+                user_id=user_id,
+                memory_id=restored.id,
+                space_ids=space_ids,
+                created_at=now,
+            )
+            _apply_temporal_invalidation(
+                connection=connection,
+                user_id=user_id,
+                new_memory=restored,
+            )
 
-        _insert_decision_log(
-            connection=connection,
-            user_id=user_id,
-            conversation_id=None,
-            candidate_json=json.dumps(
-                {
-                    "source": "temporal_restore",
-                    "source_memory_id": memory_id,
-                    "restored_memory_id": restored.id,
-                    "before": _temporal_snapshot(row),
-                    "after": {
-                        "valid_from": restored.valid_from,
-                        "valid_until": restored.valid_until,
-                        "supersedes": restored.supersedes,
-                        "superseded_by": restored.superseded_by,
-                        "status": restored.status,
+            _insert_decision_log(
+                connection=connection,
+                user_id=user_id,
+                conversation_id=None,
+                candidate_json=json.dumps(
+                    {
+                        "source": "temporal_restore",
+                        "source_memory_id": memory_id,
+                        "restored_memory_id": restored.id,
+                        "before": _temporal_snapshot(row),
+                        "after": {
+                            "valid_from": restored.valid_from,
+                            "valid_until": restored.valid_until,
+                            "supersedes": restored.supersedes,
+                            "superseded_by": restored.superseded_by,
+                            "status": restored.status,
+                        },
                     },
-                },
-                ensure_ascii=False,
-            ),
-            decision="update",
-            reason="Copied a historical temporal fact into a new current version",
+                    ensure_ascii=False,
+                ),
+                decision="update",
+                reason="Copied a historical temporal fact into a new current version",
+            )
+            return_id = restored.id
+    return store.get_memory(memory_id=return_id, user_id=user_id)
+
+
+def _successor_effective_at(
+    *,
+    connection: sqlite3.Connection,
+    user_id: str,
+    successor_id: str | None,
+) -> str | None:
+    if not successor_id:
+        return None
+    successor = connection.execute(
+        """
+        SELECT valid_from, created_at FROM memories
+        WHERE id = ? AND user_id = ?
+        """,
+        (successor_id, user_id),
+    ).fetchone()
+    if successor is None:
+        return None
+    return str(successor["valid_from"] or successor["created_at"])
+
+
+def _is_synthesized_boundary(valid_until: str | None, successor_effective_at: str | None) -> bool:
+    """A closing boundary equal to the successor's start was created by supersede."""
+    end = _parse_iso_datetime(valid_until)
+    start = _parse_iso_datetime(successor_effective_at)
+    return end is not None and start is not None and end == start
+
+
+def _reopen_superseded_memory(
+    *,
+    connection: sqlite3.Connection,
+    user_id: str,
+    row: sqlite3.Row,
+    source: MemoryRecord,
+    now: str,
+) -> str:
+    """Undo a keyless auto-supersede: reopen ``source`` in place and unlink it."""
+    successor_id = source.superseded_by
+    successor_effective_at = _successor_effective_at(
+        connection=connection,
+        user_id=user_id,
+        successor_id=successor_id,
+    )
+    if successor_id:
+        connection.execute(
+            """
+            UPDATE memories
+            SET supersedes = NULL, updated_at = ?
+            WHERE id = ? AND user_id = ? AND archived = 0 AND supersedes = ?
+            """,
+            (now, successor_id, user_id, source.id),
         )
-    return store.get_memory(memory_id=restored.id, user_id=user_id)
+    new_valid_until = (
+        None
+        if _is_synthesized_boundary(source.valid_until, successor_effective_at)
+        else source.valid_until
+    )
+    new_status = "pinned" if source.status == "pinned" else "dynamic"
+    connection.execute(
+        """
+        UPDATE memories
+        SET superseded_by = NULL, valid_until = ?, status = ?, updated_at = ?,
+            revision = revision + 1
+        WHERE id = ? AND user_id = ? AND archived = 0
+        """,
+        (new_valid_until, new_status, now, source.id, user_id),
+    )
+    _insert_decision_log(
+        connection=connection,
+        user_id=user_id,
+        conversation_id=None,
+        candidate_json=json.dumps(
+            {
+                "source": "auto_supersede_undo",
+                "memory_id": source.id,
+                "previous_superseded_by": successor_id,
+                "before": _temporal_snapshot(row),
+                "after": {
+                    "id": source.id,
+                    "valid_until": new_valid_until,
+                    "status": new_status,
+                    "supersedes": source.supersedes,
+                    "superseded_by": None,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        decision="update",
+        reason="Reopened an automatically superseded memory in place; both versions are current again",
+    )
+    return source.id
+
+
+def _unlink_keyless_chain_member(
+    *,
+    connection: sqlite3.Connection,
+    user_id: str,
+    memory: MemoryRecord,
+) -> None:
+    """Detach an archived keyless chain member so trash rows stand alone.
+
+    Neighbours are bridged (a superseded predecessor reopens when the boundary
+    was synthesized); the archived row itself loses its links so restoring it
+    from the trash yields an ordinary live row.
+    """
+    successor_effective_at = _successor_effective_at(
+        connection=connection,
+        user_id=user_id,
+        successor_id=memory.superseded_by,
+    )
+    _detach_temporal_position(connection=connection, user_id=user_id, memory=memory)
+    own_valid_until = memory.valid_until
+    own_status = memory.status or "dynamic"
+    if _is_synthesized_boundary(memory.valid_until, successor_effective_at):
+        own_valid_until = None
+        if own_status != "pinned":
+            own_status = "dynamic"
+    connection.execute(
+        """
+        UPDATE memories
+        SET supersedes = NULL, superseded_by = NULL, valid_until = ?, status = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (own_valid_until, own_status, memory.id, user_id),
+    )
+
+
+def _apply_auto_supersede(
+    *,
+    connection: sqlite3.Connection,
+    user_id: str,
+    new_memory: MemoryRecord,
+    target_id: str,
+    relation: str,
+    reason: str,
+) -> bool:
+    """Close ``target_id`` in place because ``new_memory`` replaces it.
+
+    Mirrors ``_apply_temporal_invalidation`` for rows without a temporal key.
+    The target is re-read under the caller's write lock and closed with a
+    guarded UPDATE, so a concurrent supersede of the same row is a no-op here.
+    Returns False (no link, no log) when the target is no longer eligible.
+    """
+    row = connection.execute(
+        """
+        SELECT * FROM memories
+        WHERE id = ? AND user_id = ? AND archived = 0
+        """,
+        (target_id, user_id),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["superseded_by"]
+        or str(row["status"] or "dynamic") != "dynamic"
+        or row["temporal_subject"]
+        or row["temporal_predicate"]
+    ):
+        return False
+    effective_at = new_memory.valid_from or new_memory.created_at
+    effective_instant = _parse_iso_datetime(effective_at)
+    target_start = _parse_iso_datetime(row["valid_from"] or row["created_at"])
+    if effective_instant is None or (target_start is not None and target_start > effective_instant):
+        return False
+
+    now = utc_now_iso()
+    cursor = connection.execute(
+        """
+        UPDATE memories
+        SET valid_until = ?, status = 'resolved', superseded_by = ?, updated_at = ?
+        WHERE id = ? AND user_id = ? AND archived = 0
+          AND superseded_by IS NULL
+          AND COALESCE(status, 'dynamic') = 'dynamic'
+        """,
+        (effective_at, new_memory.id, now, target_id, user_id),
+    )
+    if cursor.rowcount != 1:
+        return False
+    connection.execute(
+        """
+        UPDATE memories
+        SET supersedes = ?, updated_at = ?
+        WHERE id = ? AND user_id = ? AND archived = 0
+        """,
+        (target_id, now, new_memory.id, user_id),
+    )
+    new_memory.supersedes = target_id
+    new_memory.updated_at = now
+    _insert_decision_log(
+        connection=connection,
+        user_id=user_id,
+        conversation_id=None,
+        candidate_json=json.dumps(
+            {
+                "source": "auto_supersede",
+                "relation": relation,
+                "memory_id": new_memory.id,
+                "target_memory_id": target_id,
+                "effective_at": effective_at,
+                "before": _temporal_snapshot(row),
+                "after": {
+                    "id": target_id,
+                    "valid_until": effective_at,
+                    "status": "resolved",
+                    "superseded_by": new_memory.id,
+                },
+                "new_interval_after": {
+                    "id": new_memory.id,
+                    "supersedes": target_id,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        decision="update",
+        reason=reason,
+    )
+    return True
 
 def get_next_temporal_boundary(
     store: ConnectionProvider,

@@ -44,12 +44,14 @@ import { friendlyIngestSkipReason } from "../utils/decisionReason";
 import { downloadFile } from "../utils/files";
 import { spaceNamesFor } from "../utils/memory";
 import {
+  CLIENT_MODEL_ID,
   MEMORY_TYPES,
   MEMORY_TYPE_COLOR_VAR,
   SENSITIVITIES,
   SURFACE_MODES
 } from "../utils/constants";
 import {
+  clientConfigText,
   dateText,
   displayText,
   errorMessage,
@@ -369,12 +371,6 @@ export function DashboardPage({
     : [];
 
   const actions = data ? buildStudioActions(data, expertMode) : [];
-  const recentIgnores = useMemo(() => {
-    if (!data) return [];
-    return data.logs
-      .filter((log) => log.decision === "ignore")
-      .slice(0, 5);
-  }, [data]);
   const todayText = useMemo(
     () => new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" }),
     []
@@ -497,6 +493,18 @@ export function DashboardPage({
                   打开记忆库
                 </button>
               </div>
+              <label className="surfaced-mode-select">
+                <span className="sr-only">浮现模式</span>
+                <select
+                  value={surfaceMode}
+                  disabled={surfaceLoading}
+                  onChange={(event) => void refreshSurface(event.target.value as typeof surfaceMode)}
+                >
+                  {SURFACE_MODES.map((mode) => (
+                    <option key={mode} value={mode}>{displayText(mode)}</option>
+                  ))}
+                </select>
+              </label>
               <div className="tabs surfaced-mode-tabs" aria-label="浮现模式">
                 {SURFACE_MODES.map((mode) => (
                   <button
@@ -667,31 +675,6 @@ export function DashboardPage({
           </section>
           </details>
 
-          {recentIgnores.length > 0 && (
-            <section className="panel panel--quiet ingest-skip-panel" aria-label="最近未写入记忆">
-              <div className="panel-header">
-                <h2>
-                  <ShieldAlert size={18} />
-                  最近未写入记忆
-                </h2>
-                <button className="ghost-button compact" type="button" onClick={() => setPage("logs")}>
-                  打开决策日志
-                </button>
-              </div>
-              <p className="muted ingest-skip-hint">
-                系统保守保存：不是所有对话都会落库。下面是最近几条被跳过的原因，便于确认「没记住」是设计而非故障。
-              </p>
-              <ul className="ingest-skip-list">
-                {recentIgnores.map((log) => (
-                  <li key={log.id}>
-                    <time dateTime={log.created_at}>{dateText(log.created_at)}</time>
-                    {/* 展示白话翻译；原始审计文本在决策日志页可查 */}
-                    <span>{friendlyIngestSkipReason(log.reason || "")}</span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
         </>
       )}
     </div>
@@ -1193,9 +1176,7 @@ function ConnectClientCard({
   const copyConfig = async () => {
     if (!token) return;
     try {
-      await navigator.clipboard.writeText(
-        `Base URL: ${clientBaseUrl}\nAPI Key: ${token}\n模型名: memory-auto`
-      );
+      await navigator.clipboard.writeText(clientConfigText(clientBaseUrl, token));
       notify("客户端配置已复制（含 chat token）；请勿分享给他人。", "success");
     } catch (error) {
       notify(
@@ -1219,7 +1200,7 @@ function ConnectClientCard({
       </p>
       <div className="client-config-summary">
         <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
-        <span><small>模型名</small><code>memory-auto</code></span>
+        <span><small>模型名</small><code>{CLIENT_MODEL_ID}</code></span>
         <span>
           <small>API Key（chat token）</small>
           {token ? (

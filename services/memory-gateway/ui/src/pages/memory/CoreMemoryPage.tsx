@@ -68,8 +68,13 @@ export function CoreMemoryPage({
     }
     setConsolidating(true);
     try {
-      await api.consolidateCoreMemory();
-      notify("核心记忆已重新整理", "success");
+      const result = await api.consolidateCoreMemory();
+      if (result.created + result.updated > 0) {
+        notify(`核心记忆已重新整理：新增 ${result.created}，更新 ${result.updated}`, "success");
+      } else {
+        // Nothing written is a normal outcome with few memories; say why.
+        notify(`这次没有写入核心记忆：${result.reason || "长期记忆还太少，多聊几天再整理"}`, "info");
+      }
       await load();
     } catch (error) {
       notify(errorMessage(error), "error");

@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from datetime import UTC, datetime
 import json
 import re
 from functools import partial
@@ -5,8 +7,25 @@ from functools import partial
 import anyio
 
 from app.memory.classification import classify_memory, normalize_classification_values
-from app.memory.extractor import has_text_grounding_anchor
-from app.memory.models import CandidateMemory, MemoryRecord, MemoryRelation, ResolveResult
+from app.memory.extraction_hints import (
+    _PAST_MARKERS,
+    _UNCOMMITTED_INTENT_MARKERS,
+    _matches_any,
+)
+from app.memory.extractor import (
+    grounding_subjects_compatible_both_ways,
+    grounding_terms_overlap,
+    has_text_grounding_anchor,
+    shared_relation_families,
+    structured_value_kind_changed,
+)
+from app.memory.models import (
+    AutoSupersedeDecision,
+    CandidateMemory,
+    MemoryRecord,
+    MemoryRelation,
+    ResolveResult,
+)
 from app.memory.search import EmbeddingClient, embedding_space_id_for
 from app.vector_util import cosine_similarity
 from app.memory.store import MemoryStore
@@ -14,6 +33,7 @@ from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (
     _memory_embedding_vector,
     _normalize,
+    _parse_iso_datetime,
     _term_jaccard,
     pair_conflict,
 )
@@ -56,17 +76,43 @@ _INTENT_MARKERS = (
 )
 
 
+# Automatic supersede only touches these sectors: events are never "replaced"
+# and reflective insights accumulate rather than supersede one another.
+_AUTO_SUPERSEDE_TYPES = {"semantic", "emotional", "procedural"}
+# Preferences and consumption habits are additive (liking tea does not end
+# liking coffee), so sharing only these families is never enough on its own;
+# an explicit negation conflict is required for them.
+_ADDITIVE_RELATION_FAMILIES = {"preference", "consumption"}
+_AUTO_SUPERSEDE_REASONS: dict[str, str] = {
+    "supersede": "新信息取代同主题旧记忆，已自动替换；旧版本保留为历史，可在记忆详情恢复",
+    "conflict": "新信息与旧记忆冲突且带明确转变标记，已自动替换；旧版本保留为历史，可在记忆详情恢复",
+}
+
+
 class MemoryResolver:
     """决定候选记忆的落库方式：创建、更新旧记忆，还是忽略。
 
     能走到这里的候选都已通过 extractor 的保存校验（明确表达、非假设、
-    高置信度）。相似但非完全重复的记忆默认新建，让体检流程建议人工合并，
-    避免自动覆盖用户时间线。
+    高置信度）。落库策略分三层：
+
+    1. 白名单时态键（current_city 等）由 ``_apply_temporal_invalidation`` 按键
+       关闭旧值；
+    2. 无键候选带明确转变标记（换成/改成/现在/不再/取代/switched/now）、与
+       某条同类型、同主体、共享属性的活跃旧记忆向量高度相似时，自动关闭旧行
+       （保留为历史，可原地恢复）；
+    3. 其余相似但不同的记忆仍新建，交给体检建议人工合并，避免误改时间线。
     """
 
-    def __init__(self, *, store: MemoryStore, embedding_client: EmbeddingClient):
+    def __init__(
+        self,
+        *,
+        store: MemoryStore,
+        embedding_client: EmbeddingClient,
+        auto_supersede: bool = True,
+    ):
         self.store = store
         self.embedding_client = embedding_client
+        self.auto_supersede = auto_supersede
 
     async def resolve(
         self,
@@ -159,6 +205,23 @@ class MemoryResolver:
             )
             return final_suppression[0] if final_suppression is not None else None
 
+        supersede_decision: AutoSupersedeDecision | None = None
+        supersede_matcher: Callable[[list[MemoryRecord]], AutoSupersedeDecision | None] | None = None
+        candidate_has_key = bool(candidate.temporal_subject and candidate.temporal_predicate)
+        if self.auto_supersede and vector and not candidate_has_key:
+
+            def supersede_matcher(latest: list[MemoryRecord]) -> AutoSupersedeDecision | None:
+                nonlocal supersede_decision
+                # Re-select on the locked snapshot so a row closed by a
+                # concurrent write can no longer be chosen.
+                supersede_decision = _find_auto_supersede_target(
+                    candidate,
+                    latest,
+                    vector,
+                    embedding_space_id,
+                )
+                return supersede_decision
+
         created = await anyio.to_thread.run_sync(
             partial(
                 self.store.create_memory,
@@ -181,6 +244,7 @@ class MemoryResolver:
                 temporal_subject=candidate.temporal_subject,
                 temporal_predicate=candidate.temporal_predicate,
                 final_matcher=final_matcher,
+                supersede_matcher=supersede_matcher,
                 **classification_kwargs,
             )
         )
@@ -191,6 +255,17 @@ class MemoryResolver:
                 memory=matched,
                 relation="same",
                 reason=reason,
+            )
+        if (
+            supersede_decision is not None
+            and created.supersedes == supersede_decision.target.id
+        ):
+            return ResolveResult(
+                action="update",
+                memory=created,
+                relation=supersede_decision.relation,
+                reason=supersede_decision.reason,
+                superseded_memory_id=supersede_decision.target.id,
             )
         if target:
             return ResolveResult(
@@ -427,6 +502,125 @@ def _has_intent_marker(text: str) -> bool:
     return any(marker in lowered for marker in _INTENT_MARKERS)
 
 
+def _candidate_eligible_for_auto_supersede(candidate: CandidateMemory) -> bool:
+    """The new statement must be a committed, present-tense transition."""
+    if candidate.temporal_subject or candidate.temporal_predicate:
+        return False
+    if candidate.type not in _AUTO_SUPERSEDE_TYPES:
+        return False
+    if not _looks_superseding(candidate.memory):
+        return False
+    if _has_intent_marker(candidate.memory):
+        return False
+    if _matches_any(candidate.memory, _UNCOMMITTED_INTENT_MARKERS):
+        return False
+    if candidate.source_quote and _matches_any(candidate.source_quote, _UNCOMMITTED_INTENT_MARKERS):
+        return False
+    valid_from = _parse_iso_datetime(candidate.valid_from)
+    return valid_from is None or valid_from <= datetime.now(UTC)
+
+
+def _auto_supersede_target_is_eligible(
+    candidate: CandidateMemory,
+    memory: MemoryRecord,
+    *,
+    now: datetime,
+) -> bool:
+    """Only a live, current, user-asserted present-state fact may be closed."""
+    if memory.origin != "user_asserted":
+        return False
+    if (memory.status or "dynamic") != "dynamic":
+        return False
+    if memory.superseded_by or not is_current_temporal_memory(memory):
+        return False
+    if memory.temporal_subject or memory.temporal_predicate:
+        return False
+    if memory.type != candidate.type or memory.sensitivity != candidate.sensitivity:
+        return False
+    content = memory.content
+    if (
+        _matches_any(content, _PAST_MARKERS)
+        or _has_intent_marker(content)
+        or _matches_any(content, _UNCOMMITTED_INTENT_MARKERS)
+    ):
+        return False
+    starts_at = _parse_iso_datetime(memory.valid_from)
+    return starts_at is None or starts_at <= now
+
+
+def _find_auto_supersede_target(
+    candidate: CandidateMemory,
+    existing: list[MemoryRecord],
+    vector: list[float] | None,
+    embedding_space_id: str,
+) -> AutoSupersedeDecision | None:
+    """Pick the live fact a transition statement replaces, or None.
+
+    Unlike ``_find_related_memory`` this filters to eligible rows *before*
+    scoring, so an A→B→A return never selects the historical A.
+    """
+    if not vector or not embedding_space_id:
+        return None
+    if not _candidate_eligible_for_auto_supersede(candidate):
+        return None
+    now = datetime.now(UTC)
+    best: MemoryRecord | None = None
+    best_score = 0.0
+    for memory in existing:
+        if not _auto_supersede_target_is_eligible(candidate, memory, now=now):
+            continue
+        old_vector = _memory_embedding_vector(memory, expected_space_id=embedding_space_id)
+        if old_vector is None:
+            continue
+        score = cosine_similarity(vector, old_vector)
+        if score > best_score:
+            best, best_score = memory, score
+    if best is None or best_score < EMBEDDING_SIMILARITY_THRESHOLD:
+        return None
+    relation = _related_content_relation(candidate.memory, best.content)
+    if relation not in {"supersede", "conflict"}:
+        return None
+    if not _describes_same_replaceable_attribute(candidate, best, relation=relation):
+        return None
+    return AutoSupersedeDecision(
+        target=best,
+        relation=relation,
+        reason=_AUTO_SUPERSEDE_REASONS[relation],
+    )
+
+
+def _describes_same_replaceable_attribute(
+    candidate: CandidateMemory,
+    memory: MemoryRecord,
+    *,
+    relation: MemoryRelation,
+) -> bool:
+    """Embedding similarity is relatedness, not replacement; demand attribute evidence.
+
+    * the actor must be the same on both sides (never 用户 vs 用户的猫/朋友);
+    * an exclusive relation family (residence, employment, usage, identity,
+      possession …) shared by both statements is sufficient — the object may
+      change completely (北京 → 上海) without any shared term;
+    * additive families (preference, consumption) need a shared grounded term
+      *and* an explicit negation conflict;
+    * a structured value of the same kind with a different value (phone number,
+      e-mail) is sufficient;
+    * otherwise both a shared grounded term and overlapping topics are needed.
+    """
+    new_text, old_text = candidate.memory, memory.content
+    if not grounding_subjects_compatible_both_ways(new_text, old_text):
+        return False
+    if structured_value_kind_changed(new_text, old_text):
+        return True
+    families = shared_relation_families(new_text, old_text)
+    if families - _ADDITIVE_RELATION_FAMILIES:
+        return True
+    terms_overlap = grounding_terms_overlap(new_text, old_text)
+    if families:
+        return terms_overlap and relation == "conflict"
+    return terms_overlap and _labels_overlap(candidate.topics, memory.topics)
+
+
 def _find_related_memory(
     candidate: CandidateMemory,
     existing: list[MemoryRecord],
@@ -492,20 +686,24 @@ def _related_reason_for_relation(relation: MemoryRelation) -> str:
     }.get(relation, "发现相似旧记忆")
 
 
+_TRANSITION_MARKERS_CJK = (
+    "现在",
+    "已经",
+    "改成",
+    "改为",
+    "改用",
+    "换成",
+    "换为",
+    "不再",
+    "取代",
+)
+# English markers need word boundaries: a bare substring "now" would fire on
+# "know" / "snow" and drive an automatic supersede.
+_TRANSITION_MARKERS_EN_RE = re.compile(r"\b(?:instead|switched|now|no longer)\b", re.IGNORECASE)
+
+
 def _looks_superseding(text: str) -> bool:
     lowered = text.lower()
-    markers = (
-        "现在",
-        "已经",
-        "改成",
-        "改为",
-        "改用",
-        "换成",
-        "换为",
-        "不再",
-        "取代",
-        "instead",
-        "switched",
-        "now",
-    )
-    return any(marker in lowered for marker in markers)
+    if any(marker in lowered for marker in _TRANSITION_MARKERS_CJK):
+        return True
+    return _TRANSITION_MARKERS_EN_RE.search(lowered) is not None

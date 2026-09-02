@@ -270,3 +270,26 @@ def test_space_coverage_ignores_links_to_deleted_memories(tmp_path: Path) -> Non
     assert coverage["space_linked"] == 1
     assert coverage["space_coverage"] == 1.0
     assert active.id != deleted.id
+
+
+def test_temporal_health_counts_keyless_auto_supersede_edges_as_valid(tmp_path: Path) -> None:
+    from app.memory.models import AutoSupersedeDecision
+
+    store = _store(tmp_path)
+    old = store.create_memory(user_id="default", content="用户平时用 iPhone 手机。")
+    store.create_memory(
+        user_id="default",
+        content="用户现在改用安卓手机。",
+        supersede_matcher=lambda latest: AutoSupersedeDecision(
+            target=old, relation="supersede", reason="test"
+        ),
+    )
+
+    report = diagnose.run_diagnosis(store.database_path)
+    temporal = report["metrics"]["temporal"]
+
+    assert temporal["temporal_key_count"] == 0
+    assert temporal["active_supersession_edge_count"] == 1
+    assert temporal["keyless_supersession_edge_count"] == 1
+    assert temporal["dangling_supersession_reference_count"] == 0
+    assert _verdict(report, "temporal_kg")["state"] == "active"

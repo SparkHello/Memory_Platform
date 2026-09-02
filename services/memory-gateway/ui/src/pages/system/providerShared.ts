@@ -36,3 +36,26 @@ export const CAPABILITY_OPTIONS: Array<{
   { key: "json_object", label: "JSON 对象 json_object" },
   { key: "json_schema", label: "JSON Schema json_schema" }
 ];
+
+
+const CHANNEL_OPERATOR_LABELS: Record<string, string> = {
+  dashscope: "阿里云百炼",
+  google: "Google Gemini",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  deepseek: "DeepSeek",
+  moonshot: "Kimi（月之暗面）",
+  zhipu: "智谱 AI",
+  siliconflow: "硅基流动",
+  volcengine: "火山引擎",
+  minimax: "MiniMax",
+  openrouter: "OpenRouter",
+  ollama: "Ollama",
+  xai: "xAI",
+  mistral: "Mistral"
+};
+
+/** Human name for a channel operator id; ids stay as stored. */
+export function channelOperatorLabel(operator: string): string {
+  return CHANNEL_OPERATOR_LABELS[operator.trim().toLowerCase()] || operator;
+}

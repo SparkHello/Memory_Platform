@@ -437,7 +437,7 @@ export function App() {
             />
           )}
         {!unknownHash && activePage === "memories" && (
-          <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} setupStatus={setupStatus} />
+          <MemoriesPage api={api} notify={notify} openMemory={openMemory} refreshKey={memoryRefreshKey} setupStatus={setupStatus} expertMode={uiMode === "expert"} />
         )}
         {!unknownHash && activePage === "knowledge" && (
           <KnowledgeLibraryPage

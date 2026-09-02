@@ -1216,9 +1216,11 @@ export interface ModelGatewayChannelDiscoverResult {
 
 export interface ModelGatewayCapabilityProbeBody {
   revision: string;
-  candidate_key: string;
-  channel_operator: string;
-  base_url: string;
+  /** Probe a saved channel with its stored secret; excludes the candidate fields below. */
+  connection_id?: string;
+  candidate_key?: string;
+  channel_operator?: string;
+  base_url?: string;
   adapter?: ModelGatewayAdapter;
   auth_type?: "bearer" | "x-api-key";
   allowed_private_networks?: string[];
@@ -1314,6 +1316,7 @@ export interface ModelGatewayObjectMutationResult {
   id: string;
   updated?: boolean;
   enabled?: boolean;
+  capabilities?: ModelGatewayCapabilities;
   deleted?: boolean;
   collection?: "connections" | "deployments" | "pricing";
 }
@@ -1379,4 +1382,11 @@ export interface ProvidersStatus {
     } | null;
     upstream_ready?: boolean | null;
   };
+}
+
+export interface CoreMemoryConsolidationResult {
+  created: number;
+  updated: number;
+  ignored: number;
+  reason: string;
 }

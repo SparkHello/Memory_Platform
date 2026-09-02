@@ -115,6 +115,7 @@ def get_embedding_client(
             model_gateway_mode=True,
             timeout_seconds=settings.request_timeout_seconds,
             allow_sensitive_egress=settings.allow_sensitive_egress,
+            egress_ceiling=settings.memory_egress_ceiling,
             usage_hmac_secret=settings.gateway_signing_secret,
         )
     return NullEmbeddingClient()

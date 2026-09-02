@@ -368,6 +368,14 @@ def test_response_limit_allows_exact_boundary() -> None:
 
 
 def test_local_os_error_uses_bounded_address_failure_detail() -> None:
-    assert upstream_executor._local_failure_detail(OSError("private detail")) == (
-        "上游地址安全校验失败"
-    )
+    detail = upstream_executor._local_failure_detail(OSError("private detail"))
+    assert detail == "连接上游失败（本地网络错误）"
+    assert "private detail" not in detail
+
+
+def test_dns_failure_is_reported_as_resolution_not_safety() -> None:
+    import socket
+
+    detail = upstream_executor._local_failure_detail(socket.gaierror(8, "nodename nor servname provided"))
+    assert detail == "上游域名解析失败，请检查网络、VPN 或 DNS 后重试"
+    assert "nodename" not in detail

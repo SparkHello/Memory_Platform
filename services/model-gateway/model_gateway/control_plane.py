@@ -927,6 +927,31 @@ class ControlPlaneService:
             config=GatewayConfig.model_validate(payload),
         )
 
+    def update_deployment(
+        self,
+        snapshot: ControlPlaneSnapshot,
+        *,
+        deployment_id: str,
+        enabled: bool | None = None,
+        capabilities: Mapping[str, bool] | None = None,
+        expected_revision: str | None = None,
+    ) -> ControlPlaneCandidate:
+        """Edit an existing deployment in place; capabilities merge over the current flags."""
+
+        if deployment_id not in snapshot.config.deployments:
+            raise ValueError(f"deployments 中不存在：{deployment_id}")
+        payload = snapshot.config.model_dump(mode="python", exclude_none=False)
+        record = payload["deployments"][deployment_id]
+        if enabled is not None:
+            record["enabled"] = enabled
+        if capabilities:
+            record["capabilities"] = {**dict(record.get("capabilities") or {}), **dict(capabilities)}
+        return self.prepare(
+            snapshot,
+            expected_revision=expected_revision,
+            config=GatewayConfig.model_validate(payload),
+        )
+
     def upsert_client(
         self,
         snapshot: ControlPlaneSnapshot,

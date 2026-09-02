@@ -145,7 +145,7 @@ class Settings(BaseSettings):
         validation_alias="CHAT_GATEWAY_TURN_TTL_SECONDS",
     )
     chat_gateway_extraction_context_turns: int = Field(
-        default=2,
+        default=4,
         ge=1,
         le=6,
         validation_alias="CHAT_GATEWAY_EXTRACTION_CONTEXT_TURNS",
@@ -173,6 +173,13 @@ class Settings(BaseSettings):
         ge=500,
         le=20000,
         validation_alias="CHAT_GATEWAY_COMPACTED_SUMMARY_MAX_CHARS",
+    )
+    # Skip the memory.extract call for turns that are only greetings /
+    # acknowledgements, only questions, or only code. Explicit 记住 requests and
+    # short answers to an assistant question are never skipped.
+    chat_gateway_extraction_prefilter: bool = Field(
+        default=True,
+        validation_alias="CHAT_GATEWAY_EXTRACTION_PREFILTER",
     )
     model_gateway_base_url: str = Field(
         default="",
@@ -287,6 +294,21 @@ class Settings(BaseSettings):
     allow_sensitive_egress: bool = Field(
         default=False,
         validation_alias="ALLOW_SENSITIVE_EGRESS",
+    )
+    # Highest local sensitivity tier that memory extraction / embedding may still
+    # send to the model plane while ALLOW_SENSITIVE_EGRESS is false. "private"
+    # (health, address, contact, income) travels like the rest of the chat did;
+    # "normal" restores strict withholding, now sentence by sentence.
+    memory_egress_ceiling: Literal["normal", "private"] = Field(
+        default="private",
+        validation_alias="MEMORY_EGRESS_CEILING",
+    )
+    # Let a new fact with an explicit transition marker (换成/改成/现在/不再…)
+    # close the matching older fact in place instead of leaving a duplicate for
+    # the review page. Requires embeddings; the old version stays as history.
+    memory_auto_supersede: bool = Field(
+        default=True,
+        validation_alias="MEMORY_AUTO_SUPERSEDE",
     )
 
     @field_validator("model_gateway_base_url")

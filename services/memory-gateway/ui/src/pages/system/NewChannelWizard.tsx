@@ -31,7 +31,8 @@ import type {
 import { copyText } from "../../utils/files";
 import { channelUrlKey, distinctEmbeddingBaseUrl } from "../../utils/channelUrl";
 import { filterDiscoveredChatModels } from "../../utils/discoveredModels";
-import { errorMessage } from "../../utils/format";
+import { CLIENT_MODEL_ID } from "../../utils/constants";
+import { clientConfigText, errorMessage } from "../../utils/format";
 import { CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./providerShared";
 
 const EMBEDDING_ROUTE_ID = "memory.embedding";
@@ -693,7 +694,7 @@ export function NewChannelWizard({
       } else {
         try {
           const dateTag = new Date().toISOString().slice(0, 10);
-          const tokenName = `${operator.trim() || "渠道"}-客户端-${dateTag}`.slice(0, 100);
+          const tokenName = `聊天 App · ${dateTag}`.slice(0, 100);
           const created = await api.createAuthToken(tokenName, "chat");
           setClientChatToken(created.token);
           tokenOk = true;
@@ -765,9 +766,7 @@ export function NewChannelWizard({
       return;
     }
     try {
-      await copyText(
-        `Base URL: ${clientBaseUrl}\nAPI Key: ${clientChatToken}\n模型名: memory-auto`
-      );
+      await copyText(clientConfigText(clientBaseUrl, clientChatToken));
       setClientTokenCopied(true);
       setFeedback({
         tone: "success",
@@ -878,7 +877,7 @@ export function NewChannelWizard({
             <div className="client-config-summary">
               <span><small>类型</small><strong>OpenAI 兼容 · Chat Completions</strong></span>
               <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
-              <span><small>模型名</small><code>memory-auto</code></span>
+              <span><small>模型名</small><code>{CLIENT_MODEL_ID}</code></span>
               <span>
                 <small>API Key（chat token）</small>
                 {clientChatToken ? (

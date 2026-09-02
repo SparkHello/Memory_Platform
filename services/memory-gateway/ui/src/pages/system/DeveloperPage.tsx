@@ -22,8 +22,9 @@ import type {
   AuthTokenRecord,
   ConnectionSettings
 } from "../../types";
+import { CLIENT_MODEL_ID, CLIENT_MODEL_MODE_ALIASES } from "../../utils/constants";
 import { copyText } from "../../utils/files";
-import { dateText, errorMessage, joinUrl } from "../../utils/format";
+import { clientConfigText, dateText, errorMessage, joinUrl } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
 type DeviceRole = "chat" | "mcp";
@@ -362,9 +363,19 @@ export function DeveloperPage({
               entries={[
                 ["Base URL", chatBaseUrl],
                 ["API Key", "使用该设备的 chat token"],
-                ["模型", "memory-auto"]
+                ["模型", CLIENT_MODEL_ID]
               ]}
             />
+            <p className="muted integration-guide-note">
+              想让某个对话只读或完全不碰记忆，把模型名换成
+              {CLIENT_MODEL_MODE_ALIASES.map((alias) => (
+                <span key={alias.id}>
+                  {" "}
+                  <code>{alias.id}</code>（{alias.label}）
+                </span>
+              ))}
+              即可，不需要自定义 Header；客户端需重新同步模型列表才能看到这些名字。
+            </p>
           </article>
           <article className="integration-guide-card">
             <Plug size={19} />
@@ -512,11 +523,7 @@ function connectionText(
   mcpUrl: string
 ): string {
   if (created.record.role === "chat") {
-    return [
-      `Base URL: ${chatBaseUrl}`,
-      `API Key: ${created.token}`,
-      "Model: memory-auto"
-    ].join("\n");
+    return clientConfigText(chatBaseUrl, created.token);
   }
   return [
     `MCP URL: ${mcpUrl}`,

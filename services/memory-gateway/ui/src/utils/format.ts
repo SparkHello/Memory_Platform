@@ -1,7 +1,7 @@
 import { ApiError } from "../api";
 import { normalizeBaseUrl } from "../storage";
 import type { CoreSectionName, ReviewAction } from "../types";
-import { CORE_SECTIONS, DISPLAY_TEXT } from "./constants";
+import { CLIENT_MODEL_ID, CORE_SECTIONS, DISPLAY_TEXT } from "./constants";
 
 export function displayText(value: string): string {
   return DISPLAY_TEXT[value] || value;
@@ -76,6 +76,15 @@ export function shortId(id: string): string {
 
 export function joinUrl(baseUrl: string, path: string): string {
   return `${normalizeBaseUrl(baseUrl)}${path}`;
+}
+
+/** OpenAI 兼容客户端需要填写的三行配置，复制到剪贴板时使用同一份文案。 */
+export function clientConfigText(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string = CLIENT_MODEL_ID
+): string {
+  return `Base URL: ${baseUrl}\nAPI Key: ${apiKey}\n模型名: ${modelId}`;
 }
 
 export function candidateSummary(raw: string): string {

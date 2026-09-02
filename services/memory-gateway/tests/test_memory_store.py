@@ -2346,3 +2346,140 @@ def _set_memory_status(memory_store: MemoryStore, memory_id: str, status: str) -
             """,
             (status, now, memory_id, "default"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Keyless (automatic) supersede chains: close in place, reopen in place.
+# ---------------------------------------------------------------------------
+
+from app.memory.models import AutoSupersedeDecision
+
+
+def _supersede_matcher(target, relation: str = "supersede"):
+    def matcher(latest):
+        return AutoSupersedeDecision(target=target, relation=relation, reason="test supersede")
+
+    return matcher
+
+
+def _build_keyless_chain(memory_store: MemoryStore):
+    old = memory_store.create_memory(user_id="default", content="用户平时用 iPhone 手机。")
+    new = memory_store.create_memory(
+        user_id="default",
+        content="用户现在改用安卓手机。",
+        supersede_matcher=_supersede_matcher(old),
+    )
+    return old, new
+
+
+def test_create_memory_supersede_matcher_closes_target_and_logs_in_transaction(
+    memory_store: MemoryStore,
+) -> None:
+    old, new = _build_keyless_chain(memory_store)
+
+    assert new.supersedes == old.id
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.status == "resolved"
+    assert old_after.superseded_by == new.id
+    assert old_after.valid_until == new.created_at
+    assert old_after.temporal_subject is None
+    assert is_current_temporal_memory(old_after) is False
+    assert is_current_temporal_memory(new) is True
+
+    logs = memory_store.list_decision_logs(user_id="default")
+    payload = json.loads(logs[0].candidate_json)
+    assert payload["source"] == "auto_supersede"
+    assert payload["memory_id"] == new.id
+    assert payload["target_memory_id"] == old.id
+    assert payload["before"]["status"] in {"dynamic", None}
+    assert payload["after"]["superseded_by"] == new.id
+    assert logs[0].decision == "update"
+
+
+def test_create_memory_supersede_matcher_skips_already_superseded_target(
+    memory_store: MemoryStore,
+) -> None:
+    old, first = _build_keyless_chain(memory_store)
+    logs_before = len(memory_store.list_decision_logs(user_id="default"))
+
+    second = memory_store.create_memory(
+        user_id="default",
+        content="用户现在改用鸿蒙手机。",
+        supersede_matcher=_supersede_matcher(old),
+    )
+
+    # The guarded UPDATE finds no eligible row: no link, no log.
+    assert second.supersedes is None
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None and old_after.superseded_by == first.id
+    assert len(memory_store.list_decision_logs(user_id="default")) == logs_before
+
+
+def test_restore_temporal_memory_reopens_keyless_superseded_row_in_place(
+    memory_store: MemoryStore,
+) -> None:
+    old, new = _build_keyless_chain(memory_store)
+    old_before = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_before is not None
+
+    restored = memory_store.restore_temporal_memory(memory_id=old.id, user_id="default")
+
+    assert restored is not None
+    assert restored.id == old.id
+    assert restored.status == "dynamic"
+    assert restored.valid_until is None
+    assert restored.superseded_by is None
+    assert restored.revision == old_before.revision + 1
+    new_after = memory_store.get_memory(memory_id=new.id, user_id="default")
+    assert new_after is not None
+    assert new_after.supersedes is None
+    assert is_current_temporal_memory(restored) is True
+    assert is_current_temporal_memory(new_after) is True
+    assert len(memory_store.list_memories(user_id="default")) == 2
+
+    payload = json.loads(memory_store.list_decision_logs(user_id="default")[0].candidate_json)
+    assert payload["source"] == "auto_supersede_undo"
+    assert payload["memory_id"] == old.id
+    assert payload["previous_superseded_by"] == new.id
+
+
+def test_archive_keyless_chain_head_reopens_predecessor_and_unlinks(
+    memory_store: MemoryStore,
+) -> None:
+    old, new = _build_keyless_chain(memory_store)
+
+    assert memory_store.archive_memory(memory_id=new.id, user_id="default") is True
+
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.superseded_by is None
+    assert old_after.valid_until is None
+    assert old_after.status == "dynamic"
+    assert is_current_temporal_memory(old_after) is True
+
+    restored = memory_store.restore_memory(memory_id=new.id, user_id="default")
+    assert restored is not None
+    assert restored.supersedes is None
+    assert restored.superseded_by is None
+    assert is_current_temporal_memory(restored) is True
+    assert is_current_temporal_memory(old_after) is True
+
+
+def test_archive_keyless_superseded_row_unlinks_successor_and_neutralizes_boundary(
+    memory_store: MemoryStore,
+) -> None:
+    old, new = _build_keyless_chain(memory_store)
+
+    assert memory_store.archive_memory(memory_id=old.id, user_id="default") is True
+
+    new_after = memory_store.get_memory(memory_id=new.id, user_id="default")
+    assert new_after is not None
+    assert new_after.supersedes is None
+
+    restored = memory_store.restore_memory(memory_id=old.id, user_id="default")
+    assert restored is not None
+    assert restored.superseded_by is None
+    assert restored.valid_until is None
+    assert restored.status == "dynamic"
+    assert is_current_temporal_memory(restored) is True

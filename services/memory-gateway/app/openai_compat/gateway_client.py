@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 import logging
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import HTTPException, status
 import httpx
@@ -26,8 +26,26 @@ from app.usage.attribution import model_gateway_usage_headers
 
 logger = logging.getLogger(__name__)
 
+PublicMemoryMode = Literal["off", "read", "read-write"]
+
 AUTO_MODEL_ID = "memory-auto"
-_AUTO_MODEL_ALIASES = {AUTO_MODEL_ID, "memory-gateway", "auto", "default"}
+READ_MODEL_ID = "memory-read"
+OFF_MODEL_ID = "memory-off"
+# Public model IDs advertised by /v1/models, in this order. Every alias resolves
+# to the same configured chat route and only selects the memory mode; clients
+# that cannot set custom headers pick the mode from their model selector.
+PUBLIC_MODEL_IDS: tuple[str, ...] = (AUTO_MODEL_ID, READ_MODEL_ID, OFF_MODEL_ID)
+# Lower-cased alias -> memory mode it forces. ``None`` means "use the
+# CHAT_GATEWAY_DEFAULT_MEMORY_MODE setting". Legacy spellings stay accepted
+# for compatibility but are never listed or documented.
+_PUBLIC_MODEL_MODES: dict[str, PublicMemoryMode | None] = {
+    AUTO_MODEL_ID: None,
+    READ_MODEL_ID: "read",
+    OFF_MODEL_ID: "off",
+    "memory-gateway": None,
+    "auto": None,
+    "default": None,
+}
 _PASSTHROUGH_RESPONSE_HEADERS = {
     "content-type",
     "cache-control",
@@ -42,8 +60,47 @@ _MODEL_GATEWAY_RESPONSE_HEADERS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class PublicModel:
+    """A client-facing model ID accepted by the /v1 chat proxy."""
+
+    requested: str
+    # True for every memory-* alias: the gateway owns routing, so unprovable
+    # assistant reasoning in the client history must be stripped.
+    is_alias: bool
+    # Memory mode forced by the alias; None defers to the settings default.
+    memory_mode: PublicMemoryMode | None
+
+
+def resolve_public_model(model: str, *, route: str | None = None) -> PublicModel | None:
+    """Resolve a requested model string to a public alias or the explicit route.
+
+    Aliases are matched case-insensitively after stripping whitespace and are
+    checked before the route so an alias can never leak an internal route name.
+    The explicit chat route must match exactly.
+    """
+    requested = model.strip()
+    lowered = requested.lower()
+    if lowered in _PUBLIC_MODEL_MODES:
+        return PublicModel(
+            requested=requested,
+            is_alias=True,
+            memory_mode=_PUBLIC_MODEL_MODES[lowered],
+        )
+    if route and requested == route:
+        return PublicModel(requested=requested, is_alias=False, memory_mode=None)
+    return None
+
+
 def is_auto_model_id(model: str) -> bool:
-    return model.strip().lower() in _AUTO_MODEL_ALIASES
+    resolved = resolve_public_model(model)
+    return resolved is not None and resolved.is_alias
+
+
+def memory_mode_for_model(model: str) -> PublicMemoryMode | None:
+    """Return the memory mode selected by a ``memory-*`` alias, if any."""
+    resolved = resolve_public_model(model)
+    return resolved.memory_mode if resolved is not None else None
 
 
 @dataclass(slots=True)
@@ -138,7 +195,7 @@ class OpenAIChatGatewayClient:
 
     def list_models(self) -> list[str]:
         route = self.runtime.route_for("chat")
-        return [AUTO_MODEL_ID, route]
+        return [*PUBLIC_MODEL_IDS, route]
 
     async def complete(
         self,
@@ -297,7 +354,7 @@ class OpenAIChatGatewayClient:
         requested = str(payload.get("model") or "").strip()
         if not requested:
             raise HTTPException(status_code=422, detail="model 不能为空")
-        if requested not in {AUTO_MODEL_ID, route}:
+        if resolve_public_model(requested, route=route) is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"聊天网关未配置模型：{requested}",
