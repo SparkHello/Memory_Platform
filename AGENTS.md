@@ -10,6 +10,7 @@
 - `scripts/bootstrap.sh`：创建统一开发环境并安装两个服务。
 - `scripts/memgw`：根目录统一运行栈入口。
 - `scripts/test.sh`：两个后端测试集和前端构建。
+- `apps/android`：安卓 App（Chaquopy 内嵌 Python，前台服务里跑两个网关）。它**不直接读 `services/` 源码**：Python 代码来自 `apps/android/wheels/` 下的第一方 wheel，Web Console 来自 `services/memory-gateway/ui/dist`。构建约束见下方「安卓 App」。
 - `Dockerfile` 与 `deploy/`：Memory、Model、离线 init/maintenance 三套隔离运行镜像、首启接线入口脚本、compose 文件和 `deploy/install.sh` Docker 一键安装脚本；长期镜像使用各自独立 Python 环境，只共享窄协议包。`.github/workflows/docker.yml` 在 tag 时推送 GHCR。旧单卷（legacy）布局的一次性迁移已从安装器拆出为独立工具 `deploy/legacy_cutover.py`（容器内仍复用 `backup_legacy.py` / `migrate_legacy.py`），安装器检测到 legacy 布局时只报错并指向该工具。`install.sh` 与 `install.ps1` 是同一安装器的双实现：改动必须两边同步，默认版本号等共享常量由 `services/memory-gateway/tests/test_installer_parity.py` 钉住。
 
 ## 开发边界
@@ -29,6 +30,14 @@ scripts/bootstrap.sh
 scripts/test.sh
 scripts/memgw stack status
 ```
+
+## 安卓 App
+
+- 改了 `services/` 或 `packages/` 任何 Python 代码后，编 APK 前**必须先跑** `scripts/android/build-wheels.sh`（用 `PYTHON=services/memory-gateway/.venv/bin/python`），否则 APK 里仍是旧服务端代码，Kotlin 调新方法会在真机上报 `AttributeError`，而桌面测试全绿看不出来。
+- 改了控制台后先 `npm run build`，Gradle 才会把新的 `ui/dist` 拷进 assets。
+- 构建命令：`cd apps/android && JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./gradlew assembleDebug`。debug 与 release 签名不同，不能互相覆盖安装。
+- 嵌入式入口 `apps/android/app/src/main/python/embedded_stack.py` 单独实现接线，`app.stack_install` 的接线规则变化时要同步。
+- 用户可见文案统一叫「登录密钥」（gateway.txt）、「管理密钥」（admin.txt）、「聊天密钥 / MCP 密钥」，页面叫「客户端接入」；不要再写 Console token、admin key、chat token、接入信息。安卓「打开控制台」通过一次性登录链接自动带入登录密钥与管理密钥，文案默认按此假设。
 
 ## 帮用户配置
 
