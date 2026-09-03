@@ -127,6 +127,10 @@ def configure(
     os.environ["MEMGW_SETTINGS_PATH"] = str(layout.settings_env)
     os.environ["MODEL_GATEWAY_HOME"] = str(model_home)
     os.environ.pop("MODEL_GATEWAY_SECRETS_PATH", None)
+    # Phones routinely sit behind Clash/Surge-style VPNs whose fake-ip DNS maps
+    # every hostname into 198.18.0.0/15. The device owner is the only tenant
+    # here, so accept that range instead of failing every upstream call.
+    os.environ.setdefault("MODEL_GATEWAY_ALLOW_FAKE_IP", "1")
     # First-run credentials are generated into 0600 files only; never inherit
     # them from the process environment.
     for name in ("GATEWAY_API_KEY", "GATEWAY_SIGNING_SECRET", "MODEL_GATEWAY_API_KEY"):

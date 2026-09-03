@@ -12,6 +12,7 @@
 - Console：模型胶囊可点开修改能力并「自动检测能力」；新增模型面板同样支持自动检测，适配 profile 收进「高级」。
 - 记忆抽取：`source_quote`/`context_quote` 逐字核对改为格式容错（忽略 markdown 标记、空白、emoji、全半角），`context_quote` 核对失败不再整条否决而是丢弃引用；新增「肯定确认」规则，用户仅回答「对了/是的」时可把紧邻的助手原话作为事实锚点，关系仍须在可见上下文中有证据；新增 `education` 关系族。
 - Console 静态资源缓存头：`index.html` 为 `no-cache`，`assets/` 带 hash 文件为一年 immutable。
+- Model Gateway `MODEL_GATEWAY_ALLOW_FAKE_IP=1`：接受 Clash/Surge fake-ip 模式解析出的 198.18.0.0/15 地址，无需逐渠道配置 allowed_private_networks；安卓 App 默认开启，其他部署默认关闭。上游本地拒绝的完整原因（域名、解析地址）写入服务日志，客户端只收到有界提示。
 - 自指问题兜底召回（`CHAT_GATEWAY_SELF_REFERENCE_RECALL`，默认开启）：用户明确在问自己（「你了解我什么」「我的专业是什么」「what do you know about me」等）而相似度召回为空时，按重要度注入最多 `CHAT_GATEWAY_SEARCH_LIMIT` 条仍有效的 `normal` 记忆；`private`/`sensitive` 记忆不参与。普通消息的相关性门槛不变。
 
 - `/v1/models` 新增记忆模式模型别名 `memory-read`（只召回不写入）与 `memory-off`（纯透明代理）：发不出自定义 Header 的客户端（Chatbox、RikkaHub 等）改模型名即可切换模式。所有 `memory-*` 别名都解析到同一聊天 route，只决定记忆模式；优先级为只读 token 限制 > `X-Memory-Mode` > 别名 > `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`。旧别名 `auto`/`default`/`memory-gateway` 继续接受但不列出。客户端需重新同步模型列表。

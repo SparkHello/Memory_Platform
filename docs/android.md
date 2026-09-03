@@ -114,6 +114,7 @@ bash scripts/android/build-wheels.sh
 ## 已知限制
 
 - **前台服务类型**：用了 `specialUse`。`dataSync` 在 Android 15 上每天只允许 6 小时，不适合常驻服务。上 Play 商店需要在审核里说明用途；自用 sideload 没有限制。
+- **VPN / 代理**：Clash、Surge 等 fake-ip 模式会把所有域名解析成 198.18.x.x，网关的防误连守卫会当作私有地址拒绝。安卓版默认设置 `MODEL_GATEWAY_ALLOW_FAKE_IP=1` 放行这一段（设备只有机主一个使用者，风险可接受）；其他部署形态默认关闭，需要时手动设该环境变量或在渠道 allowed_private_networks 放行 198.18.0.0/15。
 - **Doze**：即便是前台服务，未加入电池优化白名单时后台网络仍可能被限制。状态页提供了一键跳转。
 - **明文 HTTP**：`network_security_config.xml` 只放开了本 App 自己对 127.0.0.1 的请求。系统浏览器允许 `http://127.0.0.1`；第三方聊天 App 是否允许明文回环取决于它自己。
 - **FTS5**：Chaquopy 内置的 SQLite 没有编 FTS5，会让长文知识库初始化失败、记忆关键词索引退化。现在用 `scripts/android/build-sqlite-fts5.sh`（需要 Android NDK，`sdkmanager "ndk;<版本>"` 安装）编一份同版本（3.50.4）、带 FTS5/RTREE/JSON 的 `libsqlite3_python.so` 放在 `apps/android/native/arm64-v8a/`，Gradle 任务 `patch<Variant>SqliteFts5` 在 Chaquopy 生成 jniLibs 之后、AGP 合并之前把它覆盖进去。已核对导出符号是 Chaquopy 原库的超集且覆盖 `_sqlite3` 模块全部 86 个导入。该 .so 不进 git，换机器重跑脚本即可。

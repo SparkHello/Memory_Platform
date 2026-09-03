@@ -107,6 +107,7 @@ token 会固定绑定创建时的用户，调用方不能改写命名空间；�
 | 现象 | 原因和做法 |
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
+| 开着 VPN/代理时报「上游域名被解析到本地或私有地址」 | Clash/Surge 等 fake-ip 模式把域名解析成 198.18.x.x，被防误连守卫拦下。安卓 App 已默认放行；电脑或 Docker 部署给 Model Gateway 设 `MODEL_GATEWAY_ALLOW_FAKE_IP=1`，或在该渠道的 allowed_private_networks 加 `198.18.0.0/15`，或让 VPN 绕过本服务 |
 | 聊天客户端的搜索、MCP 等工具用不了，或提示「当前模型未开启工具调用」 | 两处都要开：客户端里给 `memory-auto` 这个模型打开「工具」能力（FLIT/RikkaHub 类客户端默认不给自定义渠道的模型发工具）；控制台「模型渠道」里点击该模型的胶囊，点「自动检测能力」或手动勾选「工具调用 tools」。网关只会把带工具的请求派给声明了该能力的模型 |
 | 设备 token 找不回了 | 明文只显示一次；撤销该 token 并为这台设备新建一枚，其他设备不受影响 |
 | 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.txt`（旧版为 `admin.key`）；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |

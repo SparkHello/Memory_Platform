@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
+import os
 import socket
 from typing import Iterable
 from urllib.parse import urlparse
@@ -17,6 +18,24 @@ MAX_DISCOVERY_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_DISCOVERY_MODELS = 1_000
 MAX_MODEL_ID_LENGTH = 300
 _RFC2544_BENCHMARK_SUPERNET = ip_network("198.18.0.0/15")
+# Clash / Surge / sing-box "fake-ip" TUN modes answer every DNS query from
+# 198.18.0.0/15 and proxy the connection by the original hostname. On a device
+# where the operator is the only tenant (the Android app, a personal laptop
+# behind a VPN) that mapping is expected, so MODEL_GATEWAY_ALLOW_FAKE_IP=1
+# accepts the whole RFC 2544 benchmark range in addition to per-connection
+# allowed_private_networks. Servers keep it off and stay strict.
+_FAKE_IP_ENV = "MODEL_GATEWAY_ALLOW_FAKE_IP"
+
+
+def fake_ip_allowed() -> bool:
+    return os.environ.get(_FAKE_IP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _effective_private_networks(allowed_private_networks: Iterable[str]) -> tuple[str, ...]:
+    networks = tuple(allowed_private_networks)
+    if fake_ip_allowed() and str(_RFC2544_BENCHMARK_SUPERNET) not in networks:
+        networks = (*networks, str(_RFC2544_BENCHMARK_SUPERNET))
+    return networks
 
 
 def upstream_url(
@@ -54,6 +73,7 @@ async def require_safe_destination(
     *,
     allowed_private_networks: Iterable[str] = (),
 ) -> None:
+    allowed_private_networks = _effective_private_networks(allowed_private_networks)
     base = normalize_base_url(
         url,
         allowed_private_networks=allowed_private_networks,
@@ -81,6 +101,7 @@ def require_safe_destination_sync(
     *,
     allowed_private_networks: Iterable[str] = (),
 ) -> None:
+    allowed_private_networks = _effective_private_networks(allowed_private_networks)
     base = normalize_base_url(
         url,
         allowed_private_networks=allowed_private_networks,
