@@ -255,7 +255,7 @@ export function AppShell({
                 {showMainNav
                   ? PAGE_META[activePage].label
                   : needsCredentialSetup && settings.apiKey
-                    ? "重新配置访问密钥"
+                    ? "重新输入登录密钥"
                     : "Memory Console 初始设置"}
               </strong>
             </div>
@@ -270,7 +270,7 @@ export function AppShell({
                   title={
                     !serviceStatus.loading && serviceStatus.tone === "bad"
                       ? `${serviceStatus.message} · 点击重新检查`
-                      : "重新检查服务和访问密钥"
+                      : "重新检查服务和登录密钥"
                   }
                   aria-live="polite"
                 >
@@ -312,7 +312,7 @@ export function AppShell({
                 onClick={() => go("settings")}
                 title={
                   uiMode === "simple"
-                    ? `连接设置（访问密钥）· 用户 ${userId}`
+                    ? `连接设置（登录密钥）· 用户 ${userId}`
                     : `用户 ${userId} · 打开连接设置`
                 }
                 aria-label={`连接设置 · 用户 ${userId}`}

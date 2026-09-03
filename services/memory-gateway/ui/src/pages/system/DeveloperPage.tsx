@@ -94,7 +94,7 @@ export function DeveloperPage({
       return;
     }
     if (created) {
-      setCreateError("请先保存并关闭上一个一次性 token");
+      setCreateError("请先保存上一把密钥，再点「我已保存」");
       return;
     }
     setCreating(true);
@@ -119,7 +119,7 @@ export function DeveloperPage({
             }
           : current
       );
-      notify("设备 token 已创建；离开前请立即复制保存", "success");
+      notify("密钥已创建；离开前请立即复制保存", "success");
     } catch (error) {
       setCreateError(errorMessage(error));
     } finally {
@@ -129,19 +129,19 @@ export function DeveloperPage({
 
   const revoke = async (record: AuthTokenRecord) => {
     const confirmed = await confirm({
-      title: "撤销设备 token",
+      title: "撤销密钥",
       message: (
         <>
-          确定撤销「{record.name}」吗？该设备下一次请求会立即失去访问权限。
+          确定撤销「{record.name}」吗？这台设备下一次请求会立即失去访问权限。
           {record.is_current && (
             <strong className="token-current-warning">
-              这是当前浏览器使用的 token；撤销后需要重新登录。
+              这是当前浏览器登录用的密钥；撤销后需要重新登录。
             </strong>
           )}
         </>
       ),
       tone: "danger",
-      confirmLabel: "撤销 token"
+      confirmLabel: "撤销"
     });
     if (!confirmed) return;
     setRevokingId(record.token_id);
@@ -157,7 +157,7 @@ export function DeveloperPage({
             }
           : current
       );
-      notify(result.already_revoked ? "该 token 已经撤销" : "设备 token 已撤销", "success");
+      notify(result.already_revoked ? "这把密钥已经撤销" : "密钥已撤销", "success");
     } catch (error) {
       notify(errorMessage(error), "error");
     } finally {
@@ -183,7 +183,7 @@ export function DeveloperPage({
     <div className="page-stack developer-page">
       <PageHeader
         title="客户端接入"
-        subtitle="为每台设备创建最小权限 token，再连接聊天应用或 MCP。"
+        subtitle="每个聊天 App 或 MCP 客户端各用一把自己的密钥；哪台设备丢了就只撤销哪一把。"
         showTitle={false}
       />
 
@@ -197,18 +197,18 @@ export function DeveloperPage({
                 : "旧共享访问密钥仍处于启用状态"}
             </strong>
             <p>
-              旧 key 同时拥有聊天、MCP 和 Console 权限。请先为各设备迁移到下方 scoped
-              token，再在服务配置中关闭 legacy key。本页只显示迁移状态，绝不会回显旧 key。
+              旧 key 同时拥有聊天、MCP 和登录权限。请先为各设备迁移到下方按用途分开的密钥，
+              再在服务配置中关闭 legacy key。本页只显示迁移状态，绝不会回显旧 key。
             </p>
             <details className="provider-bootstrap-help">
               <summary>如何关闭 legacy key？</summary>
-              <p>确认所有设备都已换用下方 scoped token 后：</p>
+              <p>确认所有设备都已换用下方按用途分开的密钥后：</p>
               <p>Docker：在安装目录（默认 memory-platform）打开终端后依次运行：</p>
               <code>docker compose -f docker-compose.user.yml --profile maintenance run --rm stack-maintenance config set GATEWAY_LEGACY_API_KEY_ENABLED false</code>
               <code>docker compose -f docker-compose.user.yml restart memory-gateway</code>
               <p>源码安装：在仓库根目录运行后重启服务：</p>
               <code>scripts/memgw config set GATEWAY_LEGACY_API_KEY_ENABLED false</code>
-              <p>关闭后旧 key 立即失效；如仍有设备在用它，会收到 401，需要改配 scoped token。</p>
+              <p>关闭后旧 key 立即失效；如仍有设备在用它，会收到 401，需要改用新密钥。</p>
             </details>
           </div>
         </section>
@@ -217,10 +217,9 @@ export function DeveloperPage({
       <section className="panel access-card token-create-panel">
         <div className="panel-header">
           <div>
-            <h2>创建设备 token</h2>
+            <h2>创建密钥</h2>
             <p className="muted">
-              新 token 固定到当前用户 <code>{tokens?.current_user_id || settings.userId}</code>，
-              不能通过请求头切换用户。
+              密钥归当前用户 <code>{tokens?.current_user_id || settings.userId}</code> 所有，客户端无法切换到别的用户。
             </p>
           </div>
           <KeyRound size={20} />
@@ -236,8 +235,8 @@ export function DeveloperPage({
           >
             <MessageCircle size={20} />
             <span>
-              <strong>OpenAI 兼容聊天</strong>
-              <small>默认推荐。Chatbox、RikkaHub、FLIT 等客户端使用 chat token。</small>
+              <strong>聊天 App</strong>
+              <small>默认推荐。Chatbox、RikkaHub、FLIT 等 OpenAI 兼容客户端填这把聊天密钥。</small>
             </span>
           </button>
           <button
@@ -249,8 +248,8 @@ export function DeveloperPage({
           >
             <Plug size={20} />
             <span>
-              <strong>MCP 工具接入</strong>
-              <small>仅供支持 Streamable HTTP MCP 的客户端使用 mcp token。</small>
+              <strong>MCP 客户端</strong>
+              <small>仅供支持 Streamable HTTP MCP 的客户端使用这把 MCP 密钥。</small>
             </span>
           </button>
         </div>
@@ -291,7 +290,7 @@ export function DeveloperPage({
             disabled={creating || Boolean(created)}
           >
             {creating ? <RefreshCcw className="spin" size={16} /> : <KeyRound size={16} />}
-            {creating ? "创建中" : `创建 ${role} token`}
+            {creating ? "创建中" : role === "chat" ? "创建聊天密钥" : "创建 MCP 密钥"}
           </button>
         </div>
         {createError && <p className="form-error" role="alert">{createError}</p>}
@@ -300,8 +299,8 @@ export function DeveloperPage({
           <div className="one-time-token" role="status" aria-live="polite">
             <div className="one-time-token-heading">
               <div>
-                <strong>只显示这一次</strong>
-                <p>服务端只保存哈希。关闭、刷新或离开此页后无法再次查看。</p>
+                <strong>密钥只显示这一次</strong>
+                <p>服务端不保存原文。关闭、刷新或离开此页后无法再次查看，丢了就撤销后重新创建。</p>
               </div>
             </div>
             <code className="one-time-token-value">
@@ -316,7 +315,7 @@ export function DeveloperPage({
                 onClick={() => setShowCreatedToken((value) => !value)}
               >
                 {showCreatedToken ? <EyeOff size={16} /> : <Eye size={16} />}
-                {showCreatedToken ? "隐藏 token" : "显示 token"}
+                {showCreatedToken ? "隐藏密钥" : "显示密钥"}
               </button>
               <button
                 className="primary-button"
@@ -324,7 +323,7 @@ export function DeveloperPage({
                 onClick={() =>
                   void copy(
                     connectionText(created, chatBaseUrl, mcpUrl),
-                    "接入配置已复制；其中包含一次性 token，请妥善保存"
+                    "接入配置已复制；其中包含只显示一次的密钥，请妥善保存"
                   )
                 }
               >
@@ -351,18 +350,18 @@ export function DeveloperPage({
         <div className="panel-header">
           <div>
             <h2>接入参数</h2>
-            <p className="muted">客户端只使用与入口匹配的 token，不要填 Console 登录 token。</p>
+            <p className="muted">聊天 App 填聊天密钥，MCP 客户端填 MCP 密钥；都不要填登录本网页的登录密钥。</p>
           </div>
         </div>
         <div className="integration-guide-grid">
           <article className="integration-guide-card">
             <MessageCircle size={19} />
-            <h3>OpenAI 兼容客户端</h3>
+            <h3>聊天 App（OpenAI 兼容）</h3>
             <FieldList
               compact
               entries={[
                 ["Base URL", chatBaseUrl],
-                ["API Key", "使用该设备的 chat token"],
+                ["API Key", "这台设备的聊天密钥"],
                 ["模型", CLIENT_MODEL_ID]
               ]}
             />
@@ -384,7 +383,7 @@ export function DeveloperPage({
               compact
               entries={[
                 ["地址", mcpUrl],
-                ["鉴权", "Bearer + 该设备的 mcp token"]
+                ["鉴权", "Bearer + 这台设备的 MCP 密钥"]
               ]}
             />
           </article>
@@ -394,8 +393,8 @@ export function DeveloperPage({
       <section className="panel access-card">
         <div className="panel-header">
           <div>
-            <h2>已创建设备</h2>
-            <p className="muted">这里只显示标识和使用状态，不保存或回显 token 原文。</p>
+            <h2>已创建的密钥</h2>
+            <p className="muted">只显示名称和使用状态，不会显示密钥原文。</p>
           </div>
           <button
             className="secondary-button compact"
@@ -407,12 +406,12 @@ export function DeveloperPage({
             刷新
           </button>
         </div>
-        {loading && !tokens && <LoadingBlock label="读取设备 token" />}
+        {loading && !tokens && <LoadingBlock label="读取已创建的密钥" />}
         {loadError && <ErrorBlock message={loadError} onRetry={() => void load()} />}
         {!loading && !loadError && tokens?.data.length === 0 && (
           <EmptyBlock
-            label="还没有 scoped token"
-            hint="先为聊天客户端创建 chat token，或为 MCP 客户端创建 mcp token。"
+            label="还没有创建密钥"
+            hint="先为聊天 App 创建聊天密钥，或为 MCP 客户端创建 MCP 密钥。"
           />
         )}
         {tokens && tokens.data.length > 0 && (
@@ -441,8 +440,8 @@ export function DeveloperPage({
                     <small>ID {record.token_id}</small>
                     {record.revoke_block_reason === "last_active_console_token" && (
                       <small className="token-revoke-blocked" role="status">
-                        这是该用户最后一个可用 Console token。请先在运行主机用
-                        <code>memgw token create --role console</code> 创建备用凭据。
+                        这是该用户最后一把可用的登录密钥。请先在运行主机用
+                        <code>memgw token create --role console</code> 创建备用密钥。
                       </small>
                     )}
                   </div>
@@ -468,7 +467,7 @@ export function DeveloperPage({
                     }
                     title={
                       record.revoke_block_reason === "last_active_console_token"
-                        ? "必须保留至少一个可用的 Console token"
+                        ? "必须保留至少一把可用的登录密钥"
                         : undefined
                     }
                   >
@@ -504,7 +503,7 @@ export function DeveloperPage({
           </button>
         </div>
         <p className="muted">
-          以下管理接口只接受 Console 登录凭证；chat/mcp token 无法访问。
+          以下管理接口只接受登录密钥；聊天密钥和 MCP 密钥无法访问。
         </p>
         <div className="endpoint-list">
           {endpoints.map((endpoint) => (
@@ -535,5 +534,5 @@ function connectionText(
 function roleLabel(role: AuthTokenRecord["role"]): string {
   if (role === "chat") return "聊天";
   if (role === "mcp") return "MCP";
-  return "Console";
+  return "登录";
 }

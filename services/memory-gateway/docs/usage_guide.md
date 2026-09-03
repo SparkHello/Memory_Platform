@@ -152,7 +152,7 @@ curl -X POST http://localhost:2026/memories/search \
 
 ### 3.4 首次使用 Web 控制台
 
-打开 `http://localhost:2026/ui`，在「设置/接入信息」页填写：
+打开 `http://localhost:2026/ui`，在「连接设置」页填写：
 
 - API Base URL：`http://localhost:2026`（手机访问则填局域网/Tailscale 地址）
 - 访问密钥：与 `.env` 里的 `GATEWAY_API_KEY` 相同

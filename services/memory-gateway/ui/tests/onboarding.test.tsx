@@ -73,7 +73,7 @@ describe("first-run setup", () => {
       />
     );
 
-    expect(screen.getByRole("heading", { name: "输入访问密钥" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "输入登录密钥" })).toBeInTheDocument();
     expect(screen.getByText(/已检测到本地服务/)).toBeInTheDocument();
     expect(screen.getAllByText(/credentials\/gateway\.txt/).length).toBeGreaterThan(0);
     expect(screen.queryByLabelText("服务地址")).not.toBeInTheDocument();
@@ -81,7 +81,7 @@ describe("first-run setup", () => {
 
     const continueButton = screen.getByRole("button", { name: "验证并继续" });
     expect(continueButton).toBeDisabled();
-    await user.type(screen.getByLabelText("访问密钥"), "valid-gateway-key");
+    await user.type(screen.getByLabelText("登录密钥"), "valid-gateway-key");
     expect(continueButton).toBeEnabled();
   });
 
@@ -111,7 +111,7 @@ describe("first-run setup", () => {
 
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "rejected-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "密钥和渠道都还没保存"
@@ -123,7 +123,7 @@ describe("first-run setup", () => {
     const keyInput = screen.getByPlaceholderText("sk-...");
     await user.clear(keyInput);
     await user.type(keyInput, "corrected-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
 
     const model = await screen.findByLabelText("聊天模型");
     expect(model).toHaveValue("deepseek-chat");
@@ -190,7 +190,7 @@ describe("first-run setup", () => {
 
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
     await screen.findByLabelText("聊天模型");
     expect(screen.getByLabelText("现有文本路由")).toHaveValue("keep");
 
@@ -259,7 +259,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
     await user.selectOptions(await screen.findByLabelText("聊天模型"), "chat-v1");
     await user.click(screen.getByLabelText("同时保存一个向量模型（可选）"));
     await user.type(screen.getByPlaceholderText("精确 embedding 模型 ID"), "embed-v4");
@@ -291,7 +291,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
     await screen.findByLabelText("聊天模型");
     await user.click(screen.getByRole("button", { name: "校验完整配置" }));
     await screen.findByText(/配置检查通过/);
@@ -315,7 +315,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("使用 Clash/Surge 等 TUN fake-ip");
     const boxes = screen.getAllByRole("checkbox", { name: /使用 Clash\/Surge 等 TUN fake-ip/ });
@@ -336,7 +336,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
 
     const chatSelect = await screen.findByLabelText("聊天模型");
     expect(chatSelect).toHaveTextContent("deepseek-chat");
@@ -398,7 +398,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
     await user.click(screen.getByLabelText("同时保存一个向量模型（可选）"));
     await user.type(screen.getByPlaceholderText("精确 embedding 模型 ID"), "text-embedding-v3");
     await user.type(screen.getByPlaceholderText("例如 1024"), "1024");
@@ -410,7 +410,7 @@ describe("first-run setup", () => {
     expect(createAuthToken).not.toHaveBeenCalled();
     expect(reEmbedMemories).toHaveBeenCalledWith({ scan: true });
     expect(screen.getByText(/已为 2 条缺少当前空间向量的记忆补齐向量/)).toBeInTheDocument();
-    expect(screen.getByText(/请到「客户端接入」使用已有 chat token/)).toBeInTheDocument();
+    expect(screen.getByText(/请到「客户端接入」使用已有聊天密钥/)).toBeInTheDocument();
   });
 
   it("defaults the embedding access point to the chat URL and only sends it when different", async () => {
@@ -436,7 +436,7 @@ describe("first-run setup", () => {
     );
     await pickDeepseek(user);
     await user.type(screen.getByPlaceholderText("sk-..."), "candidate-key");
-    await user.click(screen.getByRole("button", { name: "只读发现模型" }));
+    await user.click(screen.getByRole("button", { name: "列出可用模型" }));
     await user.click(screen.getByLabelText("同时保存一个向量模型（可选）"));
     await user.type(screen.getByPlaceholderText("精确 embedding 模型 ID"), "text-embedding-v3");
     await user.type(screen.getByPlaceholderText("例如 1024"), "1024");

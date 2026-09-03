@@ -2128,6 +2128,16 @@ code {
   color: var(--success);
 }
 
+@media (max-width: 780px) {
+  /* 手机上底栏占着最下面 ~70px，toast 抬高避免盖住页面主按钮和底栏。 */
+  .toast {
+    right: 12px;
+    left: 12px;
+    bottom: calc(max(10px, env(safe-area-inset-bottom)) + 74px);
+    max-width: none;
+  }
+}
+
 .modal-backdrop {
   position: fixed;
   z-index: var(--z-modal);

@@ -783,6 +783,7 @@ async def _execute_live_probe(
         if not ok and (
             "安全校验" in body_preview
             or "198.18" in body_preview
+            or "fc00:" in body_preview
             or "私网" in body_preview
             or "destination" in body_preview.lower()
         ):

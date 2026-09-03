@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand_gold">#9C6F2E</color>
+    <color name="brand_on_gold">#FFFFFF</color>
+    <color name="brand_gold_container">#F4E3C4</color>
+    <color name="brand_on_gold_container">#2B1D0E</color>
+    <color name="step_done">#3E9B63</color>
+    <color name="step_todo">#8E8E93</color>
+</resources>

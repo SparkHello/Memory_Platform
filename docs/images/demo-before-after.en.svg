@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="440" viewBox="0 0 1280 440" role="img" aria-labelledby="title desc">
+  <title id="title">The same conversation before and after Memory Platform</title>
+  <desc id="desc">Left: in a plain chat window the AI does not remember the user's taste and asks again. Right: with Memory Platform, a new conversation automatically carries the memory "likes black coffee, no sugar" and the AI answers directly.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151217"/>
+      <stop offset="1" stop-color="#241c1a"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#c79a5a"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="440" rx="28" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <g transform="translate(40 36)">
+      <text x="0" y="0" font-size="15" fill="#a99da2">Before · every new chat starts from zero</text>
+      <rect y="18" width="540" height="350" rx="22" fill="#211b20" stroke="#4b3d39"/>
+      <rect x="1" y="19" width="538" height="40" rx="21" fill="#2a2227"/>
+      <circle cx="26" cy="39" r="5" fill="#5b4c49"/><circle cx="44" cy="39" r="5" fill="#5b4c49"/><circle cx="62" cy="39" r="5" fill="#5b4c49"/>
+      <text x="270" y="44" text-anchor="middle" font-size="14" fill="#a99da2">The chat app you already use</text>
+
+      <rect x="180" y="82" width="330" height="46" rx="16" fill="#3a2f2b"/>
+      <text x="200" y="111" font-size="16" fill="#fffaf4">Recommend a coffee for the morning</text>
+
+      <rect x="30" y="148" width="440" height="70" rx="16" fill="#2b2326"/>
+      <text x="50" y="178" font-size="16" fill="#d8ced2">Sure! What do you usually like?</text>
+      <text x="50" y="204" font-size="16" fill="#d8ced2">Bright or bitter, with milk or sugar?</text>
+
+      <rect x="180" y="238" width="330" height="46" rx="16" fill="#3a2f2b"/>
+      <text x="200" y="267" font-size="16" fill="#fffaf4">…I told you last time</text>
+
+      <text x="30" y="330" font-size="14" fill="#a99da2">The AI remembers nothing from yesterday or last week.</text>
+    </g>
+
+    <g transform="translate(600 200)">
+      <path d="M0 24 H60" stroke="#c79a5a" stroke-width="3" marker-end="url(#arrow)"/>
+      <text x="40" y="8" text-anchor="middle" font-size="13" fill="#e8bd78">change one URL</text>
+    </g>
+
+    <g transform="translate(700 36)">
+      <text x="0" y="0" font-size="15" fill="#e8bd78">After · same app, new Base URL</text>
+      <rect y="18" width="540" height="350" rx="22" fill="#211b20" stroke="#8a6742" stroke-width="2"/>
+      <rect x="1" y="19" width="538" height="40" rx="21" fill="#2a2227"/>
+      <circle cx="26" cy="39" r="5" fill="#5b4c49"/><circle cx="44" cy="39" r="5" fill="#5b4c49"/><circle cx="62" cy="39" r="5" fill="#5b4c49"/>
+      <text x="270" y="44" text-anchor="middle" font-size="14" fill="#a99da2">Same chat app · new conversation</text>
+
+      <rect x="180" y="82" width="330" height="46" rx="16" fill="#3a2f2b"/>
+      <text x="200" y="111" font-size="16" fill="#fffaf4">Recommend a coffee for the morning</text>
+
+      <rect x="30" y="148" width="460" height="42" rx="12" fill="#1d2522" stroke="#39564a"/>
+      <text x="48" y="175" font-size="14" fill="#8dd8b5">✓ Memory recalled: likes black coffee, no sugar</text>
+
+      <rect x="30" y="204" width="470" height="96" rx="16" fill="#2b2326"/>
+      <text x="50" y="234" font-size="16" fill="#d8ced2">Since you drink black coffee without sugar,</text>
+      <text x="50" y="260" font-size="16" fill="#d8ced2">try a light-roast Ethiopian pour-over:</text>
+      <text x="50" y="286" font-size="16" fill="#d8ced2">bright, not bitter, easy on an empty stomach.</text>
+
+      <text x="30" y="330" font-size="14" fill="#a99da2">Memory stays on your own device: inspect, edit or delete it any time.</text>
+    </g>
+  </g>
+</svg>

@@ -18,12 +18,16 @@ MAX_DISCOVERY_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_DISCOVERY_MODELS = 1_000
 MAX_MODEL_ID_LENGTH = 300
 _RFC2544_BENCHMARK_SUPERNET = ip_network("198.18.0.0/15")
+# Clash Meta / mihomo answer AAAA queries from fc00::/18 in fake-ip mode
+# ("fake-ip-range6" default); phones with IPv6 enabled hit this range first.
+_FAKE_IP6_RANGE = ip_network("fc00::/18")
+FAKE_IP_RANGES: tuple[str, ...] = (str(_RFC2544_BENCHMARK_SUPERNET), str(_FAKE_IP6_RANGE))
 # Clash / Surge / sing-box "fake-ip" TUN modes answer every DNS query from
-# 198.18.0.0/15 and proxy the connection by the original hostname. On a device
-# where the operator is the only tenant (the Android app, a personal laptop
-# behind a VPN) that mapping is expected, so MODEL_GATEWAY_ALLOW_FAKE_IP=1
-# accepts the whole RFC 2544 benchmark range in addition to per-connection
-# allowed_private_networks. Servers keep it off and stay strict.
+# 198.18.0.0/15 (and fc00::/18 for IPv6) and proxy the connection by the
+# original hostname. On a device where the operator is the only tenant (the
+# Android app, a personal laptop behind a VPN) that mapping is expected, so
+# MODEL_GATEWAY_ALLOW_FAKE_IP=1 accepts both fake-ip ranges in addition to
+# per-connection allowed_private_networks. Servers keep it off and stay strict.
 _FAKE_IP_ENV = "MODEL_GATEWAY_ALLOW_FAKE_IP"
 
 
@@ -33,8 +37,8 @@ def fake_ip_allowed() -> bool:
 
 def _effective_private_networks(allowed_private_networks: Iterable[str]) -> tuple[str, ...]:
     networks = tuple(allowed_private_networks)
-    if fake_ip_allowed() and str(_RFC2544_BENCHMARK_SUPERNET) not in networks:
-        networks = (*networks, str(_RFC2544_BENCHMARK_SUPERNET))
+    if fake_ip_allowed():
+        networks = (*networks, *(item for item in FAKE_IP_RANGES if item not in networks))
     return networks
 
 
@@ -177,12 +181,13 @@ def _validate_resolved_addresses(
         shown = ", ".join(sorted(blocked)[:8])
         fake_ip_hint = ""
         if any(
-            address.version == 4 and address in _RFC2544_BENCHMARK_SUPERNET
+            (address.version == 4 and address in _RFC2544_BENCHMARK_SUPERNET)
+            or (address.version == 6 and address in _FAKE_IP6_RANGE)
             for address in (ip_address(item) for item in blocked)
         ):
             fake_ip_hint = (
                 " 若使用 Clash/Surge 等 TUN fake-ip，请在渠道 "
-                "allowed_private_networks 中显式加入 198.18.0.0/15，或关闭 fake-ip。"
+                "allowed_private_networks 中显式加入 198.18.0.0/15 与 fc00::/18，或关闭 fake-ip。"
             )
         raise ValueError(
             f"base_url hostname 解析到未显式允许的本地或私有地址"

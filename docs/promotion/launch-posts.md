@@ -114,12 +114,12 @@ recall-explanation design.
 有 Docker 就行，两条命令：
 
 ```bash
-VERSION=v0.2.0
-curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
-docker compose -f docker-compose.user.yml up -d
+VERSION=v0.5.1
+curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/install.sh" -o install-memory-platform.sh
+MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-离线初始化会把初始 Console token 和 Model admin key 分别写入宿主机私有的 `credentials/gateway.key`、`credentials/admin.key`，不会写进 Docker 日志或容器环境。随后打开 `http://127.0.0.1:2026/ui/` 完成模型配置（渠道向导 + 自动发现可用模型，不用碰 CLI），并在「接入信息」为每台聊天设备创建独立 chat token；客户端只需填写 Base URL、该设备的 token 和 `memory-auto`。
+离线初始化会把登录密钥和管理密钥分别写入宿主机私有的 `credentials/gateway.txt`、`credentials/admin.txt`，不会写进 Docker 日志或容器环境。随后打开 `http://127.0.0.1:2026/ui/` 完成模型配置（渠道向导 + 自动列出可用模型，不用碰 CLI），并在「客户端接入」为每台聊天设备创建独立聊天密钥；客户端只需填写 Base URL、该设备的密钥和 `memory-auto`。手机用户直接装安卓 App，整套服务跑在手机上，从 App 点「打开控制台」自动登录。
 
 ## 链接
 
@@ -139,7 +139,7 @@ docker compose -f docker-compose.user.yml up -d
 ## 3. 发布前检查清单
 
 - [ ] 录制 30 秒演示 GIF：发一条含个人偏好的消息 → 打开 Web Console → 记忆出现 → 新对话中被自动召回。放在 README 顶部和帖子正文里。
-- [ ] 确认 README 的 Release / CI badge 显示正常（Release v0.2.0 已发布，CI 需在 main 上有通过记录）。
+- [ ] 确认 README 的 Release / CI badge 显示正常（Release v0.5.1 已发布，CI 需在 main 上有通过记录）。
 - [ ] 设置 GitHub 仓库 Social preview 图（Settings → General → Social preview，可用 `docs/images/memory-platform-hero.jpg`）。
 - [ ] Show HN 发出后 24 小时内，再发 V2EX 中文帖（两边受众重叠少，不用怕分流）。
 - [ ] 第二波（发帖后 1 周）：提交 `awesome-selfhosted`、`awesome-mcp-servers` 列表；r/selfhosted、r/LocalLLaMA 用 Show HN 英文稿精简版。

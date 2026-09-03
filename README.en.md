@@ -2,12 +2,10 @@
 
 # 🧠 Memory Platform
 
-**Add an automatic, local memory gateway to the AI client you already use.**
+**Make the AI chat app you already use remember you. New window, different model, it still remembers.**
 
-For ordinary chat, connect to the OpenAI-compatible `/v1` endpoint: Memory Platform recalls relevant memory, injects context, and extracts durable information after a complete answer.<br>
-**No MCP setup and no extra “remember this” prompt are required.** MCP remains available for explicit memory organization and knowledge retrieval.
-
-Memory stays on your own device, where you can inspect, edit, delete, and back it up. Providers, routes, and failover are managed server-side.
+A memory relay that runs on your own phone or computer: point your chat app at it,<br>
+and every conversation automatically carries the relevant memories, then saves what is worth keeping afterwards. No plugin, no repeated “remember this”.
 
 [![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
 [![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
@@ -15,63 +13,55 @@ Memory stays on your own device, where you can inspect, edit, delete, and back i
 
 [中文](README.md) · **[English](README.en.md)**
 
-[🔀 How it works](#-two-gateway-layers-automatic-ordinary-chat) · [🧭 Why Memory Platform](#-why-memory-platform) · [🚀 Get started](#-quick-start) · [🔌 Connect a client](#-connecting-clients) · [📱 Android app](#-on-your-phone-the-android-app) · [📚 Docs](#-documentation)
+<br>
+
+[<kbd>&nbsp;📱 &nbsp;On your phone: Android app&nbsp;</kbd>](#-on-your-phone-android-app) &nbsp;&nbsp; [<kbd>&nbsp;💻 &nbsp;On your computer: Docker one-liner&nbsp;</kbd>](#-on-your-computer-docker-one-liner)
+
+<sub>[🔌 What to enter in the chat app](#-what-to-enter-in-the-chat-app) · [🔑 Three keys](#-three-keys) · [🖥️ Visible and governable](#️-visible-and-governable) · [🔬 Going deeper](#-going-deeper) · [📚 Docs](#-documentation)</sub>
 
 </div>
 
-![Memory Platform automatic memory gateway banner with a real view of the local Web Console](docs/images/memory-platform-hero.jpg)
+![The same conversation before and after Memory Platform: before, the AI asks what you like; after, it recalls "likes black coffee, no sugar" and answers directly](docs/images/demo-before-after.en.svg)
 
-<p align="center"><sub>Automatic memory gateway · Local-first · Auditable · Model-neutral · All product screens use demo data, never real user content</sub></p>
+<p align="center"><sub>Illustration. Memory stays on your own device, where you can inspect, edit, delete and back it up.</sub></p>
 
-## ✨ The one-minute version
+## ✨ The problem it solves
 
-| What you may want to know first | Short answer |
+Every new chat window forgets you: yesterday's preferences, the project you are working on, your family's names. Memory Platform sits between your chat app and the model and handles that automatically:
+
+| What you may want to know | Short answer |
 | --- | --- |
-| **What does it do?** | It is an automatic memory gateway between a chat client and a model: it recalls and injects relevant memory, then extracts durable information after a complete answer. |
-| **Who is it for?** | People using Chatbox, RikkaHub, FLIT, or another OpenAI-compatible client who want durable preferences and project context. |
-| **Where is the data?** | Memory, knowledge documents, and runtime configuration remain local; Docker separates them into Memory/Model data and secret volumes. |
-| **Must I change clients?** | No. Point your current client's Base URL at Memory Platform's OpenAI-compatible `/v1` endpoint. |
-| **Do I need MCP or a memory prompt?** | Not for ordinary chat. The gateway handles recall and saving automatically; `/mcp` is only for explicit memory organization and knowledge retrieval. |
-| **Does it lock me to a model?** | No. Clients use `memory-auto`; provider and model changes stay on the server. |
-| **What is the fastest path?** | Start Docker → configure a model in the browser → enter a Base URL, API key, and model name in your client. |
-
-Memory Platform is not a new chat client and does not include a model. The embedding route is optional; leaving it absent or disabled explicitly selects keyword retrieval.
+| **Do I have to switch chat apps?** | No. Chatbox, RikkaHub, FLIT or any app with an “OpenAI-compatible” provider works; you change three fields: address, key, model name. |
+| **Do I have to say “remember this”?** | No. After the AI finishes a complete answer it decides on its own whether the turn contained something worth keeping. Passwords and ID numbers are never saved unless you explicitly ask. |
+| **Where is the data?** | On your own phone or computer (SQLite files). Search, edit, delete and export from a local web console. |
+| **Do I start over when I change models?** | No. The chat app always uses the model name `memory-auto`; which provider answers is changed in the console. |
+| **What do I need?** | An Android phone, or a computer with Docker, plus an API key from one model provider (the wizard links to where to get one). |
 
 > [!IMPORTANT]
-> **Local-first does not mean no network traffic.** Memory, knowledge documents, and configuration stay on your device by default. If you choose a cloud model provider, the current message you send and the context permitted for that turn are sent to that provider for inference. The default deployment targets a personal machine or trusted home network; do not expose it unauthenticated to the public internet.
-
-## 🔀 Two gateway layers, automatic ordinary chat
-
-![Two-gateway flow: an existing client connects through the OpenAI-compatible Memory Gateway for automatic recall and saving, then Model Gateway handles model routing and failover; MCP is optional](docs/images/gateway-flow.en.svg)
-
-Clients connect only to Memory Gateway. For ordinary `/v1` requests, the gateway automatically recalls memory, injects context, and extracts durable information after the answer; it does not depend on the model remembering to call a tool. Model Gateway selects providers, models, and fallback order by stable purpose. Add `/mcp` only when the model should explicitly search or organize memory or retrieve knowledge.
-
-## 🧭 Why Memory Platform
-
-- **Gateway-managed memory instead of waiting for tool calls:** ordinary OpenAI-compatible chat gets automatic recall, injection, and saving; neither MCP nor an extra memory prompt is a prerequisite.
-- **Keep your current chat entry point:** change only the Base URL, API key, and model name, then continue using the client you already know.
-- **Governance before “remember more”:** every memory keeps its source and status, explains why it was recalled, and can be edited, archived, restored, or permanently deleted.
-- **Memory and knowledge stay physically separate:** personal facts and preferences live in `memory.db`; imported long-form documents live in `knowledge.db` and never enter memory decay or automatic chat context.
-- **Model choices stay server-side:** Model Gateway selects providers, models, and fallback order by stable purpose, so clients and memory data do not migrate with a vendor change.
-
-These projects solve different layers of the problem. Start with the one closest to your primary goal:
-
-| Your primary goal | Start with |
-| --- | --- |
-| Add a general-purpose memory SDK, server API, or managed platform to an application | [Mem0](https://github.com/mem0ai/mem0) |
-| Build a temporal context graph centered on entities, fact validity, and historical queries | [Zep / Graphiti](https://github.com/getzep/graphiti) |
-| Build a stateful agent runtime in which the agent manages its own memory, state, and tools | [Letta](https://github.com/letta-ai/letta) |
-| Keep an existing OpenAI-compatible client while adding gateway-managed automatic memory, local deployment, auditable governance, isolated knowledge, and unified model routing | **Memory Platform** |
-
-This is not a performance ranking. Memory Platform currently targets personal machines and trusted home networks; it does not try to replace a managed memory platform, a full temporal knowledge graph, or an agent runtime.
+> **Local-first does not mean offline.** Memory, documents and configuration stay on your device, but the message you send and the memories allowed for that turn are sent to the model provider you chose. The default deployment targets a personal machine or trusted home network; do not expose it unauthenticated to the public internet.
 
 ## 🚀 Quick start
 
-### Easiest path: one-line installer (Docker)
+### 📱 On your phone: Android app
 
-You need Docker Desktop and an API key for one model provider. You do not need Python, Node.js, or a repository clone.
+The lowest-friction path. The whole stack runs inside one app in the background; chat apps on the same phone connect to it. No computer needed.
 
-Choose a released version instead of tracking the mutable `main` branch. On macOS or Linux:
+1. Download `memory-platform-android-*.apk` (arm64, Android 8.0+) from [Releases](https://github.com/SparkHello/Memory_Platform/releases) and allow installs from unknown sources.
+2. Open the app, tap **Start service** and allow notifications. The status page is a four-step checklist that ticks itself off.
+3. Tap **Open console to configure a model**. The browser **signs in automatically** (nothing to copy or paste); pick a provider, paste its API key, choose a chat model, save.
+4. Back in the app, tap **Open console to create a chat key** and create one under *Client access*.
+5. In your phone's chat app add an “OpenAI-compatible” provider: Base URL `http://127.0.0.1:2026/v1`, API key = the chat key you just created, model `memory-auto`. The status page has copy buttons for the address and the model name.
+6. If a red **Background may be restricted** card appears, tap **Disable battery optimization**. Xiaomi, Huawei, OPPO, vivo and similar systems additionally need auto-start permission, an unrestricted power policy and locking the app in recents; otherwise the service gets killed and memories are silently lost.
+
+Once everything is ticked, the console home shows a **Try it** card: send the suggested test sentence and the card shows live whether the first memory was saved. If something goes wrong, **Export diagnostics** under *Advanced* bundles logs, redacted config and a memory database snapshot.
+
+Under the hood it embeds Python 3.14 via Chaquopy, runs the same server code, ships an FTS5-enabled SQLite and listens on `127.0.0.1` only. Build steps, known limits and troubleshooting: [Android client guide](docs/android.md) (Chinese).
+
+### 💻 On your computer: Docker one-liner
+
+You need Docker Desktop and an API key from one model provider. No Python, Node.js or repository clone.
+
+macOS or Linux (pin the version to the release you want):
 
 ```bash
 VERSION=v0.5.1
@@ -79,66 +69,45 @@ curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSIO
 MEMORY_PLATFORM_VERSION="$VERSION" sh install-memory-platform.sh
 ```
 
-Windows PowerShell uses the matching release installer (currently **experimental**: it passed PowerShell syntax regression and containerized fault-injection tests, but has not yet completed a disaster-recovery drill on a real NTFS + Docker Desktop machine — keep an extra manual backup of important data):
+Windows PowerShell 5.1+ (also pinned to a release):
 
 ```powershell
 $Version = "v0.5.1"
-$env:MEMORY_PLATFORM_VERSION = $Version
 irm "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$Version/deploy/install.ps1" -OutFile install-memory-platform.ps1
-& .\install-memory-platform.ps1
+$env:MEMORY_PLATFORM_VERSION = $Version
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-memory-platform.ps1
 ```
 
-After installation, remember two credential files and three steps:
+The Windows installer is still marked experimental: keep an extra manual backup of important data and read the [stack operations guide](docs/stack-operations.en.md) first.
 
-1. Sign in to the Web Console at `http://127.0.0.1:2026/ui/` with the token in `credentials/gateway.txt` (legacy installs may use `gateway.key`);
-2. Open Models & Routes and enter the admin key from `credentials/admin.txt` (legacy `admin.key`) to configure a model channel;
-3. Create a chat token in the Web Console and paste it into your chat client.
+After installation there are two key files under `credentials/` in the install directory, then three steps:
 
-First start takes 1–2 minutes; chat works once a model channel is configured. Before first-run setup, `/health` returning 200 while `/readyz` returns 503 is expected: liveness keeps the setup UI reachable, while readiness means the stack is operationally configured. Credential values are never printed to Docker logs or passed through Compose environment variables — they live only in owner-only files under `credentials/`.
+1. Open `http://127.0.0.1:2026/ui/` and paste the **login key** from `credentials/gateway.txt` (legacy installs: `gateway.key`).
+2. Open *Models & Routes*, paste the **admin key** from `credentials/admin.txt`, add a channel, paste the provider API key, pick a model.
+3. Create a **chat key** under *Client access* and enter it in your chat app as described in [What to enter in the chat app](#-what-to-enter-in-the-chat-app).
+
+First start takes 1–2 minutes. Before a model is configured, `/health` returning 200 while `/readyz` returns 503 is expected: the former keeps the setup page reachable, the latter means chat is ready. Key values never enter environment variables, command arguments or Docker logs; they only live in owner-only files under `credentials/`.
 
 To uninstall, see [Stack operations · Uninstall a Docker install](docs/stack-operations.en.md#uninstall-a-docker-install). Do not run `docker system prune`.
 
 <details>
-<summary>Installer implementation details (digest pinning, backup and upgrade strategy)</summary>
+<summary>Installer details, manual Compose, install from source</summary>
 
-The installer checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. Re-running the same release installer finds the existing installation; on upgrade it stops the old stack, creates and verifies a single consistent backup, then rolls back automatically if an already configured stack regresses at `/readyz`. A fresh install requires only `/health` so that onboarding remains reachable. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows. Sigstore signature verification is skipped by default (images are already digest-pinned); set `MEMORY_VERIFY_SIGNATURES=1` to enable it. Legacy all-in-one single-volume layouts are no longer migrated by the installer itself: run the one-shot migration tool from the same release first (`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`), then re-run the installer once the four split volumes exist.
+**Installer**: it checks Docker, uses a stable per-user install directory, picks a free port, pins every image to its immutable digest, and opens browser-based onboarding. Re-running the same release installer finds the existing installation; on upgrade it stops the old stack, creates and verifies a single consistent backup, then rolls back automatically if an already configured stack regresses at `/readyz`. A fresh install requires only `/health`. The default directory is `~/memory-platform` on macOS/Linux or `$HOME\memory-platform` on Windows. Sigstore signature verification is skipped by default (images are digest-pinned); set `MEMORY_VERIFY_SIGNATURES=1` to enable it. Legacy all-in-one single-volume layouts are no longer migrated by the installer itself: run the one-shot migration tool from the same release first (`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`), then re-run the installer. If GHCR or GitHub is unreachable, set an HTTPS proxy before re-running, or set `MEMORY_IMAGE_REGISTRY=<ghcr-mirror-host>` (only the registry host changes; paths and digests stay identical).
 
-If GHCR or GitHub is unreachable from your network, set an HTTPS proxy before re-running the script, or set `MEMORY_IMAGE_REGISTRY=<ghcr-mirror-host>` to pull the images through a GHCR mirror (only the registry host changes; repository paths and digest pinning stay identical).
-
-</details>
-
-### Manual path (to review each step)
+**Manual Compose** (to review each step):
 
 ```bash
 VERSION=v0.5.1
 curl -O "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/docker-compose.user.yml"
+mkdir -m 700 credentials
+printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" > .env
 docker compose -f docker-compose.user.yml up -d
 ```
 
-The release Compose file starts separate Memory, Model, and one-shot initializer images. The installer resolves the selected semver images to immutable digests; do the same when maintaining a manual deployment. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists versions and digests.
+The release Compose file starts separate Memory, Model and one-shot initializer images built from one hash-verified artifact set; they do not share a complete Python environment. The [GHCR package page](https://github.com/SparkHello/Memory_Platform/pkgs/container/memory-platform) lists versions and digests. Once ready, `ls -l credentials/gateway.txt credentials/admin.txt` shows the two keys. On a fresh install the login key is the sole Console-scoped `first-console` token; only migrated legacy volumes keep a one-version all-scope key. If port 2026 is taken, write `MEMORY_PORT=3026` into `.env` next to the Compose file and restart. Image upgrades preserve the four isolated data/secret volumes.
 
-All three images are built from one hash-verified artifact set, but they do not share a complete Python environment. The long-lived Memory image installs only Memory, the Web UI, the narrow contracts package, and Memory dependencies; the long-lived Model image installs only Model, contracts, and Model dependencies. Only the offline init/maintenance image contains both services' maintenance tools.
-
-First start takes 1–2 minutes of offline initialization, during which `http://127.0.0.1:2026/ui/` is not reachable yet — that is expected. Generated credentials are host files, not log output:
-
-```bash
-ls -l credentials/gateway.txt credentials/admin.txt
-```
-
-On a fresh install, `gateway.txt` contains the sole Console-scoped `first-console` token. Only migrated legacy volumes retain a one-version all-scope bootstrap key; older installations may still use `gateway.key`. The Web Console can create separate chat and MCP device tokens after login. `admin.txt` (legacy `admin.key`) is used only to change model channels and routes in the browser. If port 2026 is already taken, write `MEMORY_PORT=3026` into a `.env` file next to the Compose file and restart (see the [stack operations guide](docs/stack-operations.en.md#port-2026-already-in-use)).
-
-Then:
-
-1. Open `http://127.0.0.1:2026/ui/` and connect with the value in `credentials/gateway.txt` (or legacy `gateway.key`).
-2. Open Models & Routes and use the admin key to unlock this configuration session.
-3. Add a channel, enter the provider API key, and choose a model from the discovered list.
-4. Follow [Connecting clients](#-connecting-clients) below for the Base URL, API key, and model name.
-
-Image upgrades preserve the four isolated data/secret volumes. Daily commands, scoped-token management, backup, and migration are in the [stack operations guide](docs/stack-operations.en.md).
-
-### Install from source
-
-For macOS or Linux, with Python 3.12+, Node.js 22, and npm:
+**Install from source** (macOS or Linux, Python 3.12+, Node.js 22 and npm):
 
 ```bash
 git clone https://github.com/SparkHello/Memory_Platform.git
@@ -146,56 +115,39 @@ cd Memory_Platform
 scripts/setup.sh
 ```
 
-The setup script prepares the environment, builds the Web Console, starts the stack, generates local keys, and opens guided model setup. Use `scripts/setup.sh --install-only` to prepare the environment only, or add `--skip-ui` if you do not need the Web Console.
+The setup script prepares the environment, builds the Web Console, starts the stack, generates local keys and opens guided model setup. Use `--install-only` to prepare the environment only, or `--skip-ui` without the Web Console. An AI or agent can instead follow [Installing with an AI assistant](docs/ai-install.md) (Chinese) and call `scripts/setup.sh --config <file> --json`; the provider API key is passed only through standard input.
 
-An AI or agent can instead follow [Installing with an AI assistant](docs/ai-install.md) (Chinese), create a non-secret recipe, and call `scripts/setup.sh --config <file> --json`. The provider API key is passed only through standard input.
+</details>
 
-### 📱 On your phone: the Android app
+## 🔌 What to enter in the chat app
 
-No computer required. The Android build packs Memory Gateway, Model Gateway and the Web Console into one app that runs as a foreground service bound to `127.0.0.1`. Chat apps on the same phone point at `http://127.0.0.1:2026/v1`; the console opens in the phone browser at `http://127.0.0.1:2026/` with exactly the desktop feature set. Memories and keys stay in the app's private storage.
-
-1. Download `memory-platform-android-*.apk` (arm64, Android 8.0+) from [Releases](https://github.com/SparkHello/Memory_Platform/releases) and allow installs from unknown sources.
-2. Open the app, tap **Start service**, allow notifications, and once it shows **Running** tap **Disable battery optimization**. Chinese OEM systems (Xiaomi, Huawei, OPPO, vivo, ...) additionally need auto-start permission, an unrestricted power policy and locking the app in recents, or the background service gets killed.
-3. Tap **Copy first login token**, then **Open console** and paste it; use **Copy Model Gateway admin key** when configuring models.
-4. Create a chat token in the console and enter it in your chat app. For search/MCP tools, enable the *tools* ability for `memory-auto` in the client and tick *tools* (or use *Auto-detect capabilities*) for the model in the console.
-5. If something goes wrong, **Export diagnostics** produces a zip with logs, redacted config, a memory database snapshot and the extraction decision log.
-
-Under the hood it embeds Python 3.14 via Chaquopy and runs the same server code, with an FTS5-enabled SQLite and the two Rust dependencies compiled on-device. Build steps, known limits and troubleshooting: [Android client guide](docs/android.md) (Chinese).
-
-## 🔌 Connecting clients
-
-Add a new “OpenAI-compatible” provider in Chatbox, RikkaHub, FLIT, or another client:
+Add an “OpenAI-compatible” provider in Chatbox, RikkaHub, FLIT or a similar app and fill in three fields:
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  a per-device chat token created in the Web Console or CLI
+API Key:  the chat key created for this device under Client access in the console
 Model:    memory-auto
 ```
 
-After one complete message, open `http://127.0.0.1:2026/ui/` to check whether a memory was created. When you later change providers or models, only the server configuration changes; the client keeps using `memory-auto`. The model list also offers `memory-read` (recall only, never writes new memory) and `memory-off` (plain transparent proxy, no reads or writes): switch the model name for a conversation that should leave no memory, with no custom-header support required.
+Then send one message with a personal preference, for example “I like black coffee, no sugar, keep that in mind when you recommend coffee”, and let the AI finish its answer. The memory appears in the console; open a new conversation and ask “what coffee do I like?”.
 
-Ordinary chat does not require MCP or a system prompt telling the model when to save memory. In the default `read-write` mode, Memory Gateway handles relevant-memory recall, context injection, and post-answer extraction automatically.
+- **On a phone, `127.0.0.1` means the phone itself.** With the Android app installed that is exactly the address to use. To reach a computer instead, use the computer's LAN address; Docker deployments also need `MEMORY_HOST=0.0.0.0` in `.env` next to the Compose file plus a restart.
+- **For a conversation that should leave no trace**, switch the model name to `memory-read` (recall only, never writes) or `memory-off` (no reads, no writes). No custom-header support needed.
+- **When you change providers later**, change it in the console only; the chat app stays as is.
 
-On a phone, `localhost` and `127.0.0.1` point to the phone itself: with the [Android app](#-on-your-phone-the-android-app) installed that is exactly the address to use. To reach a computer instead, LAN or Tailscale devices must use that computer's address; Docker deployments also need `MEMORY_HOST=0.0.0.0` in a `.env` file next to the Compose file, plus a restart, to listen on the LAN. Field locations, verification, and troubleshooting are covered in the [client setup guide](docs/client-setup.md) (Chinese).
+Per-app field locations, verification and troubleshooting: [client setup guide](docs/client-setup.md) (Chinese).
 
-### Optional MCP: let the model use memory and knowledge explicitly
+## 🔑 Three keys
 
-Clients that support Streamable HTTP MCP can connect to:
+There are exactly three keys, each for one job. Do not mix them up:
 
-```text
-http://127.0.0.1:2026/mcp
-```
+| Key | Where | Purpose | Android app |
+| --- | --- | --- | --- |
+| **Login key** | `credentials/gateway.txt` (legacy `gateway.key`) | Sign in to the web console | Carried automatically by **Open console** |
+| **Admin key** | `credentials/admin.txt` (legacy `admin.key`) | Change model channels on *Models & Routes* | Carried automatically by **Open console** |
+| **Chat key** | Created under *Client access*, shown once | The API key inside the chat app | Create in the console, then copy |
 
-Authenticate with a separate per-device MCP token. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported. It is an enhancement, not a prerequisite for automatic memory. For ordinary chat, the OpenAI-compatible endpoint above is enough.
-
-| What you want to do | Entry point | Who decides when to use memory |
-| --- | --- | --- |
-| Recall and save automatically in a normal chat client | `/v1` | Memory Platform handles it automatically |
-| Let the model search, save, or organize explicitly | `/mcp` | The model calls tools |
-| Inspect, edit, delete, import, or back up | `/ui` | You act in the browser |
-| Use only unified model routing | Model Gateway `/v1` | The caller selects a purpose |
-
-The knowledge base never enters chat context automatically. It requires an explicit MCP, REST, or Web Console search.
+Every chat app gets its own chat key, so losing one device means revoking one key. MCP-capable clients get a separate MCP key. Provider API keys stay on the server and are never handed to chat apps.
 
 ## 🖥️ Visible and governable
 
@@ -221,26 +173,62 @@ Sensitivity filtering is per sentence: by default (`ALLOW_SENSITIVE_EGRESS=false
 
 <p align="center"><sub>All screens use demo data. Search, filter, pin, archive, restore, and permanently delete from the local Web Console.</sub></p>
 
-## 🧰 Core capabilities
+## 🔬 Going deeper
+
+### Two gateway layers, automatic ordinary chat
+
+![Two-gateway flow: an existing client connects through the OpenAI-compatible Memory Gateway for automatic recall and saving, then Model Gateway handles model routing and failover; MCP is optional](docs/images/gateway-flow.en.svg)
+
+Clients connect only to Memory Gateway. For ordinary `/v1` requests, the gateway automatically recalls memory, injects context, and extracts durable information after the answer; it does not depend on the model remembering to call a tool. Model Gateway selects providers, models, and fallback order by stable purpose. Add `/mcp` only when the model should explicitly search or organize memory or retrieve knowledge.
+
+| What you want to do | Entry point | Who decides when to use memory |
+| --- | --- | --- |
+| Recall and save automatically in a normal chat client | `/v1` | Memory Platform handles it automatically |
+| Let the model search, save, or organize explicitly | `/mcp` | The model calls tools |
+| Inspect, edit, delete, import, or back up | `/ui` | You act in the browser |
+| Use only unified model routing | Model Gateway `/v1` | The caller selects a purpose |
+
+Clients that support Streamable HTTP MCP connect to `http://127.0.0.1:2026/mcp` with a separate per-device MCP key. MCP is useful when the model should explicitly search, save, or organize memory and retrieve documents you deliberately imported; it is an enhancement, not a prerequisite. The knowledge base never enters chat context automatically.
+
+### Why Memory Platform
+
+- **Gateway-managed memory instead of waiting for tool calls:** ordinary OpenAI-compatible chat gets automatic recall, injection, and saving; neither MCP nor an extra memory prompt is a prerequisite.
+- **Keep your current chat entry point:** change only the Base URL, API key, and model name.
+- **Governance before “remember more”:** every memory keeps its source and status, explains why it was recalled, and can be edited, archived, restored, or permanently deleted.
+- **Memory and knowledge stay physically separate:** personal facts live in `memory.db`; imported long-form documents live in `knowledge.db` and never enter memory decay or automatic chat context.
+- **Model choices stay server-side:** Model Gateway selects providers, models, and fallback order by stable purpose, so clients and memory data do not migrate with a vendor change.
+
+These projects solve different layers of the problem. Start with the one closest to your primary goal:
+
+| Your primary goal | Start with |
+| --- | --- |
+| Add a general-purpose memory SDK, server API, or managed platform to an application | [Mem0](https://github.com/mem0ai/mem0) |
+| Build a temporal context graph centered on entities, fact validity, and historical queries | [Zep / Graphiti](https://github.com/getzep/graphiti) |
+| Build a stateful agent runtime in which the agent manages its own memory, state, and tools | [Letta](https://github.com/letta-ai/letta) |
+| Keep an existing OpenAI-compatible client while adding gateway-managed automatic memory, local deployment, auditable governance, isolated knowledge, and unified model routing | **Memory Platform** |
+
+This is not a performance ranking. Memory Platform currently targets personal machines and trusted home networks; it does not try to replace a managed memory platform, a full temporal knowledge graph, or an agent runtime.
+
+### Core capabilities
 
 - **Automatic memory gateway with optional MCP:** ordinary `/v1` chat gets automatic recall, injection, and saving, with streaming, tool-call, multimodal-part, and reasoning-field compatibility plus `off` / `read` / `read-write` modes and conversation branches.
 - **Long-term memory and governance:** verifiable source text, lifecycles, timelines, topic links, recall explanations, edit, merge, soft delete, restore, permanent deletion, and export.
 - **Isolated knowledge base:** text, Markdown, PDF, DOCX, and EPUB with full-text/vector hybrid retrieval, immutable document versions, and exact passage citations.
 - **Models, failover, and usage:** purpose-based model selection and fallback, with channel, model, token, latency, and price snapshots but no prompts, replies, tool arguments, or knowledge content in usage logs.
-- **Optional, strict vector capability:** a missing or disabled `memory.embedding` route uses keyword retrieval. Enabling it opts into semantic vectors; a blank space setting automatically adopts the route contract, while an invalid, unavailable, or pin-mismatched contract makes `/readyz` fail instead of mixing old vector spaces. Sentences containing passwords, IDs, or account numbers are excluded from remote extraction and embeddings by default (filtered per sentence; the rest of the text still goes out); the egress ceiling for private content such as health, address, contact details, and income is set by `MEMORY_EGRESS_CEILING`; context compaction, AI review, and the knowledge agent still keep all non-normal content local by default.
+- **Optional, strict vector capability:** a missing or disabled `memory.embedding` route uses keyword retrieval. Enabling it opts into semantic vectors; a blank space setting automatically adopts the route contract, while an invalid, unavailable, or pin-mismatched contract makes `/readyz` fail instead of mixing old vector spaces. Sentences containing passwords, IDs, or account numbers are excluded from remote extraction and embeddings by default (filtered per sentence); the egress ceiling for private content such as health, address, contact details, and income is set by `MEMORY_EGRESS_CEILING`; context compaction, AI review, and the knowledge agent still keep all non-normal content local by default.
 
 The complete interface and behavior contracts are documented in [Memory Gateway](services/memory-gateway/README.md) and [Model Gateway](services/model-gateway/README.md).
 
-## 🧱 Two gateways, one installation
+### Two gateways, one installation
 
 | Service | Default address | Owns | Does not own |
 | --- | --- | --- | --- |
 | [Memory Gateway](services/memory-gateway/README.md) | `127.0.0.1:2026` | Long-term memory, recent context, knowledge base, MCP, OpenAI-compatible proxy, and Web Console | Provider accounts and channel pricing |
 | [Model Gateway](services/model-gateway/README.md) | Docker-internal `model-gateway:2030` | Model connections, purpose routes, fallback order, secret references, usage, and price snapshots | Chat, memory, or knowledge content |
 
-Memory behavior and model-provider configuration have different change rates and security responsibilities, so they run in separate containers and OS identities. Model Gateway is not published to the host; Memory Gateway calls it over a private backend network through exact stable routes and a separate backend key. Memory cannot mount provider or admin secrets.
+Memory behavior and model-provider configuration have different change rates and security responsibilities, so they run in separate containers and OS identities. Model Gateway is not published to the host; Memory Gateway calls it over a private backend network through exact stable routes and a separate backend key.
 
-## 🔐 Current boundaries
+### Current boundaries
 
 - The default target is a personal machine or trusted home network, not an unhardened public multi-tenant SaaS.
 - SQLite, caches, tool idempotency, and some background state are designed for one process; low-latency ANN retrieval over millions of memories is not a current goal.
@@ -254,6 +242,7 @@ Key boundaries, sensitive-data egress, backup and restore, and advanced model co
 ## 📚 Documentation
 
 - [Client setup for Chatbox, RikkaHub, FLIT, and similar clients](docs/client-setup.md) (Chinese)
+- [Android client guide](docs/android.md) (Chinese)
 - [Stack operations, advanced configuration, backup, and migration](docs/stack-operations.en.md)
 - [Installing with an AI assistant](docs/ai-install.md) (Chinese)
 - [Memory Gateway full documentation](services/memory-gateway/README.md)

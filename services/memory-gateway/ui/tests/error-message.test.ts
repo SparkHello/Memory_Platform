@@ -3,14 +3,14 @@ import { ApiError } from "../src/api";
 import { errorMessage, inferErrorCredential } from "../src/utils/format";
 
 describe("errorMessage credential typing", () => {
-  it("defaults bare 401 to Console token guidance", () => {
+  it("defaults bare 401 to login-key guidance", () => {
     const error = new ApiError(401, "Unauthorized", undefined, undefined, "/memories");
-    expect(errorMessage(error)).toMatch(/Console token/);
+    expect(errorMessage(error)).toMatch(/登录密钥/);
     expect(errorMessage(error)).toMatch(/gateway\.txt/);
     expect(inferErrorCredential(error)).toBe("console");
   });
 
-  it("maps mechanism-only bearer token detail to Console token guidance", () => {
+  it("maps mechanism-only bearer token detail to login-key guidance", () => {
     const error = new ApiError(
       401,
       "Authorization Bearer token 无效",
@@ -18,7 +18,7 @@ describe("errorMessage credential typing", () => {
       undefined,
       "/memories/report"
     );
-    expect(errorMessage(error)).toMatch(/Console token/);
+    expect(errorMessage(error)).toMatch(/登录密钥/);
     expect(errorMessage(error)).toMatch(/gateway\.txt/);
     expect(inferErrorCredential(error)).toBe("console");
   });
@@ -32,7 +32,7 @@ describe("errorMessage credential typing", () => {
       "/providers/admin/check"
     );
     expect(errorMessage(error)).toMatch(/admin\.txt/);
-    expect(errorMessage(error)).toMatch(/不是同一把钥匙/);
+    expect(errorMessage(error)).toMatch(/不是同一把/);
     expect(inferErrorCredential(error)).toBe("admin");
   });
 
@@ -64,7 +64,7 @@ describe("errorMessage credential typing", () => {
     );
     const message = errorMessage(error);
     expect(message).toContain("请输入 Model Gateway admin");
-    expect(message).toMatch(/不是同一把钥匙|Console token/);
+    expect(message).toMatch(/不是同一把|登录密钥/);
   });
 
   it("does not force Console token wording on admin 401 with full server message", () => {

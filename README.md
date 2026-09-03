@@ -2,12 +2,10 @@
 
 # 🧠 Memory Platform
 
-**给现有 AI 客户端加上一层会自动记忆的本地网关。**
+**让你正在用的 AI 聊天 App 记住你。换个窗口、换个模型，它还记得。**
 
-普通聊天只需接入 OpenAI-compatible `/v1`：Memory Platform 自动召回相关记忆、注入上下文，并在完整回答后提取值得长期保存的信息。<br>
-**无需配置 MCP，也无需额外提示 AI“记住这件事”。** MCP 是可选入口，用于显式搜索、整理记忆和检索知识库。
-
-记忆保存在自己的设备上，随时可以查看、修改、删除和备份；模型渠道、路由和故障切换统一由服务端管理。
+装在自己手机或电脑上的一层「记忆中转站」：聊天 App 只需把接口地址改成它，<br>
+每次对话它会自动带上相关的记忆，聊完再把值得记住的事保存下来。不用装插件，也不用反复说「记住这件事」。
 
 [![Release](https://img.shields.io/github/v/release/SparkHello/Memory_Platform)](https://github.com/SparkHello/Memory_Platform/releases)
 [![CI](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/SparkHello/Memory_Platform/actions/workflows/ci.yml)
@@ -15,63 +13,55 @@
 
 **[中文](README.md)** · [English](README.en.md)
 
-[🔀 工作原理](#-两层网关普通聊天自动工作) · [🧭 为什么选择](#-为什么选择-memory-platform) · [🚀 开始使用](#-快速开始) · [📱 安卓 App](#-手机上跑安卓-app) · [🔌 接入客户端](#-客户端接入) · [📚 文档](#-文档)
+<br>
+
+[<kbd>&nbsp;📱 &nbsp;手机上用：安卓 App&nbsp;</kbd>](#-手机上用安卓-app) &nbsp;&nbsp; [<kbd>&nbsp;💻 &nbsp;电脑上用：Docker 一键安装&nbsp;</kbd>](#-电脑上用docker-一键安装)
+
+<sub>[🔌 聊天 App 怎么填](#-聊天-app-怎么填) · [🔑 三把钥匙](#-三把钥匙) · [🖥️ 看得见管得住](#️-看得见也管得住) · [🔬 进一步了解](#-进一步了解) · [📚 文档](#-文档)</sub>
 
 </div>
 
-![Memory Platform 自动记忆网关品牌横幅：让 AI 跨对话记住你，右侧为真实的本地 Web Console 工作室界面](docs/images/memory-platform-hero.jpg)
+![接入 Memory Platform 前后的同一段对话：之前 AI 反问你喜欢什么口味，之后它自动带上「你喜欢黑咖啡、不加糖」直接给出推荐](docs/images/demo-before-after.zh-CN.svg)
 
-<p align="center"><sub>Automatic memory gateway · Local-first · Auditable · Model-neutral · 所有产品界面均为演示数据，不含真实用户内容</sub></p>
+<p align="center"><sub>示意图。记忆保存在你自己的设备上，随时可以查看、修改、删除、备份。</sub></p>
 
-## ✨ 1 分钟了解
+## ✨ 它解决什么问题
 
-| 你可能先想知道 | 简短回答 |
+AI 聊天 App 每开一个新窗口就把你忘光：昨天说过的偏好、正在做的项目、家里人的名字，都要重新交代。Memory Platform 站在聊天 App 和模型之间，把这件事自动做掉：
+
+| 你想知道 | 简短回答 |
 | --- | --- |
-| **它是做什么的？** | 一个运行在聊天客户端和模型之间的自动记忆网关：需要时召回并注入相关记忆，完整回答结束后提取值得长期保留的信息。 |
-| **适合谁？** | 已在使用 Chatbox、RikkaHub、FLIT 或其他 OpenAI 兼容客户端，希望 AI 记得个人偏好与长期项目的人。 |
-| **数据保存在哪里？** | 记忆、知识文档和运行配置保存在本机；Docker 把 Memory 数据/密钥与 Model 数据/密钥分成四个私有卷。 |
-| **需要更换客户端吗？** | 不需要。把现有客户端的 Base URL 指向 Memory Platform 的 OpenAI 兼容 `/v1` 即可。 |
-| **需要 MCP 或记忆提示词吗？** | 普通聊天不需要。网关自动处理召回与保存；`/mcp` 只用于模型显式搜索、整理记忆和检索知识库。 |
-| **会绑定某个模型吗？** | 不会。客户端始终使用 `memory-auto`，以后更换渠道或模型只改服务端配置。 |
-| **最快怎么开始？** | 启动 Docker → 浏览器里配置模型 → 在客户端填写 Base URL、API Key 和模型名三项。 |
-
-Memory Platform 不是新的聊天客户端，也不自带大模型。语义搜索使用的 embedding route 是可选项；不创建或关闭它即明确使用关键词检索。
+| **要换聊天 App 吗？** | 不用。Chatbox、RikkaHub、FLIT 等任何能填「OpenAI 兼容」地址的 App 都行，只改地址、密钥、模型名三项。 |
+| **要我自己说「记住」吗？** | 不用。它等 AI 完整回答后，自己判断这一轮有没有值得长期记住的事；密码、证件号这类除非你明确要求，否则永不保存。 |
+| **记忆存在哪？** | 你自己的手机或电脑上（SQLite 文件）。可以在本地网页控制台里搜索、修改、删除、导出。 |
+| **换模型要重来吗？** | 不用。聊天 App 里模型名永远填 `memory-auto`，用哪家模型在控制台里改。 |
+| **需要什么？** | 一部安卓手机，或一台装了 Docker 的电脑；再加一个模型渠道的 API Key（DeepSeek、阿里云百炼等，向导里有领取链接）。 |
 
 > [!IMPORTANT]
-> **“本地优先”不等于“永不联网”。** 记忆、知识文档和配置默认留在自己的设备上；如果使用云端模型渠道，你主动发送的当前消息，以及本轮允许使用的相关上下文，会发给该渠道完成推理。默认部署面向个人电脑或可信家庭网络，请不要把服务无鉴权暴露到公网。
-
-## 🔀 两层网关，普通聊天自动工作
-
-![双网关数据流：现有客户端通过 OpenAI 兼容入口接入 Memory Gateway 自动召回和保存，再由 Model Gateway 负责模型路由与故障切换；MCP 是可选入口](docs/images/gateway-flow.zh-CN.svg)
-
-客户端只需要连接 Memory Gateway。普通 `/v1` 请求的记忆召回、上下文注入和回答后提取都由网关自动完成，不依赖模型是否记得调用工具。Model Gateway 在后方按稳定用途选择渠道、模型和备用顺序；需要显式搜索、整理记忆或检索知识库时，再按需使用 `/mcp`。
-
-## 🧭 为什么选择 Memory Platform
-
-- **网关自动记忆，而不是等待模型调用工具**：普通 OpenAI-compatible 聊天自动召回、注入和保存；MCP 与额外记忆提示词都不是前提。
-- **接入现有客户端，而不是重做聊天入口**：只需替换 Base URL、API Key 和模型名，继续使用熟悉的聊天客户端。
-- **治理先于“记得更多”**：每条记忆保留来源和状态，可解释为什么被召回，也可以编辑、归档、恢复或彻底删除。
-- **记忆和知识物理分开**：个人事实与长期偏好进入 `memory.db`；导入的长文档进入独立的 `knowledge.db`，不会混入记忆衰减或自动聊天上下文。
-- **模型选择留在服务端**：Model Gateway 按稳定用途选择渠道、模型和备用顺序，客户端与记忆数据不用跟着供应商迁移。
-
-常见项目解决的不是同一层问题，按你的首要目标选择即可：
-
-| 你的首要目标 | 更适合先看 |
-| --- | --- |
-| 给自研应用接入通用记忆 SDK、服务端 API 或托管平台 | [Mem0](https://github.com/mem0ai/mem0) |
-| 构建强调实体关系、事实有效期和历史查询的时态上下文图 | [Zep / Graphiti](https://github.com/getzep/graphiti) |
-| 构建由 agent 自主管理状态、记忆和工具的有状态 agent runtime | [Letta](https://github.com/letta-ai/letta) |
-| 继续使用现有 OpenAI 兼容客户端，同时获得网关自动记忆、本地部署、可审计治理、独立知识库和统一模型路由 | **Memory Platform** |
-
-这不是性能排名。Memory Platform 当前更偏个人、本机或可信家庭网络；它不试图替代托管记忆平台、完整时态知识图谱或 agent runtime。
+> **「本地」不等于「不联网」。** 记忆、文档和配置留在你的设备上；但你发出的当前消息，以及这一轮允许使用的相关记忆，会发给你选的模型渠道去生成回答。默认只服务本机或可信家庭网络，不要把它无鉴权地暴露到公网。
 
 ## 🚀 快速开始
 
-### 最省事：一键脚本（Docker）
+### 📱 手机上用：安卓 App
+
+用得最多、门槛最低的方式。整套服务装进一个 App，在手机后台常驻，手机上的聊天 App 直接连它。不需要电脑。
+
+1. 到 [Releases](https://github.com/SparkHello/Memory_Platform/releases) 下载 `memory-platform-android-*.apk`（arm64，Android 8.0+），安装时允许「未知来源」。
+2. 打开 App，点「启动服务」，允许通知。状态页是一张四步清单，做完一步自动打勾。
+3. 点「打开控制台配置模型」。浏览器会**自动登录**（不用复制粘贴任何密钥），选一个渠道、粘贴该渠道的 API Key、选一个聊天模型，保存。
+4. 回到 App，点「打开控制台创建聊天密钥」，在「客户端接入」创建一把聊天密钥。
+5. 在手机聊天 App 里新建「OpenAI 兼容」供应商：地址填 `http://127.0.0.1:2026/v1`，API Key 填刚创建的聊天密钥，模型名填 `memory-auto`。地址和模型名在 App 状态页有「复制」按钮。
+6. 状态页若出现红框「后台可能被系统限制」，点「去关闭电池优化」。小米、华为、OPPO、vivo 等系统还要在系统设置里允许自启动、把省电策略设为无限制，并在最近任务里锁定，否则后台会被杀，记忆会悄悄丢失。
+
+做完后控制台工作台会出现「试一下」卡：照着发一句测试语，卡片会实时显示第一条记忆有没有存下来。出问题时 App「高级」里的「导出诊断包」会打包日志、脱敏配置和记忆库快照。
+
+技术上它用 Chaquopy 内嵌 Python 3.14 运行同一份服务端代码，SQLite 自带 FTS5，只监听 `127.0.0.1`。构建方法、已知限制和排障见[安卓客户端方案](docs/android.md)。
+
+### 💻 电脑上用：Docker 一键安装
 
 只需要 Docker Desktop 和一个模型渠道的 API Key；不需要安装 Python、Node.js，也不需要 clone 仓库。
 
-macOS / Linux 终端（版本号必须固定到要安装的 release）：
+macOS / Linux 终端（版本号固定到要安装的 release）：
 
 ```bash
 VERSION=v0.5.1
@@ -90,28 +80,24 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-memory-platfor
 
 Windows 安装器目前仍标记为实验性；正式数据请先阅读[栈运维指南](docs/stack-operations.md)，并额外保留一份手动备份。
 
-安装完成后记住两枚密钥文件、三步用法：
+安装完成后，安装目录 `credentials/` 下有两个密钥文件，接着三步：
 
-1. 用 `credentials/gateway.txt`（旧版为 `gateway.key`）里的 token 登录网页控制台 `http://127.0.0.1:2026/ui/`；
-2. 在「模型与路由」输入 `credentials/admin.txt`（旧版为 `admin.key`）里的 admin key，配置模型渠道；
-3. 在网页里生成聊天 key（chat token），填进你的聊天客户端。
+1. 打开 `http://127.0.0.1:2026/ui/`，粘贴 `credentials/gateway.txt` 里的**登录密钥**登录（旧版叫 `gateway.key`）。
+2. 进「模型与路由」，粘贴 `credentials/admin.txt` 里的**管理密钥**，新建渠道、粘贴供应商 API Key、选模型。
+3. 在「客户端接入」创建一把**聊天密钥**，按下面[聊天 App 怎么填](#-聊天-app-怎么填)填进聊天 App。
 
-首次启动需要 1–2 分钟；配置完模型渠道后即可聊天。全新安装在配置模型前 `/health` 为 200、`/readyz` 为 503 是正常的：前者保证首次设置页面可访问，后者才表示业务运行就绪。密钥值不会进入环境变量、命令参数或 Docker 日志，只写入安装目录 `credentials/` 下的 `0600` 文件；终端只报告文件路径。
+首次启动需要 1–2 分钟。配置模型之前 `/health` 为 200、`/readyz` 为 503 是正常的：前者保证设置页面能打开，后者才表示可以聊天。密钥值不会进入环境变量、命令参数或 Docker 日志，只写入 `credentials/` 下的 `0600` 文件。
 
 卸载见[栈运维指南 · 卸载 Docker 安装](docs/stack-operations.md#卸载-docker-安装)。不要用 `docker system prune`。
 
 <details>
-<summary>安装器实现细节（digest 固定、备份与升级策略、离线迁移）</summary>
+<summary>国内网络、安装器细节、手工 Compose、源码安装</summary>
 
-脚本会：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或升级 → 启动独立的 Memory/Model 容器。
+**国内网络**：直连 GHCR 或 GitHub 受阻时，脚本下载失败可先设代理（`HTTPS_PROXY=http://127.0.0.1:7890`）重跑；镜像拉取失败可设 `MEMORY_IMAGE_REGISTRY=<GHCR 镜像站域名>` 覆盖镜像源（只替换 registry 主机，仓库路径与 digest 固定不变）。
 
-重复运行时，digest、受管配置和健康状态都一致会走 `noop`；只有服务退化时走不备份、不停整栈的定向 `repair`；镜像或受管配置变化才进入带一致性备份与回滚 journal 的 `upgrade`。升级前会记录旧 Memory/Model 的实际 readiness 基线，无法确定时在停机前失败，候选验收不得低于该基线；全新安装只要求 `/health`，以便先打开设置页面。升级时显式把 `VERSION` 改为目标 release。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。旧单卷（legacy all-in-one）布局不再由安装器内嵌迁移：先运行同一 release 的一次性迁移工具（`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`），完成旧单卷到四卷的迁移后再重跑安装命令。
+**安装器做了什么**：下载固定 release → 把三枚镜像解析为不可变 digest → 旧栈停写后创建并复验一致性备份（每次升级一份）→ 离线初始化或升级 → 启动独立的 Memory/Model 容器。重复运行时，digest、受管配置和健康状态都一致会走 `noop`；只有服务退化时走不备份、不停整栈的定向 `repair`；镜像或受管配置变化才进入带一致性备份与回滚 journal 的 `upgrade`。升级前会记录旧 Memory/Model 的实际 readiness 基线，无法确定时在停机前失败，候选验收不得低于该基线；全新安装只要求 `/health`。升级时显式把 `VERSION` 改为目标 release。默认目录是 `~/memory-platform`。镜像签名验证默认跳过（镜像已按 digest 固定）；需要时设 `MEMORY_VERIFY_SIGNATURES=1` 启用 Sigstore 验签。旧单卷（legacy all-in-one）布局不再由安装器内嵌迁移：先运行同一 release 的一次性迁移工具（`curl -fsSL "https://raw.githubusercontent.com/SparkHello/Memory_Platform/$VERSION/deploy/legacy_cutover.py" -o legacy-cutover.py && python3 legacy-cutover.py`），完成旧单卷到四卷的迁移后再重跑安装命令。
 
-</details>
-
-国内网络直连 GHCR 或 GitHub 受阻时：脚本下载失败可先设代理（`HTTPS_PROXY=http://127.0.0.1:7890`）重跑；镜像拉取失败可设 `MEMORY_IMAGE_REGISTRY=<GHCR 镜像站域名>` 覆盖镜像源（只替换 registry 主机，仓库路径与 digest 固定不变）。
-
-### 手工方式（想自己控制每一步）
+**手工 Compose（想自己控制每一步）**：
 
 ```bash
 VERSION=v0.5.1
@@ -121,29 +107,9 @@ printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" > .env
 docker compose -f docker-compose.user.yml up -d
 ```
 
-Compose 拉取同一 semver 的 `memory-platform-memory`、`memory-platform-model` 和 `memory-platform-init` 镜像；正式安装器还会把 tag 固定成实际 digest。首次启动期间 `http://127.0.0.1:2026/ui/` 暂时打不开是正常现象。就绪后查看密钥文件：
+Compose 拉取同一 semver 的 `memory-platform-memory`、`memory-platform-model` 和 `memory-platform-init` 镜像；正式安装器还会把 tag 固定成实际 digest。三枚镜像使用同一份哈希校验的依赖制品集合构建，但不共享完整 Python 环境：Memory 长期镜像只安装 Memory、Web UI、窄协议包及自身依赖，Model 长期镜像只安装 Model、窄协议包及自身依赖；只有离线 init/maintenance 镜像同时包含两侧维护工具。就绪后 `cat credentials/gateway.txt`、`cat credentials/admin.txt` 查看两把密钥。全新安装时登录密钥是仅有 Console scope 的 `first-console` token；旧卷迁移时才保留一个版本的 legacy all-scope key。端口 2026 被占用时，在 `.env` 增加 `MEMORY_PORT=3026` 后重启即可。镜像升级不会删除四个私有卷中的数据。
 
-三枚镜像使用同一份哈希校验的依赖制品集合构建，但不会共享完整 Python 环境：Memory 长期镜像只安装 Memory、Web UI、窄协议包及自身依赖，Model 长期镜像只安装 Model、窄协议包及自身依赖；只有离线 init/maintenance 镜像同时包含两侧维护工具。
-
-```bash
-cat credentials/gateway.txt   # 或旧版 gateway.key
-cat credentials/admin.txt     # 或旧版 admin.key
-```
-
-全新安装时，第一枚是仅有 Console scope 的 `first-console` token；旧卷迁移时才保留一个版本的 legacy all-scope key。登录后在「接入信息」为每台聊天客户端/MCP 客户端创建独立 token。第二枚 admin key 只用于修改模型渠道与路由。端口 2026 被占用时，在 `.env` 增加 `MEMORY_PORT=3026` 后重启即可。
-
-接下来：
-
-1. 打开 `http://127.0.0.1:2026/ui/`，用 `credentials/gateway.txt`（或旧版 `gateway.key`）中的初始 Console token 连接（迁移旧卷时该文件暂为 legacy key）。
-2. 进入「模型与路由」，用 admin key 解锁本次配置操作。
-3. 新建渠道、填写供应商 API Key，并从自动发现的列表中选择模型。
-4. 在「接入信息」创建命名的 chat token，再按下方的[客户端接入](#-客户端接入)填写 Base URL、token 和模型名。
-
-镜像升级不会删除四个私有卷中的数据。日常命令、token 撤销、备份和迁移见[栈运维指南](docs/stack-operations.md)。
-
-### 从源码安装
-
-适合 macOS/Linux，需要 Python 3.12+、Node.js 22 和 npm：
+**从源码安装**（macOS/Linux，需要 Python 3.12+、Node.js 22 和 npm）：
 
 ```bash
 git clone https://github.com/SparkHello/Memory_Platform.git
@@ -151,56 +117,39 @@ cd Memory_Platform
 scripts/setup.sh
 ```
 
-安装脚本会准备环境、构建 Web Console、启动服务、生成本地密钥，并进入模型配置向导。只准备环境时使用 `scripts/setup.sh --install-only`；不需要 Web Console 时可以加 `--skip-ui`。
+安装脚本会准备环境、构建 Web Console、启动服务、生成本地密钥，并进入模型配置向导。只准备环境用 `scripts/setup.sh --install-only`；不需要 Web Console 加 `--skip-ui`。也可以让 AI/Agent 按[AI 安装指南](docs/ai-install.md)生成不含密钥的配置单，再调用 `scripts/setup.sh --config <文件> --json` 完成安装。供应商 API Key 只通过标准输入传给安装命令。
 
-也可以让 AI/Agent 按[AI 安装指南](docs/ai-install.md)生成不含密钥的配置单，再调用 `scripts/setup.sh --config <文件> --json` 完成安装。供应商 API Key 只通过标准输入传给安装命令。
+</details>
 
-### 📱 手机上跑：安卓 App
+## 🔌 聊天 App 怎么填
 
-不想开电脑也能用。安卓版把 Memory Gateway、Model Gateway 和 Web Console 整套装进一个 App，在手机上以前台服务常驻运行，只监听 `127.0.0.1`。手机上的聊天 App 填 `http://127.0.0.1:2026/v1` 就走记忆代理，控制台用手机浏览器打开 `http://127.0.0.1:2026/`，功能与电脑版完全相同。记忆和密钥都留在手机的应用私有目录里。
-
-1. 到 [Releases](https://github.com/SparkHello/Memory_Platform/releases) 下载 `memory-platform-android-*.apk`（arm64，Android 8.0+），安装时允许「未知来源」。
-2. 打开 App 点「启动服务」，允许通知；状态变为「运行中」后点「关闭电池优化」。国产系统（小米、华为、OPPO、vivo 等）还需在系统设置里允许自启动、把省电策略设为无限制，并在最近任务里锁定，否则后台会被杀。
-3. 点「复制首次登录令牌」，再点「打开控制台」粘贴登录；配置模型时用「复制模型网关管理密钥」。
-4. 在控制台创建 chat token，填进手机上的聊天 App。需要搜索、MCP 等工具时，客户端里给 `memory-auto` 打开「工具」能力，控制台里给模型勾选「工具调用」或点「自动检测能力」。
-5. 出问题点「导出诊断包」，会得到一个含日志、脱敏配置、记忆库快照和抽取决策记录的 zip。
-
-技术上它用 Chaquopy 内嵌 Python 3.14 运行同一份服务端代码，SQLite 自带 FTS5，两个 Rust 依赖在手机上编译后打包。构建方法、已知限制和排障见[安卓客户端方案](docs/android.md)。
-
-## 🔌 客户端接入
-
-在 Chatbox、RikkaHub、FLIT 等客户端中新建“OpenAI 兼容”提供方，填写：
+在 Chatbox、RikkaHub、FLIT 等 App 里新建一个「OpenAI 兼容」供应商，填三项：
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  在「接入信息」为该设备创建的 chat token
+API Key:  在控制台「客户端接入」为这台设备创建的聊天密钥
 模型名:   memory-auto
 ```
 
-发送一条完整消息后，打开 `http://127.0.0.1:2026/ui/` 查看是否产生了记忆。以后更换供应商或模型，只改服务端配置，客户端继续使用 `memory-auto`。模型列表里还会出现 `memory-read`（只召回、不写入新记忆）和 `memory-off`（纯透明代理，不读不写）：某个对话不想留下记忆时，把模型名切换过去即可，不需要客户端支持自定义请求头。
+然后发一句带个人偏好的话，比如「我喜欢黑咖啡，不加糖，以后推荐咖啡时记住这一点」，等 AI 完整回答结束。打开控制台就能看到这条记忆；新开一个对话问「我喜欢什么咖啡」，它应该能答上来。
 
-普通聊天不需要安装 MCP，也不需要在 system prompt 里要求模型判断“什么时候该保存记忆”。默认 `read-write` 模式由 Memory Gateway 自动处理相关记忆的召回、注入和回答后提取。
+- **手机上的 `127.0.0.1` 指手机自己**。装了安卓 App 时这正是要填的地址；要连电脑上的服务，改成电脑的局域网地址，Docker 部署还需先在 Compose 同目录 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 并重启。
+- **不想留下记忆的对话**，把模型名换成 `memory-read`（只用已有记忆、不写新的）或 `memory-off`（完全不碰记忆）即可，不需要客户端支持自定义请求头。
+- **以后换模型渠道**，只在控制台改，聊天 App 不用动。
 
-手机上的 `localhost` 和 `127.0.0.1` 指手机自己：装了[安卓 App](#-手机上跑安卓-app) 时这正是要填的地址；连电脑上的服务则要改用电脑的地址，Docker 部署还需先在 Compose 同目录 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 并重启，放开局域网监听。具体填写位置、验证步骤和常见问题见[客户端接入指南](docs/client-setup.md)。
+具体每个 App 的填写位置、验证步骤和常见问题见[客户端接入指南](docs/client-setup.md)。
 
-### 可选 MCP：让模型显式使用记忆和知识库
+## 🔑 三把钥匙
 
-支持 Streamable HTTP MCP 的客户端可以连接：
+全程只有三把钥匙，各管一件事，不要混用：
 
-```text
-http://127.0.0.1:2026/mcp
-```
+| 钥匙 | 在哪 | 干什么 | 安卓 App |
+| --- | --- | --- | --- |
+| **登录密钥** | `credentials/gateway.txt`（旧版 `gateway.key`） | 登录网页控制台 | 点「打开控制台」自动带上 |
+| **管理密钥** | `credentials/admin.txt`（旧版 `admin.key`） | 在「模型与路由」页改模型渠道 | 点「打开控制台」自动带上 |
+| **聊天密钥** | 控制台「客户端接入」创建，只显示一次 | 填进聊天 App 的 API Key | 控制台里创建后复制 |
 
-鉴权使用为该 MCP 客户端单独创建的 mcp token，不与 chat 或 Console 共用。MCP 适合让模型显式搜索、保存或整理记忆，以及检索你明确导入的知识文档；它是增强入口，不是自动记忆的前提。
-
-| 你想做什么 | 使用入口 | 谁决定何时使用记忆 |
-| --- | --- | --- |
-| 在普通聊天客户端里自动记住和召回 | `/v1` | Memory Platform 自动处理 |
-| 让模型主动搜索、保存或整理记忆 | `/mcp` | 模型调用工具 |
-| 查看、修改、删除、导入或备份 | `/ui` | 你在浏览器中操作 |
-| 只使用统一模型路由 | Model Gateway `/v1` | 调用方选择用途 |
-
-知识库不会因为使用聊天代理而自动进入上下文，需要通过 MCP、REST 或 Web Console 显式检索。
+每台聊天 App 用自己的聊天密钥，哪台设备丢了就只撤销哪一把。支持 MCP 的客户端另有独立的 MCP 密钥。供应商的 API Key 只存在服务端，永远不会发给聊天 App。
 
 ## 🖥️ 看得见，也管得住
 
@@ -226,7 +175,43 @@ http://127.0.0.1:2026/mcp
 
 <p align="center"><sub>所有界面均使用演示数据。搜索、筛选、固定、归档、恢复和永久删除都在本地 Web Console 中完成。</sub></p>
 
-## 🧰 核心能力
+## 🔬 进一步了解
+
+### 两层网关，普通聊天自动工作
+
+![双网关数据流：现有客户端通过 OpenAI 兼容入口接入 Memory Gateway 自动召回和保存，再由 Model Gateway 负责模型路由与故障切换；MCP 是可选入口](docs/images/gateway-flow.zh-CN.svg)
+
+客户端只需要连接 Memory Gateway。普通 `/v1` 请求的记忆召回、上下文注入和回答后提取都由网关自动完成，不依赖模型是否记得调用工具。Model Gateway 在后方按稳定用途选择渠道、模型和备用顺序；需要显式搜索、整理记忆或检索知识库时，再按需使用 `/mcp`。
+
+| 你想做什么 | 使用入口 | 谁决定何时使用记忆 |
+| --- | --- | --- |
+| 在普通聊天客户端里自动记住和召回 | `/v1` | Memory Platform 自动处理 |
+| 让模型主动搜索、保存或整理记忆 | `/mcp` | 模型调用工具 |
+| 查看、修改、删除、导入或备份 | `/ui` | 你在浏览器中操作 |
+| 只使用统一模型路由 | Model Gateway `/v1` | 调用方选择用途 |
+
+支持 Streamable HTTP MCP 的客户端可以连接 `http://127.0.0.1:2026/mcp`，鉴权使用为该客户端单独创建的 MCP 密钥。MCP 适合让模型显式搜索、保存或整理记忆，以及检索你明确导入的知识文档；它是增强入口，不是自动记忆的前提。知识库不会因为使用聊天代理而自动进入上下文，需要通过 MCP、REST 或 Web Console 显式检索。
+
+### 为什么选择 Memory Platform
+
+- **网关自动记忆，而不是等待模型调用工具**：普通 OpenAI-compatible 聊天自动召回、注入和保存；MCP 与额外记忆提示词都不是前提。
+- **接入现有客户端，而不是重做聊天入口**：只需替换 Base URL、API Key 和模型名，继续使用熟悉的聊天客户端。
+- **治理先于“记得更多”**：每条记忆保留来源和状态，可解释为什么被召回，也可以编辑、归档、恢复或彻底删除。
+- **记忆和知识物理分开**：个人事实与长期偏好进入 `memory.db`；导入的长文档进入独立的 `knowledge.db`，不会混入记忆衰减或自动聊天上下文。
+- **模型选择留在服务端**：Model Gateway 按稳定用途选择渠道、模型和备用顺序，客户端与记忆数据不用跟着供应商迁移。
+
+常见项目解决的不是同一层问题，按你的首要目标选择即可：
+
+| 你的首要目标 | 更适合先看 |
+| --- | --- |
+| 给自研应用接入通用记忆 SDK、服务端 API 或托管平台 | [Mem0](https://github.com/mem0ai/mem0) |
+| 构建强调实体关系、事实有效期和历史查询的时态上下文图 | [Zep / Graphiti](https://github.com/getzep/graphiti) |
+| 构建由 agent 自主管理状态、记忆和工具的有状态 agent runtime | [Letta](https://github.com/letta-ai/letta) |
+| 继续使用现有 OpenAI 兼容客户端，同时获得网关自动记忆、本地部署、可审计治理、独立知识库和统一模型路由 | **Memory Platform** |
+
+这不是性能排名。Memory Platform 当前更偏个人、本机或可信家庭网络；它不试图替代托管记忆平台、完整时态知识图谱或 agent runtime。
+
+### 核心能力
 
 - **自动记忆网关与可选 MCP**：普通 `/v1` 聊天自动召回、注入和保存；兼容流式回答、工具调用、多模态消息段和推理字段，并支持 `off`、`read`、`read-write` 三种记忆模式和会话分支。
 - **长期记忆与治理**：保存可核对的原文来源，支持生命周期、时间线、主题关联、召回解释、编辑、合并、软删除、恢复、永久删除和导出。
@@ -236,7 +221,7 @@ http://127.0.0.1:2026/mcp
 
 完整接口和行为契约见 [Memory Gateway](services/memory-gateway/README.md) 与 [Model Gateway](services/model-gateway/README.md)。
 
-## 🧱 两个网关，一套安装
+### 两个网关，一套安装
 
 | 服务 | 默认地址 | 负责 | 不负责 |
 | --- | --- | --- | --- |
@@ -245,7 +230,7 @@ http://127.0.0.1:2026/mcp
 
 记忆行为与模型供应商配置的变化速度、安全职责不同，因此分别运行；安装、测试、备份和迁移仍由仓库根命令统一完成。Memory Gateway 只通过稳定 route 和独立 backend key 调用 Model Gateway。
 
-## 🔐 当前边界
+### 当前边界
 
 - 默认目标是个人电脑或可信家庭网络，不是未经加固的公网多租户 SaaS。
 - SQLite、缓存、工具幂等和部分后台状态按单进程设计，不以百万级记忆的低延迟 ANN 检索为目标。

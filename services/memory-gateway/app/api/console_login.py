@@ -51,6 +51,9 @@ class ConsoleLoginExchangeResponse(BaseModel):
     token: str
     token_id: str
     user_id: str
+    # 只有同进程宿主（安卓 App）为本机浏览器签发的 code 才会携带管理密钥；
+    # 通过 HTTP 签发的 code 一律为 null。
+    model_admin_key: str | None = None
 
 
 @router.post(
@@ -100,4 +103,5 @@ def exchange_console_login_code(
         token=delivered.token,
         token_id=delivered.token_id,
         user_id=delivered.user_id,
+        model_admin_key=delivered.admin_key,
     )

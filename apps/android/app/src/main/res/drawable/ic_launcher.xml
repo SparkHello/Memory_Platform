@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 与 Web Console 顶栏的 “M” 徽标一致：深色圆角底、暖金字母。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path android:fillColor="#1F2937" android:pathData="M0,0h108v108h-108z" />
     <path
-        android:fillColor="#F9FAFB"
-        android:pathData="M54,26c-13.3,0 -24,10.7 -24,24v6c0,4.4 3.6,8 8,8h6v-16h-6c0,-8.8 7.2,-16 16,-16s16,7.2 16,16h-6v16h6c4.4,0 8,-3.6 8,-8v-6c0,-13.3 -10.7,-24 -24,-24zM40,70h28v6h-28z" />
+        android:fillColor="#1B1519"
+        android:pathData="M24,0h60a24,24 0 0 1 24,24v60a24,24 0 0 1 -24,24h-60a24,24 0 0 1 -24,-24v-60a24,24 0 0 1 24,-24z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#E0B76E"
+        android:strokeWidth="9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M30,76 L30,32 L54,58 L78,32 L78,76" />
 </vector>

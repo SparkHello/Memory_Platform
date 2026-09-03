@@ -22,11 +22,21 @@ export function percent(value?: number | null) {
   return `${Math.round(value * 100)}%`;
 }
 
+// 中文界面统一用 2026/08/09 16:00 这种写法，不再跟随浏览器默认的 8/9/2026, 4:00:00 PM。
+const DATE_TIME_FORMAT = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false
+});
+
 export function dateText(value?: string | null) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+  return DATE_TIME_FORMAT.format(date);
 }
 
 export function numberText(value?: number | null) {
@@ -144,12 +154,12 @@ export type ErrorMessageOptions = {
 
 const CREDENTIAL_401_MESSAGES: Record<Exclude<ErrorCredentialHint, "auto">, string> = {
   console:
-    "访问凭证无效，请在设置中核对当前设备的 Console token（credentials/gateway.txt 或旧版 gateway.key）",
+    "登录密钥无效，请在「连接设置」重新输入（安装目录 credentials/gateway.txt 的内容，旧版为 gateway.key）",
   admin:
-    "Model Gateway admin 密钥无效。它与登录网页用的 Console token（gateway.txt）不是同一把钥匙；请使用 credentials/admin.txt",
+    "管理密钥无效。它和登录网页用的登录密钥不是同一把：管理密钥在 credentials/admin.txt，登录密钥在 gateway.txt",
   provider: "供应商 API Key 或渠道凭证无效，请核对渠道密钥后重试",
-  chat: "chat token 无效或已撤销，请到「客户端接入」重新创建",
-  mcp: "MCP token 无效或已撤销，请到「客户端接入」重新创建"
+  chat: "聊天密钥无效或已撤销，请到「客户端接入」重新创建",
+  mcp: "MCP 密钥无效或已撤销，请到「客户端接入」重新创建"
 };
 
 const GENERIC_UNAUTHORIZED = new Set([
@@ -240,9 +250,10 @@ export function errorMessage(error: unknown, options?: ErrorMessageOptions): str
           !error.detail.includes("gateway.key") &&
           !error.detail.includes("gateway.txt") &&
           !error.detail.includes("Console") &&
+          !error.detail.includes("登录密钥") &&
           !error.detail.includes("不是同一")
         ) {
-          return `${error.detail}（admin.txt 与登录用的 Console token 不是同一把钥匙）`;
+          return `${error.detail}（admin.txt 是管理密钥，和登录网页用的登录密钥 gateway.txt 不是同一把）`;
         }
         return error.detail;
       }

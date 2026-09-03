@@ -1,6 +1,7 @@
 import {
   CheckCircle2,
   ClipboardCopy,
+  ExternalLink,
   Eye,
   EyeOff,
   KeyRound,
@@ -37,12 +38,15 @@ import { CAPABILITY_OPTIONS, CHAT_ROUTE_IDS, type ProviderFeedback } from "./pro
 
 const EMBEDDING_ROUTE_ID = "memory.embedding";
 
+// key_url：该供应商创建 API Key 的官方页面。非专业用户最常卡在「Key 去哪领」，
+// 所以直接在向导里给链接，而不是让人去翻文档。
 const CHANNEL_PRESETS = [
   {
     id: "deepseek",
     label: "DeepSeek 官方",
     channel_operator: "deepseek",
     base_url: "https://api.deepseek.com",
+    key_url: "https://platform.deepseek.com/api_keys",
     adapter: "deepseek",
     plan: "payg",
     usage_scope: "backend_allowed",
@@ -54,6 +58,7 @@ const CHANNEL_PRESETS = [
     channel_operator: "anthropic",
     // OpenAI-compatible base URL if you use a relay; official Messages API is not this path.
     base_url: "https://api.anthropic.com/v1",
+    key_url: "https://console.anthropic.com/settings/keys",
     adapter: "generic",
     plan: "payg",
     usage_scope: "backend_allowed",
@@ -64,6 +69,7 @@ const CHANNEL_PRESETS = [
     label: "Google Gemini（OpenAI 兼容）",
     channel_operator: "google",
     base_url: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    key_url: "https://aistudio.google.com/apikey",
     adapter: "generic",
     plan: "payg",
     usage_scope: "backend_allowed",
@@ -74,6 +80,7 @@ const CHANNEL_PRESETS = [
     label: "阿里云百炼按量",
     channel_operator: "dashscope",
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    key_url: "https://bailian.console.aliyun.com/?tab=model#/api-key",
     adapter: "dashscope_openai",
     plan: "payg",
     usage_scope: "backend_allowed",
@@ -84,6 +91,7 @@ const CHANNEL_PRESETS = [
   label: string;
   channel_operator: string;
   base_url: string;
+  key_url: string;
   adapter: ModelGatewayAdapter;
   plan: ModelGatewayPlan;
   usage_scope: ModelGatewayUsageScope;
@@ -119,8 +127,10 @@ const PLAN_OPTIONS: Array<{ value: ModelGatewayPlan; label: string }> = [
   { value: "custom", label: "自定义" }
 ];
 
-/** Clash/Surge TUN fake-ip range; only applied when the user opts in. */
+/** Clash/Surge TUN fake-ip ranges (IPv4 + Clash Meta IPv6); only applied when the user opts in. */
 const FAKE_IP_CIDR = "198.18.0.0/15";
+const FAKE_IP6_CIDR = "fc00::/18";
+const FAKE_IP_CIDRS = [FAKE_IP_CIDR, FAKE_IP6_CIDR];
 
 function embeddingHostSlug(embeddingUrl: string, chatUrl: string): string {
   const embed = channelUrlKey(embeddingUrl);
@@ -165,11 +175,13 @@ function joinCidrList(items: string[]): string {
 }
 
 function cidrListIncludesFakeIp(items: string[]): boolean {
-  return items.some((item) => item === FAKE_IP_CIDR || item.startsWith("198.18."));
+  return items.some(
+    (item) => item === FAKE_IP_CIDR || item === FAKE_IP6_CIDR || item.startsWith("198.18.")
+  );
 }
 
 export function looksLikeFakeIpDetail(detail: string): boolean {
-  return /198\.18|fake-ip/i.test(detail);
+  return /198\.18|fc00::|fake-ip/i.test(detail);
 }
 
 function FakeIpOptIn({
@@ -224,6 +236,7 @@ export function NewChannelWizard({
   onCompleted: () => Promise<void> | void;
 }) {
   const [preset, setPreset] = useState<PresetId | "">("");
+  const selectedPreset = CHANNEL_PRESETS.find((item) => item.id === preset) ?? null;
   const [operator, setOperator] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [adapter, setAdapter] = useState<ModelGatewayAdapter>(CUSTOM_CHANNEL_DEFAULTS.adapter);
@@ -374,12 +387,12 @@ export function NewChannelWizard({
   const keepFeedbackRef = useRef(false);
   const setFakeIpEnabled = (enabled: boolean) => {
     const current = parseCidrList(allowedPrivateNetworks).filter(
-      (item) => item !== FAKE_IP_CIDR
+      (item) => !FAKE_IP_CIDRS.includes(item)
     );
     // 发现失败的错误文案本身在引导用户勾选此项后重试，所以这次失效保留该提示。
     keepFeedbackRef.current = true;
     if (enabled) {
-      setAllowedPrivateNetworks(joinCidrList([...current, FAKE_IP_CIDR]));
+      setAllowedPrivateNetworks(joinCidrList([...current, ...FAKE_IP_CIDRS]));
     } else {
       setAllowedPrivateNetworks(joinCidrList(current));
     }
@@ -415,8 +428,8 @@ export function NewChannelWizard({
       setFeedback({
         tone: result.models.length ? "success" : "warning",
         message: result.models.length
-          ? `只读检查通过，发现 ${result.models.length} 个模型；候选渠道和密钥尚未保存。`
-          : "只读检查通过，但没有返回模型列表；可以手动填写精确模型 ID。候选配置尚未保存。"
+          ? `连接成功，找到 ${result.models.length} 个模型；渠道和密钥还没有保存。`
+          : "连接成功，但没有返回模型列表；可以手动填写模型 ID。渠道和密钥还没有保存。"
       });
     } catch (cause) {
       setDiscovery(null);
@@ -431,10 +444,10 @@ export function NewChannelWizard({
       setFeedback({
         tone: "error",
         message: looksLikeFakeIp
-          ? `${detail} 密钥和渠道都还没保存。本机解析到了 TUN fake-ip：请勾选下方「使用 Clash/Surge 等 TUN fake-ip」后重试「只读发现模型」（与密钥是否正确无关）。`
+          ? `${detail} 密钥和渠道都还没保存。本机解析到了 TUN fake-ip：请勾选下方「使用 Clash/Surge 等 TUN fake-ip」后重试「列出可用模型」（与密钥是否正确无关）。`
           : looksLikeAuth
             ? `${detail} 密钥和渠道都还没保存。请核对 API Key 与 Base URL 是否属于同一渠道。`
-            : `${detail} 密钥和渠道都还没保存（这是只读检查失败，不是密钥已写入）。`
+            : `${detail} 密钥和渠道都还没保存（连接检查失败，密钥没有写入）。`
       });
     } finally {
       setBusy("");
@@ -729,19 +742,19 @@ export function NewChannelWizard({
         setFeedback({
           tone: "warning",
           message:
-            "渠道配置已生效，但自动创建 chat token 失败。请打开「客户端接入」手动创建设备 token，切勿把 Console 密钥填进聊天客户端。"
+            "渠道配置已生效，但自动创建聊天密钥失败。请打开「客户端接入」手动创建聊天密钥，切勿把登录密钥填进聊天 App。"
         });
       } else if (reusedExisting) {
         setFeedback({
           tone: "success",
           message:
-            "渠道已生效。已有可用的 chat token，请到「客户端接入」使用现有客户端配置，不要把 Console 或 admin 密钥填进聊天应用。"
+            "渠道已生效。已有可用的聊天密钥，请到「客户端接入」使用现有客户端配置，不要把登录密钥或管理密钥填进聊天 App。"
         });
       } else {
         setFeedback({
           tone: "success",
           message:
-            "渠道已生效，并已创建仅用于聊天的 chat token（明文只显示一次）。请复制下方客户端配置，不要使用 Console 或 admin 密钥。" +
+            "渠道已生效，并已创建一把聊天密钥（只显示一次）。请复制下方客户端配置，不要使用登录密钥或管理密钥。" +
             "若之前为该渠道创建过 token，可在「客户端接入」页撤销不再使用的旧 token。"
         });
       }
@@ -761,7 +774,7 @@ export function NewChannelWizard({
       setFeedback({
         tone: "error",
         message:
-          "还没有 chat token 可复制。请到「客户端接入」为该设备创建 chat token；不会用 Console 密钥冒充客户端密钥。"
+          "还没有聊天密钥可复制。请到「客户端接入」为这台设备创建聊天密钥；登录密钥不能拿来当聊天密钥。"
       });
       return;
     }
@@ -770,7 +783,7 @@ export function NewChannelWizard({
       setClientTokenCopied(true);
       setFeedback({
         tone: "success",
-        message: "客户端配置已复制（含 chat token）；请勿分享给他人或填入管理端。"
+        message: "客户端配置已复制（含聊天密钥）；请勿分享给他人或填入管理端。"
       });
     } catch (cause) {
       setFeedback({
@@ -788,9 +801,9 @@ export function NewChannelWizard({
     if (done) {
       if (clientChatToken && !clientTokenCopied) {
         const confirmed = await confirm({
-          title: "chat token 只显示这一次",
+          title: "聊天密钥只显示这一次",
           message:
-            "关闭后将无法再查看这个 chat token 明文，只能撤销后重新创建。确认已把客户端配置保存到安全的地方了吗？",
+            "关闭后将无法再查看这把聊天密钥，只能撤销后重新创建。确认已把客户端配置保存到安全的地方了吗？",
           confirmLabel: "已保存，关闭",
           cancelLabel: "返回复制",
           tone: "warning"
@@ -829,7 +842,7 @@ export function NewChannelWizard({
       <div className="panel-header provider-section-header">
         <div>
           <h2 id="new-channel-title">新建渠道</h2>
-          <p>先只读发现模型，再校验整套 bundle；只有最后确认时才原子保存。</p>
+          <p>先用 Key 列出可用模型，选好后检查一遍，最后一步才保存。保存之前，密钥不会写到任何地方。</p>
         </div>
         <button
           type="button"
@@ -869,8 +882,8 @@ export function NewChannelWizard({
             <p className="provider-wizard-hint">
               已保存 {appliedSummary.deployments} 个模型，变更 {appliedSummary.routes} 条用途路由。
               {clientTokenReused
-                ? "已有可用的 chat token，请到「客户端接入」查看客户端三项填写。"
-                : "请用下方 chat token 连接 OpenAI 兼容客户端。"}
+                ? "已有可用的聊天密钥，请到「客户端接入」查看客户端三项填写。"
+                : "请用下方聊天密钥连接 OpenAI 兼容的聊天 App。"}
               Console / admin 密钥不能填进 Chatbox 等聊天应用。
             </p>
             {reembedNote && <p className="provider-wizard-hint">{reembedNote}</p>}
@@ -879,7 +892,7 @@ export function NewChannelWizard({
               <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
               <span><small>模型名</small><code>{CLIENT_MODEL_ID}</code></span>
               <span>
-                <small>API Key（chat token）</small>
+                <small>API Key（聊天密钥）</small>
                 {clientChatToken ? (
                   <code className="client-token-value">
                     {showClientToken
@@ -887,7 +900,7 @@ export function NewChannelWizard({
                       : `${clientChatToken.slice(0, 12)}…${clientChatToken.slice(-4)}`}
                   </code>
                 ) : clientTokenReused ? (
-                  <strong>请到「客户端接入」使用已有 chat token</strong>
+                  <strong>请到「客户端接入」使用已有聊天密钥</strong>
                 ) : (
                   <strong className="text-warning">未创建 — 请到「客户端接入」手动创建</strong>
                 )}
@@ -896,7 +909,7 @@ export function NewChannelWizard({
             {clientTokenError && (
               <div className="provider-feedback is-warning" role="status">
                 <TriangleAlert size={18} aria-hidden />
-                <span>自动创建 chat token 失败：{clientTokenError}</span>
+                <span>自动创建聊天密钥失败：{clientTokenError}</span>
               </div>
             )}
             <div className="provider-wizard-actions">
@@ -923,7 +936,7 @@ export function NewChannelWizard({
                 className="secondary-button"
                 onClick={() => void goToIntegration()}
               >
-                <KeyRound size={16} aria-hidden />生成 chat token
+                <KeyRound size={16} aria-hidden />创建聊天密钥
               </button>
               <button type="button" className="primary-button" onClick={() => void requestClose()}>完成</button>
             </div>
@@ -987,7 +1000,7 @@ export function NewChannelWizard({
               )}
 
               <label className="field-block">
-                <span>API Key（仅组件内存；发现和校验均不会保存）</span>
+                <span>供应商 API Key（保存前只留在这个页面里）</span>
                 <div className="secret-field">
                   <input
                     type={showApiKey ? "text" : "password"}
@@ -1002,6 +1015,18 @@ export function NewChannelWizard({
                     {showApiKey ? <EyeOff size={16} aria-hidden /> : <Eye size={16} aria-hidden />}
                   </button>
                 </div>
+                {selectedPreset ? (
+                  <small className="provider-key-help">
+                    还没有 Key？
+                    <a href={selectedPreset.key_url} target="_blank" rel="noreferrer noopener">
+                      去 {selectedPreset.label} 创建 API Key
+                      <ExternalLink size={12} aria-hidden />
+                    </a>
+                    ，创建后复制回来粘贴到上面。
+                  </small>
+                ) : preset === "custom" ? (
+                  <small className="provider-key-help">到你的供应商控制台创建 API Key 后粘贴到上面。</small>
+                ) : null}
               </label>
 
               <details className="provider-inline-advanced">
@@ -1057,7 +1082,7 @@ export function NewChannelWizard({
                   只会允许显式列出的私网段，不会放开任意内网访问。
                   {fakeIpEnabled
                     ? " 已允许 RFC 2544 fake-ip 段；仅在你确实使用此类代理时勾选。"
-                    : " 若发现模型时报「解析到未允许的私网/198.18」，再勾选 fake-ip。"}
+                    : " 若列出模型时报「解析到未允许的私网/198.18」，再勾选 fake-ip。"}
                 </p>
               </details>
 
@@ -1082,7 +1107,7 @@ export function NewChannelWizard({
                   disabled={!hasAdminKey || Boolean(busy) || !operator.trim() || !baseUrl.trim() || !apiKey.trim()}
                 >
                   <PlugZap size={16} aria-hidden />
-                  {busy === "discover" ? "正在只读发现" : effectiveDiscovery ? "重新发现模型" : "只读发现模型"}
+                  {busy === "discover" ? "正在列出模型" : effectiveDiscovery ? "重新列出模型" : "列出可用模型"}
                 </button>
               </div>
             </div>

@@ -4,13 +4,19 @@
 新的 console role token；``POST /auth/console-login-exchange``（免 Bearer，仅
 本机来源）凭 code 一次性取回该 token 明文，免除手工复制 64 位 token。
 
+同进程的宿主（安卓 App 的嵌入式入口）还可以用 ``mint_for_token`` 为一枚**既有**
+console token 签发 code：浏览器换到的始终是同一枚首次登录密钥，不会每次打开
+控制台都多出一枚新 token；这类 code 过期时也绝不吊销那枚既有 token。宿主可以
+随 code 一并暂存 Model Gateway 管理密钥，交换时一同交付，让本机浏览器免去
+第二次手工粘贴。
+
 安全不变量：
 
 - AUTH DB 只保存 code 的 SHA-256 哈希（复用 token 的哈希方案）、绑定的
-  token id、过期与使用状态；code 明文与 token 明文都绝不落盘。
-- token 明文只暂存在进程内存（``_PENDING_TOKENS``），在交换响应交付的瞬间
-  弹出并丢弃。进程重启后暂存丢失，对应 code 交换按失败处理并吊销已换发的
-  token（fail-closed，见 ``exchange``）。
+  token id、过期与使用状态；code 明文、token 明文与管理密钥都绝不落盘。
+- 明文只暂存在进程内存（``_PENDING_TOKENS``），在交换响应交付的瞬间
+  弹出并丢弃。进程重启后暂存丢失，对应 code 交换按失败处理，并吊销由该
+  code 换发的 token（fail-closed，见 ``exchange``）。
 - code 5 分钟过期、单次使用；无效/过期/已使用一律由路由返回同一 401 响应，
   不区分原因。
 """
@@ -44,31 +50,44 @@ class ExchangedConsoleLogin:
     token: str
     token_id: str
     user_id: str
+    # 仅宿主进程（安卓 App）签发的 code 会携带；HTTP 路径签发的 code 永远为 None。
+    admin_key: str | None = None
 
 
-# code 哈希 -> (console token 明文, 过期时间)。明文只存在于本进程内存中。
+@dataclass(frozen=True, slots=True)
+class _PendingDelivery:
+    token: str
+    expires_at: datetime
+    admin_key: str | None
+
+
+# code 哈希 -> 待交付明文。明文只存在于本进程内存中。
 _PENDING_LOCK = threading.Lock()
-_PENDING_TOKENS: dict[str, tuple[str, datetime]] = {}
+_PENDING_TOKENS: dict[str, _PendingDelivery] = {}
 
 
-def _stash_pending_token(code_hash: str, token: str, expires_at: datetime) -> None:
+def _stash_pending_token(
+    code_hash: str,
+    token: str,
+    expires_at: datetime,
+    admin_key: str | None = None,
+) -> None:
     now = datetime.now(UTC)
     with _PENDING_LOCK:
-        for key, (_, expiry) in list(_PENDING_TOKENS.items()):
-            if expiry <= now:
+        for key, entry in list(_PENDING_TOKENS.items()):
+            if entry.expires_at <= now:
                 _PENDING_TOKENS.pop(key, None)
-        _PENDING_TOKENS[code_hash] = (token, expires_at)
+        _PENDING_TOKENS[code_hash] = _PendingDelivery(token, expires_at, admin_key)
 
 
-def _pop_pending_token(code_hash: str) -> str | None:
+def _pop_pending_token(code_hash: str) -> _PendingDelivery | None:
     with _PENDING_LOCK:
         entry = _PENDING_TOKENS.pop(code_hash, None)
     if entry is None:
         return None
-    token, expires_at = entry
-    if expires_at <= datetime.now(UTC):
+    if entry.expires_at <= datetime.now(UTC):
         return None
-    return token
+    return entry
 
 
 def _clear_pending_tokens() -> None:
@@ -83,7 +102,9 @@ class ConsoleLoginCodeStore:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = str(Path(database_path).expanduser())
 
-    def mint(self, *, user_id: str) -> MintedConsoleLoginCode:
+    def mint(
+        self, *, user_id: str, admin_key: str | None = None
+    ) -> MintedConsoleLoginCode:
         """签发一次性 code 并换发绑定的 console token；明文只随返回值存在。"""
         token_store = AuthTokenStore(self.database_path)
         created = token_store.create_token(
@@ -91,38 +112,75 @@ class ConsoleLoginCodeStore:
             user_id=user_id,
             role="console",
         )
-        code = f"mgc_{secrets.token_urlsafe(24)}"
-        code_hash = _hash_secret(code)
-        now = datetime.now(UTC)
-        expires = now + timedelta(seconds=CONSOLE_LOGIN_CODE_TTL_SECONDS)
         try:
-            with self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                self._retire_expired(connection, now)
-                connection.execute(
-                    """
-                    INSERT INTO console_login_codes(
-                        code_hash, user_id, console_token_id,
-                        created_at, expires_at, used_at
-                    ) VALUES (?, ?, ?, ?, ?, NULL)
-                    """,
-                    (
-                        code_hash,
-                        user_id,
-                        created.record.token_id,
-                        _iso(now),
-                        _iso(expires),
-                    ),
-                )
-                connection.commit()
+            return self._insert_code(
+                user_id=user_id,
+                token_id=created.record.token_id,
+                token=created.token,
+                token_owned=True,
+                admin_key=admin_key,
+            )
         except (OSError, sqlite3.Error):
             # code 落库失败时吊销刚换发的 token，不留无人持有的 console 凭证。
             _revoke_quietly(token_store, created.record.token_id)
             raise
-        _stash_pending_token(code_hash, created.token, expires)
+
+    def mint_for_token(
+        self, token: str, *, admin_key: str | None = None
+    ) -> MintedConsoleLoginCode:
+        """为一枚既有、仍有效的 console token 签发一次性 code。
+
+        供同进程宿主（安卓 App）把首次登录密钥交付给本机浏览器：交换后浏览器
+        拿到的就是这枚 token 本身，不新增 token；code 过期也不吊销它。
+        """
+        record = AuthTokenStore(self.database_path).authenticate(token)
+        if record is None or record.role != "console":
+            raise AuthStoreError("登录密钥无效、已吊销或不是 console 角色")
+        return self._insert_code(
+            user_id=record.user_id,
+            token_id=record.token_id,
+            token=token,
+            token_owned=False,
+            admin_key=admin_key,
+        )
+
+    def _insert_code(
+        self,
+        *,
+        user_id: str,
+        token_id: str,
+        token: str,
+        token_owned: bool,
+        admin_key: str | None,
+    ) -> MintedConsoleLoginCode:
+        code = f"mgc_{secrets.token_urlsafe(24)}"
+        code_hash = _hash_secret(code)
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=CONSOLE_LOGIN_CODE_TTL_SECONDS)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._retire_expired(connection, now)
+            connection.execute(
+                """
+                INSERT INTO console_login_codes(
+                    code_hash, user_id, console_token_id,
+                    created_at, expires_at, used_at, token_owned
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    code_hash,
+                    user_id,
+                    token_id,
+                    _iso(now),
+                    _iso(expires),
+                    1 if token_owned else 0,
+                ),
+            )
+            connection.commit()
+        _stash_pending_token(code_hash, token, expires, admin_key)
         return MintedConsoleLoginCode(
             code=code,
-            token_id=created.record.token_id,
+            token_id=token_id,
             expires_at=_iso(expires),
         )
 
@@ -137,7 +195,7 @@ class ConsoleLoginCodeStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT user_id, console_token_id, expires_at, used_at
+                SELECT user_id, console_token_id, expires_at, used_at, token_owned
                 FROM console_login_codes
                 WHERE code_hash = ?
                 """,
@@ -148,22 +206,31 @@ class ConsoleLoginCodeStore:
                 return None
             token_id = str(row["console_token_id"])
             user_id = str(row["user_id"])
+            token_owned = bool(row["token_owned"])
             if _parse_instant(str(row["expires_at"])) <= now:
-                # 过期即作废：同时吊销换发的 token，避免留下无人持有的凭证。
+                # 过期即作废：由 code 换发的 token 一并吊销，避免留下无人持有的凭证；
+                # 只是交付既有 token 的 code 则不能动那枚 token。
                 self._mark_used(connection, code_hash, now)
-                self._revoke_token(connection, token_id, now)
+                if token_owned:
+                    self._revoke_token(connection, token_id, now)
                 connection.commit()
                 return None
             if not self._mark_used(connection, code_hash, now):
                 connection.rollback()
                 return None
             connection.commit()
-        token = _pop_pending_token(code_hash)
-        if token is None:
-            # 进程重启导致内存明文丢失：code 已作废，token 也必须吊销。
-            _revoke_quietly(AuthTokenStore(self.database_path), token_id)
+        pending = _pop_pending_token(code_hash)
+        if pending is None:
+            # 进程重启导致内存明文丢失：code 已作废；由它换发的 token 也必须吊销。
+            if token_owned:
+                _revoke_quietly(AuthTokenStore(self.database_path), token_id)
             return None
-        return ExchangedConsoleLogin(token=token, token_id=token_id, user_id=user_id)
+        return ExchangedConsoleLogin(
+            token=pending.token,
+            token_id=token_id,
+            user_id=user_id,
+            admin_key=pending.admin_key,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -181,13 +248,14 @@ class ConsoleLoginCodeStore:
         cls, connection: sqlite3.Connection, now: datetime
     ) -> None:
         rows = connection.execute(
-            "SELECT code_hash, console_token_id FROM console_login_codes "
+            "SELECT code_hash, console_token_id, token_owned FROM console_login_codes "
             "WHERE used_at IS NULL AND expires_at <= ?",
             (_iso(now),),
         ).fetchall()
         for row in rows:
             cls._mark_used(connection, str(row["code_hash"]), now)
-            cls._revoke_token(connection, str(row["console_token_id"]), now)
+            if bool(row["token_owned"]):
+                cls._revoke_token(connection, str(row["console_token_id"]), now)
 
     @staticmethod
     def _mark_used(

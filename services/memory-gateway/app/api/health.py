@@ -26,8 +26,14 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health(settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, str]:
+    payload = {"status": "ok"}
+    if settings.deployment_profile:
+        # Lets the Web Console tailor first-login guidance (e.g. the Android
+        # app hands the login key over itself, there is no credentials file
+        # the user could open).
+        payload["deployment"] = settings.deployment_profile
+    return payload
 
 
 _MAX_CONTROL_RESPONSE_BYTES = 2 * 1024 * 1024

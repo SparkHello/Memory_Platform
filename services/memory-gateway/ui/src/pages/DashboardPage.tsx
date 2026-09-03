@@ -10,6 +10,8 @@ import {
   EyeOff,
   GitBranch,
   Layers3,
+  LoaderCircle,
+  MessageCircle,
   PlugZap,
   RefreshCcw,
   ShieldAlert,
@@ -182,6 +184,8 @@ export function DashboardPage({
   const [networkDensity, setNetworkDensity] = useState<NetworkDensity>("overview");
   const [networkFiltersOpen, setNetworkFiltersOpen] = useState(false);
   const [networkFilters, setNetworkFilters] = useState<NetworkFilters>(DEFAULT_NETWORK_FILTERS);
+  // 「试一下」卡在第一条记忆出现后要停留在完成态，而不是随着计数变化立刻消失。
+  const [firstChatDone, setFirstChatDone] = useState(false);
 
   const load = useCallback(async (
     nextSurfaceMode: SurfaceMode,
@@ -478,7 +482,23 @@ export function DashboardPage({
             isProviderSetupReady(data.setup) &&
             data.setup.next_action === "connect_client" &&
             data.hasChatToken === false && (
-              <ConnectClientCard api={api} settings={settings} notify={notify} />
+              <ConnectClientCard api={api} settings={settings} notify={notify} setPage={setPage} />
+            )}
+
+          {data.setup &&
+            isProviderSetupReady(data.setup) &&
+            data.hasChatToken === true &&
+            (firstChatDone ||
+              (data.report.counts.active_memories === 0 && data.report.counts.deleted_memories === 0)) && (
+              <FirstChatCard
+                api={api}
+                notify={notify}
+                setPage={setPage}
+                onFirstMemory={() => {
+                  setFirstChatDone(true);
+                  void load(surfaceMode);
+                }}
+              />
             )}
 
           <div className="studio-grid">
@@ -1109,8 +1129,8 @@ function SetupNextStepCard({
       </div>
       <p className="muted">
         {isRepair
-          ? "记忆服务在线，但与 Model Gateway 的接线或路由配置有问题。到「模型与路由」用 credentials/admin.txt（旧版 admin.key）解锁并按提示修复后，才能正常聊天。"
-          : "你已登录 Console。还差一步：用安装时保存的 credentials/admin.txt（旧版 admin.key）解锁「模型与路由」，添加渠道并选择聊天模型。完成后回到这里生成 chat token。"}
+          ? "记忆服务在线，但模型网关的配置有问题。到「模型与路由」输入管理密钥（credentials/admin.txt）并按提示修复后，才能正常聊天。"
+          : "你已经登录。还差一步：到「模型与路由」输入管理密钥（安装时保存在 credentials/admin.txt；从安卓 App 打开控制台时会自动带上），添加渠道并选择聊天模型。完成后回到这里创建聊天密钥。"}
       </p>
       {!isRepair && setup.missing_chat_routes?.length > 0 && (
         <p className="muted">
@@ -1132,13 +1152,13 @@ function SetupNextStepCard({
       </div>
       <ol className="muted setup-key-legend">
         <li>
-          <strong>gateway.txt</strong>：登录本网页的 Console token（你已经在用；旧安装可能是 gateway.key）
+          <strong>登录密钥</strong>（gateway.txt）：打开这个网页用的，你已经在用
         </li>
         <li>
-          <strong>admin.txt</strong>：只在「模型与路由」页粘贴，用于改渠道与路由
+          <strong>管理密钥</strong>（admin.txt）：只在「模型与路由」页输入，用来改模型渠道
         </li>
         <li>
-          <strong>chat token</strong>：模型就绪后在本页生成，填进 Chatbox 等客户端
+          <strong>聊天密钥</strong>：模型就绪后在本页创建，填进 Chatbox 等聊天 App
         </li>
       </ol>
     </section>
@@ -1148,11 +1168,13 @@ function SetupNextStepCard({
 function ConnectClientCard({
   api,
   settings,
-  notify
+  notify,
+  setPage
 }: {
   api: MemoryApi;
   settings: ConnectionSettings;
   notify: Notify;
+  setPage: (page: PageKey) => void;
 }) {
   const [token, setToken] = useState<string | null>(null);
   const [showToken, setShowToken] = useState(false);
@@ -1165,9 +1187,9 @@ function ConnectClientCard({
       const dateTag = new Date().toISOString().slice(0, 10);
       const result = await api.createAuthToken(`我的第一台设备 · ${dateTag}`, "chat");
       setToken(result.token);
-      notify("chat token 已创建；明文只显示这一次，请立即保存到客户端。", "success");
+      notify("聊天密钥已创建；只显示这一次，请立即填进聊天 App。", "success");
     } catch (error) {
-      notify(`创建 chat token 失败：${errorMessage(error)}`, "error");
+      notify(`创建聊天密钥失败：${errorMessage(error)}`, "error");
     } finally {
       setCreating(false);
     }
@@ -1177,10 +1199,10 @@ function ConnectClientCard({
     if (!token) return;
     try {
       await navigator.clipboard.writeText(clientConfigText(clientBaseUrl, token));
-      notify("客户端配置已复制（含 chat token）；请勿分享给他人。", "success");
+      notify("客户端配置已复制（含聊天密钥）；请勿分享给他人。", "success");
     } catch (error) {
       notify(
-        `复制失败：${errorMessage(error)}。局域网 HTTP 页面浏览器可能禁止自动复制；请点击「显示 token」后手动选中复制。`,
+        `复制失败：${errorMessage(error)}。局域网 HTTP 页面浏览器可能禁止自动复制；请点击「显示密钥」后手动选中复制。`,
         "error"
       );
     }
@@ -1191,24 +1213,24 @@ function ConnectClientCard({
       <div className="panel-header">
         <h2 id="connect-client-title">
           <PlugZap size={18} />
-          连接你的第一个聊天客户端
+          连接你的第一个聊天 App
         </h2>
       </div>
       <p className="muted">
-        模型已就绪，但还没有任何设备接入。生成一枚 chat token，把下面三行填进
-        OpenAI 兼容客户端（如 Chatbox、Lobe Chat）即可开始积累记忆。
+        模型已就绪，还没有任何聊天 App 接入。创建一把聊天密钥，把下面三行填进
+        OpenAI 兼容的聊天 App（如 Chatbox、RikkaHub）即可开始积累记忆。
       </p>
       <div className="client-config-summary">
         <span><small>Base URL</small><code>{clientBaseUrl}</code></span>
         <span><small>模型名</small><code>{CLIENT_MODEL_ID}</code></span>
         <span>
-          <small>API Key（chat token）</small>
+          <small>API Key（聊天密钥）</small>
           {token ? (
             <code className="client-token-value">
               {showToken ? token : `${token.slice(0, 12)}…${token.slice(-4)}`}
             </code>
           ) : (
-            <strong className="text-warning">未创建 — 点击下方按钮生成</strong>
+            <strong className="text-warning">未创建，点下方按钮生成</strong>
           )}
         </span>
       </div>
@@ -1221,7 +1243,7 @@ function ConnectClientCard({
               onClick={() => setShowToken((value) => !value)}
             >
               {showToken ? <EyeOff size={16} aria-hidden /> : <Eye size={16} aria-hidden />}
-              {showToken ? "隐藏 token" : "显示 token"}
+              {showToken ? "隐藏密钥" : "显示密钥"}
             </button>
             <button type="button" className="primary-button" onClick={() => void copyConfig()}>
               <ClipboardCopy size={16} aria-hidden />
@@ -1235,16 +1257,146 @@ function ConnectClientCard({
             onClick={() => void createToken()}
             disabled={creating}
           >
-            {creating ? "正在创建…" : "生成 chat token"}
+            {creating ? "正在创建…" : "创建聊天密钥"}
           </button>
         )}
       </div>
       {token && (
-        <p className="muted">
-          token 明文只显示这一次；丢失后到「客户端接入」撤销并重新创建即可。
-        </p>
+        <>
+          <p className="muted">
+            聊天密钥只显示这一次；丢失后到「客户端接入」撤销并重新创建即可。
+          </p>
+          <FirstChatProbe api={api} setPage={setPage} />
+        </>
       )}
     </section>
+  );
+}
+
+/** 让非专业用户一句话验证「记忆真的在工作」的测试对话。 */
+const FIRST_MEMORY_SENTENCE = "我喜欢黑咖啡，不加糖，以后推荐咖啡时记住这一点。";
+const FIRST_MEMORY_FOLLOW_UP = "我喜欢什么咖啡？";
+const FIRST_MEMORY_POLL_MS = 6000;
+
+function FirstChatCard({
+  api,
+  notify,
+  setPage,
+  onFirstMemory
+}: {
+  api: MemoryApi;
+  notify: Notify;
+  setPage: (page: PageKey) => void;
+  onFirstMemory: () => void;
+}) {
+  return (
+    <section className="panel connect-client-panel" aria-labelledby="first-chat-title">
+      <div className="panel-header">
+        <h2 id="first-chat-title">
+          <MessageCircle size={18} />
+          试一下：让 AI 记住第一件事
+        </h2>
+      </div>
+      <p className="muted">
+        聊天 App 已经接好，记忆库还是空的。发一句带个人偏好的话试试，这里会实时显示它有没有被记住。
+      </p>
+      <FirstChatProbe api={api} setPage={setPage} onFirstMemory={onFirstMemory} notify={notify} />
+    </section>
+  );
+}
+
+function FirstChatProbe({
+  api,
+  setPage,
+  onFirstMemory,
+  notify
+}: {
+  api: MemoryApi;
+  setPage: (page: PageKey) => void;
+  onFirstMemory?: () => void;
+  notify?: Notify;
+}) {
+  const [phase, setPhase] = useState<"waiting" | "done">("waiting");
+  const [skipReason, setSkipReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (phase === "done") return;
+    let cancelled = false;
+    const controller = new AbortController();
+    const tick = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const report = await api.memoryReport(controller.signal);
+        if (cancelled) return;
+        if (report.counts.active_memories > 0) {
+          setPhase("done");
+          onFirstMemory?.();
+          return;
+        }
+        const logs = await api.decisionLogs(3, {}, controller.signal);
+        if (cancelled) return;
+        const skipped = logs.find((log) => log.decision === "ignore");
+        setSkipReason(skipped ? friendlyIngestSkipReason(skipped.reason) : null);
+      } catch (error) {
+        // 轮询失败静默：这只是引导卡，不该刷屏报错。
+        if (isAbortError(error)) return;
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), FIRST_MEMORY_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [api, phase, onFirstMemory]);
+
+  const copySentence = async () => {
+    try {
+      await navigator.clipboard.writeText(FIRST_MEMORY_SENTENCE);
+      notify?.("测试句子已复制，去聊天 App 里发出去吧", "success");
+    } catch {
+      notify?.("浏览器不允许自动复制，请手动选中句子复制", "error");
+    }
+  };
+
+  return (
+    <div className="first-chat-probe">
+      <ol className="muted first-chat-steps">
+        <li>
+          在聊天 App 里选模型 <code>{CLIENT_MODEL_ID}</code>，发这一句：
+          <div className="first-chat-sentence">
+            <q>{FIRST_MEMORY_SENTENCE}</q>
+            <button type="button" className="secondary-button compact" onClick={() => void copySentence()}>
+              <ClipboardCopy size={14} aria-hidden />
+              复制
+            </button>
+          </div>
+        </li>
+        <li>等 AI 回答完整结束（记忆只在完整回答后保存）。</li>
+        <li>
+          新开一个对话问「{FIRST_MEMORY_FOLLOW_UP}」，它应该能答上来。
+        </li>
+      </ol>
+      {phase === "done" ? (
+        <div className="first-chat-status is-done" role="status">
+          <CheckCircle2 size={16} aria-hidden />
+          <span>第一条记忆已经保存。以后聊天时相关内容会自动带上。</span>
+          <button type="button" className="ghost-button compact" onClick={() => setPage("memories")}>
+            打开记忆库
+          </button>
+        </div>
+      ) : (
+        <div className="first-chat-status" role="status" aria-live="polite">
+          <LoaderCircle size={16} aria-hidden className="spin" />
+          <span>
+            {skipReason
+              ? `收到过一轮对话，但没有保存：${skipReason}。换一句带个人偏好或事实的话再试。`
+              : "正在等第一条记忆出现…"}
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 

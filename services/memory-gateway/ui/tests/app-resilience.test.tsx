@@ -182,9 +182,9 @@ describe("App resilience shell", () => {
 
     // 凭证门回退后由设置页标题与顶栏文案共同呈现。
     expect(
-      await screen.findByRole("heading", { name: "更新访问密钥" })
+      await screen.findByRole("heading", { name: "更新登录密钥" })
     ).toBeInTheDocument();
-    expect(screen.getByText("重新配置访问密钥")).toBeInTheDocument();
+    expect(screen.getByText("重新输入登录密钥")).toBeInTheDocument();
   });
 
   it("页面组件渲染崩溃时整站不白屏，「返回工作室」无需刷新即可恢复", async () => {

@@ -465,7 +465,7 @@ def _stack_install(
     print(f"Model Gateway 配置：{result.model_gateway_home}")
     print("backend key 已在两端同步，值未显示，也未写入项目 .env。")
     print("")
-    print("接入信息")
+    print("客户端接入")
     print("-" * 36)
     print(f"Web Console            http://127.0.0.1:{public_port}/ui/")
     print(f"OpenAI 兼容 base URL   http://127.0.0.1:{public_port}/v1")

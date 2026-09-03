@@ -13,20 +13,23 @@ export function SettingsPage({
   settings,
   onSave,
   notify,
-  loginLinkStatus = null
+  loginLinkStatus = null,
+  embedded = false
 }: {
   settings: ConnectionSettings;
   onSave: (settings: ConnectionSettings, message?: string) => void;
   notify: Notify;
-  /** memgw open 一次性登录链接的交换状态；仅首启门槛场景由 App 传入。 */
+  /** 一次性登录链接的交换状态；仅首启门槛场景由 App 传入。 */
   loginLinkStatus?: "pending" | "failed" | null;
+  /** /health 报告服务跑在安卓 App 里：登录密钥由 App 交付，不存在可打开的凭据文件。 */
+  embedded?: boolean;
 }) {
   const [form, setForm] = useState(settings);
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [serviceCheck, setServiceCheck] = useState<"idle" | "checking" | "ok" | "error">("idle");
   const [authCheck, setAuthCheck] = useState<"idle" | "checking" | "ok" | "error">("idle");
-  const [testMessage, setTestMessage] = useState("保存前可先确认服务和访问密钥都有效。");
+  const [testMessage, setTestMessage] = useState("保存前可先确认服务和登录密钥都有效。");
   const testRequestRef = useRef<AbortController | null>(null);
   const onboarding = !settings.apiKey;
   const reauth = Boolean(settings.apiKey) && Boolean(
@@ -62,10 +65,10 @@ export function SettingsPage({
       serviceOnline = true;
       setServiceCheck("ok");
       setAuthCheck("checking");
-      setTestMessage("服务在线，正在验证访问密钥…");
+      setTestMessage("服务在线，正在验证登录密钥…");
       await client.memoryReport(controller.signal);
       setAuthCheck("ok");
-      setTestMessage("服务与访问密钥均有效，连接信息已保存。");
+      setTestMessage("服务与登录密钥均有效，连接信息已保存。");
       onSave(form, "连接测试通过并已保存");
     } catch (error) {
       if (isAbortError(error)) return;
@@ -89,17 +92,19 @@ export function SettingsPage({
         showTitle={onboarding || reauth}
         title={
           onboarding
-            ? "输入访问密钥"
+            ? "输入登录密钥"
             : reauth
-              ? "更新访问密钥"
+              ? "更新登录密钥"
               : "连接设置"
         }
         subtitle={
           onboarding
-            ? "这是登录本网页控制台的 Console token，不是聊天用的 chat token，也不是 admin.txt。"
+            ? "登录密钥只用来打开这个网页。聊天 App 用的是另一把「聊天密钥」，改模型用的是「管理密钥」，这两把稍后才会用到。"
             : reauth
-              ? "当前浏览器保存的密钥已失效（常见于重装或轮换 token）。请粘贴新的 gateway.txt（或旧版 gateway.key）。"
-              : "更换登录本网页的 Console token；日常聊天密钥请到「客户端接入」管理。"
+              ? embedded
+                ? "当前浏览器保存的登录密钥已失效。回到 Memory Platform App 点「打开控制台」即可重新登录，或在 App 里点「复制登录密钥」后粘贴到下方。"
+                : "当前浏览器保存的登录密钥已失效（常见于重装或更换密钥）。请重新粘贴 credentials/gateway.txt（旧版 gateway.key）的内容。"
+              : "更换登录本网页的登录密钥；聊天 App 用的聊天密钥请到「客户端接入」管理。"
         }
       />
       <section className="panel settings-panel">
@@ -115,36 +120,54 @@ export function SettingsPage({
           </div>
         )}
         {loginLinkStatus === "failed" && (
-          <ErrorBlock message="登录链接已失效，请重新运行 memgw open" />
+          <ErrorBlock
+            message={
+              embedded
+                ? "登录链接已失效。回到 App 重新点一次「打开控制台」即可。"
+                : "登录链接已失效，请重新运行 memgw open"
+            }
+          />
         )}
         {gateMode && (
           <div className="notice">
             {/* 整句包成单个 .notice-text：flex 容器里散落的文本节点会被压成竖条 */}
             <span className="notice-text">
               {onboarding ? (
-                <>
-                  已检测到本地服务：<code>{window.location.origin}</code>
-                  。请打开安装目录里的 <code>credentials/gateway.txt</code>
-                  （旧安装可能是 <code>gateway.key</code>），用文本编辑器打开后把整行粘贴到下方。
-                </>
+                embedded ? (
+                  <>
+                    这台设备上的 Memory Platform App 可以替你登录：回到 App，点「打开控制台」。
+                    如果你是自己打开浏览器进来的，在 App 里点「复制登录密钥」，再粘贴到下方即可。
+                  </>
+                ) : (
+                  <>
+                    已检测到本地服务：<code>{window.location.origin}</code>
+                    。登录密钥保存在安装目录的 <code>credentials/gateway.txt</code>
+                    （旧安装可能叫 <code>gateway.key</code>），用文本编辑器打开后把整行粘贴到下方。
+                  </>
+                )
               ) : (
                 <>
-                  密钥只保存在当前浏览器的本地存储。Docker 重装或撤销 token 后，需要重新粘贴{" "}
-                  <code>credentials/gateway.txt</code>（或旧版 <code>gateway.key</code>）。
+                  登录密钥只保存在当前浏览器里。重装或更换密钥后需要重新输入
+                  {embedded ? "（回到 App 点「打开控制台」最省事）" : (
+                    <>
+                      {" "}<code>credentials/gateway.txt</code>（或旧版 <code>gateway.key</code>）的内容
+                    </>
+                  )}
+                  。
                 </>
               )}
             </span>
           </div>
         )}
         <label className="field-block">
-          <span>访问密钥</span>
+          <span>登录密钥</span>
           <div className="secret-field">
             <input
               type={showKey ? "text" : "password"}
               value={form.apiKey}
               onChange={(event) => setForm({ ...form, apiKey: event.target.value })}
-              placeholder="mgw_…（credentials/gateway.txt 全文）"
-              aria-label="访问密钥"
+              placeholder={embedded ? "mgw_…（App 里「复制登录密钥」得到的那一串）" : "mgw_…（gateway.txt 的整行内容）"}
+              aria-label="登录密钥"
               autoComplete="off"
               spellCheck={false}
             />
@@ -152,15 +175,15 @@ export function SettingsPage({
               className="icon-button"
               type="button"
               onClick={() => setShowKey(!showKey)}
-              title={showKey ? "隐藏访问密钥" : "显示访问密钥"}
+              title={showKey ? "隐藏登录密钥" : "显示登录密钥"}
             >
               {showKey ? <EyeOff size={16} /> : <Eye size={16} />}
             </button>
           </div>
           <small className="field-hint">
-            即 Console token：安装时写入 <code>credentials/gateway.txt</code> 的那一串（旧版
-            <code>gateway.key</code> 仍可用）。不要填 <code>admin.txt</code>
-            （模型配置用），也不要填 chat token（聊天客户端用）。
+            {embedded
+              ? "就是 App 状态页「复制登录密钥」复制的那一串。不要填管理密钥，也不要填聊天密钥。"
+              : "即安装时写入 credentials/gateway.txt 的那一串（旧版 gateway.key 仍可用）。不要填 admin.txt（那是管理密钥），也不要填聊天密钥。"}
           </small>
         </label>
         {!onboarding && (
@@ -208,7 +231,7 @@ export function SettingsPage({
         </div>
         <div className="connection-checks" aria-live="polite">
           <ConnectionCheck icon={Server} label="服务在线" state={serviceCheck} />
-          <ConnectionCheck icon={KeyRound} label="密钥鉴权有效" state={authCheck} />
+          <ConnectionCheck icon={KeyRound} label="登录密钥有效" state={authCheck} />
           <p>{testMessage}</p>
         </div>
       </section>
@@ -217,7 +240,7 @@ export function SettingsPage({
         <details className="panel panel--quiet settings-reference settings-reference-details">
           <summary>高级：运维与旧版直连配置参考</summary>
           <div className="notice">
-            日常模型配置请使用「模型与路由」，设备 token 请使用「客户端接入」。下面内容仅供源码运维或迁移旧版 direct 配置时排障。
+            日常模型配置请使用「模型与路由」，聊天密钥请使用「客户端接入」。下面内容仅供源码运维或迁移旧版 direct 配置时排障。
           </div>
           <h2>服务进程管理</h2>
           <div className="config-grid">

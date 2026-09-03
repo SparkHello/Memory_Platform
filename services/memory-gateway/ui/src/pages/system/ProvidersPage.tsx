@@ -682,7 +682,7 @@ function AdminAccess({
           </span>
           <div>
             <h2 id="provider-admin-title">管理密钥已验证</h2>
-            <p>只在当前标签页有效，关闭标签页后需要重新粘贴。</p>
+            <p>只在当前标签页有效，关闭标签页后需要重新输入。</p>
           </div>
         </div>
         <div className="provider-admin-actions">
@@ -701,12 +701,12 @@ function AdminAccess({
           <LockKeyhole size={18} />
         </span>
         <div>
-          <h2 id="provider-admin-title">解锁配置操作</h2>
-          <p>粘贴安装时保存的 admin key 才能新建渠道、添加模型或修改能力。只保存在当前标签页。</p>
+          <h2 id="provider-admin-title">输入管理密钥</h2>
+          <p>新建渠道、添加模型或修改能力都需要管理密钥。它只留在当前标签页，不会写入本机存储。</p>
         </div>
       </div>
       <label className="field-block provider-admin-field">
-        <span>Model Gateway admin 密钥</span>
+        <span>管理密钥</span>
         <div className="secret-field">
           <input
             type={show ? "text" : "password"}
@@ -714,7 +714,7 @@ function AdminAccess({
             onChange={(event) => onChange(event.target.value)}
             autoComplete="off"
             spellCheck={false}
-            placeholder="仅在校验、应用或替换密钥时发送"
+            placeholder="粘贴 admin.txt 的整行内容；只在验证和保存时发送"
           />
           <button
             type="button"
@@ -737,7 +737,7 @@ function AdminAccess({
           <KeyRound size={16} aria-hidden />
           {state === "checking" ? "正在验证" : "验证管理密钥"}
         </button>
-        {state === "invalid" && <span className="field-error">密钥无效，请重新粘贴。</span>}
+        {state === "invalid" && <span className="field-error">管理密钥无效，请核对后重新输入。</span>}
         {value.trim() && (
           <button type="button" className="ghost-button compact" onClick={onForget}>
             <XCircle size={15} aria-hidden />
@@ -746,9 +746,12 @@ function AdminAccess({
         )}
       </div>
       <details className="provider-bootstrap-help">
-        <summary>还没有 admin 密钥？</summary>
+        <summary>找不到管理密钥？</summary>
         <p>
-          Docker 首次安装只把它写入安装目录的 <code>credentials/admin.txt</code> 私有文件（旧版为 <code>admin.key</code>）；不会写入容器日志或环境变量。
+          安卓 App：从 App 点「打开控制台」会自动带上，无需手动输入；也可以在状态页「高级」里点「复制管理密钥」。
+        </p>
+        <p>
+          Docker 或源码安装：它在安装目录的 <code>credentials/admin.txt</code> 私有文件里（旧版为 <code>admin.key</code>）；不会写入容器日志或环境变量。
         </p>
         <p>丢失后只能换一枚新的；旧密钥会立即失效：</p>
         <p>Docker：在安装目录（默认 memory-platform）打开终端后运行：</p>
@@ -780,7 +783,7 @@ function FirstRunProgress({
         <li className="is-done"><CheckCircle2 size={17} aria-hidden /><span>本地服务已连接</span></li>
         <li className={adminCheck === "valid" ? "is-done" : "is-current"}>
           {adminCheck === "valid" ? <CheckCircle2 size={17} aria-hidden /> : <span>2</span>}
-          <span>验证安装时保存的管理密钥</span>
+          <span>输入管理密钥（admin.txt）</span>
         </li>
         <li className={status.setup.chat_ready ? "is-done" : adminCheck === "valid" ? "is-current" : ""}>
           {status.setup.chat_ready ? <CheckCircle2 size={17} aria-hidden /> : <span>3</span>}

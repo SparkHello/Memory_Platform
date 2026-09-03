@@ -194,7 +194,7 @@ describe("provider object management", () => {
 
     render(<ProvidersPage api={api} expertMode />);
     await screen.findByText("official");
-    await user.type(screen.getByLabelText("Model Gateway admin 密钥"), "admin-key");
+    await user.type(screen.getByLabelText("管理密钥"), "admin-key");
     await user.click(screen.getByRole("button", { name: "验证管理密钥" }));
 
     const orphanRow = (await screen.findByText("orphan-pricing")).closest("article");
@@ -251,7 +251,7 @@ describe("provider object management", () => {
     sessionStorage.clear();
     render(<ProvidersPage api={api} expertMode />);
     await screen.findByText("official");
-    await user.type(screen.getByLabelText("Model Gateway admin 密钥"), "admin-key");
+    await user.type(screen.getByLabelText("管理密钥"), "admin-key");
     await user.click(screen.getByRole("button", { name: "验证管理密钥" }));
 
     const chip = await screen.findByRole("button", { name: "修改模型 orphan-chat 的能力" });

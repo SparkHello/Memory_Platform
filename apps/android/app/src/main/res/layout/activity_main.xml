@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fillViewport="true"
@@ -10,48 +11,270 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:padding="20dp">
 
-        <TextView
-            android:id="@+id/state"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textAppearance="?attr/textAppearanceHeadlineMedium"
-            android:text="@string/state_stopped" />
-
-        <TextView
-            android:id="@+id/detail"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:textAppearance="?attr/textAppearanceBodyMedium" />
-
+        <!-- 状态 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:orientation="vertical">
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
 
-            <TextView
-                android:layout_width="match_parent"
+            <ImageView
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginEnd="12dp"
+                android:contentDescription="@string/app_name"
+                android:src="@drawable/ic_launcher" />
+
+            <LinearLayout
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:text="@string/label_console_url"
-                android:textAppearance="?attr/textAppearanceLabelMedium" />
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/state"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textAppearance="?attr/textAppearanceHeadlineSmall"
+                    android:text="@string/state_stopped" />
+
+                <TextView
+                    android:id="@+id/detail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:textColor="?android:attr/textColorSecondary" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 首次使用清单 -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="1dp">
 
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
+                android:orientation="vertical"
+                android:padding="16dp">
 
                 <TextView
-                    android:id="@+id/consoleUrl"
-                    android:layout_width="0dp"
+                    android:id="@+id/checklistTitle"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:fontFamily="monospace"
-                    android:textAppearance="?attr/textAppearanceBodyMedium" />
+                    android:textAppearance="?attr/textAppearanceTitleMedium"
+                    android:text="@string/checklist_title" />
 
+                <TextView
+                    android:id="@+id/stepService"
+                    style="@style/Widget.MemoryPlatform.Step"
+                    android:text="@string/step_service" />
+
+                <TextView
+                    android:id="@+id/stepModel"
+                    style="@style/Widget.MemoryPlatform.Step"
+                    android:text="@string/step_model" />
+
+                <TextView
+                    android:id="@+id/stepChatKey"
+                    style="@style/Widget.MemoryPlatform.Step"
+                    android:text="@string/step_chat_key" />
+
+                <TextView
+                    android:id="@+id/stepBattery"
+                    style="@style/Widget.MemoryPlatform.Step"
+                    android:text="@string/step_battery" />
+
+                <Button
+                    android:id="@+id/primaryAction"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/action_start" />
+
+                <TextView
+                    android:id="@+id/primaryHint"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:gravity="center_horizontal"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:textColor="?android:attr/textColorSecondary"
+                    android:text="@string/open_console_hint"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/stopAction"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/action_stop"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- 电池优化警告 -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/batteryCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="1dp"
+            app:strokeColor="?attr/colorError"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textAppearance="?attr/textAppearanceTitleMedium"
+                    android:textColor="?attr/colorError"
+                    android:text="@string/battery_title" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textAppearance="?attr/textAppearanceBodyMedium"
+                    android:text="@string/battery_body" />
+
+                <Button
+                    android:id="@+id/battery"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/action_battery" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- 聊天 App 填写项 -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textAppearance="?attr/textAppearanceTitleMedium"
+                    android:text="@string/client_card_title" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:textColor="?android:attr/textColorSecondary"
+                    android:text="@string/client_card_body" />
+
+                <TextView
+                    style="@style/Widget.MemoryPlatform.RowLabel"
+                    android:text="@string/label_openai_url" />
+
+                <LinearLayout style="@style/Widget.MemoryPlatform.Row">
+                    <TextView
+                        android:id="@+id/openaiUrl"
+                        style="@style/Widget.MemoryPlatform.RowValue" />
+                    <Button
+                        android:id="@+id/copyOpenaiUrl"
+                        style="@style/Widget.Material3.Button.TextButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/action_copy" />
+                </LinearLayout>
+
+                <TextView
+                    style="@style/Widget.MemoryPlatform.RowLabel"
+                    android:text="@string/label_model_name" />
+
+                <LinearLayout style="@style/Widget.MemoryPlatform.Row">
+                    <TextView
+                        android:id="@+id/modelName"
+                        style="@style/Widget.MemoryPlatform.RowValue"
+                        android:text="@string/model_name_value" />
+                    <Button
+                        android:id="@+id/copyModelName"
+                        style="@style/Widget.Material3.Button.TextButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/action_copy" />
+                </LinearLayout>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- 高级 -->
+        <LinearLayout
+            android:id="@+id/advancedToggle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingTop="8dp"
+            android:paddingBottom="8dp"
+            android:background="?attr/selectableItemBackground">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textAppearance="?attr/textAppearanceTitleSmall"
+                android:text="@string/advanced_title" />
+
+            <TextView
+                android:id="@+id/advancedState"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textAppearance="?attr/textAppearanceLabelMedium"
+                android:textColor="?attr/colorPrimary"
+                android:text="@string/advanced_expand" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/advancedPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/advanced_hint" />
+
+            <TextView
+                style="@style/Widget.MemoryPlatform.RowLabel"
+                android:text="@string/label_console_url" />
+
+            <LinearLayout style="@style/Widget.MemoryPlatform.Row">
+                <TextView
+                    android:id="@+id/consoleUrl"
+                    style="@style/Widget.MemoryPlatform.RowValue" />
                 <Button
                     android:id="@+id/copyConsoleUrl"
                     style="@style/Widget.Material3.Button.TextButton"
@@ -61,55 +284,13 @@
             </LinearLayout>
 
             <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/label_openai_url"
-                android:textAppearance="?attr/textAppearanceLabelMedium" />
+                style="@style/Widget.MemoryPlatform.RowLabel"
+                android:text="@string/label_mcp_url" />
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:id="@+id/openaiUrl"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:fontFamily="monospace"
-                    android:textAppearance="?attr/textAppearanceBodyMedium" />
-
-                <Button
-                    android:id="@+id/copyOpenaiUrl"
-                    style="@style/Widget.Material3.Button.TextButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/action_copy" />
-            </LinearLayout>
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/label_mcp_url"
-                android:textAppearance="?attr/textAppearanceLabelMedium" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
+            <LinearLayout style="@style/Widget.MemoryPlatform.Row">
                 <TextView
                     android:id="@+id/mcpUrl"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:fontFamily="monospace"
-                    android:textAppearance="?attr/textAppearanceBodyMedium" />
-
+                    style="@style/Widget.MemoryPlatform.RowValue" />
                 <Button
                     android:id="@+id/copyMcpUrl"
                     style="@style/Widget.Material3.Button.TextButton"
@@ -117,55 +298,28 @@
                     android:layout_height="wrap_content"
                     android:text="@string/action_copy" />
             </LinearLayout>
+
+            <Button
+                android:id="@+id/copyToken"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/action_copy_token" />
+
+            <Button
+                android:id="@+id/copyAdminKey"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/action_copy_admin_key" />
+
+            <Button
+                android:id="@+id/exportDiagnostics"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/action_export" />
         </LinearLayout>
-
-        <Button
-            android:id="@+id/toggle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:text="@string/action_start" />
-
-        <Button
-            android:id="@+id/openConsole"
-            style="@style/Widget.Material3.Button.TonalButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/action_open_console" />
-
-        <Button
-            android:id="@+id/copyToken"
-            style="@style/Widget.Material3.Button.TonalButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/action_copy_token" />
-
-        <Button
-            android:id="@+id/copyAdminKey"
-            style="@style/Widget.Material3.Button.TonalButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/action_copy_admin_key" />
-
-        <Button
-            android:id="@+id/exportDiagnostics"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/action_export" />
-
-        <Button
-            android:id="@+id/battery"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/action_battery" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:textAppearance="?attr/textAppearanceBodySmall"
-            android:text="@string/hint_clients" />
     </LinearLayout>
 </ScrollView>

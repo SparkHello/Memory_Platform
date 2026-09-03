@@ -21,7 +21,7 @@ to the user for the first Web console login; the service never prints them.
 
 Kotlin entry points (all return JSON strings, all safe to call from any thread):
 ``start(data_dir, memory_port, model_port, ui_dist_dir)``, ``stop()``,
-``status()``.
+``status()``, ``console_login_link()`` and ``export_diagnostics()``.
 """
 from __future__ import annotations
 
@@ -125,6 +125,9 @@ def configure(
         _chmod(directory, 0o700)
     os.environ["MEMGW_HOME"] = str(memory_home)
     os.environ["MEMGW_SETTINGS_PATH"] = str(layout.settings_env)
+    # Tells the Web Console it runs inside the host app: first-login guidance
+    # then points at the app's "打开控制台" button instead of a credentials file.
+    os.environ["MEMGW_DEPLOYMENT_PROFILE"] = "embedded"
     os.environ["MODEL_GATEWAY_HOME"] = str(model_home)
     os.environ.pop("MODEL_GATEWAY_SECRETS_PATH", None)
     # Phones routinely sit behind Clash/Surge-style VPNs whose fake-ip DNS maps
@@ -418,6 +421,75 @@ def status() -> str:
             "runtime": runtime_info(),
         }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def console_login_link(include_admin_key: bool = True) -> str:
+    """Mint a one-time login link for the local browser. Returns JSON.
+
+    ``{"url": "http://127.0.0.1:2026/ui/#login=mgc_...", "expires_in_seconds": 300,
+    "admin_key_included": true}`` on success, ``{"error": "..."}`` otherwise.
+
+    The link delivers the *existing* first console token from
+    ``credentials/gateway.txt`` (no new token per tap) and, by default, the
+    Model Gateway admin key from ``credentials/admin.txt``, so the console can
+    unlock model configuration without a second manual paste. The phone is a
+    single-tenant device and the exchange endpoint only answers loopback
+    callers holding the unguessable code, which is exactly the trust boundary
+    the copy-token buttons already had. If the stored console token was
+    revoked, a fresh one is minted and written back to gateway.txt.
+    """
+
+    with _lock:
+        stack = _stack
+        layout = stack.layout if stack else _last_layout
+        state = _state
+    if layout is None or state != "running":
+        return json.dumps({"error": "服务尚未运行"}, ensure_ascii=False)
+    try:
+        from app.auth.console_login import (
+            CONSOLE_LOGIN_CODE_TTL_SECONDS,
+            ConsoleLoginCodeStore,
+        )
+        from app.auth.tokens import AuthStoreError, AuthTokenStore
+
+        admin_key: str | None = None
+        if include_admin_key and layout.admin_key_path.is_file():
+            admin_key = layout.admin_key_path.read_text(encoding="utf-8").strip() or None
+        store = ConsoleLoginCodeStore(layout.auth_db)
+        token = (
+            layout.console_token_path.read_text(encoding="utf-8").strip()
+            if layout.console_token_path.is_file()
+            else ""
+        )
+        try:
+            if not token:
+                raise AuthStoreError("首次登录密钥文件不存在")
+            minted = store.mint_for_token(token, admin_key=admin_key)
+        except AuthStoreError:
+            # The stored key was revoked or lost: issue a new console token and
+            # keep gateway.txt in step so the copy button stays usable too.
+            token_store = AuthTokenStore(layout.auth_db)
+            created = token_store.create_token(
+                name="first-console", user_id="default", role="console"
+            )
+            try:
+                _write_private_file(layout.console_token_path, created.token)
+            except Exception:
+                token_store.revoke_token(created.record.token_id)
+                raise
+            minted = store.mint_for_token(created.token, admin_key=admin_key)
+        url = f"{layout.memory_url}/ui/#login={minted.code}"
+        return json.dumps(
+            {
+                "url": url,
+                "expires_in_seconds": CONSOLE_LOGIN_CODE_TTL_SECONDS,
+                "admin_key_included": admin_key is not None,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:  # surfaced to the host UI, not raised across JNI
+        logger.exception("console_login_link failed")
+        return json.dumps({"error": _describe(exc)}, ensure_ascii=False)
 
 
 def runtime_info() -> dict[str, Any]:

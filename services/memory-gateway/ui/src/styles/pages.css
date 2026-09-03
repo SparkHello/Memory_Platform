@@ -1613,6 +1613,53 @@
   gap: 8px;
 }
 
+/* 「试一下」闭环卡：创建聊天密钥后直到第一条记忆出现前的引导。 */
+.first-chat-steps {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+  line-height: 1.6;
+}
+
+.first-chat-steps li + li {
+  margin-top: 0.35rem;
+}
+
+.first-chat-sentence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px dashed color-mix(in srgb, var(--primary) 45%, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
+}
+
+.first-chat-sentence q {
+  flex: 1 1 220px;
+  min-width: 0;
+  color: var(--text);
+  quotes: "「" "」";
+}
+
+.first-chat-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.first-chat-status.is-done {
+  color: var(--success);
+}
+
+.first-chat-status .spin {
+  animation: spin 1.2s linear infinite;
+}
+
 .ingest-skip-hint {
   margin: 0 0 12px;
   font-size: 13px;

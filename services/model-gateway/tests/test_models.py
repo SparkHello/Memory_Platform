@@ -603,7 +603,25 @@ def test_fake_ip_env_accepts_rfc2544_range_without_per_connection_allowlist(
     monkeypatch.setenv("MODEL_GATEWAY_ALLOW_FAKE_IP", "1")
     require_safe_destination_sync("https://provider.example/v1/models")
 
-    # Only the benchmark range is relaxed; real LAN addresses stay blocked.
+    # IPv6 fake-ip (Clash Meta / mihomo fake-ip-range6 fc00::/18) is relaxed too.
+    def benchmark_dns6(host: str, port: int, **kwargs):
+        return [(10, 1, 6, "", ("fc00::8", port, 0, 0))]
+
+    monkeypatch.setattr("socket.getaddrinfo", benchmark_dns6)
+    require_safe_destination_sync("https://provider.example/v1/models")
+    monkeypatch.delenv("MODEL_GATEWAY_ALLOW_FAKE_IP", raising=False)
+    with pytest.raises(ValueError, match="fc00::/18"):
+        require_safe_destination_sync("https://provider.example/v1/models")
+    monkeypatch.setenv("MODEL_GATEWAY_ALLOW_FAKE_IP", "1")
+
+    # Only the fake-ip ranges are relaxed; real LAN / ULA addresses stay blocked.
+    def ula_dns(host: str, port: int, **kwargs):
+        return [(10, 1, 6, "", ("fd12::1", port, 0, 0))]
+
+    monkeypatch.setattr("socket.getaddrinfo", ula_dns)
+    with pytest.raises(ValueError, match="未显式允许"):
+        require_safe_destination_sync("https://provider.example/v1/models")
+
     def lan_dns(host: str, port: int, **kwargs):
         return [(2, 1, 6, "", ("192.168.1.9", port))]
 

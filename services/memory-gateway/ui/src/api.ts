@@ -150,7 +150,7 @@ export class MemoryApi {
     return `${this.settings.apiBaseUrl}${path}`;
   }
 
-  async health(signal?: AbortSignal): Promise<{ status: string }> {
+  async health(signal?: AbortSignal): Promise<{ status: string; deployment?: string }> {
     return this.request("/health", { auth: false, signal });
   }
 
@@ -159,14 +159,20 @@ export class MemoryApi {
   }
 
   /**
-   * memgw open 的一次性登录链接：code 换 console token 明文（交付一次）。
+   * 一次性登录链接（memgw open 或安卓 App「打开控制台」）：code 换登录密钥明文
+   * （交付一次）。安卓 App 签发的链接还会带上管理密钥，省去第二次手工粘贴。
    * 端点在中间件中豁免 Bearer，因此必须 auth: false；无效/过期/已用一律 401。
    */
-  async exchangeConsoleLoginCode(code: string, signal?: AbortSignal): Promise<string> {
-    const payload = await this.request<{ token?: unknown; api_key?: unknown; apiKey?: unknown }>(
-      "/auth/console-login-exchange",
-      { method: "POST", body: { code }, auth: false, signal }
-    );
+  async exchangeConsoleLoginCode(
+    code: string,
+    signal?: AbortSignal
+  ): Promise<{ token: string; modelAdminKey: string | null }> {
+    const payload = await this.request<{
+      token?: unknown;
+      api_key?: unknown;
+      apiKey?: unknown;
+      model_admin_key?: unknown;
+    }>("/auth/console-login-exchange", { method: "POST", body: { code }, auth: false, signal });
     const raw = payload?.token ?? payload?.api_key ?? payload?.apiKey;
     const token = typeof raw === "string" ? raw.trim() : "";
     if (!token) {
@@ -178,7 +184,9 @@ export class MemoryApi {
         "/auth/console-login-exchange"
       );
     }
-    return token;
+    const adminRaw = payload?.model_admin_key;
+    const modelAdminKey = typeof adminRaw === "string" && adminRaw.trim() ? adminRaw.trim() : null;
+    return { token, modelAdminKey };
   }
 
   async createAuthToken(

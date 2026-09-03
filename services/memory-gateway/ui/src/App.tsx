@@ -34,6 +34,7 @@ import {
   type UiMode
 } from "./storage";
 import type { ConnectionSettings, KnowledgeStatus, PageKey, ProvidersStatus } from "./types";
+import { saveModelAdminKey } from "./utils/adminKeySession";
 import { errorMessage } from "./utils/format";
 import { isProviderSetupReady } from "./utils/providerSetup";
 import { scrollWorkspaceToTop } from "./utils/scroll";
@@ -82,6 +83,8 @@ export function App() {
     message: string;
   }>({ loading: true, tone: "warning", message: "检查中" });
   const [navSignals, setNavSignals] = useState<NavSignals>({});
+  // /health 上报的部署形态：安卓 App 内嵌运行时登录页不再让用户找凭据文件。
+  const [deployment, setDeployment] = useState<string>("");
   // 角标刷新失败的持久提示（不发 toast，避免连续失败刷屏）。
   const [signalsError, setSignalsError] = useState<string | null>(null);
   const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeStatus | null>(null);
@@ -265,13 +268,14 @@ export function App() {
     setServiceStatus((current) => ({ ...current, loading: true }));
     try {
       const result = await api.health();
+      setDeployment(typeof result.deployment === "string" ? result.deployment : "");
       if (result.status !== "ok") {
         setServiceStatus({ loading: false, tone: "bad", message: result.status });
         return;
       }
       if (!settings.apiKey) {
         setCredentialsBlocked(true);
-        setServiceStatus({ loading: false, tone: "warning", message: "服务在线 · 请填写访问密钥" });
+        setServiceStatus({ loading: false, tone: "warning", message: "服务在线 · 请输入登录密钥" });
         return;
       }
       const [, providers] = await Promise.all([api.memoryReport(), api.providersStatus()]);
@@ -299,7 +303,7 @@ export function App() {
         setServiceStatus({
           loading: false,
           tone: "warning",
-          message: "访问密钥无效 · 请重新配置"
+          message: "登录密钥无效 · 请重新输入"
         });
         return;
       }
@@ -348,7 +352,9 @@ export function App() {
   // 一次性登录链接交换：仅在挂载时消费一次 #login=<code>。无论成败都先
   // 把 code 从 URL 抹掉（replaceState 不触发 hashchange），避免泄露到历史
   // 记录或被路由层误判。成功后复用 applySettings 的首启路径进入主站；
-  // 失败则落回手动粘贴 gateway.txt 的既有流程。
+  // 安卓 App 签发的链接还会带上管理密钥，先写入本标签页的 sessionStorage，
+  // 「模型与路由」页挂载时会静默重验，用户无需再粘贴一次。
+  // 失败则落回手动粘贴登录密钥的既有流程。
   const loginExchangeStartedRef = useRef(false);
   useEffect(() => {
     if (loginLinkStatus !== "pending" || loginExchangeStartedRef.current) return;
@@ -360,16 +366,20 @@ export function App() {
       return;
     }
     void api.exchangeConsoleLoginCode(code)
-      .then((token) => {
-        applySettings({ ...loadSettings(), apiKey: token }, "已通过登录链接登录");
+      .then(({ token, modelAdminKey }) => {
+        if (modelAdminKey) saveModelAdminKey(modelAdminKey);
+        applySettings(
+          { ...loadSettings(), apiKey: token },
+          modelAdminKey ? "已自动登录，管理密钥也已带入" : "已通过登录链接登录"
+        );
         setLoginLinkStatus(null);
       })
       .catch(() => {
         setLoginLinkStatus("failed");
         if (loadSettings().apiKey) {
           // 已有保存密钥：失效链接不踢出现有会话，仅提示；首启（无密钥）
-          // 才强制落回手动粘贴 gateway.txt 的填 key 页。
-          notify("登录链接已失效，请重新运行 memgw open", "error");
+          // 才强制落回手动粘贴登录密钥的页面。
+          notify("登录链接已失效。请回到 App 重新点「打开控制台」，或在电脑上重新运行 memgw open", "error");
         } else {
           setCredentialsBlocked(true);
         }
@@ -485,6 +495,7 @@ export function App() {
             onSave={applySettings}
             notify={notify}
             loginLinkStatus={loginLinkStatus}
+            embedded={deployment === "embedded"}
           />
         )}
         {!unknownHash && activePage === "developer" && (

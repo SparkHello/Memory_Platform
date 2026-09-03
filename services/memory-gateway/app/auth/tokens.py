@@ -362,10 +362,26 @@ class AuthTokenStore:
                     CHECK(length(console_token_id) = 16),
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                used_at TEXT
+                used_at TEXT,
+                token_owned INTEGER NOT NULL DEFAULT 1
+                    CHECK(token_owned IN (0, 1))
             )
             """
         )
+        # token_owned=1：code 自己换发了绑定的 console token，过期时一并吊销；
+        # token_owned=0：code 只是把一枚既有 token（如安卓 App 的首次登录密钥）
+        # 交付给本机浏览器，过期时绝不能吊销那枚 token。
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(console_login_codes)"
+            ).fetchall()
+        }
+        if columns and "token_owned" not in columns:
+            connection.execute(
+                "ALTER TABLE console_login_codes ADD COLUMN token_owned "
+                "INTEGER NOT NULL DEFAULT 1 CHECK(token_owned IN (0, 1))"
+            )
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
@@ -398,6 +414,7 @@ class AuthTokenStore:
             "created_at",
             "expires_at",
             "used_at",
+            "token_owned",
         }:
             raise AuthStoreError(
                 "AUTH_DATABASE_PATH 的 console_login_codes schema 不兼容"

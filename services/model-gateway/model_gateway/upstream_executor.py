@@ -911,7 +911,7 @@ def _local_failure_detail(exc: BaseException) -> str:
         return (
             "上游域名被解析到本地或私有地址，已按安全策略拒绝。这通常是手机上的 VPN/代理"
             "（Clash、Surge 等 fake-ip 模式）造成的：关闭 VPN，或在渠道的"
-            " allowed_private_networks 中放行 198.18.0.0/15 后重试"
+            " allowed_private_networks 中放行 198.18.0.0/15 与 fc00::/18 后重试"
         )
     if "没有可用地址" in message:
         return "上游域名无法解析到任何地址，请检查网络或 DNS 后重试"

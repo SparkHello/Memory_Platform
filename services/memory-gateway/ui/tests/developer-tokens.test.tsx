@@ -90,18 +90,18 @@ describe("device-token integration page", () => {
     expect(screen.queryByText("console-login-secret-must-never-render")).not.toBeInTheDocument();
 
     await user.type(screen.getByLabelText("设备或客户端名称"), "Alice phone");
-    await user.click(screen.getByRole("button", { name: "创建 chat token" }));
+    await user.click(screen.getByRole("button", { name: "创建聊天密钥" }));
 
     expect(createAuthToken).toHaveBeenCalledWith("Alice phone", "chat", {
       memoryAccess: "read-write"
     });
-    // 一次性 token 默认掩码，点击「显示 token」后才出现明文。
-    expect(await screen.findByText("只显示这一次")).toBeInTheDocument();
+    // 一次性密钥默认掩码，点击「显示密钥」后才出现明文。
+    expect(await screen.findByText("密钥只显示这一次")).toBeInTheDocument();
     expect(screen.queryByText(rawToken)).not.toBeInTheDocument();
     expect(
       screen.getByText(`${rawToken.slice(0, 12)}…${rawToken.slice(-4)}`)
     ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "显示 token" }));
+    await user.click(screen.getByRole("button", { name: "显示密钥" }));
     expect(screen.getByText(rawToken)).toBeInTheDocument();
 
     Object.defineProperty(navigator, "clipboard", {
@@ -117,7 +117,7 @@ describe("device-token integration page", () => {
     await user.click(screen.getByRole("button", { name: "复制完整接入配置" }));
     await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
     expect(notify).toHaveBeenCalledWith(
-      expect.stringContaining("包含一次性 token"),
+      expect.stringContaining("包含只显示一次的密钥"),
       "success"
     );
 
@@ -148,12 +148,12 @@ describe("device-token integration page", () => {
 
     expect(await screen.findByText("Work MCP")).toBeInTheDocument();
     expect(screen.getAllByText("MCP").length).toBeGreaterThan(0);
-    expect(screen.getByText("MCP 工具接入")).toBeInTheDocument();
+    expect(screen.getByText("MCP 客户端")).toBeInTheDocument();
     expect(screen.getByText("最近使用")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "撤销" }));
 
     expect(confirm).toHaveBeenCalledWith(
-      expect.objectContaining({ tone: "danger", confirmLabel: "撤销 token" })
+      expect.objectContaining({ tone: "danger", confirmLabel: "撤销" })
     );
     expect(revokeAuthToken).toHaveBeenCalledWith(active.token_id);
     expect(await screen.findAllByText("已撤销")).not.toHaveLength(0);
@@ -177,7 +177,7 @@ describe("device-token integration page", () => {
     renderPage({ authTokens, revokeAuthToken } as Partial<MemoryApi>);
 
     expect(await screen.findByText("Current browser")).toBeInTheDocument();
-    expect(screen.getByText(/最后一个可用 Console token/)).toBeInTheDocument();
+    expect(screen.getByText(/最后一把可用的登录密钥/)).toBeInTheDocument();
     expect(screen.getByText("memgw token create --role console")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "需保留" })).toBeDisabled();
     expect(revokeAuthToken).not.toHaveBeenCalled();

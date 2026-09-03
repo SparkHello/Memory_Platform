@@ -6,7 +6,7 @@
 
 ## 还没有 API Key？去哪领
 
-Memory Platform 自己不产生回答，背后需要至少一个模型渠道的 API Key。安装时的 quickstart 内置四个预设渠道，任选一个去其官方开放平台注册、创建 key 即可：
+Memory Platform 自己不产生回答，背后需要至少一个模型渠道的 API Key。网页控制台的新建渠道向导内置 DeepSeek、Anthropic Claude、Google Gemini、阿里云百炼四个预设，选中后会直接给出该供应商创建 Key 的页面链接；命令行 quickstart 则内置 DeepSeek、Kimi、MiMo、百炼。任选一个去其官方开放平台注册、创建 key 即可：
 
 - **DeepSeek 官方**：[platform.deepseek.com](https://platform.deepseek.com) 注册 → API keys 页面创建；
 - **Kimi 中国区**：[platform.moonshot.cn](https://platform.moonshot.cn) 注册 → API Key 管理页面创建；
@@ -22,14 +22,14 @@ Memory Platform 对外是一个标准的 OpenAI 兼容接口。在客户端里�
 
 ```text
 Base URL: http://127.0.0.1:2026/v1
-API Key:  为这台设备创建的 chat token
+API Key:  为这台设备创建的聊天密钥（chat token）
 模型名:   memory-auto
 ```
 
 要点：
 
-- **每台设备用自己的 chat token**。在 Web Console「接入信息」创建，明文只显示一次；服务端 Auth DB 只保存不可逆 SHA-256。Docker 全新安装交付到 `credentials/gateway.txt` 的是 Console-only 初始 token（旧安装可能为 `gateway.key`）；迁移旧卷时该文件才暂存 legacy key。两者都不应复制给聊天设备。
-- **聊天、MCP、Console 权限分开**。聊天客户端只拿 chat token；MCP 客户端只拿 MCP token；Model Gateway admin key 仅在电脑浏览器中临时解锁渠道配置，绝不能填进聊天或 MCP 客户端。
+- **每台设备用自己的聊天密钥**。在 Web Console「客户端接入」创建，明文只显示一次；服务端 Auth DB 只保存不可逆 SHA-256。Docker 全新安装交付到 `credentials/gateway.txt` 的是 Console-only 初始 token（旧安装可能为 `gateway.key`）；迁移旧卷时该文件才暂存 legacy key。两者都不应复制给聊天设备。
+- **三把钥匙分开**。登录密钥（gateway.txt）只用来登录网页控制台；管理密钥（admin.txt）只在「模型与路由」页临时输入，用来改渠道；聊天密钥、MCP 密钥各自只给对应客户端。管理密钥和登录密钥绝不能填进聊天或 MCP 客户端。
 - **丢一台设备只撤销这一枚 token**。在 Console 撤销，或运行 `scripts/memgw token revoke <token-id>`；其他设备不用重配。不要为了好记而自定义低熵密码，也不要经聊天软件或跨设备剪贴板传递 token。
 - **Docker 初始密钥不在日志或环境变量里**。安装器只报告宿主机 `credentials/gateway.txt` 与 `credentials/admin.txt` 路径（旧安装兼容 `.key`）；文件应保持仅当前用户可读。不要再用 `GATEWAY_API_KEY=...` 环境变量运行安装器。
 - **模型名默认填 `memory-auto`**。它不代表某个具体模型，而是「让服务端按用途路由选择当前配置的模型」，记忆模式取服务端默认值。以后换渠道、换模型只改服务端，客户端不用动。模型列表里还有 `memory-read`（只召回不写入）和 `memory-off`（不读不写，纯代理），见下文「记忆模式」。
@@ -42,7 +42,7 @@ API Key:  为这台设备创建的 chat token
 0. **Docker 部署先放开局域网监听**：默认只监听本机。一键安装用户重新运行安装命令即可：macOS/Linux 在命令前加 `MEMORY_HOST=0.0.0.0`；Windows PowerShell 先运行 `$env:MEMORY_HOST="0.0.0.0"`。安装器会保留数据并直接打印手机地址。手工安装则在 Compose 同目录的 `.env` 加一行 `MEMORY_HOST=0.0.0.0` 后重启。源码安装默认已监听局域网，跳过这一步。
 1. 一键安装结束时会打印电脑的局域网地址。手工查询时：macOS 运行 `ipconfig getifaddr en0`，Linux 运行 `hostname -I`，Windows 运行 `ipconfig`；已装 Tailscale 时用 `tailscale ip -4`。
 2. Base URL 换成 `http://<电脑IP>:2026/v1`，例如 `http://192.168.1.20:2026/v1`。
-3. 模型名不变；在手机上填写专门为它创建的 chat token。MCP 地址同理换成 `http://<电脑IP>:2026/mcp`，但使用独立 MCP token。
+3. 模型名不变；在手机上填写专门为它创建的聊天密钥。MCP 地址同理换成 `http://<电脑IP>:2026/mcp`，但使用独立 MCP token。
 
 只在可信家庭网络或 Tailscale 内这样用，不要把服务无鉴权暴露到公网。
 
@@ -57,7 +57,7 @@ API Key:  为这台设备创建的 chat token
 ### 验证接通了没有
 
 1. 在客户端随便聊一句，比如「我喜欢黑咖啡，以后推荐咖啡时记住这一点」。
-2. 打开浏览器访问 `http://127.0.0.1:2026/ui/`（Web Console 使用 Console/迁移期 legacy 凭据，不复用 chat token）。
+2. 打开浏览器访问 `http://127.0.0.1:2026/ui/`（Web Console 用登录密钥登录，不复用聊天密钥；安卓 App 从「打开控制台」进入会自动登录）。工作台上的「试一下」卡会实时显示第一条记忆有没有存下来。
 3. 新开一个对话问「我喜欢什么咖啡」，回答里应该能用到上一轮记住的信息；Web Console 的记忆列表里也能看到新记忆。
 
 如果没记住：确认客户端确实填的是 Memory Platform 的地址而不是直连渠道；确认上一轮的最终回答完整结束（中途断开不会写入记忆）。
@@ -84,7 +84,7 @@ MCP 地址：
 http://127.0.0.1:2026/mcp
 ```
 
-在 Web Console「接入信息」为该客户端创建独立 MCP token。支持远程 MCP 的客户端（如 RikkaHub）在 MCP 服务器配置里选择「Streamable HTTP」，填上面的地址，并在请求头里加 `Authorization: Bearer <你的 MCP token>`。chat token 调 MCP 会得到 403，而不是被提升为管理权限。
+在 Web Console「客户端接入」为该客户端创建独立 MCP 密钥。支持远程 MCP 的客户端（如 RikkaHub）在 MCP 服务器配置里选择「Streamable HTTP」，填上面的地址，并在请求头里加 `Authorization: Bearer <你的 MCP token>`。chat token 调 MCP 会得到 403，而不是被提升为管理权限。
 
 为了让模型正确使用这些工具，建议把 [Client Integration](../services/memory-gateway/docs/client_integration.md#mcp-client-rules) 里的推荐系统提示词放进该 MCP 会话的系统提示。两个路径可以同时开启；普通聊天客户端只配网关即可，知识库检索再由支持 MCP 的客户端负责。
 
@@ -107,10 +107,10 @@ token 会固定绑定创建时的用户，调用方不能改写命名空间；�
 | 现象 | 原因和做法 |
 | --- | --- |
 | 手机上填 `localhost` / `127.0.0.1` 连不上 | 这个地址指手机自己；改成电脑的局域网 IP 或 Tailscale 地址 |
-| 开着 VPN/代理时报「上游域名被解析到本地或私有地址」 | Clash/Surge 等 fake-ip 模式把域名解析成 198.18.x.x，被防误连守卫拦下。安卓 App 已默认放行；电脑或 Docker 部署给 Model Gateway 设 `MODEL_GATEWAY_ALLOW_FAKE_IP=1`，或在该渠道的 allowed_private_networks 加 `198.18.0.0/15`，或让 VPN 绕过本服务 |
+| 开着 VPN/代理时报「上游域名被解析到本地或私有地址」 | Clash/Surge 等 fake-ip 模式把域名解析成 198.18.x.x（IPv6 下是 fc00::/18），被防误连守卫拦下。安卓 App 已默认放行；电脑或 Docker 部署给 Model Gateway 设 `MODEL_GATEWAY_ALLOW_FAKE_IP=1`，或在该渠道的 allowed_private_networks 加 `198.18.0.0/15` 与 `fc00::/18`，或让 VPN 绕过本服务 |
 | 聊天客户端的搜索、MCP 等工具用不了，或提示「当前模型未开启工具调用」 | 两处都要开：客户端里给 `memory-auto` 这个模型打开「工具」能力（FLIT/RikkaHub 类客户端默认不给自定义渠道的模型发工具）；控制台「模型渠道」里点击该模型的胶囊，点「自动检测能力」或手动勾选「工具调用 tools」。网关只会把带工具的请求派给声明了该能力的模型 |
 | 设备 token 找不回了 | 明文只显示一次；撤销该 token 并为这台设备新建一枚，其他设备不受影响 |
-| 配置模型时要的 admin 密钥找不到了 | Docker 首先检查宿主 `credentials/admin.txt`（旧版为 `admin.key`）；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
+| 配置模型时要的管理密钥找不到了 | 安卓 App：从 App 点「打开控制台」会自动带上，或在「高级」里点「复制管理密钥」。 Docker 首先检查宿主 `credentials/admin.txt`（旧版为 `admin.key`）；确需重置时用 `modelgw secret set memory-console-admin --stdin`，不要把值放进命令参数或环境变量 |
 | 模型名不知道填什么 | 默认 `memory-auto`；只读或不留记忆的对话改填 `memory-read` / `memory-off`。以后换渠道换模型只改服务端，客户端不动 |
 | 聊了但什么都没记住 | 记忆只在**完整**最终回答后写入；中途断开、被截断、内容被过滤都不会写 |
 | 决策日志显示「本地预过滤」 | 预期行为：本轮只是寒暄致谢、纯提问或纯代码，没有调用提取模型；明确说「记住」的消息和回答助手提问的短句不会被跳过 |

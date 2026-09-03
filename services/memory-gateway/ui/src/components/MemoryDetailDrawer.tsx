@@ -428,22 +428,26 @@ export function MemoryDetailDrawer({
                 <span>重要度</span>
                 <strong>{memory.importance}<small> / 10</small></strong>
               </div>
-              <div>
-                <span>置信度</span>
-                <strong>{percent(memory.confidence)}</strong>
-              </div>
-              <div>
-                <span>正向度</span>
-                <strong>{percent(memory.valence)}</strong>
-              </div>
-              <div>
-                <span>唤起度</span>
-                <strong>{percent(memory.arousal)}</strong>
-              </div>
-              <div>
-                <span>激活次数</span>
-                <strong>{memory.usage_count}</strong>
-              </div>
+              {expertMode && (
+                <>
+                  <div>
+                    <span>置信度</span>
+                    <strong>{percent(memory.confidence)}</strong>
+                  </div>
+                  <div>
+                    <span>正向度</span>
+                    <strong>{percent(memory.valence)}</strong>
+                  </div>
+                  <div>
+                    <span>唤起度</span>
+                    <strong>{percent(memory.arousal)}</strong>
+                  </div>
+                  <div>
+                    <span>激活次数</span>
+                    <strong>{memory.usage_count}</strong>
+                  </div>
+                </>
+              )}
               <div>
                 <span>最近使用</span>
                 <strong>{dateText(memory.last_used_at) || "-"}</strong>
@@ -513,13 +517,20 @@ export function MemoryDetailDrawer({
                 {why && (
                   <FieldList
                     compact
-                    entries={[
-                      ["来源摘录", why.source_excerpt],
-                      ["来源对话 ID", why.source_conversation_id],
-                      ["保存时间", dateText(why.saved_at)],
-                      ["是否核心记忆证据", why.is_core_memory_evidence ? "是" : "否"],
-                      ["核心记忆分区", why.core_memory_sections.map(displayText)]
-                    ]}
+                    entries={
+                      expertMode
+                        ? [
+                            ["来源摘录", why.source_excerpt],
+                            ["来源对话 ID", why.source_conversation_id],
+                            ["保存时间", dateText(why.saved_at)],
+                            ["是否核心记忆证据", why.is_core_memory_evidence ? "是" : "否"],
+                            ["核心记忆分区", why.core_memory_sections.map(displayText)]
+                          ]
+                        : [
+                            ["来源摘录", why.source_excerpt],
+                            ["保存时间", dateText(why.saved_at)]
+                          ]
+                    }
                   />
                 )}
               </section>

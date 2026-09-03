@@ -6,6 +6,24 @@
 
 ### Added
 
+- 安卓 App「打开控制台」一键自动登录：嵌入式入口新增 `console_login_link()`，为 `credentials/gateway.txt` 里的既有登录密钥签发一次性登录码（`ConsoleLoginCodeStore.mint_for_token`，不再每次新增 token，过期也不吊销既有 token；`console_login_codes` 表新增 `token_owned` 列），并把管理密钥随码交付给本机浏览器（`/auth/console-login-exchange` 响应新增 `model_admin_key`，仅宿主进程签发的码携带，HTTP 签发一律为 null）。控制台收到后写入本标签页 sessionStorage，「模型与路由」页静默重验，用户无需再粘贴任何密钥。
+- `MEMGW_DEPLOYMENT_PROFILE=embedded`：`/health` 上报 `deployment`，控制台登录页据此把「打开 credentials/gateway.txt」的文案换成「回到 App 点打开控制台」。
+- 安卓状态页改为四步清单（启动服务 → 配置模型 → 创建聊天密钥 → 关闭电池优化），每 5 秒探测 `/health`、`/readyz` 与 `/auth/tokens` 自动打勾；主按钮随进度变化；未关电池优化时显示警告卡；「高级」里才有复制登录密钥/管理密钥、MCP 地址和导出诊断包。新增品牌图标与通知栏单色图标。
+- 控制台工作台「试一下」闭环卡：聊天密钥创建后给出测试句子与验证步骤，每 6 秒轮询记忆库；出现第一条记忆时变绿并可跳转记忆库，若上一轮被跳过则显示可读的跳过原因。
+- 新建渠道向导：每个预设附「去 xx 创建 API Key」的官方链接；工程文案（只读发现、bundle、原子保存）改为「列出可用模型 / 检查 / 保存」。
+
+### Fixed
+
+- `MODEL_GATEWAY_ALLOW_FAKE_IP=1` 同时放行 Clash Meta / mihomo 的 IPv6 fake-ip 段 `fc00::/18`：开了 IPv6 的手机上域名会先解析到这一段，此前仍被防误连守卫拒绝（真机 vivo 上 dashscope → fc00::8 复现）。向导的 fake-ip 勾选、错误提示和文档同步加入该网段。
+
+### Changed
+
+- 三把钥匙统一叫法：登录密钥（gateway.txt，原 Console token / 访问密钥）、管理密钥（admin.txt，原 Model Gateway admin 密钥）、聊天密钥 / MCP 密钥（原 chat token / mcp token）；页面统一叫「客户端接入」（原「接入信息」）。README、文档、控制台、安卓 App、CLI 输出同步。
+- 控制台日期统一为 `2026/08/09 16:00` 格式，不再跟随浏览器区域显示 `8/9/2026, 4:00:00 PM`。
+- 记忆档案在简洁模式下隐藏置信度、正向度、唤起度、激活次数、核心记忆证据等内部指标；专家模式不变。
+- 手机端 toast 抬到底栏上方，不再盖住页面主按钮。
+- README 首屏重排：一句话说明、接入前后对比图、手机 / 电脑两个入口；安卓 App 提到「快速开始」第一位，架构图与同类项目对比下沉到「进一步了解」。
+
 - 安卓 App（`apps/android`）：用 Chaquopy 内嵌 Python 3.14，在手机前台服务里以单进程运行 Model Gateway 与 Memory Gateway（仅监听 `127.0.0.1`），复用现有 Web Console；状态页提供启动/停止、复制首次登录令牌与模型网关管理密钥、复制接入地址、导出诊断包（日志、脱敏配置、memory.db 快照、决策与落库任务报告）、关闭电池优化。自带 FTS5 的 SQLite 替换 Chaquopy 内置版本；pydantic-core 与 rpds-py 由 Termux 在手机上编译后导出。构建、验证与导出脚本见 `scripts/android/`，方案与限制见 `docs/android.md`。
 - 嵌入式单进程入口 `embedded_stack.py`：不依赖 `memgw`/`modelgw` CLI 与子进程完成两网关接线、首次凭据与 settings.env 生成；uvicorn 使用纯 asyncio/h11，不再需要 uvloop、httptools、websockets、watchfiles。
 - Model Gateway `PATCH /admin/deployments/{id}` 支持部分更新 `capabilities`（仍受路由 `required_capabilities` 约束）；`POST /admin/channels/probe-capabilities` 新增 `connection_id`，用已保存渠道的密钥探测已有模型的能力，不再要求重新输入供应商密钥。

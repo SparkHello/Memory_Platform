@@ -90,6 +90,12 @@ class Settings(BaseSettings):
         validation_alias="GATEWAY_LEGACY_API_KEY_ENABLED",
     )
     gateway_user_id: str = Field(default="default", validation_alias="GATEWAY_USER_ID")
+    # 部署形态提示，只影响 Web Console 的引导文案（如安卓 App 内嵌运行时不再
+    # 让用户去找 credentials/gateway.txt 文件）。留空表示普通 Docker/源码部署。
+    deployment_profile: Literal["", "embedded"] = Field(
+        default="",
+        validation_alias="MEMGW_DEPLOYMENT_PROFILE",
+    )
     gateway_allow_user_id_header: bool = Field(
         default=False,
         validation_alias="GATEWAY_ALLOW_USER_ID_HEADER",

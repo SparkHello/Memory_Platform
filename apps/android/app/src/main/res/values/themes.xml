@@ -1,4 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.MemoryPlatform" parent="Theme.Material3.DayNight.NoActionBar" />
+    <!-- 与 Web Console 一致的暖金主色；其余颜色沿用 Material3 日夜主题默认值。 -->
+    <style name="Theme.MemoryPlatform" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brand_gold</item>
+        <item name="colorOnPrimary">@color/brand_on_gold</item>
+        <item name="colorPrimaryContainer">@color/brand_gold_container</item>
+        <item name="colorOnPrimaryContainer">@color/brand_on_gold_container</item>
+    </style>
+
+    <!-- 首次使用清单的一行：前面的圆点/对勾由代码按状态切换。 -->
+    <style name="Widget.MemoryPlatform.Step" parent="Widget.AppCompat.TextView">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">10dp</item>
+        <item name="android:drawablePadding">10dp</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:textAppearance">?attr/textAppearanceBodyLarge</item>
+    </style>
+
+    <style name="Widget.MemoryPlatform.RowLabel" parent="Widget.AppCompat.TextView">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">10dp</item>
+        <item name="android:textAppearance">?attr/textAppearanceLabelMedium</item>
+        <item name="android:textColor">?android:attr/textColorSecondary</item>
+    </style>
+
+    <style name="Widget.MemoryPlatform.Row" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+    </style>
+
+    <style name="Widget.MemoryPlatform.RowValue" parent="Widget.AppCompat.TextView">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:textIsSelectable">true</item>
+        <item name="android:textAppearance">?attr/textAppearanceBodyMedium</item>
+    </style>
 </resources>

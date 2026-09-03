@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import console_login
-from app.auth.tokens import AuthTokenStore
+from app.auth.tokens import AuthStoreError, AuthTokenStore
 from app.config import get_settings
 from app.main import create_app
 
@@ -137,6 +137,8 @@ def test_exchange_delivers_console_token_exactly_once(
         token = delivered["token"]
         assert delivered["token_id"] == minted["token_id"]
         assert delivered["user_id"] == "default"
+        # HTTP 签发的 code 永远不携带管理密钥。
+        assert delivered["model_admin_key"] is None
 
         # 交付的明文是真实可用的 console 凭证。
         record = _auth_store().authenticate(token)
@@ -303,3 +305,103 @@ def test_code_and_token_plaintext_are_never_stored(
     assert code_hash == hashlib.sha256(code.encode("utf-8")).hexdigest()
     assert (user_id, console_token_id) == ("default", minted["token_id"])
     assert used_at is not None
+
+
+def _active_console_token_ids() -> set[str]:
+    return {
+        record.token_id
+        for record in _auth_store().list_tokens(user_id="default")
+        if record.role == "console" and record.revoked_at is None
+    }
+
+
+def test_mint_for_token_reuses_existing_token_and_delivers_admin_key(
+    local_client: TestClient,
+) -> None:
+    """安卓 App 的一键登录：交付既有首次登录密钥与管理密钥，不新增 token。"""
+    created = _auth_store().create_token(
+        name="first-console", user_id="default", role="console"
+    )
+    before = _active_console_token_ids()
+    store = console_login.ConsoleLoginCodeStore(_auth_database_path())
+    minted = store.mint_for_token(created.token, admin_key="synthetic-admin-key")
+    assert minted.token_id == created.record.token_id
+    assert _active_console_token_ids() == before
+
+    exchanged = local_client.post(
+        "/auth/console-login-exchange", json={"code": minted.code}
+    )
+    assert exchanged.status_code == 200
+    delivered = exchanged.json()
+    assert delivered["token"] == created.token
+    assert delivered["token_id"] == created.record.token_id
+    assert delivered["model_admin_key"] == "synthetic-admin-key"
+
+    replay = local_client.post(
+        "/auth/console-login-exchange", json={"code": minted.code}
+    )
+    assert replay.status_code == 401
+    assert replay.json() == _EXCHANGE_FAILURE
+    # 既有 token 依然可用。
+    assert _auth_store().authenticate(created.token) is not None
+
+
+def test_mint_for_token_expiry_never_revokes_existing_token(
+    local_client: TestClient,
+) -> None:
+    created = _auth_store().create_token(
+        name="first-console", user_id="default", role="console"
+    )
+    store = console_login.ConsoleLoginCodeStore(_auth_database_path())
+    minted = store.mint_for_token(created.token)
+    _expire_code(minted.code)
+
+    expired = local_client.post(
+        "/auth/console-login-exchange", json={"code": minted.code}
+    )
+    assert expired.status_code == 401
+    assert _token_record(created.record.token_id).revoked_at is None
+
+    # 下一次签发时的过期清理同样不能碰这枚既有 token。
+    again = store.mint_for_token(created.token)
+    _expire_code(again.code)
+    store.mint_for_token(created.token)
+    assert _token_record(created.record.token_id).revoked_at is None
+
+    # 进程重启丢失明文：既有 token 也不能被吊销。
+    lost = store.mint_for_token(created.token)
+    console_login._clear_pending_tokens()
+    response = local_client.post(
+        "/auth/console-login-exchange", json={"code": lost.code}
+    )
+    assert response.status_code == 401
+    assert _token_record(created.record.token_id).revoked_at is None
+
+
+def test_mint_for_token_rejects_non_console_or_revoked(
+    local_client: TestClient,
+) -> None:
+    store = console_login.ConsoleLoginCodeStore(_auth_database_path())
+    chat = _auth_store().create_token(name="chat", user_id="default", role="chat")
+    with pytest.raises(AuthStoreError):
+        store.mint_for_token(chat.token)
+    console = _auth_store().create_token(
+        name="console", user_id="default", role="console"
+    )
+    _auth_store().revoke_token(console.record.token_id)
+    with pytest.raises(AuthStoreError):
+        store.mint_for_token(console.token)
+    with pytest.raises(AuthStoreError):
+        store.mint_for_token("not-a-token")
+
+
+def test_embedded_deployment_profile_is_reported_by_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _build_client(monkeypatch) as plain:
+        assert plain.get("/health").json() == {"status": "ok"}
+    monkeypatch.setenv("MEMGW_DEPLOYMENT_PROFILE", "embedded")
+    get_settings.cache_clear()
+    with _build_client(monkeypatch) as embedded:
+        assert embedded.get("/health").json() == {"status": "ok", "deployment": "embedded"}
+    get_settings.cache_clear()

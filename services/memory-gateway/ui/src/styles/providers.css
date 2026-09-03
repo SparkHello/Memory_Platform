@@ -1057,6 +1057,25 @@
   gap: 12px;
 }
 
+/* 向导里「去领 Key」的引导：非专业用户最常卡在这一步。 */
+.provider-key-help {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: var(--text-caption);
+  line-height: 1.5;
+}
+
+.provider-key-help a {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: 0 2px;
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .provider-capability-field {
   display: grid;
   gap: 8px;

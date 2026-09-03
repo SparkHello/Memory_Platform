@@ -13,7 +13,7 @@ test("one-time login link exchanges the code and enters the console", async ({ p
 
   // 成功：直接进入主站（模型配置引导），而不是「输入访问密钥」门槛或「页面不存在」。
   await expect(page.getByRole("heading", { name: "连接一个模型渠道" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "输入访问密钥" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "输入登录密钥" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "页面不存在" })).toHaveCount(0);
 
   // 交换来的 console token 已写入本地存储。
@@ -43,7 +43,7 @@ test("expired login link falls back to manual token entry with a notice", async 
   await page.goto("/ui/#login=mgc_expired_or_reused_code_0000000000");
 
   // 失败：落回既有首启填 key 页，并显示失效提示；不会显示「页面不存在」。
-  await expect(page.getByRole("heading", { name: "输入访问密钥" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输入登录密钥" })).toBeVisible();
   await expect(page.getByRole("alert")).toContainText(
     "登录链接已失效，请重新运行 memgw open"
   );
@@ -59,7 +59,7 @@ test("expired login link falls back to manual token entry with a notice", async 
 
   // 手动粘贴 gateway.txt 的兜底流程原样可用。
   const consoleToken = "mgw_firstconsole_synthetic_console_secret_000000000000";
-  await page.getByLabel("访问密钥").fill(consoleToken);
+  await page.getByLabel("登录密钥").fill(consoleToken);
   await page.getByRole("button", { name: "验证并继续" }).click();
   await expect(page.getByRole("heading", { name: "连接一个模型渠道" })).toBeVisible();
   expect(

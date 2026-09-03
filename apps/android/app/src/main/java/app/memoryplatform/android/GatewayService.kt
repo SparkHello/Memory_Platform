@@ -98,7 +98,7 @@ class GatewayService : Service() {
             this, 1, Intent(this, GatewayService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+            .setSmallIcon(R.drawable.ic_stat_gateway)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(text)
             .setContentIntent(open)

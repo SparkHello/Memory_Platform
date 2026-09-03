@@ -3,26 +3,66 @@
     <string name="app_name">Memory Platform</string>
     <string name="notification_channel">后台服务</string>
     <string name="notification_title">Memory Platform 正在运行</string>
+
     <string name="state_stopped">已停止</string>
     <string name="state_starting">启动中…</string>
     <string name="state_running">运行中</string>
     <string name="state_failed">启动失败</string>
+    <string name="health_unknown">未检测</string>
+    <string name="health_ok">健康检查正常</string>
+    <string name="health_unreachable">健康检查不可达</string>
+    <string name="health_http">健康检查 HTTP %1$d</string>
+    <string name="error_prefix">错误：%1$s</string>
+
+    <!-- 首次使用清单 -->
+    <string name="checklist_title">第一次用，照着这四步走</string>
+    <string name="step_service">启动服务</string>
+    <string name="step_model">在控制台配置一个模型渠道</string>
+    <string name="step_chat_key">在控制台「客户端接入」创建聊天密钥</string>
+    <string name="step_battery">关闭电池优化，后台才不会被杀</string>
+    <string name="step_state_pending">待完成</string>
+    <string name="step_state_checking">检查中…</string>
+    <string name="step_state_done">已完成</string>
+    <string name="checklist_all_done">都配好了。聊天 App 里填下面的地址、聊天密钥和模型名，就可以聊了。</string>
+
+    <!-- 主操作 -->
     <string name="action_start">启动服务</string>
     <string name="action_stop">停止服务</string>
     <string name="action_open_console">打开控制台</string>
-    <string name="action_copy_token">复制首次登录令牌</string>
-    <string name="action_copy_admin_key">复制模型网关管理密钥</string>
-    <string name="action_battery">关闭电池优化</string>
-    <string name="action_export">导出诊断包</string>
-    <string name="export_running">正在打包日志、配置和记忆库快照…</string>
-    <string name="export_failed">导出失败：%1$s</string>
-    <string name="hint_clients">怎么用：1. 复制首次登录令牌，打开控制台粘贴登录；2. 在控制台配置模型时粘贴管理密钥；3. 聊天 App 里填上面的 OpenAI 兼容地址，令牌在控制台「接入」页创建。</string>
-    <string name="label_console_url">控制台</string>
-    <string name="label_openai_url">聊天 App 用的 OpenAI 兼容地址</string>
+    <string name="action_open_console_model">打开控制台配置模型</string>
+    <string name="action_open_console_key">打开控制台创建聊天密钥</string>
+    <string name="open_console_hint">从这里打开会自动登录，不用手动粘贴密钥。</string>
+    <string name="login_link_failed">自动登录链接生成失败（%1$s），已改为普通方式打开控制台</string>
+
+    <!-- 电池优化 -->
+    <string name="battery_title">后台可能被系统限制</string>
+    <string name="battery_body">没关电池优化时，熄屏后向模型发请求会被系统掐断，记忆会悄悄丢失。小米、华为、OPPO、vivo 等系统还需在系统设置里允许自启动、把省电策略设为无限制，并在最近任务里锁定本 App。</string>
+    <string name="action_battery">去关闭电池优化</string>
+    <string name="battery_already_ignored">已经关闭电池优化</string>
+
+    <!-- 聊天 App 填写项 -->
+    <string name="client_card_title">聊天 App 里这样填</string>
+    <string name="client_card_body">在 Chatbox、RikkaHub 等 App 里新建一个「OpenAI 兼容」供应商，填下面两项，API Key 填控制台创建的聊天密钥。</string>
+    <string name="label_openai_url">Base URL（接口地址）</string>
+    <string name="label_model_name">模型名</string>
+    <string name="model_name_value">memory-auto</string>
+
+    <!-- 高级 -->
+    <string name="advanced_title">高级</string>
+    <string name="advanced_expand">展开</string>
+    <string name="advanced_collapse">收起</string>
+    <string name="label_console_url">控制台网址</string>
     <string name="label_mcp_url">MCP 地址</string>
+    <string name="action_copy_token">复制登录密钥</string>
+    <string name="action_copy_admin_key">复制管理密钥</string>
+    <string name="action_export">导出诊断包</string>
+    <string name="advanced_hint">登录密钥用于手动登录控制台，管理密钥用于控制台「模型与路由」页；从上面的「打开控制台」进入时两把都会自动带上，一般用不到。</string>
+
     <string name="action_copy">复制</string>
     <string name="copied">已复制</string>
-    <string name="token_copied">令牌已复制，30 秒后请从剪贴板清除</string>
-    <string name="admin_key_copied">管理密钥已复制。控制台配置模型连接时粘贴到「模型网关管理密钥」</string>
-    <string name="token_missing">未找到凭据文件；服务尚未完成初始化</string>
+    <string name="token_copied">登录密钥已复制。粘贴到控制台登录页即可，30 秒后请从剪贴板清除</string>
+    <string name="admin_key_copied">管理密钥已复制。在控制台「模型与路由」页粘贴</string>
+    <string name="token_missing">还没有生成密钥；服务尚未完成初始化</string>
+    <string name="export_running">正在打包日志、配置和记忆库快照…</string>
+    <string name="export_failed">导出失败：%1$s</string>
 </resources>

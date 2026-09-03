@@ -7,12 +7,12 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
   expect(viewport).toEqual({ width: 1440, height: 900 });
 
   await page.goto("/ui/");
-  await expect(page.getByRole("heading", { name: "输入访问密钥" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "输入登录密钥" })).toBeVisible();
   await expect(page.getByLabel("服务地址")).toHaveCount(0);
   await expect(page.getByLabel("用户 ID")).toHaveCount(0);
 
   const consoleToken = "mgw_firstconsole_synthetic_console_secret_000000000000";
-  await page.getByLabel("访问密钥").fill(consoleToken);
+  await page.getByLabel("登录密钥").fill(consoleToken);
   await page.getByRole("button", { name: "验证并继续" }).click();
   await expect(page.getByRole("heading", { name: "连接一个模型渠道" })).toBeVisible();
   expect(
@@ -24,7 +24,7 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
     )
   ).toBe(true);
 
-  await page.getByLabel("Model Gateway admin 密钥").fill(
+  await page.getByLabel("管理密钥", { exact: true }).fill(
     "synthetic-admin-secret-that-is-never-persisted"
   );
   await page.getByRole("button", { name: "验证管理密钥" }).click();
@@ -33,8 +33,8 @@ test("first Console token setup, expert mode, and interrupted channel draft stay
   const candidateKey = "synthetic-provider-candidate-key-never-persisted";
   await page.getByRole("radio", { name: /DeepSeek 官方/ }).click();
   await page.getByPlaceholder("sk-...").fill(candidateKey);
-  await page.getByRole("button", { name: "只读发现模型" }).click();
-  await expect(page.getByText(/候选渠道和密钥尚未保存/)).toBeVisible();
+  await page.getByRole("button", { name: "列出可用模型" }).click();
+  await expect(page.getByText(/渠道和密钥还没有保存/)).toBeVisible();
   // 已填写供应商 API Key 时关闭必须先确认，误触不会直接丢弃草稿。
   await page.getByRole("button", { name: "关闭新建渠道" }).click();
   const discardDialog = page
