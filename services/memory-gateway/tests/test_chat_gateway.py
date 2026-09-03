@@ -2295,3 +2295,78 @@ def test_v1_mixed_message_withholds_sensitive_sentence_and_saves_directive_local
     assert [memory.content for memory in memories] == ["我的银行卡密码是 123456。"]
     assert memories[0].sensitivity == "sensitive"
     assert memories[0].embedding_json is None
+
+
+def _seed_profile_memory(memory_store: MemoryStore, content: str, *, sensitivity: str = "normal", importance: int = 7):
+    return memory_store.create_memory(
+        user_id="default",
+        content=content,
+        type="preference",
+        importance=importance,
+        sensitivity=sensitivity,
+        embedding_json="[1.0, 0.0]",
+        embedding_space_id="test-space",
+    )
+
+
+def test_self_reference_question_injects_profile_when_recall_is_empty(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    # Query vector is orthogonal to every memory: similarity recall finds nothing.
+    embedding = RecordingEmbeddingClient([0.0, 1.0])
+    client.app.dependency_overrides[deps.get_embedding_client] = lambda: embedding
+    _seed_profile_memory(memory_store, "用户很喜欢 CS（计算机科学）。", importance=7)
+    _seed_profile_memory(memory_store, "用户不会玩 FPS 游戏。", importance=6)
+    _seed_profile_memory(memory_store, "用户的住址是某小区 3 栋。", sensitivity="private", importance=9)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Memory-Mode": "read"},
+        json={"model": "memory-auto", "messages": [{"role": "user", "content": "你了解我什么？"}]},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-hit-count"] == "2"
+    injected = json.dumps(fake_gateway.payloads[-1]["messages"], ensure_ascii=False)
+    assert "计算机科学" in injected and "FPS" in injected
+    # private memories are never part of the profile fallback
+    assert "住址" not in injected
+
+
+def test_unrelated_question_keeps_relevance_gated_recall(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_gateway,
+) -> None:
+    embedding = RecordingEmbeddingClient([0.0, 1.0])
+    client.app.dependency_overrides[deps.get_embedding_client] = lambda: embedding
+    _seed_profile_memory(memory_store, "用户很喜欢 CS（计算机科学）。")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**auth_headers, "X-Memory-Mode": "read"},
+        json={"model": "memory-auto", "messages": [{"role": "user", "content": "今天天气怎么样"}]},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-memory-hit-count"] == "0"
+    assert "计算机科学" not in json.dumps(fake_gateway.payloads[-1]["messages"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["你知道我读什么专业吗", "你了解我什么？", "关于我你记得哪些", "what do you know about me?", "Who am I?"],
+)
+def test_self_reference_pattern_matches_about_me_questions(text: str) -> None:
+    from app.api.chat_gateway import _is_self_reference_query
+
+    assert _is_self_reference_query(text)
+
+
+@pytest.mark.parametrize("text", ["今天天气怎么样", "帮我写个排序函数", "我的订单到哪了", "x" * 300 + " 你了解我什么"])
+def test_self_reference_pattern_ignores_ordinary_messages(text: str) -> None:
+    from app.api.chat_gateway import _is_self_reference_query
+
+    assert not _is_self_reference_query(text)

@@ -12,6 +12,7 @@
 - Console：模型胶囊可点开修改能力并「自动检测能力」；新增模型面板同样支持自动检测，适配 profile 收进「高级」。
 - 记忆抽取：`source_quote`/`context_quote` 逐字核对改为格式容错（忽略 markdown 标记、空白、emoji、全半角），`context_quote` 核对失败不再整条否决而是丢弃引用；新增「肯定确认」规则，用户仅回答「对了/是的」时可把紧邻的助手原话作为事实锚点，关系仍须在可见上下文中有证据；新增 `education` 关系族。
 - Console 静态资源缓存头：`index.html` 为 `no-cache`，`assets/` 带 hash 文件为一年 immutable。
+- 自指问题兜底召回（`CHAT_GATEWAY_SELF_REFERENCE_RECALL`，默认开启）：用户明确在问自己（「你了解我什么」「我的专业是什么」「what do you know about me」等）而相似度召回为空时，按重要度注入最多 `CHAT_GATEWAY_SEARCH_LIMIT` 条仍有效的 `normal` 记忆；`private`/`sensitive` 记忆不参与。普通消息的相关性门槛不变。
 
 - `/v1/models` 新增记忆模式模型别名 `memory-read`（只召回不写入）与 `memory-off`（纯透明代理）：发不出自定义 Header 的客户端（Chatbox、RikkaHub 等）改模型名即可切换模式。所有 `memory-*` 别名都解析到同一聊天 route，只决定记忆模式；优先级为只读 token 限制 > `X-Memory-Mode` > 别名 > `CHAT_GATEWAY_DEFAULT_MEMORY_MODE`。旧别名 `auto`/`default`/`memory-gateway` 继续接受但不列出。客户端需重新同步模型列表。
 - 提取前置过滤（`CHAT_GATEWAY_EXTRACTION_PREFILTER`，默认开启）：仅为寒暄致谢、纯提问或纯代码的轮次不再调用 `memory.extract`，也不写 finalize outbox；跳过原因以「本地预过滤：」开头写入决策日志（只记长度与 SHA-256）。明确的「记住/remember」请求与助手提问后的短回答永不跳过。不影响 `memory.compact` 压缩与请求侧召回。

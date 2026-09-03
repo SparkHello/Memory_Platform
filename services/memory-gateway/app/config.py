@@ -102,6 +102,13 @@ class Settings(BaseSettings):
         default="read-write",
         validation_alias="CHAT_GATEWAY_DEFAULT_MEMORY_MODE",
     )
+    # When the user asks about themselves ("你了解我什么", "我的专业是什么",
+    # "what do you know about me") and similarity recall finds nothing, inject
+    # the most important normal-sensitivity memories instead of nothing.
+    chat_gateway_self_reference_recall: bool = Field(
+        default=True,
+        validation_alias="CHAT_GATEWAY_SELF_REFERENCE_RECALL",
+    )
     chat_gateway_search_limit: int = Field(
         default=8,
         ge=1,

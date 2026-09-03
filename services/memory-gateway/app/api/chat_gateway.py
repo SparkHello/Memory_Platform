@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -1152,6 +1153,13 @@ async def _build_turn_context(
     )
 
     recalled_memories = [hit.memory for hit in hits]
+    if not recalled_memories and settings.chat_gateway_self_reference_recall:
+        recalled_memories = await _self_reference_fallback(
+            user_id=user_id,
+            query=query,
+            store=store,
+            limit=settings.chat_gateway_search_limit,
+        )
     search_block, injected_memories = _fit_memory_context(
         recalled_memories,
         max_chars=settings.chat_gateway_context_max_chars,
@@ -1225,6 +1233,71 @@ async def _resolve_previous_context(
         if recent is not None:
             return recent, "conversation-fallback"
     return None, "root"
+
+
+# Questions about the user themselves. Deliberately narrow: only explicit
+# "about me" phrasings, so ordinary chat keeps the relevance-gated recall.
+_SELF_REFERENCE_PATTERN = re.compile(
+    r"(你(了解|认识|知道|记得|清楚)我"
+    r"|你对我(了解|知道|记得|印象)"
+    r"|关于我(的)?(信息|情况|资料|事)?"
+    r"|我是谁"
+    r"|我的(专业|名字|叫什么|偏好|喜好|爱好|习惯|职业|工作|背景|信息|情况|资料|兴趣|性格|学校|大学)"
+    r"|介绍(一下)?我"
+    r"|(what|anything|something)\s+(do\s+)?you\s+(know|remember)\s+about\s+me"
+    r"|tell\s+me\s+about\s+(myself|me)"
+    r"|who\s+am\s+i"
+    r"|my\s+(major|name|job|preferences?|hobbies|habits|background|profile))",
+    re.IGNORECASE,
+)
+_SELF_REFERENCE_MAX_QUERY_CHARS = 200
+
+
+def _is_self_reference_query(query: str) -> bool:
+    text = (query or "").strip()
+    if not text or len(text) > _SELF_REFERENCE_MAX_QUERY_CHARS:
+        return False
+    return _SELF_REFERENCE_PATTERN.search(text) is not None
+
+
+async def _self_reference_fallback(
+    *,
+    user_id: str,
+    query: str,
+    store: MemoryStore,
+    limit: int,
+) -> list[MemoryRecord]:
+    """Profile-style recall for explicit "about me" questions.
+
+    Similarity recall has nothing to match against for "what do you know about
+    me"; return the most important, still-valid, normal-sensitivity memories so
+    the model can answer from what it actually knows. Private and sensitive
+    memories stay out: they are only ever injected when specifically relevant.
+    """
+
+    if not _is_self_reference_query(query):
+        return []
+    try:
+        candidates = await anyio.to_thread.run_sync(
+            partial(store.list_memories, user_id=user_id, limit=max(limit * 4, 20))
+        )
+    except Exception:
+        logger.exception("自指问题兜底召回读取记忆失败；本轮不注入。")
+        return []
+    selected: list[MemoryRecord] = []
+    for memory in candidates:
+        if memory.sensitivity != "normal":
+            continue
+        if (memory.status or "") in {"archived", "resolved"}:
+            continue
+        if memory.valid_until:
+            continue
+        selected.append(memory)
+        if len(selected) >= limit:
+            break
+    if selected:
+        logger.info("自指问题兜底注入 %d 条记忆（常规召回为空）。", len(selected))
+    return selected
 
 
 async def _safe_memory_search(
