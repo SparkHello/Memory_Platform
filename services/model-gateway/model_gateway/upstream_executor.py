@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
 import socket
 import time
 from typing import Any, AsyncIterator, Mapping
@@ -529,6 +530,13 @@ class UpstreamExecutor:
                     ),
                 )
         except (OSError, ValueError) as exc:
+            # Full reason (hostname, resolved addresses) goes to the server log
+            # for diagnostics; the client only gets the bounded category.
+            _LOGGER.warning(
+                "上游请求在本地被拒绝或失败：%s: %s",
+                type(exc).__name__,
+                str(exc).strip()[:400],
+            )
             return _StartedJsonPost(
                 local_error_type=type(exc).__name__,
                 local_error_detail=_local_failure_detail(exc),
@@ -640,6 +648,9 @@ async def record_exact_usage(
     except Exception as exc:
         _mark_storage_unavailable(storage_monitor)
         raise UsageLedgerRecordError("usage ledger record failed") from exc
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def connection_timeouts(
@@ -895,6 +906,15 @@ def _local_failure_detail(exc: BaseException) -> str:
     message = str(exc).strip()
     if "密钥" in message:
         return "上游密钥格式无效"
+    # Bounded categories only: the exact hostname/addresses stay in the server log.
+    if "本地或私有地址" in message:
+        return (
+            "上游域名被解析到本地或私有地址，已按安全策略拒绝。这通常是手机上的 VPN/代理"
+            "（Clash、Surge 等 fake-ip 模式）造成的：关闭 VPN，或在渠道的"
+            " allowed_private_networks 中放行 198.18.0.0/15 后重试"
+        )
+    if "没有可用地址" in message:
+        return "上游域名无法解析到任何地址，请检查网络或 DNS 后重试"
     return "上游 URL 或请求 Header 未通过安全校验"
 
 

@@ -379,3 +379,16 @@ def test_dns_failure_is_reported_as_resolution_not_safety() -> None:
     detail = upstream_executor._local_failure_detail(socket.gaierror(8, "nodename nor servname provided"))
     assert detail == "上游域名解析失败，请检查网络、VPN 或 DNS 后重试"
     assert "nodename" not in detail
+
+
+def test_private_address_block_is_explained_without_leaking_addresses() -> None:
+    detail = upstream_executor._local_failure_detail(
+        ValueError("base_url hostname 解析到未显式允许的本地或私有地址（api.example → 198.18.0.5）。")
+    )
+    assert "VPN" in detail and "198.18.0.0/15" in detail
+    assert "198.18.0.5" not in detail and "api.example" not in detail
+
+
+def test_unresolvable_hostname_is_reported_as_dns_problem() -> None:
+    detail = upstream_executor._local_failure_detail(ValueError("base_url hostname 没有可用地址"))
+    assert detail == "上游域名无法解析到任何地址，请检查网络或 DNS 后重试"
