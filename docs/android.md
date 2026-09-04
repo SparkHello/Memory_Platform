@@ -37,7 +37,8 @@ App 本身是一张四步清单状态页（启动服务 → 配置模型 → 创
 | `apps/android/requirements-embedded.txt` | 不含 `uvicorn[standard]` 的完整依赖闭包，版本与根目录 `requirements-runtime.lock` 一致 |
 | `apps/android/app/build.gradle.kts` | Chaquopy 17、Python 3.14、arm64；pip 用 `--no-deps --find-links wheels/`；构建时把 `ui/dist` 拷进 assets |
 | `GatewayService.kt` | 前台服务（`specialUse` 类型），在工作线程调用 Python `start()`，通知栏显示状态 |
-| `MainActivity.kt` | 状态页：四步清单（每 5 秒探测 `/health`、`/readyz`，并用登录密钥查 `/auth/tokens` 判断有没有聊天密钥）、按进度变化的主按钮（启动服务 / 打开控制台配置模型 / 打开控制台创建聊天密钥）、未关电池优化时的警告卡、聊天 App 填写项（Base URL、模型名）；「高级」里才是复制登录密钥、复制管理密钥、MCP 地址、导出诊断包（分享面板） |
+| `MainActivity.kt` | 状态页：四步清单（每 5 秒探测 `/health`、`/readyz`，并用登录密钥查 `/auth/tokens` 判断有没有聊天密钥）、按进度变化的主按钮（启动服务 / 打开控制台配置模型 / 打开控制台创建聊天密钥）、未关电池优化时的警告卡、聊天 App 填写项（Base URL、模型名）；「高级」里才是复制登录密钥、复制管理密钥、MCP 地址、查看日志（弹窗 + 复制全部）、导出诊断包（分享面板，默认不含记忆内容）、当前版本与检查更新 |
+| `UpdateChecker.kt` | 读取 GitHub Releases（`android-v*` 标签，只比较 x.y.z 三段），每 6 小时自动检查一次或手动触发；比当前 versionName 新时状态页显示「有新版本」卡（下载 APK 资产 / 忽略此版本），结果缓存到 SharedPreferences |
 | `ConsoleAssets.kt` | 把 assets/ui 按版本号解压到 `filesDir/ui`，因为 StaticFiles 需要真实文件 |
 | `BootReceiver.kt` | 开机自启（用户上次是运行状态时） |
 | `scripts/android/build-wheels.sh` | 打三个第一方纯 Python 轮子到 `apps/android/wheels/` |
@@ -128,16 +129,26 @@ bash scripts/android/build-wheels.sh
 
 正式包用 `./gradlew assembleRelease` 构建，签名配置读取 `apps/android/keystore.properties`（已 gitignore），它指向仓库外的密钥库 `~/.memory-platform/android-release.keystore`。**这个密钥库和 properties 文件务必备份**：安卓只允许同一签名的包覆盖升级，丢了密钥库就只能让用户卸载重装（本机记忆随之丢失）。debug 包与 release 包签名不同，从 debug 包切到 release 包也必须先卸载；切换前先在控制台导出备份。产物文件名为 `memory-platform-android-<版本>-release.apk`，发布到 GitHub Releases 的预发布标签（`android-v*`，不触发 Docker 镜像流水线）。
 
-## 诊断包
+## 日志与诊断包
 
-状态页「导出诊断包」生成一个 zip 并弹出系统分享面板（可发给自己、存到云盘或传到电脑）。内容：
+**查看日志**（「高级」）：弹窗显示版本、系统、服务状态，`stack.log` 尾部（最多 40 KB）和本进程最近 150 行 logcat，「复制全部」后直接粘贴到聊天里即可求助。日志里没有记忆内容，也没有密钥明文。嵌入式入口 `recent_logs(data_dir, max_bytes)` 负责读尾部。
+
+**导出诊断包**（「高级」）生成一个 zip 并弹出系统分享面板。默认内容**不含任何记忆或对话文本**：
 
 - `runtime.json`、`logs/stack.log*`（服务日志，2 MB 轮转 3 份）、`logs/logcat.txt`（App 进程日志）
 - `config/settings.env` 与 `config/model-gateway.config.json`，所有密钥类字段已替换为 `<redacted>`
-- `db/memory.db` 一致性快照，含 memories、memory_decision_logs、chat_finalize_jobs、conversation_branch_nodes、core_memory_sections
-- `reports/summary.json`（按状态/决策/任务状态计数）、`reports/decision_logs.jsonl`（最近 1000 条抽取决策及原因）、`reports/finalize_jobs.json`（未完成的落库任务，即尚未保存的记忆）、`reports/recent_conversations.json`（最近 50 段对话摘要与近几轮原文）
+- `reports/summary.json`（按状态/决策/任务状态计数）、`reports/finalize_jobs.json`（未完成落库任务的 id/kind/状态/次数/last_error，不含 payload）
 
-明确排除：auth.db、model-gateway/secrets.env、knowledge.db。定位「某条记忆没存下来」看 decision_logs 里对应 conversation 的 decision/reason，再看 finalize_jobs 里有没有 pending/failed。
+勾选「诊断包附带记忆库快照与对话内容」（`export_diagnostics(..., include_memory=True)`）后追加：
+
+- `db/memory.db` 一致性快照，含 memories、memory_decision_logs、chat_finalize_jobs、conversation_branch_nodes、core_memory_sections
+- `reports/decision_logs.jsonl`（最近 1000 条抽取决策及原因）、完整 `reports/finalize_jobs.json`（含 payload 与最近 50 条已完成）、`reports/recent_conversations.json`（最近 50 段对话摘要与近几轮原文）
+
+两种模式都排除：auth.db、model-gateway/secrets.env、knowledge.db。定位「某条记忆没存下来」需要勾选后导出，看 decision_logs 里对应 conversation 的 decision/reason，再看 finalize_jobs 里有没有 pending/failed。
+
+## 自动检查更新
+
+App 每 6 小时（前台 onResume 时判断）匿名读取一次 `https://api.github.com/repos/SparkHello/Memory_Platform/releases`，只看 `android-v*` 标签，取 `x.y.z` 三段与安装包 versionName 比较（`-preview.N` 后缀不参与比较，所以同版本重打的预览包不会提示）。有新版本时状态页出现「有新版本」卡：「下载新版本」打开 release 里的 `.apk` 资产（无资产时打开 release 页面），「忽略此版本」记住该版本号不再提示；「高级」里可手动「检查更新」。网络不通（例如未开代理）时静默失败，手动检查才提示原因。**发布新版必须同时提高 `versionName` 和 `versionCode`**，否则旧客户端不会提示更新，安卓也会拒绝覆盖安装。
 
 ## 后续可以补的
 

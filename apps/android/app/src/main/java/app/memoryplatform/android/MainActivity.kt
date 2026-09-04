@@ -13,11 +13,16 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
 import android.os.PowerManager
+import android.graphics.Typeface
+import android.util.TypedValue
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -47,7 +52,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var primaryHint: TextView
     private lateinit var stopAction: Button
     private lateinit var batteryCard: View
+    private lateinit var updateCard: View
+    private lateinit var updateTitle: TextView
+    private lateinit var updateBody: TextView
     private val handler = Handler(Looper.getMainLooper())
+    private var pendingUpdate: UpdateChecker.Release? = null
 
     /** Result of the last background probe against the running stack. */
     private data class Readiness(
@@ -87,6 +96,9 @@ class MainActivity : AppCompatActivity() {
         primaryHint = findViewById(R.id.primaryHint)
         stopAction = findViewById(R.id.stopAction)
         batteryCard = findViewById(R.id.batteryCard)
+        updateCard = findViewById(R.id.updateCard)
+        updateTitle = findViewById(R.id.updateTitle)
+        updateBody = findViewById(R.id.updateBody)
         readiness = readiness.copy(health = getString(R.string.health_unknown))
 
         primaryAction.setOnClickListener {
@@ -113,6 +125,17 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<Button>(R.id.battery).setOnClickListener { requestIgnoreBatteryOptimizations() }
         findViewById<Button>(R.id.exportDiagnostics).setOnClickListener { exportDiagnostics() }
+        findViewById<Button>(R.id.viewLogs).setOnClickListener { showLogs() }
+        findViewById<Button>(R.id.checkUpdate).setOnClickListener { checkForUpdate(manual = true) }
+        findViewById<Button>(R.id.updateDownload).setOnClickListener { openUpdate() }
+        findViewById<Button>(R.id.updateIgnore).setOnClickListener {
+            pendingUpdate?.let { UpdateChecker.ignore(this, it) }
+            pendingUpdate = null
+            updateCard.visibility = View.GONE
+        }
+        findViewById<TextView>(R.id.appVersion).text =
+            getString(R.string.app_version, UpdateChecker.installedVersion(this))
+        showUpdate(UpdateChecker.cachedUpdate(this))
 
         val advancedPanel = findViewById<View>(R.id.advancedPanel)
         val advancedState = findViewById<TextView>(R.id.advancedState)
@@ -129,6 +152,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         handler.post(poll)
+        if (UpdateChecker.shouldAutoCheck(this)) checkForUpdate(manual = false)
     }
 
     override fun onPause() {
@@ -303,17 +327,22 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, copiedMessage, Toast.LENGTH_LONG).show()
     }
 
-    /** Zip logs, redacted config, a memory.db snapshot and decision reports, then hand it to the share sheet. */
+    /**
+     * Zip logs, redacted config and count-only reports, then hand it to the share
+     * sheet. The memory.db snapshot and conversation digests are only included
+     * when the user ticks the checkbox: the default bundle carries no memory content.
+     */
     private fun exportDiagnostics() {
         val button = findViewById<Button>(R.id.exportDiagnostics)
+        val includeMemory = findViewById<CheckBox>(R.id.includeMemory).isChecked
         button.isEnabled = false
-        Toast.makeText(this, R.string.export_running, Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, if (includeMemory) R.string.export_running_full else R.string.export_running, Toast.LENGTH_SHORT).show()
         thread(name = "diagnostics-export") {
             val result = try {
                 writeLogcat()
                 val dataDir = File(filesDir, "memory-platform")
                 val json = Python.getInstance().getModule("embedded_stack")
-                    .callAttr("export_diagnostics", dataDir.absolutePath).toString()
+                    .callAttr("export_diagnostics", dataDir.absolutePath, includeMemory).toString()
                 Result.success(File(JSONObject(json).getString("path")))
             } catch (e: Exception) {
                 Result.failure(e)
@@ -347,6 +376,121 @@ class MainActivity : AppCompatActivity() {
             .putExtra(Intent.EXTRA_SUBJECT, file.name)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         startActivity(Intent.createChooser(intent, getString(R.string.action_export)))
+    }
+
+    // ---- Update check -------------------------------------------------------
+
+    private fun checkForUpdate(manual: Boolean) {
+        val button = findViewById<Button>(R.id.checkUpdate)
+        if (manual) {
+            button.isEnabled = false
+            Toast.makeText(this, R.string.update_checking, Toast.LENGTH_SHORT).show()
+        }
+        thread(name = "update-check") {
+            val result = UpdateChecker.check(this, manual)
+            handler.post {
+                button.isEnabled = true
+                when (result) {
+                    is UpdateChecker.Result.UpdateAvailable -> showUpdate(result.release)
+                    is UpdateChecker.Result.UpToDate -> {
+                        showUpdate(null)
+                        if (manual) Toast.makeText(this, R.string.update_none, Toast.LENGTH_SHORT).show()
+                    }
+                    is UpdateChecker.Result.Failed ->
+                        if (manual) Toast.makeText(this, getString(R.string.update_failed, result.reason), Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun showUpdate(release: UpdateChecker.Release?) {
+        pendingUpdate = release
+        if (release == null) {
+            updateCard.visibility = View.GONE
+            return
+        }
+        updateTitle.text = getString(R.string.update_title, release.version, UpdateChecker.installedVersion(this))
+        updateBody.text = getString(R.string.update_body, release.name)
+        updateCard.visibility = View.VISIBLE
+    }
+
+    /** The APK asset downloads straight from the browser; the release page is the fallback. */
+    private fun openUpdate() {
+        val release = pendingUpdate ?: return
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.apkUrl ?: release.pageUrl)))
+    }
+
+    // ---- Logs ----------------------------------------------------------------
+
+    /**
+     * Show the tail of the service log plus this process's recent logcat in a
+     * dialog with a copy button. Pasting text into a chat is far less friction
+     * than sharing a zip, and the log carries no memory content.
+     */
+    private fun showLogs() {
+        val button = findViewById<Button>(R.id.viewLogs)
+        button.isEnabled = false
+        thread(name = "logs-view") {
+            val text = try {
+                collectLogText()
+            } catch (e: Exception) {
+                getString(R.string.logs_failed, e.message ?: e.toString())
+            }
+            handler.post {
+                button.isEnabled = true
+                val view = TextView(this).apply {
+                    typeface = Typeface.MONOSPACE
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextIsSelectable(true)
+                    val pad = (16 * resources.displayMetrics.density).toInt()
+                    setPadding(pad, pad / 2, pad, pad / 2)
+                    this.text = text
+                }
+                val scroll = ScrollView(this).apply { addView(view) }
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.logs_title)
+                    .setView(scroll)
+                    .setPositiveButton(R.string.action_copy_all) { _, _ ->
+                        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText("memory-platform-logs", text))
+                        Toast.makeText(this, R.string.logs_copied, Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton(R.string.action_close, null)
+                    .show()
+                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            }
+        }
+    }
+
+    private fun collectLogText(): String {
+        val dataDir = File(filesDir, "memory-platform")
+        val header = buildString {
+            append("Memory Platform Android ").append(UpdateChecker.installedVersion(this@MainActivity))
+            append(" · Android ").append(Build.VERSION.RELEASE).append(" (").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append(")\n")
+            append("state=").append(StackState.state())
+            append(" health=").append(readiness.health)
+            append(" battery_optimization_ignored=").append(isIgnoringBatteryOptimizations()).append('\n')
+            StackState.status.value?.optString("error", "")?.takeIf { it.isNotEmpty() && it != "null" }?.let { append("error=").append(it).append('\n') }
+        }
+        val stackLog = try {
+            val json = Python.getInstance().getModule("embedded_stack")
+                .callAttr("recent_logs", dataDir.absolutePath, 40_000).toString()
+            val payload = JSONObject(json)
+            val body = payload.optString("text").ifEmpty { getString(R.string.logs_empty) }
+            (if (payload.optBoolean("truncated")) "…(earlier lines omitted)\n" else "") + body
+        } catch (e: Exception) {
+            "stack.log unavailable: $e\n"
+        }
+        val logcat = try {
+            val process = ProcessBuilder("logcat", "-d", "-v", "time", "-t", "150", "--pid=${android.os.Process.myPid()}")
+                .redirectErrorStream(true).start()
+            val out = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            out
+        } catch (e: Exception) {
+            "logcat unavailable: $e\n"
+        }
+        return header + "\n===== stack.log (tail) =====\n" + stackLog.trimEnd() + "\n\n===== logcat (this process, last 150 lines) =====\n" + logcat.trimEnd() + "\n"
     }
 
     private fun isIgnoringBatteryOptimizations(): Boolean =

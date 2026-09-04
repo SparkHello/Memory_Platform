@@ -63,6 +63,29 @@
     <string name="token_copied">登录密钥已复制。粘贴到控制台登录页即可，30 秒后请从剪贴板清除</string>
     <string name="admin_key_copied">管理密钥已复制。在控制台「模型与路由」页粘贴</string>
     <string name="token_missing">还没有生成密钥；服务尚未完成初始化</string>
-    <string name="export_running">正在打包日志、配置和记忆库快照…</string>
+    <string name="export_running">正在打包日志与配置（不含记忆内容）…</string>
+    <string name="export_running_full">正在打包日志、配置、记忆库快照与对话摘要…</string>
     <string name="export_failed">导出失败：%1$s</string>
+    <string name="export_include_memory">诊断包附带记忆库快照与对话内容（默认不带，只在排查“记忆没存下来”时勾选）</string>
+
+    <!-- 日志 -->
+    <string name="action_view_logs">查看日志</string>
+    <string name="logs_hint">遇到问题先点「查看日志」，复制全部粘贴给作者即可；日志里没有记忆内容。</string>
+    <string name="logs_title">最近日志</string>
+    <string name="logs_empty">（服务日志还是空的：服务可能尚未启动过）</string>
+    <string name="logs_failed">读取日志失败：%1$s</string>
+    <string name="logs_copied">日志已复制</string>
+    <string name="action_copy_all">复制全部</string>
+    <string name="action_close">关闭</string>
+
+    <!-- 更新 -->
+    <string name="app_version">当前版本 %1$s</string>
+    <string name="action_check_update">检查更新</string>
+    <string name="update_checking">正在检查更新…</string>
+    <string name="update_none">已经是最新版本</string>
+    <string name="update_failed">检查更新失败：%1$s</string>
+    <string name="update_title">有新版本 %1$s（当前 %2$s）</string>
+    <string name="update_body">%1$s。下载后直接安装覆盖即可，记忆数据会保留；安装时如提示「未知来源」请允许。</string>
+    <string name="action_update_download">下载新版本</string>
+    <string name="action_update_ignore">忽略此版本</string>
 </resources>

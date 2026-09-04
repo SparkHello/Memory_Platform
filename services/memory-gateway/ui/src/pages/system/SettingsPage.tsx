@@ -9,6 +9,24 @@ import { CONFIG_KEYS, CONFIG_KEY_HINTS } from "../../utils/constants";
 import { errorMessage } from "../../utils/format";
 import type { Notify } from "../pageTypes";
 
+/** 页面本身来自回环地址：服务和浏览器在同一台设备上，不存在"地址填错"的可能。 */
+function servedFromLoopback(): boolean {
+  if (typeof window === "undefined") return false;
+  return ["127.0.0.1", "localhost", "[::1]"].includes(window.location.hostname);
+}
+
+/** 健康检查都没过时的提示。回环场景下"确认服务地址与端口"是误导，用户改不了地址。 */
+export function serviceDownMessage(error: unknown, embedded: boolean): string {
+  const generic = errorMessage(error, { credential: "console" });
+  const networkFailure = error instanceof Error && error.message === "Failed to fetch";
+  if (!networkFailure || !servedFromLoopback()) return generic;
+  const onPhone = embedded || (typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent));
+  if (onPhone) {
+    return "手机上的记忆服务没有响应，多半是切换 App 时被系统清理了。回到 Memory Platform App：若显示「已停止」就点「启动服务」，然后刷新本页重试；再在 App 里关闭电池优化并锁定后台，避免再次被杀。";
+  }
+  return "本机的记忆服务没有响应，服务进程可能已退出。请重新运行 memgw stack start（Docker 用户确认容器在运行），然后刷新本页重试。";
+}
+
 export function SettingsPage({
   settings,
   onSave,
@@ -77,7 +95,9 @@ export function SettingsPage({
       } else {
         setAuthCheck("error");
       }
-      const message = errorMessage(error, { credential: "console" });
+      const message = serviceOnline
+        ? errorMessage(error, { credential: "console" })
+        : serviceDownMessage(error, embedded);
       setTestMessage(message);
       notify(message, "error");
     } finally {

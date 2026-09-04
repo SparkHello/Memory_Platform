@@ -21,7 +21,8 @@ to the user for the first Web console login; the service never prints them.
 
 Kotlin entry points (all return JSON strings, all safe to call from any thread):
 ``start(data_dir, memory_port, model_port, ui_dist_dir)``, ``stop()``,
-``status()``, ``console_login_link()`` and ``export_diagnostics()``.
+``status()``, ``console_login_link()``, ``export_diagnostics(data_dir, include_memory)``
+and ``recent_logs(data_dir)``.
 """
 from __future__ import annotations
 
@@ -543,15 +544,18 @@ _NON_SECRET_SUFFIXES = ("_ENABLED", "_PATH", "_ID", "_MODEL", "_URL", "_DIR", "_
 _SECRET_NAME_RE = __import__("re").compile(r"(api_?key|secret(?!_ref)|token|password|signing)", __import__("re").IGNORECASE)
 
 
-def export_diagnostics(data_dir: str | None = None) -> str:
+def export_diagnostics(data_dir: str | None = None, include_memory: bool = False) -> str:
     """Write a diagnostics zip and return its path (JSON string with {"path": ...}).
 
-    Contents: runtime status, rotating service logs (plus logs/*.txt the host
-    dropped in, e.g. logcat), settings.env and Model Gateway config.json with
-    every secret-looking value redacted, a consistent snapshot of memory.db
-    (memories, decision logs, finalize jobs, conversation digests, core memory),
-    and readable JSON reports of the last decisions and any unfinished
-    finalize jobs. Never includes auth.db, secrets.env or knowledge.db.
+    Default contents: runtime status, rotating service logs (plus logs/*.txt the
+    host dropped in, e.g. logcat), settings.env and Model Gateway config.json
+    with every secret-looking value redacted, and count-only reports (memories
+    by status, decisions by outcome, finalize jobs by state). Nothing a user
+    said or remembered leaves the phone unless ``include_memory`` is set, which
+    adds a consistent snapshot of memory.db (memories, decision logs, finalize
+    jobs, conversation digests, core memory) plus readable JSON reports of the
+    last decisions, unfinished finalize jobs and recent conversation digests.
+    Never includes auth.db, secrets.env or knowledge.db.
     """
 
     import shutil
@@ -594,15 +598,16 @@ def export_diagnostics(data_dir: str | None = None) -> str:
         if layout.memory_db.is_file():
             source = sqlite3.connect(f"file:{layout.memory_db}?mode=ro", uri=True)
             try:
-                snapshot = sqlite3.connect(db_dir / "memory.db")
-                try:
-                    source.backup(snapshot)
-                finally:
-                    snapshot.close()
-                _write_reports(source, reports)
+                if include_memory:
+                    snapshot = sqlite3.connect(db_dir / "memory.db")
+                    try:
+                        source.backup(snapshot)
+                    finally:
+                        snapshot.close()
+                _write_reports(source, reports, include_memory=include_memory)
             finally:
                 source.close()
-        (staging / "README.txt").write_text(_diagnostics_readme(), encoding="utf-8")
+        (staging / "README.txt").write_text(_diagnostics_readme(include_memory), encoding="utf-8")
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(staging.rglob("*")):
                 if path.is_file():
@@ -612,10 +617,38 @@ def export_diagnostics(data_dir: str | None = None) -> str:
         shutil.rmtree(staging, ignore_errors=True)
     for old in sorted(exports.glob("memory-platform-diagnostics-*.zip"))[:-3]:
         old.unlink(missing_ok=True)
-    return json.dumps({"path": str(target), "bytes": target.stat().st_size})
+    return json.dumps({"path": str(target), "bytes": target.stat().st_size, "include_memory": include_memory})
 
 
-def _write_reports(connection: sqlite3.Connection, reports: Path) -> None:
+def recent_logs(data_dir: str | None = None, max_bytes: int = 60_000) -> str:
+    """Tail of the service log for in-app viewing and copy-paste (JSON string).
+
+    Returns ``{"text": ..., "path": ..., "truncated": bool}``. Reads only the
+    current ``stack.log``; rotated files stay in the diagnostics zip.
+    """
+
+    layout = _last_layout
+    if layout is None:
+        if not data_dir:
+            raise RuntimeError("服务尚未启动过，且未提供 data_dir")
+        layout = configure(data_dir)
+    path = layout.data_dir / "logs" / "stack.log"
+    if not path.is_file():
+        return json.dumps({"text": "", "path": str(path), "truncated": False})
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > max_bytes:
+            handle.seek(size - max_bytes)
+        data = handle.read()
+    text = data.decode("utf-8", errors="replace")
+    truncated = size > max_bytes
+    if truncated:
+        # Drop the partial first line left over from seeking into the middle of the file.
+        text = text.split("\n", 1)[1] if "\n" in text else text
+    return json.dumps({"text": text, "path": str(path), "truncated": truncated}, ensure_ascii=False)
+
+
+def _write_reports(connection: sqlite3.Connection, reports: Path, include_memory: bool) -> None:
     connection.row_factory = sqlite3.Row
 
     def rows(sql: str) -> list[dict[str, Any]]:
@@ -634,6 +667,14 @@ def _write_reports(connection: sqlite3.Connection, reports: Path) -> None:
         "conversations": rows("SELECT COUNT(*) AS n FROM conversation_branch_nodes"),
     }
     (reports / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not include_memory:
+        # Job rows without payload_json: enough to see stuck/failed saves and their errors.
+        jobs = rows(
+            "SELECT id, kind, status, attempts, last_error, created_at, updated_at "
+            "FROM chat_finalize_jobs WHERE status != 'done' ORDER BY updated_at DESC LIMIT 100"
+        )
+        (reports / "finalize_jobs.json").write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
     with (reports / "decision_logs.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows("SELECT * FROM memory_decision_logs ORDER BY created_at DESC LIMIT 1000"):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -673,17 +714,26 @@ def _redact_json(value: Any, key: str = "") -> Any:
     return value
 
 
-def _diagnostics_readme() -> str:
-    return (
+def _diagnostics_readme(include_memory: bool) -> str:
+    common = (
         "Memory Platform diagnostics bundle\n\n"
         "runtime.json                 service state and runtime info\n"
         "logs/stack.log*              service log (uvicorn, memory/model gateway, embedded runtime)\n"
         "logs/logcat.txt              Android process log, when exported from the app\n"
         "config/settings.env          Memory Gateway settings, secret values redacted\n"
         "config/model-gateway.config.json  Model Gateway routes/clients, secret values redacted\n"
+        "reports/summary.json         counts by status / decision / job state\n"
+    )
+    if not include_memory:
+        return common + (
+            "reports/finalize_jobs.json   unfinished chat finalize jobs: id, kind, status, attempts, last_error (no payload)\n\n"
+            "This bundle contains NO memory content and NO conversation text (the default).\n"
+            "Tick「附带记忆库快照与对话内容」in the app before exporting to include them.\n"
+            "Excluded on purpose: auth.db (token hashes), model-gateway/secrets.env, knowledge.db.\n"
+        )
+    return common + (
         "db/memory.db                 consistent snapshot: memories, memory_decision_logs, chat_finalize_jobs,\n"
         "                             conversation_branch_nodes, core_memory_sections. Contains personal memory content.\n"
-        "reports/summary.json         counts by status / decision / job state\n"
         "reports/decision_logs.jsonl  last 1000 extraction decisions with reasons (why a memory was or was not saved)\n"
         "reports/finalize_jobs.json   unfinished chat finalize jobs (memories not yet saved) plus last 50 done\n"
         "reports/recent_conversations.json  last 50 conversation digests with recent turns\n\n"

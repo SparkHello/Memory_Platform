@@ -6,6 +6,15 @@
 
 ### Added
 
+- 安卓 App 自动检查更新：每 6 小时（及「高级」里手动点「检查更新」）读取 GitHub Releases 的 `android-v*` 标签，比当前版本新时在状态页显示「有新版本」卡，可直接下载 APK 或忽略该版本；「高级」里显示当前版本号。
+- 安卓 App「高级」新增「查看日志」：弹窗展示 `stack.log` 尾部与本进程最近 logcat，一键「复制全部」粘贴即可求助，不再需要传诊断包文件。嵌入式入口新增 `recent_logs(data_dir, max_bytes)`。
+
+### Changed
+
+- 安卓诊断包默认不再携带记忆内容：默认只含日志、脱敏配置和计数报表（未完成落库任务只留 id/状态/错误，不含 payload）；`db/memory.db` 快照、决策日志与对话摘要改为勾选「附带记忆库快照与对话内容」后才导出。`export_diagnostics()` 新增 `include_memory` 参数（默认 `False`）。
+- 控制台登录页健康检查失败时的提示按场景区分：网页来自回环地址且在安卓浏览器（或 `/health` 已报 embedded）时，提示"手机上的记忆服务没有响应，多半是切换 App 时被系统清理了，回到 App 重新启动服务并关闭电池优化"；桌面回环安装提示重新运行 `memgw stack start`；不再对手机用户说"请确认服务地址与端口"。
+- 安卓 App 版本 0.5.2（versionCode 3）。
+
 - 安卓 App「打开控制台」一键自动登录：嵌入式入口新增 `console_login_link()`，为 `credentials/gateway.txt` 里的既有登录密钥签发一次性登录码（`ConsoleLoginCodeStore.mint_for_token`，不再每次新增 token，过期也不吊销既有 token；`console_login_codes` 表新增 `token_owned` 列），并把管理密钥随码交付给本机浏览器（`/auth/console-login-exchange` 响应新增 `model_admin_key`，仅宿主进程签发的码携带，HTTP 签发一律为 null）。控制台收到后写入本标签页 sessionStorage，「模型与路由」页静默重验，用户无需再粘贴任何密钥。
 - `MEMGW_DEPLOYMENT_PROFILE=embedded`：`/health` 上报 `deployment`，控制台登录页据此把「打开 credentials/gateway.txt」的文案换成「回到 App 点打开控制台」。
 - 安卓状态页改为四步清单（启动服务 → 配置模型 → 创建聊天密钥 → 关闭电池优化），每 5 秒探测 `/health`、`/readyz` 与 `/auth/tokens` 自动打勾；主按钮随进度变化；未关电池优化时显示警告卡；「高级」里才有复制登录密钥/管理密钥、MCP 地址和导出诊断包。新增品牌图标与通知栏单色图标。
