@@ -18,8 +18,8 @@ android {
         applicationId = "app.memoryplatform.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.5.2"
+        versionCode = 4
+        versionName = "0.5.3"
         // Chaquopy needs an explicit ABI list. arm64 covers every phone that
         // matters; add "x86_64" only for emulator builds (needs x86_64 Rust wheels too).
         ndk { abiFilters += listOf("arm64-v8a") }
