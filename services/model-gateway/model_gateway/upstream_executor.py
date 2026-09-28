@@ -556,6 +556,15 @@ class UpstreamExecutor:
             )
             response = await client.send(request, stream=True)
         except httpx.HTTPError as exc:
+            # Usage traces keep only the failure class; the OS-level reason
+            # (unreachable network, refused, TLS reset) is what tells a VPN or
+            # a just-resumed phone apart from a provider outage.
+            _LOGGER.warning(
+                "上游请求发送失败：deployment=%s %s: %s",
+                target.deployment_id,
+                type(exc).__name__,
+                str(exc).strip()[:400] or "-",
+            )
             return _StartedJsonPost(
                 client=client,
                 started_monotonic=started_monotonic,
@@ -732,6 +741,21 @@ def target_url(target: RouteTarget) -> str:
         target.connection.base_url,
         endpoint,
         allowed_private_networks=target.connection.allowed_private_networks,
+    )
+
+
+# Delays before re-sending to the same deployment after a fast connect error.
+# The request provably never left the host, so nothing can have been billed;
+# this covers the seconds after a phone resumes or a VPN reconnects.  Connect
+# *timeouts* are not retried: each already waited the full connect timeout.
+CONNECT_ERROR_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.5, 1.5)
+
+
+def is_retryable_connect_error(trace: AttemptTrace | None) -> bool:
+    return (
+        trace is not None
+        and trace.outcome == "connect_failure"
+        and trace.failure_class == "connect_error"
     )
 
 

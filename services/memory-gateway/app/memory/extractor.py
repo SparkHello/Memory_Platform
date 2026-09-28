@@ -280,7 +280,10 @@ _GROUNDING_RELATION_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "education": (
         r"就读|在读|上大学|读大学|上学|读书|念书|专业|学生|毕业|学校|大学是|"
-        r"本科|硕士|博士|研究生|学历",
+        r"本科|硕士|博士|研究生|学历|"
+        # "读 CS" / "读计算机": reading a major, not reading a document.
+        r"读\s*(?:(?-i:[A-Z]{2,5})(?![A-Za-z])|计算机|软件|电子|自动化|通信|数学|物理|"
+        r"化学|生物|医学|临床|法学|金融|经济|会计|管理|英语|新闻|建筑|土木|机械)",
         r"\b(?:attend|attends|attended|enrolled|enrol|study|studies|studying|studied|"
         r"major|majors|majored|university|college|graduate|graduated|student|degree)\b",
     ),
@@ -372,6 +375,24 @@ _JOINT_FIRST_PERSON_SUBJECT_RE = re.compile(
 # to the same local assertion.  Merely seeing both somewhere in one sentence is
 # unsafe: "applied to Acme's job" is not employment, and "visited Beijing and
 # stayed at a hotel" is not residence in Beijing.
+# A Latin/digit product name directly followed by a device category noun.
+_PRODUCT_DEVICE_DESCRIPTOR_PATTERN = re.compile(
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9.+\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9.+\-]*)*)"
+    r"\s*(?:笔记本电脑|笔记本|台式电脑|台式机|电脑|手机|平板电脑|平板|设备)"
+)
+# Only a Latin/digit product name counts ("我的 iPhone"); "我的朋友" and
+# "我的想法" are not ownership claims.  The captured name stops at the first
+# CJK character, so "我的 iPhone 比 Pixel 好" binds to iPhone only.
+_FIRST_PERSON_POSSESSIVE_PRODUCT_PATTERN = re.compile(
+    r"(?:我|本人)的\s*"
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9.+\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9.+\-]*)*)"
+)
+_LOST_OWNERSHIP_PATTERN = re.compile(
+    r"\s*(?:已经|早就|早已|都|也|又)?\s*"
+    r"(?:没了|没有了|不见了|丢了|丢掉了|弄丢了|被偷了|卖了|卖掉了|出掉了|送人了|"
+    r"退了|退掉了|换掉了|淘汰了|报废了)"
+)
+
 _BOUND_RELATION_ASSERTION_PATTERNS: dict[str, tuple[str, ...]] = {
     "employment": (
         r"(?:在|为)\s*[^,，。！？!?;；]{1,60}?(?:工作|任职|就职)",
@@ -1081,13 +1102,17 @@ def _grounding_gate_reason(
             return f"candidate.memory 中的结构化{kind}未出现在 source_quote，疑似模型编造"
 
     lowered_quote = quote.casefold()
+    compact_quote = _compact_casefold(quote)
+    compact_memory = _compact_casefold(candidate.memory)
     for entity in candidate.entities:
         normalized_entity = entity.strip()
         if not normalized_entity or normalized_entity.casefold() in _GENERIC_ENTITIES:
             continue
-        if normalized_entity.casefold() not in lowered_quote:
+        # Spacing and case are not facts: "枪神 9 Plus" names "枪神 9plus".
+        compact_entity = _compact_casefold(normalized_entity)
+        if compact_entity not in compact_quote:
             return "candidate.entities 中有值未出现在 source_quote，疑似模型编造"
-        if normalized_entity.casefold() not in candidate.memory.casefold():
+        if compact_entity not in compact_memory:
             # Detailed sensitive entities are intentionally removed before
             # persistence.  They may ground only a deliberately minimized
             # sensitive statement below; a normal candidate must bind every
@@ -1156,6 +1181,14 @@ def _grounding_proposition_matches(
         for clause in _GROUNDING_EVIDENCE_SPLIT_PATTERN.split(quote)
         if clause.strip()
     ] or [quote]
+    # An ownership phrase is its own evidence, so a negation elsewhere in the
+    # clause ("…倒没有这个烦恼") does not flip the ownership it asserts.
+    evidence_clauses.extend(
+        phrase
+        for clause in list(evidence_clauses)
+        for _, phrase in _possessive_product_phrases(clause)
+        if phrase not in evidence_clauses
+    )
     if not propositions:
         return []
 
@@ -1237,6 +1270,12 @@ def _grounding_pair_score(
         # answer (for example age), but object/value anchors above still come
         # exclusively from the current verbatim source quote.
         evidence_relations |= _grounding_relation_families(relation_context)
+    if (
+        "possession" in proposition_relations
+        and "possession" not in evidence_relations
+        and _possessive_product_grounds(evidence_clause, proposition_terms)
+    ):
+        evidence_relations.add("possession")
     if proposition_relations:
         # A multi-fact candidate that escaped the clause splitter still cannot
         # be supported by evidence for only one of its asserted relations.
@@ -1331,11 +1370,43 @@ def _relation_is_bound_to_asserted_object(
 
 
 def _grounding_relation_families(text: str) -> set[str]:
+    # "MacBook Air M5 笔记本电脑" describes the named product; only a bare or
+    # role-qualified device noun ("主力电脑", "用户的手机") asserts tool_choice.
+    text = _PRODUCT_DEVICE_DESCRIPTOR_PATTERN.sub(r"\g<name>", text)
     return {
         family
         for family, patterns in _GROUNDING_RELATION_PATTERNS.items()
         if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
     }
+
+
+def _possessive_product_phrases(text: str) -> list[tuple[str, str]]:
+    """``我的 MacBook Air M5`` phrases as (product name, phrase).
+
+    The phrase itself asserts ownership, independent of what the rest of the
+    clause says about the product ("我的 MacBook 倒没有这个烦恼").  Phrases
+    followed by a loss of ownership ("我的 iPad 丢了") assert nothing.
+    """
+    phrases: list[tuple[str, str]] = []
+    for match in _FIRST_PERSON_POSSESSIVE_PRODUCT_PATTERN.finditer(text):
+        if _LOST_OWNERSHIP_PATTERN.match(text, match.end()):
+            continue
+        phrases.append((match.group("name"), match.group(0).strip()))
+    return phrases
+
+
+def _possessive_product_grounds(
+    evidence_clause: str,
+    proposition_terms: set[str],
+) -> bool:
+    return any(
+        proposition_terms & _grounding_terms(name)
+        for name, _ in _possessive_product_phrases(evidence_clause)
+    )
+
+
+def _compact_casefold(text: str) -> str:
+    return re.sub(r"\s+", "", text).casefold()
 
 
 def _grounding_has_negation(text: str) -> bool:

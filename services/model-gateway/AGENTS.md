@@ -7,7 +7,8 @@
 - 配置必须区分 client、connection、deployment、route；模型作者不能代替接入渠道。
 - 代理不得记录 prompt、回复、工具参数、embedding 输入或知识正文。
 - 请求 JSON 的未知字段必须保留；成功上游响应正文与 SSE chunk 必须原样转发。
-- 流式请求只允许在下游响应开始前故障切换；首个成功流建立后禁止重试，避免重复输出。
+- 流式请求只允许在下游响应开始前故障切换；首个成功流建立后禁止重试，避免重复输出。首字节后上游中断只追加一条 SSE 错误事件，绝不补 `[DONE]`。
+- 同一 deployment 的自动重发只限请求确定未发出的快速 `ConnectError`（`CONNECT_ERROR_RETRY_DELAYS_SECONDS`），连接超时或可能已计费的失败一律不重发。
 - embedding 路由中的 deployment 必须使用相同 `embedding_space` 和 `dimensions`，避免混用不兼容向量空间。
 - 套餐类型不再强制 `interactive_only`；仅当连接显式 `usage_scope=interactive_only` 时 backend client 不可路由到它。提供商条款由使用者自行遵守。
 - `pricing research` 只能读取用户明确给出的渠道官方 HTTPS 页面，并使用显式 `backend_allowed` chat deployment；页面是不可信资料，默认候选不写配置，应用必须明确确认。

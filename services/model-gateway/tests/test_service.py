@@ -6,6 +6,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi.testclient import TestClient
+import pytest
 
 from model_gateway.service import create_app
 from model_gateway.config_store import (
@@ -649,6 +650,62 @@ def test_service_preserves_complete_sse_bytes_and_records_usage(gateway_home) ->
         ).fetchone()
     assert row == (1, "actual", 3)
     assert attempt == (1, "actual", 3)
+
+
+class _BrokenStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]):
+        self.chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_prefix"),
+    [
+        ([b'data: {"choices":[{"delta":{"content":"half"}}]}\n\n'], b"data: "),
+        # Upstream broke mid-event: close the fragment before the error event.
+        ([b'data: {"choices":[{"delta":{"content":"ha'], b"\n\ndata: "),
+    ],
+)
+def test_mid_stream_upstream_break_ends_with_error_event_not_done(
+    gateway_home,
+    chunks: list[bytes],
+    expected_prefix: bytes,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_BrokenStream(chunks),
+        )
+
+    app = create_app(paths=gateway_home, transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": f"Bearer {BACKEND_CLIENT_TOKEN}"},
+            json={"model": "memory.chat", "messages": [], "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"".join(chunks))
+    tail = response.content[len(b"".join(chunks)) :]
+    assert tail.startswith(expected_prefix)
+    assert b"[DONE]" not in response.content
+    error = json.loads(tail.strip()[len(b"data: ") :])["error"]
+    assert error["code"] == "model_gateway_ambiguous_upstream_error"
+    assert "RemoteProtocolError" in error["message"]
+    with sqlite3.connect(gateway_home.usage_db) as connection:
+        complete, = connection.execute("SELECT complete FROM usage_events").fetchone()
+    assert complete == 0
 
 
 def test_client_disconnect_still_records_stream_usage() -> None:

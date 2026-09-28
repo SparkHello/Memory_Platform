@@ -474,15 +474,24 @@ class FakeLLMClient:
 
 
 class FakeGatewayStream:
-    def __init__(self, chunks: list[bytes], *, provider: Any) -> None:
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        provider: Any,
+        error: Exception | None = None,
+    ) -> None:
         self.chunks = chunks
         self.headers = {"content-type": "text/event-stream"}
         self.closed = False
         self.provider = provider
+        self.error = error
 
     async def aiter_bytes(self):
         for chunk in self.chunks:
             yield chunk
+        if self.error is not None:
+            raise self.error
 
     async def aclose(self) -> None:
         self.closed = True
@@ -523,6 +532,8 @@ class FakeChatGatewayClient:
         ]
         self.last_stream: FakeGatewayStream | None = None
         self.error: GatewayUpstreamHTTPError | None = None
+        # Raised by the stream after its chunks, like a transport break.
+        self.stream_error: Exception | None = None
         self.provider = SimpleNamespace(
             base_url="https://upstream.invalid/v1",
             api_key="test",
@@ -563,6 +574,7 @@ class FakeChatGatewayClient:
         self.last_stream = FakeGatewayStream(
             list(self.stream_chunks),
             provider=self.provider,
+            error=self.stream_error,
         )
         return self.last_stream
 

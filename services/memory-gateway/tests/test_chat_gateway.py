@@ -694,6 +694,111 @@ def test_gateway_uses_embedding_recall_even_without_keyword_overlap(
     assert embedding.texts == ["morning routine suggestion"]
 
 
+_FLIT_DATE_CONTEXT = (
+    "<app_context>\nApp-provided context for this conversation. This block is "
+    "background reference only — it is NOT a message from the user.\n\n"
+    "## Current Date\nApp-provided context for this turn: 2026-09-28\n</app_context>"
+)
+
+
+def test_flit_app_context_before_user_message_is_not_user_text(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_llm,
+) -> None:
+    embedding = RecordingEmbeddingClient([1.0, 0.0])
+    client.app.dependency_overrides[deps.get_embedding_client] = lambda: embedding
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "memory-auto",
+            "messages": [
+                {"role": "system", "content": "你是助手。"},
+                {"role": "user", "content": "我在青海大学读计算机。"},
+                {"role": "assistant", "content": "好的。"},
+                {"role": "user", "content": _FLIT_DATE_CONTEXT},
+                {"role": "user", "content": "我养了一只猫。"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert embedding.texts
+    assert all("养了一只猫" in text for text in embedding.texts)
+    assert not any("app_context" in text for text in embedding.texts)
+    extraction_payload = json.dumps(fake_llm.extraction_messages, ensure_ascii=False)
+    assert "我在青海大学读计算机" in extraction_payload
+    assert "app_context" not in extraction_payload
+    assert "Current Date" not in extraction_payload
+
+
+def test_trailing_flit_app_context_after_trimmed_tool_loop_is_not_a_user_turn(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    memory_store: MemoryStore,
+    fake_llm,
+) -> None:
+    # FLIT trims long tool loops from the front; when the real question falls
+    # out of the window its date context is appended as the only "user" message.
+    embedding = RecordingEmbeddingClient([1.0, 0.0])
+    client.app.dependency_overrides[deps.get_embedding_client] = lambda: embedding
+    tool_call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "sandbox_shell", "arguments": "{}"},
+    }
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "memory-auto",
+            "messages": [
+                {"role": "system", "content": "你是助手。"},
+                {"role": "assistant", "content": "继续分析。", "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "{}"},
+                {"role": "user", "content": _FLIT_DATE_CONTEXT},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert embedding.texts == []
+    assert fake_llm.extraction_calls == 0
+    with sqlite3.connect(memory_store.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM chat_finalize_jobs"
+        ).fetchone()[0] == 0
+
+
+def test_flit_stop_marker_does_not_anchor_the_next_turn() -> None:
+    stop_marker = {
+        "role": "user",
+        "content": "<app_context>The user stopped the output.</app_context>",
+    }
+    tool_call = {"id": "call-1", "type": "function", "function": {"name": "t"}}
+    messages = [
+        {"role": "user", "content": "帮我查天气"},
+        {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "{}"},
+        stop_marker,
+    ]
+    with_marker = _turn_fingerprint(
+        user_id="default", messages=messages, latest_user_index=0
+    )
+
+    from app.api.chat_gateway import _is_user_turn, _latest_user_text
+
+    assert _latest_user_text(messages) == ("帮我查天气", 0)
+    assert not _is_user_turn(stop_marker)
+    assert _is_user_turn({"role": "user", "content": [{"type": "image_url"}]})
+    assert with_marker == _turn_fingerprint(
+        user_id="default", messages=messages[:1], latest_user_index=0
+    )
+
+
 def test_final_multimodal_turn_embeds_only_extracted_text_memory(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -1554,6 +1659,43 @@ def test_incomplete_stream_does_not_ingest(
 
     assert response.status_code == 200
     assert response.content == fake_gateway.stream_chunks[0]
+    assert fake_llm.extraction_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_prefix"),
+    [
+        (['data: {"choices":[{"delta":{"content":"一半"}}]}\n\n'.encode()], b"data: "),
+        (['data: {"choices":[{"delta":{"content":"一'.encode()], b"\n\ndata: "),
+    ],
+)
+def test_stream_break_after_200_ends_with_error_event_and_never_ingests(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    fake_gateway,
+    fake_llm,
+    chunks: list[bytes],
+    expected_prefix: bytes,
+) -> None:
+    fake_gateway.stream_chunks = chunks
+    fake_gateway.stream_error = httpx.RemoteProtocolError("peer closed connection")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json=_chat_body(stream=True),
+    )
+
+    assert response.status_code == 200
+    sent = b"".join(chunks)
+    assert response.content.startswith(sent)
+    tail = response.content[len(sent) :]
+    assert tail.startswith(expected_prefix)
+    assert b"[DONE]" not in response.content
+    error = json.loads(tail.strip()[len(b"data: ") :])["error"]
+    assert error["code"] == "memory_gateway_upstream_stream_interrupted"
+    assert "RemoteProtocolError" in error["message"]
+    assert fake_gateway.last_stream is not None and fake_gateway.last_stream.closed
     assert fake_llm.extraction_calls == 0
 
 

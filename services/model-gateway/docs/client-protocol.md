@@ -28,6 +28,10 @@ Content-Type: application/json
 
 不发送 affinity Header 时，网关按请求所需能力、route 的 targets 顺序、`fallback_scope`、`max_attempts`、启用状态、使用范围和 429 冷却选择 deployment。`none` 不自动切换目标，`same_channel` 只允许同 connection/channel，`any_channel` 才允许跨渠道。只有 provider/连接层可恢复错误才会尝试下一项；内容或策略拒绝不会借 fallback 绕过。
 
+快速连接错误（`ConnectError`，请求确定未发出）会先对同一 deployment 间隔 0.5 秒、1.5 秒各重发一次，再按上面的规则切换或失败；这覆盖手机刚从后台恢复、VPN 重连后的几秒不可达。每次未发出的尝试都有独立的 not-sent trace，不计费、不占用 `max_attempts`。连接超时和任何可能已发出的失败都不在此列。
+
+流式响应在 200 与部分内容已经发出后若上游中断，网关以一条 SSE 错误事件结束响应：`data: {"error":{"code":"model_gateway_ambiguous_upstream_error",...}}`，**不发送** `[DONE]`，客户端必须把已收到的内容视为不完整。若上游断在半个事件中间，错误事件前会先补一个空行结束残片。
+
 运行时能力由 `stream`、`tools`、`parallel_tool_calls`、多模态消息 part、推理控制和
 `response_format` 推导。route 中没有兼容目标时返回
 `422 model_gateway_capability_unavailable`，`required_capabilities` 列出缺少的声明能力。

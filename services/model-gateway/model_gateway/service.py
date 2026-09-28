@@ -75,6 +75,7 @@ from model_gateway.proxy import (
     RawOpenAIProxy,
     RequestPreparationError,
     prepare_resolved_route,
+    stream_interrupted_event,
 )
 from model_gateway.routing import (
     RequestRequirements,
@@ -92,6 +93,7 @@ from model_gateway.usage import (
     UsageStore,
 )
 from model_gateway.upstream_executor import (
+    CONNECT_ERROR_RETRY_DELAYS_SECONDS,
     UsageLedgerPreflightError,
     preflight_usage_ledger,
 )
@@ -1269,7 +1271,7 @@ async def _proxy_request(
     route_attempts = min(
         len(resolved.targets),
         resolved.route.max_attempts if resolved.route is not None else 1,
-    )
+    ) * (1 + len(CONNECT_ERROR_RETRY_DELAYS_SECONDS))
     try:
         await preflight_usage_ledger(
             usage_store,
@@ -1438,11 +1440,29 @@ def _streaming_response(
 
     async def body() -> Any:
         complete = False
+        at_event_boundary = True
         try:
-            async for chunk in stream.aiter_raw():
-                capture.feed(chunk)
-                yield chunk
-            complete = capture.saw_done and not capture.malformed
+            try:
+                async for chunk in stream.aiter_raw():
+                    capture.feed(chunk)
+                    at_event_boundary = chunk.endswith((b"\n\n", b"\r\n\r\n"))
+                    yield chunk
+            except httpx.HTTPError as exc:
+                # The 200 status line is already out, so the only way left to
+                # tell the client is an in-band error event; letting the
+                # exception escape just drops the connection.
+                _LOGGER.warning(
+                    "上游流在输出中途中断：deployment=%s %s: %s",
+                    stream.target.deployment_id,
+                    type(exc).__name__,
+                    str(exc).strip()[:400] or "-",
+                )
+                yield stream_interrupted_event(
+                    exc,
+                    at_event_boundary=at_event_boundary,
+                )
+            else:
+                complete = capture.saw_done and not capture.malformed
         finally:
             # A client disconnect cancels this generator mid-yield. Shield the
             # upstream close + usage accounting so the ledger records the

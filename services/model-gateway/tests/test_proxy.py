@@ -195,6 +195,113 @@ async def test_connect_timeout_can_fallback_before_request_is_sent(
 
 
 @pytest.mark.asyncio
+async def test_stream_connect_error_retries_same_deployment_before_giving_up(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    # A phone resuming from background refuses connects for a few seconds.
+    gateway_config.routes["memory.chat"].fallback_scope = "none"
+    gateway_config.routes["memory.chat"].max_attempts = 1
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if len(calls) < 3:
+            raise httpx.ConnectError("Network is unreachable", request=request)
+        return httpx.Response(
+            200,
+            stream=ChunkStream([b"data: ok\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    proxy.connect_retry_delays = (0.0, 0.0)
+    result = await proxy.open_stream(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": [], "stream": True},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert not isinstance(result, ProxyHTTPResult)
+    try:
+        assert b"".join([chunk async for chunk in result.aiter_raw()]) == (
+            b"data: ok\n\n"
+        )
+        assert calls == ["official.example"] * 3
+        assert result.attempts == 3
+        assert [trace.attempt_index for trace in result.attempt_traces] == [1, 2, 3]
+        assert [trace.request_sent for trace in result.attempt_traces] == [
+            False,
+            False,
+            True,
+        ]
+    finally:
+        await result.aclose()
+        await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_persistent_connect_error_stops_after_bounded_retries(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "none"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        raise httpx.ConnectError("Network is unreachable", request=request)
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    proxy.connect_retry_delays = (0.0, 0.0)
+    result = await proxy.complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 502
+    assert calls == ["official.example"] * 3
+    assert all(trace.request_sent is False for trace in result.attempt_traces)
+    await proxy.aclose()
+
+
+@pytest.mark.asyncio
+async def test_connect_retries_do_not_spend_the_fallback_budget(
+    gateway_config: GatewayConfig,
+    backend_client: AuthenticatedClient,
+) -> None:
+    gateway_config.routes["memory.chat"].fallback_scope = "any_channel"
+    gateway_config.routes["memory.chat"].max_attempts = 2
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "official.example":
+            raise httpx.ConnectError("Network is unreachable", request=request)
+        return httpx.Response(200, content=b'{"id":"fallback"}')
+
+    router = Router()
+    proxy = RawOpenAIProxy(router=router, transport=httpx.MockTransport(handler))
+    proxy.connect_retry_delays = (0.0, 0.0)
+    result = await proxy.complete(
+        route=resolved_chat(gateway_config, backend_client, router),
+        payload={"model": "memory.chat", "messages": []},
+        secrets={"UPSTREAM_OFFICIAL": "a", "UPSTREAM_RESELLER": "b"},
+        request_headers={},
+    )
+
+    assert result.status_code == 200
+    assert calls == ["official.example"] * 3 + ["reseller.example"]
+    assert result.attempts == 4
+    await proxy.aclose()
+
+
+@pytest.mark.asyncio
 async def test_connection_breaker_is_rechecked_before_each_attempt(
     gateway_config: GatewayConfig,
     backend_client: AuthenticatedClient,

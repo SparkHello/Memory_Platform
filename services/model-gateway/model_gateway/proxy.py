@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import json
+import logging
 import time
-from typing import Any, AsyncIterator, Literal, Mapping
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Mapping
 
 import httpx
 from model_gateway_contracts import (
@@ -38,9 +40,13 @@ from model_gateway.routing import (
 )
 from model_gateway.usage import AttemptTrace
 from model_gateway.upstream_executor import (
+    CONNECT_ERROR_RETRY_DELAYS_SECONDS,
     UpstreamExecutor,
     UpstreamStreamLease,
+    is_retryable_connect_error,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 PASSTHROUGH_RESPONSE_HEADERS = {
@@ -122,6 +128,7 @@ class RawOpenAIProxy:
         self.transport = transport
         self._wall_clock = wall_clock
         self.executor = UpstreamExecutor(transport=transport)
+        self.connect_retry_delays = CONNECT_ERROR_RETRY_DELAYS_SECONDS
         # Compatibility for lifecycle diagnostics; the executor owns the map.
         self._clients = self.executor._clients
 
@@ -138,12 +145,18 @@ class RawOpenAIProxy:
         last_result: ProxyHTTPResult | None = None
         last_network_error: httpx.HTTPError | None = None
         attempts = 0
+        # Same-deployment connect retries never left the host; they are traced
+        # but do not spend the route's max_attempts budget.
+        connect_retries = 0
         attempt_traces: list[AttemptTrace] = []
         for target in route.targets:
             secret = secrets.get(target.connection.auth.secret_ref, "")
             if not secret:
                 continue
-            if route.route is not None and attempts >= route.route.max_attempts:
+            if (
+                route.route is not None
+                and attempts - connect_retries >= route.route.max_attempts
+            ):
                 break
             if not self.router.runtime_health.available(target):
                 continue
@@ -156,13 +169,19 @@ class RawOpenAIProxy:
                     reasoning_origin_deployment=reasoning_origin_deployment,
                 )
             )
-            execution = await self.executor.post_json(
+            execution, retried = await self._send_with_connect_retries(
+                lambda attempt_index: self.executor.post_json(
+                    target=target,
+                    payload=forwarded,
+                    secret=secret,
+                    request_headers=request_headers,
+                    attempt_index=attempt_index,
+                ),
                 target=target,
-                payload=forwarded,
-                secret=secret,
-                request_headers=request_headers,
-                attempt_index=attempts + 1,
+                attempt_traces=attempt_traces,
             )
+            attempts = len(attempt_traces)
+            connect_retries += retried
             trace = execution.trace
             if trace is None:
                 last_network_error = httpx.ConnectError(
@@ -256,12 +275,18 @@ class RawOpenAIProxy:
         last_result: ProxyHTTPResult | None = None
         last_network_error: httpx.HTTPError | None = None
         attempts = 0
+        # Same-deployment connect retries never left the host; they are traced
+        # but do not spend the route's max_attempts budget.
+        connect_retries = 0
         attempt_traces: list[AttemptTrace] = []
         for target in route.targets:
             secret = secrets.get(target.connection.auth.secret_ref, "")
             if not secret:
                 continue
-            if route.route is not None and attempts >= route.route.max_attempts:
+            if (
+                route.route is not None
+                and attempts - connect_retries >= route.route.max_attempts
+            ):
                 break
             if not self.router.runtime_health.available(target):
                 continue
@@ -274,13 +299,19 @@ class RawOpenAIProxy:
                     reasoning_origin_deployment=reasoning_origin_deployment,
                 )
             )
-            execution = await self.executor.open_json_stream(
+            execution, retried = await self._send_with_connect_retries(
+                lambda attempt_index: self.executor.open_json_stream(
+                    target=target,
+                    payload=forwarded,
+                    secret=secret,
+                    request_headers=request_headers,
+                    attempt_index=attempt_index,
+                ),
                 target=target,
-                payload=forwarded,
-                secret=secret,
-                request_headers=request_headers,
-                attempt_index=attempts + 1,
+                attempt_traces=attempt_traces,
             )
+            attempts = len(attempt_traces)
+            connect_retries += retried
             trace = execution.trace
             if trace is None:
                 last_network_error = httpx.ConnectError(
@@ -361,6 +392,35 @@ class RawOpenAIProxy:
             phase_label="上游流连接失败",
         )
 
+    async def _send_with_connect_retries(
+        self,
+        send: Callable[[int], Awaitable[Any]],
+        *,
+        target: RouteTarget,
+        attempt_traces: list[AttemptTrace],
+    ) -> tuple[Any, int]:
+        """Re-send to the same deployment while the request never left the host.
+
+        Only fast connect errors qualify (see CONNECT_ERROR_RETRY_DELAYS_SECONDS);
+        each failed try keeps its own not-sent trace so the ledger stays exact.
+        Returns the final execution and how many retries preceded it.
+        """
+        for retry, delay in enumerate(self.connect_retry_delays, start=1):
+            execution = await send(len(attempt_traces) + 1)
+            if not is_retryable_connect_error(execution.trace):
+                return execution, retry - 1
+            attempt_traces.append(execution.trace)
+            _LOGGER.warning(
+                "上游连接失败（请求未发出），%.1f 秒后重试同一 deployment（%d/%d）：%s",
+                delay,
+                retry,
+                len(self.connect_retry_delays),
+                target.deployment_id,
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+        return await send(len(attempt_traces) + 1), len(self.connect_retry_delays)
+
     async def aclose(self) -> None:
         await self.executor.aclose()
 
@@ -438,6 +498,34 @@ def _network_failure_detail(
             return message
         return f"{phase_label}：{message}"
     return f"{phase_label}：{type(exc).__name__}"
+
+
+def stream_interrupted_event(
+    exc: httpx.HTTPError,
+    *,
+    at_event_boundary: bool,
+) -> bytes:
+    """A terminal SSE error for a stream that broke after its 200 was sent.
+
+    Deliberately no ``[DONE]``: clients and the memory gateway must not treat
+    the partial answer as complete.  If the upstream broke mid-event, a blank
+    line first closes that fragment so this event parses on its own.
+    """
+    payload = json.dumps(
+        {
+            "error": {
+                "message": (
+                    f"上游流响应中途中断：{type(exc).__name__}；"
+                    "已输出的内容不完整，请重试"
+                ),
+                "type": GatewayErrorCode.AMBIGUOUS_UPSTREAM_ERROR.value,
+                "code": GatewayErrorCode.AMBIGUOUS_UPSTREAM_ERROR.value,
+            }
+        },
+        ensure_ascii=False,
+    )
+    prefix = b"" if at_event_boundary else b"\n\n"
+    return prefix + b"data: " + payload.encode("utf-8") + b"\n\n"
 
 
 def _network_error_result(
