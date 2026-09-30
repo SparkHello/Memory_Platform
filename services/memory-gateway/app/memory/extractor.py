@@ -195,7 +195,9 @@ _GROUNDING_GENERIC_CJK_CHARS = set(
     "对与和跟及以及的了是为有在用喜爱偏好欢觉认发希需想住居工做使"
 )
 _GROUNDING_MEMORY_SPLIT_PATTERN = re.compile(
-    r"[。！？!?;；\n,，、]+"
+    # 、 enumerates objects of one fact ("去了京都、大阪旅行"); it does not
+    # start another proposition.
+    r"[。！？!?;；\n,，]+"
     r"|(?:但是|不过|然而|同时|而且|此外|并且)"
     r"|并(?=\s*(?:在|住|居|任|就|喜|爱|讨|使|用|有|是|叫|认|觉|发|希|需|想|工作))"
     r"|和(?=\s*(?:住在|居住|工作|任职|就职|喜欢|讨厌|使用|拥有|是|叫))"
@@ -274,16 +276,18 @@ _GROUNDING_RELATION_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bswitched?\s+to\b",
     ),
     "possession": (
-        r"拥有|我有|用户有|本人有|没有|"
+        r"拥有|我有|用户有|本人有|没有(?!问题|关系|必要|办法)|"
         r"(?:用户|我|本人)无(?:任何)?|养了|养着",
         r"\b(?:have|has|had|own|owns|owned|owning)\b",
     ),
     "education": (
-        r"就读|在读|上大学|读大学|上学|读书|念书|专业|学生|毕业|学校|大学是|"
+        # "正在读《…》" is reading a book, not being enrolled ("在读").
+        r"就读|(?<!正)在读|上大学|读大学|上学|读书|念书|专业|学生|毕业|学校|大学是|"
         r"本科|硕士|博士|研究生|学历|"
-        # "读 CS" / "读计算机": reading a major, not reading a document.
-        r"读\s*(?:(?-i:[A-Z]{2,5})(?![A-Za-z])|计算机|软件|电子|自动化|通信|数学|物理|"
-        r"化学|生物|医学|临床|法学|金融|经济|会计|管理|英语|新闻|建筑|土木|机械)",
+        # "读 CS" / "读计算机": reading a major, not reading a document
+        # ("阅读电子书", "读电子书").
+        r"(?<![阅朗解])读\s*(?:(?-i:[A-Z]{2,5})(?![A-Za-z])|计算机|软件|电子|自动化|通信|数学|物理|"
+        r"化学|生物|医学|临床|法学|金融|经济|会计|管理|英语|新闻|建筑|土木|机械)(?![书报刊])",
         r"\b(?:attend|attends|attended|enrolled|enrol|study|studies|studying|studied|"
         r"major|majors|majored|university|college|graduate|graduated|student|degree)\b",
     ),
@@ -298,11 +302,12 @@ _GROUNDING_RELATION_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bswitched?\s+to\b",
     ),
     "age": (
-        r"年龄|多少\s*岁|几\s*岁|多大(?:了)?|\d{1,3}\s*岁",
+        r"年龄|多少\s*岁|几\s*岁|多大(?:了)?|\d{1,3}\s*岁|[一二两三四五六七八九十百]{1,4}\s*岁",
         r"\bage\b|\bhow\s+old\b|\b\d{1,3}\s+years?\s+old\b",
     ),
     "belief": (
-        r"认为|觉得|相信|发现|意识到",
+        # "睡觉得戴耳塞" is 睡觉 + 得, not 觉得.
+        r"认为|(?<!睡)觉得|相信|发现|意识到",
         r"\b(?:think|thinks|thought|believe|believes|believed|realize|realized|"
         r"realise|realised)\b",
     ),
@@ -330,6 +335,48 @@ _GROUNDING_RELATION_PATTERNS: dict[str, tuple[str, ...]] = {
         r"children|colleague|coworker)\b",
     ),
 }
+# Families a model adds while normalising colloquial speech into a memory
+# sentence: an imperative becomes "偏好", "写 Go" becomes "使用 Go", "记得备注"
+# becomes "需要备注", "她" becomes "女朋友".  They frame how the user holds an
+# otherwise quoted fact, so their absence from the evidence is tolerated when
+# the evidence asserts no *other* relation and quotes the rest of the
+# proposition (see ``_relation_tolerant_score``).  Object-binding relations
+# (residence, employment, purchase, visit, ...) are never merely framing.
+_FRAMING_RELATIONS = frozenset(
+    {
+        "preference",
+        "intent",
+        "need",
+        "belief",
+        "usage",
+        "consumption",
+        "creation",
+        "relationship",
+    }
+)
+# Colloquial evidence for object-binding relations that the canonical
+# families above do not recognise: "我在上海徐汇区住", "在一家电商公司",
+# "做 UI 设计的", "我有 Switch".  A missing binding relation is tolerated only
+# when one of these cues is present in the same evidence clause.
+_COLLOQUIAL_RELATION_CUES: dict[str, tuple[str, ...]] = {
+    "residence": (r"(?<![入居])住(?!房|宅|宿|院|店|持)", r"家(?:在|住)", r"搬(?:来|回|过来)"),
+    "employment": (
+        r"上班|职位|岗位",
+        r"在[^,，。！？!?;；]{0,30}?(?:公司|单位|团队|集团|企业|工厂|厂|银行|医院|"
+        r"学校|研究所|机构|部门|工作室)",
+        r"(?:当|做|干)[^,，。！？!?;；]{1,15}?的",
+        r"(?:当|是)\s*(?:一名|一个|个)?[^,，。！？!?;；]{0,12}?(?:工程师|程序员|设计师|"
+        r"经理|老师|教师|医生|护士|律师|会计|分析师|研究员|运营|销售)",
+    ),
+    # Verb uses only: a bare "学" also sits inside the object ("青海大学").
+    "education": (r"读|念书|念大学|上学|考上|在读|研究生|本科|专业|学(?:的是|过|了)",),
+    "possession": (r"有|养|入手|没|(?:我|我们)家(?:里|的)?",),
+    "visit": (r"去了|去过|到过|玩了|逛了",),
+}
+_GROUNDING_CONTENT_UNIT_RE = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]")
+# Filler characters and words that carry no fact but dilute coverage.
+_GROUNDING_COVERAGE_FILLER_CHARS = set("点吧呢啊呀嘛就都再也还那这个些下真话挺")
+_GROUNDING_COVERAGE_FILLER_WORDS = (r"的时候|时候|进行|参加|一下|一些|的话",)
 _GENERIC_MINIMIZED_SENSITIVE_MEMORY = re.compile(
     r"证件信息|身份信息|隐私信息|敏感信息|"
     r"\b(?:identity|identification|credential|private|sensitive)\s+information\b",
@@ -338,16 +385,23 @@ _GENERIC_MINIMIZED_SENSITIVE_MEMORY = re.compile(
 
 _THIRD_PARTY_RELATION_SUBJECTS = (
     "猫|狗|宠物|朋友|同事|妻子|丈夫|伴侣|父亲|母亲|父母|孩子|"
-    "儿子|女儿|老师|客户|室友|老板"
+    "儿子|女儿|老师|客户|室友|老板|"
+    "女朋友|男朋友|女友|男友|对象|老婆|老公|爸爸|妈妈|爸|妈|哥哥|姐姐|弟弟|妹妹|"
+    "爷爷|奶奶|外公|外婆|家人|亲戚|同学|邻居|领导|上司"
 )
+# "用户的橘猫" / "用户家的大学室友": a short modifier may sit between the
+# possessive and the third party, but not a predicate ("用户的生日是妈妈…").
+_THIRD_PARTY_POSSESSIVE = r"(?:(?:的|家(?:的)?)\s*(?:(?![是在叫有和与为])[\u4e00-\u9fff]){0,4}?)"
 _CANDIDATE_THIRD_PARTY_SUBJECT_RE = re.compile(
-    rf"^\s*(?:用户|本人)(?:的|家(?:的)?)?\s*(?:{_THIRD_PARTY_RELATION_SUBJECTS})"
+    rf"^\s*(?:用户|本人)(?:{_THIRD_PARTY_POSSESSIVE}|\s*)(?:{_THIRD_PARTY_RELATION_SUBJECTS})"
     r"|^\s*(?:the\s+)?user['’]s\s+(?:cat|dog|pet|friend|colleague|coworker|"
     r"wife|husband|partner|parent|child|teacher|client|roommate|boss)\b",
     flags=re.IGNORECASE,
 )
 _DIRECT_USER_SUBJECT_RE = re.compile(
-    r"^\s*(?:用户|本人)(?!\s*(?:的|家(?:的)?)?\s*(?:"
+    r"^\s*(?:用户|本人)(?!(?:"
+    + _THIRD_PARTY_POSSESSIVE
+    + r"|\s*)(?:"
     + _THIRD_PARTY_RELATION_SUBJECTS
     + r"))"
     r"|^\s*(?:the\s+)?user(?!['’]s\s+(?:cat|dog|pet|friend|colleague|"
@@ -356,7 +410,7 @@ _DIRECT_USER_SUBJECT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _THIRD_PARTY_EVIDENCE_SUBJECT_RE = re.compile(
-    rf"^\s*(?:关于\s*)?(?:(?:我|用户|本人)(?:的|家(?:的)?)?\s*)?"
+    rf"^\s*(?:关于\s*)?(?:(?:我|用户|本人)(?:{_THIRD_PARTY_POSSESSIVE}|\s*))?"
     rf"(?:{_THIRD_PARTY_RELATION_SUBJECTS})(?:们)?(?:的)?"
     r"|^\s*(?:他|她|它|他们|她们|它们)(?:的)?"
     r"|^\s*(?:about\s+)?(?:my|the\s+user['’]s|his|her|their|the)\s+"
@@ -766,7 +820,11 @@ def _validate_candidate_for_save(
     if require_quote_in_user_message:
         _apply_sensitivity_floor(candidate)
     if require_quote_in_user_message and not source_grounding_checked:
-        grounding_rejection = _grounding_gate_reason(candidate, quote=quote)
+        grounding_rejection = _grounding_gate_reason(
+            candidate,
+            quote=quote,
+            source_text=user_message or "",
+        )
         if grounding_rejection:
             return grounding_rejection
 
@@ -884,6 +942,7 @@ def _raw_candidate_source_gate_reason(
         grounding_candidate,
         quote=grounding_quote,
         relation_context=relation_context,
+        source_text=user_message or "",
     )
 
 
@@ -1089,6 +1148,8 @@ def _grounding_gate_reason(
     *,
     quote: str,
     relation_context: str = "",
+    source_text: str = "",
+    now: datetime | None = None,
 ) -> str | None:
     memory_sensitive, memory_private = detected_sensitive_categories(candidate.memory)
     quote_sensitive, quote_private = detected_sensitive_categories(quote)
@@ -1097,13 +1158,17 @@ def _grounding_gate_reason(
         categories = ", ".join(sorted(unsupported_categories))
         return f"candidate.memory 的敏感事实缺少 source_quote 支撑（类别: {categories}）"
 
-    for kind, value in sorted(_structured_values(candidate.memory)):
+    # A year the model resolved from "明年" / "今年年中" / "12 月" against the
+    # backend clock is metadata, not a quoted value; ground the rest.
+    memory = _without_resolved_years(candidate.memory, quote, now=now)
+    for kind, value in sorted(_structured_values(memory)):
         if not _structured_value_present(value, quote):
             return f"candidate.memory 中的结构化{kind}未出现在 source_quote，疑似模型编造"
 
     lowered_quote = quote.casefold()
     compact_quote = _compact_casefold(quote)
-    compact_memory = _compact_casefold(candidate.memory)
+    compact_memory = _compact_casefold(memory)
+    antecedents: list[str] = []
     for entity in candidate.entities:
         normalized_entity = entity.strip()
         if not normalized_entity or normalized_entity.casefold() in _GENERIC_ENTITIES:
@@ -1111,7 +1176,13 @@ def _grounding_gate_reason(
         # Spacing and case are not facts: "枪神 9 Plus" names "枪神 9plus".
         compact_entity = _compact_casefold(normalized_entity)
         if compact_entity not in compact_quote:
-            return "candidate.entities 中有值未出现在 source_quote，疑似模型编造"
+            if not _entity_is_quote_antecedent(
+                compact_entity,
+                quote=quote,
+                source_text=source_text,
+            ):
+                return "candidate.entities 中有值未出现在 source_quote，疑似模型编造"
+            antecedents.append(normalized_entity)
         if compact_entity not in compact_memory:
             # Detailed sensitive entities are intentionally removed before
             # persistence.  They may ground only a deliberately minimized
@@ -1121,9 +1192,11 @@ def _grounding_gate_reason(
                 return "candidate.entities 中有值未绑定到 candidate.memory 命题"
             continue
 
+    # A verified antecedent restores the subject the quote leaves implicit
+    # ("口语就一般般了" continues "我英语…"), so it counts as quoted wording.
     proposition_matches = _grounding_proposition_matches(
-        candidate.memory,
-        quote,
+        memory,
+        "".join(antecedents) + quote,
         relation_context=relation_context,
     )
     # Preserve privacy-minimized sensitive facts such as "用户有一项证件信息"
@@ -1134,7 +1207,7 @@ def _grounding_gate_reason(
     if (
         not proposition_matches
         and candidate.sensitivity != "normal"
-        and _GENERIC_MINIMIZED_SENSITIVE_MEMORY.search(candidate.memory)
+        and _GENERIC_MINIMIZED_SENSITIVE_MEMORY.search(memory)
         and any(
             entity.strip()
             and entity.strip().casefold() not in _GENERIC_ENTITIES
@@ -1142,7 +1215,7 @@ def _grounding_gate_reason(
             for entity in candidate.entities
         )
     ):
-        propositions = _grounding_propositions(candidate.memory)
+        propositions = _grounding_propositions(memory)
         if len(propositions) == 1:
             proposition_matches = [(propositions[0], [quote])]
     if not proposition_matches:
@@ -1154,6 +1227,65 @@ def _grounding_gate_reason(
         ):
             return "candidate.memory 与 source_quote 的否定含义不一致"
     return None
+
+
+_RELATIVE_YEAR_OFFSETS = {"前年": -2, "去年": -1, "今年": 0, "明年": 1, "后年": 2}
+_BARE_MONTH_OR_PERIOD_RE = re.compile(
+    r"(?<!\d)(?:1[0-2]|0?[1-9])\s*月|[一二三四五六七八九十]{1,3}月|年[初中底末]|上半年|下半年"
+)
+_RESOLVED_YEAR_SPAN_RE = re.compile(r"[（(]\s*(\d{4})\s*年?\s*[）)]|(?<!\d)(\d{4})\s*年")
+_MAX_ANTECEDENT_DISTANCE = 80
+_THIRD_PERSON_PRONOUN_RE = re.compile(r"(?<![其吉])[她他它]|\b(?:she|he|it|they|her|him|them)\b", re.IGNORECASE)
+_FIRST_PERSON_RE = re.compile(r"我|咱|\b(?:i|me|my|we|our)\b", re.IGNORECASE)
+
+
+def _resolved_relative_year(year: int, quote: str, *, now: datetime | None = None) -> bool:
+    """Whether ``year`` is what the quote's relative time means today.
+
+    "明年想报半马" said in 2026 is 2027; "12 月要考 N2" or "今年年中" with no
+    year of its own is the current year.  Any other year stays unsupported,
+    and a quote that names a year itself is taken literally.
+    """
+    if re.search(r"(?<!\d)\d{4}(?!\d)", quote):
+        return False
+    current = _utc_now(now).year
+    offsets = {offset for word, offset in _RELATIVE_YEAR_OFFSETS.items() if word in quote}
+    if offsets:
+        return year - current in offsets
+    return year == current and _BARE_MONTH_OR_PERIOD_RE.search(quote) is not None
+
+
+def _without_resolved_years(memory: str, quote: str, *, now: datetime | None = None) -> str:
+    """Drop year annotations such as "（2027 年）" that the quote's relative time supports."""
+
+    def replace(match: re.Match[str]) -> str:
+        year = int(match.group(1) or match.group(2))
+        return "" if _resolved_relative_year(year, quote, now=now) else match.group(0)
+
+    return _RESOLVED_YEAR_SPAN_RE.sub(replace, memory)
+
+
+def _entity_is_quote_antecedent(compact_entity: str, *, quote: str, source_text: str) -> bool:
+    """Whether the quote refers back to an entity the same message named first.
+
+    "我女朋友叫小雨，做 UI 设计的。她 11 月 3 号生日": the model may quote only
+    the last clause yet name 小雨.  The entity must precede the quote closely
+    in the verbatim user text, and the quote must continue that subject with a
+    pronoun or no subject at all; a quote that speaks about the user ("我在
+    上海工作") cannot inherit a third party named earlier.
+    """
+    if not source_text:
+        return False
+    compact_source = _compact_casefold(source_text)
+    quote_at = compact_source.find(_compact_casefold(quote))
+    if quote_at < 0:
+        return False
+    antecedent_at = compact_source.rfind(compact_entity, 0, quote_at)
+    if antecedent_at < 0 or quote_at - antecedent_at > _MAX_ANTECEDENT_DISTANCE:
+        return False
+    if _THIRD_PERSON_PRONOUN_RE.search(quote):
+        return True
+    return _FIRST_PERSON_RE.search(quote) is None
 
 
 def _grounding_evidence_clauses(memory: str, quote: str) -> list[str]:
@@ -1209,6 +1341,22 @@ def _grounding_proposition_matches(
             for clause in evidence_clauses
         ]
         best_score = max((score for score, _ in scored), default=0)
+        if best_score <= 0 and len(evidence_clauses) > 1:
+            # One fact may span clauses of the same quote ("从杭州搬来上海的，
+            # 因为换了工作").  The whole quote asserts at least as many
+            # relations as any clause, so the conflict rules only get stricter,
+            # and its negations all count against a positive proposition.
+            scored = [
+                (
+                    _grounding_pair_score(
+                        proposition,
+                        quote,
+                        relation_context=relation_context,
+                    ),
+                    quote,
+                )
+            ]
+            best_score = scored[0][0]
         if best_score <= 0:
             return []
         matches.append(
@@ -1277,13 +1425,11 @@ def _grounding_pair_score(
     ):
         evidence_relations.add("possession")
     if proposition_relations:
-        # A multi-fact candidate that escaped the clause splitter still cannot
-        # be supported by evidence for only one of its asserted relations.
-        if not proposition_relations.issubset(evidence_relations):
-            return 0
-        if shared_count <= 0 and not structured_anchor:
-            return 0
-        for relation in proposition_relations & _BOUND_RELATION_ASSERTION_PATTERNS.keys():
+        for relation in (
+            proposition_relations
+            & evidence_relations
+            & _BOUND_RELATION_ASSERTION_PATTERNS.keys()
+        ):
             if not _relation_is_bound_to_asserted_object(
                 relation,
                 evidence_clause=evidence_clause,
@@ -1291,6 +1437,20 @@ def _grounding_pair_score(
                 proposition_structured_values=_structured_values(proposition),
             ):
                 return 0
+        if not proposition_relations.issubset(evidence_relations):
+            # A multi-fact candidate that escaped the clause splitter still
+            # cannot be supported by evidence for only one of its asserted
+            # relations; only framing or colloquially evidenced relations may
+            # be missing, and then the wording itself must carry the fact.
+            return _relation_tolerant_score(
+                proposition,
+                evidence_clause,
+                proposition_relations=proposition_relations,
+                evidence_relations=evidence_relations,
+                shared_terms=proposition_terms & evidence_terms,
+            )
+        if shared_count <= 0 and not structured_anchor:
+            return 0
         return shared_count + len(proposition_relations) * 4 + int(structured_anchor) * 2
 
     # Unknown relations do not get the one-entity escape hatch.  Exact or near-
@@ -1301,9 +1461,113 @@ def _grounding_pair_score(
     if shared_count < 2:
         return 0
     coverage = shared_count / max(1, len(proposition_terms))
-    if coverage < 0.5:
+    if (
+        coverage < 0.5
+        and _grounding_content_coverage(proposition, evidence_clause) < _TOLERANT_CONTENT_COVERAGE
+    ):
         return 0
     return shared_count
+
+
+_TOLERANT_CONTENT_COVERAGE = 0.6
+
+
+def _relation_tolerant_score(
+    proposition: str,
+    evidence_clause: str,
+    *,
+    proposition_relations: set[str],
+    evidence_relations: set[str],
+    shared_terms: set[str],
+) -> int:
+    """Score a paraphrase whose relation words are absent from the evidence.
+
+    Evidence that asserts a relation the proposition does not ("我申请了
+    Acme" for "在 Acme 工作", "我喜欢咖啡" for "购买咖啡") is still a conflict.
+    Otherwise every missing relation must be framing or colloquially evidenced,
+    and the quoted words must cover most of the proposition's content, so a
+    bare object mention ("上海徐汇区的房价") cannot ground "住在上海徐汇区".
+    The score stays below any relation-matched pair so explicit evidence wins.
+    """
+    if evidence_relations - proposition_relations:
+        return 0
+    missing = proposition_relations - evidence_relations
+    for relation in missing - _FRAMING_RELATIONS:
+        cues = _COLLOQUIAL_RELATION_CUES.get(relation, ())
+        if not any(re.search(cue, evidence_clause, re.IGNORECASE) for cue in cues):
+            return 0
+    if len(shared_terms) < 2:
+        return 0
+    # The missing relation words are the paraphrase itself; they are neither
+    # quoted content nor evidence against it.
+    missing_patterns = tuple(
+        pattern for relation in missing for pattern in _GROUNDING_RELATION_PATTERNS[relation]
+    )
+    if (
+        _grounding_content_coverage(proposition, evidence_clause, masked_patterns=missing_patterns)
+        < _TOLERANT_CONTENT_COVERAGE
+    ):
+        return 0
+    if missing & _ATTITUDE_RELATIONS and (
+        _grounding_content_coverage(evidence_clause, proposition) < _TOLERANT_CONTENT_COVERAGE
+    ):
+        # An attitude read into a clause that is mostly about something else
+        # ("上海徐汇区的房价太高了" → "喜欢上海徐汇区") is invented, not paraphrased.
+        return 0
+    return len(shared_terms)
+
+
+# Attitudes a model could read into a neutral mention of the object.
+_ATTITUDE_RELATIONS = frozenset({"preference", "belief", "intent"})
+
+
+def _grounding_content_coverage(
+    text: str,
+    other: str,
+    *,
+    masked_patterns: tuple[str, ...] = (),
+) -> float:
+    """Share of ``text``'s content characters that also appear in ``other``.
+
+    Term coverage counts every bigram and trigram, so the cross-word n-grams of
+    a paraphrase ("好之后", "勤约") dilute it even when every content word is
+    quoted.  Counting characters covered by shared n-grams ignores those seams.
+    Framing characters (用户, 的, 使用, 喜欢 ...) and spans matching
+    ``masked_patterns`` are not content and are skipped.
+    """
+    folded = text.casefold()
+    shared = _terms(folded) & _terms(other.casefold())
+    covered = [False] * len(folded)
+    for term in shared:
+        start = folded.find(term)
+        while start >= 0:
+            for index in range(start, start + len(term)):
+                covered[index] = True
+            start = folded.find(term, start + 1)
+    masked = [False] * len(folded)
+    for pattern in (*masked_patterns, *_GROUNDING_COVERAGE_FILLER_WORDS):
+        for match in re.finditer(pattern, folded, re.IGNORECASE):
+            for index in range(match.start(), match.end()):
+                masked[index] = True
+    other_chars = set(other.casefold())
+    total = 0
+    hit = 0.0
+    for match in _GROUNDING_CONTENT_UNIT_RE.finditer(folded):
+        unit = match.group(0)
+        if len(unit) == 1 and (
+            unit in _GROUNDING_GENERIC_CJK_CHARS or unit in _GROUNDING_COVERAGE_FILLER_CHARS
+        ):
+            continue
+        if any(masked[match.start() : match.end()]):
+            continue
+        total += 1
+        if all(covered[match.start() : match.end()]):
+            hit += 1
+        elif len(unit) == 1 and unit in other_chars:
+            # A lone shared character ("参加…考试" / "要考") is weaker evidence
+            # than a shared word, but not none.
+            hit += 0.5
+    return hit / total if total else 0.0
 
 
 def _grounding_subjects_compatible(
@@ -1412,11 +1676,20 @@ def _compact_casefold(text: str) -> str:
 def _grounding_has_negation(text: str) -> bool:
     # "not only" / "不但" are additive constructions rather than negative
     # polarity.  Strip them before applying the shared conservative detector.
+    # Idioms that contain 不 without negating anything ("单程差不多 40 分钟",
+    # "不得不") are stripped the same way.  An imperative 别 ("别用 Java") is
+    # a negation the shared detector does not know; 特别/区别 are not.
     normalized = re.sub(
-        r"不但|不仅|不只是|不只|\bnot\s+only\b|\bwithout\s+fail\b",
+        r"不但|不仅|不只是|不只|差不多|不错|不少|不久|不断|不得不|"
+        r"\bnot\s+only\b|\bwithout\s+fail\b",
         " ",
         text,
         flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"(?<![特区分类级性告识辨差鉴派])别(?=\s*(?:再|用|吃|喝|给|让|要|买|去|发|提|放|加|说|写|推荐))",
+        "不",
+        normalized,
     )
     return _has_negation(normalized)
 
@@ -1450,6 +1723,11 @@ def grounding_subjects_compatible_both_ways(new_text: str, old_text: str) -> boo
 def grounding_terms_overlap(new_text: str, old_text: str) -> bool:
     """The two statements share at least one non-generic grounded term."""
     return bool(_grounding_terms(new_text) & _grounding_terms(old_text))
+
+
+def grounding_relation_families(text: str) -> set[str]:
+    """Relation families (employment, residence, possession, age, …) the text asserts."""
+    return _grounding_relation_families(text)
 
 
 def shared_relation_families(new_text: str, old_text: str) -> set[str]:

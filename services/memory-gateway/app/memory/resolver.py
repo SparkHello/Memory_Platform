@@ -13,6 +13,7 @@ from app.memory.extraction_hints import (
     _matches_any,
 )
 from app.memory.extractor import (
+    grounding_relation_families,
     grounding_subjects_compatible_both_ways,
     grounding_terms_overlap,
     has_text_grounding_anchor,
@@ -605,6 +606,11 @@ def _describes_same_replaceable_attribute(
       *and* an explicit negation conflict;
     * a structured value of the same kind with a different value (phone number,
       e-mail) is sufficient;
+    * statements asserting different attribute relations describe different
+      attributes ("养了一只叫年糕的橘猫" vs "年糕现在三岁"), and closing a
+      compound fact ("住在北京，在字节工作") for one of its parts would lose
+      the rest, so their attribute relations must match exactly (wording
+      families such as usage or preference may differ);
     * otherwise both a shared grounded term and overlapping topics are needed.
     """
     new_text, old_text = candidate.memory, memory.content
@@ -612,6 +618,8 @@ def _describes_same_replaceable_attribute(
         return False
     if structured_value_kind_changed(new_text, old_text):
         return True
+    if _attribute_relations(new_text) != _attribute_relations(old_text):
+        return False
     families = shared_relation_families(new_text, old_text)
     if families - _ADDITIVE_RELATION_FAMILIES:
         return True
@@ -619,6 +627,29 @@ def _describes_same_replaceable_attribute(
     if families:
         return terms_overlap and relation == "conflict"
     return terms_overlap and _labels_overlap(candidate.topics, memory.topics)
+
+
+# Relations that pin down *which* attribute a statement sets.  Wording
+# families (usage, preference, consumption, tool choice …) vary with phrasing
+# ("用 iPhone" / "改用安卓手机") and are not compared.
+_ATTRIBUTE_RELATION_FAMILIES = frozenset(
+    {
+        "residence",
+        "employment",
+        "education",
+        "application",
+        "visit",
+        "purchase",
+        "sale",
+        "possession",
+        "identity",
+        "age",
+    }
+)
+
+
+def _attribute_relations(text: str) -> set[str]:
+    return grounding_relation_families(text) & _ATTRIBUTE_RELATION_FAMILIES
 
 
 def _find_related_memory(

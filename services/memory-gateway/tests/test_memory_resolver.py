@@ -839,6 +839,40 @@ async def test_resolver_does_not_auto_supersede_third_party_subject(memory_store
     assert result.action == "create"
 
 
+# A new fact *about* an object the user owns or knows is a supplement, not a
+# replacement: "现在" there describes the object's state, not a change of it.
+@pytest.mark.parametrize(
+    ("old_content", "new_content"),
+    [
+        ("用户养了一只叫年糕的橘猫。", "用户的橘猫年糕现在三岁。"),
+        ("用户有一个妹妹。", "用户的妹妹现在在北京读研。"),
+        ("用户的女朋友叫小雨。", "用户现在住在上海。"),
+        ("用户养了一只叫年糕的橘猫。", "用户现在三十岁了，还养着年糕。"),
+        # Closing a compound fact for one of its parts would lose the rest.
+        ("用户住在北京，在字节跳动工作。", "用户现在住在上海。"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolver_does_not_auto_supersede_a_different_attribute_of_the_same_object(
+    memory_store: MemoryStore,
+    old_content: str,
+    new_content: str,
+) -> None:
+    old = _old_fact(memory_store, old_content, topics=["宠物", "家人"])
+
+    result = await _resolver(memory_store).resolve(
+        user_id="default",
+        candidate=_candidate(new_content, type="semantic", topics=["宠物", "家人"]),
+        auto_classify=False,
+    )
+
+    assert result.action == "create"
+    old_after = memory_store.get_memory(memory_id=old.id, user_id="default")
+    assert old_after is not None
+    assert old_after.superseded_by is None
+    assert _auto_supersede_logs(memory_store) == []
+
+
 @pytest.mark.asyncio
 async def test_resolver_does_not_auto_supersede_future_dated_or_uncommitted_candidate(
     memory_store: MemoryStore,

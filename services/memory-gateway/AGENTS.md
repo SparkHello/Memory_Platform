@@ -184,6 +184,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - 知识导入以用户选择的敏感级别为最终值，但本地检测级别更高时必须先返回结构化确认要求，只有 Web 用户明确点击后才可带 `confirm_sensitivity_override=true` 重试；该确认需持久化审计，MCP 不得暴露绕过参数。
 - ingest 决策日志不得复制完整 `source_quote`；敏感候选正文只记录长度、哈希、敏感级别和关联 memory ID。提取模型返回空候选时，自由文本理由也只记录长度/哈希，但必须保留经过枚举校验的 `model_reason_code`；无效或缺失代码记为 `unclassified`。
 - 模型提取候选必须通过逐字 quote、事实锚点、否定一致性和子句级敏感授权；记忆的 direct/update/restore 仍须在 MemoryStore 边界强制 sensitivity 下限，不受知识导入确认机制影响。
+- 事实锚点（`extractor.py::_grounding_pair_score`）：候选关系族不在引用中时走 `_relation_tolerant_score`，只要引用没有**其他**关系族（申请≠就职、旅游≠居住、购买≠喜欢仍拒绝），缺失的是框架类关系（`_FRAMING_RELATIONS`：偏好/计划/需要/认为/使用/饮食/制作/人际称谓）或有口语线索的对象型关系（`_COLLOQUIAL_RELATION_CUES`：居住/就职/就读/拥有/去过），并且按字符算的内容覆盖率 ≥0.6（缺失关系词与「进行」「的时候」等虚词不计），就接受；态度类（偏好/认为/计划）还要求引用子句本身大部分在讲这件事，防止从「上海的房价太高」读出「喜欢上海」。单子句都不成立时才用整句引用兜底。否定检测剥掉「差不多/不得不/不错」等非否定成语，并把祈使「别用/别吃」视为否定。结构化数字里的年份：若 quote 自身不含四位年份，且年份正是 quote 里「前年/去年/今年/明年/后年」相对服务端 UTC 当前年的换算结果，或 quote 只写了月份/年中/上下半年而年份等于当前年，则视为可信换算（`_without_resolved_years`，保存的记忆仍保留该年份）；「刚买了」这类没有时间词的推断仍拒绝。实体：不在 quote 中的实体，只有在本轮用户原文里、quote 之前 80 字内出现过（先行词），且 quote 用她/他/它续指或不含「我」这类主语时才接受（`_entity_is_quote_antecedent`），并以「先行实体 + quote」参与锚点匹配。改这些规则时必须同时跑 `tests/test_memory_extraction.py` 里的 colloquial/mention/idioms/relative_time/antecedent 用例。
 
 ## 重要文件说明
 
@@ -214,7 +215,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/extractor.py`：LLM 记忆提取和保存门槛校验。
 - `app/memory/extraction_prefilter.py`：提取前置过滤。保守判断仅为寒暄致谢、纯提问或纯代码的轮次并跳过 `memory.extract`；必须写入以「本地预过滤：」开头的 ignore 决策日志（只记长度与 SHA-256），不得使用单纯长度阈值，明确「记住/remember」请求和助手提问后的短回答永不跳过，内部任何异常一律 fail-open 回到正常提取。不影响 `memory.compact` 和请求侧召回。
 - `app/memory/egress.py`：按句子划分出站文本，供所有 ingest 入口（`/v1`、REST ingest、MCP `submit_memory_text`、对话导入）共用：只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子；紧邻「记住」的被扣留句子不经模型、不生成向量地原句本地保存（`type=semantic`、importance 8、confidence 0.9、「私密信息」空间），其余被扣留句子只留哈希/长度/级别审计，正文绝不入日志。
-- `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。旧事实替换分三层：temporal 白名单 key → 按 key 失效旧版本；无 key 但带明确转变标记（现在/已经/改成/换成/不再/取代、整词 `instead`/`switched`/`now`/`no longer`）且通过严格配对安全检查（同主体、同类型同敏感级别、共享可替换关系族或同类结构化值不同取值、旧记忆无过去时/意图标记、余弦≥0.80；偏好/消费类只在显式否定冲突时替换）→ 无键自动替换，把旧记忆原地关闭（`status=resolved`、`valid_until`、`superseded_by`），依赖 embedding，由 `MEMORY_AUTO_SUPERSEDE` 控制、默认开启；其余（纯极性翻转、`supplement`、episodic/reflective、pinned/resolved、无向量）→ 创建并交给体检。
+- `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。旧事实替换分三层：temporal 白名单 key → 按 key 失效旧版本；无 key 但带明确转变标记（现在/已经/改成/换成/不再/取代、整词 `instead`/`switched`/`now`/`no longer`）且通过严格配对安全检查（同主体——「用户的橘猫/女朋友/大学室友」这类带修饰语的第三方与用户本人永不配对、同类型同敏感级别、属性关系族（居住/就职/就读/拥有/年龄/身份/去过/买卖/申请）完全一致——「养了叫年糕的橘猫」不会被「年糕现在三岁」替换，复合事实也不会因其中一部分变化被整条关闭、共享可替换关系族或同类结构化值不同取值、旧记忆无过去时/意图标记、余弦≥0.80；偏好/消费类只在显式否定冲突时替换）→ 无键自动替换，把旧记忆原地关闭（`status=resolved`、`valid_until`、`superseded_by`），依赖 embedding，由 `MEMORY_AUTO_SUPERSEDE` 控制、默认开启；其余（纯极性翻转、`supplement`、episodic/reflective、pinned/resolved、无向量）→ 创建并交给体检。
 - `app/memory/core.py`：核心记忆整理。只从已保存长期记忆中提炼，并要求 evidence ids。
 - `app/memory/review.py`：记忆体检建议，不直接修改数据。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。

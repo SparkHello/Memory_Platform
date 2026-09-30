@@ -2279,6 +2279,229 @@ def test_grounding_accepts_relation_paraphrase_and_additive_not_only(
     )
 
 
+# Normalised rewrites a real extraction model produced for colloquial speech.
+# The relation word is the model's own ("工作", "住在", "偏好", "使用"), the
+# rest of the fact is quoted, and the evidence asserts no other relation.
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户在一家做跨境电商的公司工作。", "在一家做跨境电商的公司"),
+        ("用户目前住在上海徐汇区。", "我在上海徐汇区住"),
+        ("用户的女朋友从事 UI 设计工作。", "我女朋友叫小雨，做 UI 设计的"),
+        ("用户平时主要使用 Go 进行开发。", "平时主要写 Go"),
+        ("用户偏好之后的代码示例都使用 Go，不要用 Java。", "以后给我代码示例都用 Go 吧，别用 Java"),
+        ("用户偏好回答简洁，先给结论再解释。", "回答我的时候简洁点，先给结论再解释"),
+        ("用户每天坐 9 号线上班，单程通勤约 40 分钟。", "每天坐 9 号线上班，单程差不多 40 分钟"),
+        ("用户对噪音特别敏感，睡觉时需要戴耳塞。", "对噪音特别敏感，睡觉得戴耳塞"),
+        ("用户用 Kindle 阅读电子书。", "电子书用 Kindle"),
+        ("用户去年秋天和小雨一起去了京都、大阪旅行。", "去年秋天和小雨去了京都、大阪"),
+        ("用户英语阅读技术文档没有问题。", "我英语看技术文档没问题"),
+    ],
+)
+def test_grounding_accepts_normalised_rewrite_of_colloquial_evidence(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    assert (
+        validate_candidate_for_save(
+            candidate,
+            user_message=quote,
+            require_quote_in_user_message=True,
+        )
+        is None
+    )
+
+
+# The same tolerance must not turn a mere mention of the object into a
+# relation: no colloquial cue, an attitude read into an unrelated clause, or a
+# different relation in the evidence.
+@pytest.mark.parametrize(
+    ("memory", "quote"),
+    [
+        ("用户住在上海徐汇区。", "上海徐汇区的房价太高了"),
+        ("用户喜欢上海徐汇区。", "上海徐汇区的房价太高了"),
+        ("用户计划去大理。", "大理的洱海很有名"),
+        ("用户在字节跳动工作。", "字节跳动的新闻挺多"),
+        ("用户在 Acme 工作。", "我面试了 Acme"),
+        ("用户就读于北京大学。", "北京大学挺漂亮"),
+        ("用户拥有特斯拉 Model 3。", "我看过特斯拉 Model 3"),
+        ("用户使用 Neovim。", "Neovim 的插件好多"),
+        ("用户喜欢咖啡。", "我今天买了咖啡"),
+        ("用户养了一只橘猫。", "朋友养了一只橘猫"),
+    ],
+)
+def test_grounding_tolerance_does_not_invent_a_relation_from_a_mention(
+    memory: str,
+    quote: str,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert rejection is not None
+    assert "每个事实" in rejection
+
+
+def _year_offset_cases() -> list[tuple[str, str, bool]]:
+    year = datetime.now(UTC).year
+    return [
+        # The model resolves relative time against the prompt's current date.
+        (f"用户计划明年（{year + 1} 年）报名上海半马。", "明年想报上海半马", True),
+        (f"用户今年（{year}年）给自己定了学会 Rust 的目标。", "今年给自己定了个目标，把 Rust 学会", True),
+        (f"用户计划在 {year} 年 12 月参加日语 N2 考试。", "12 月要考日语 N2", True),
+        (f"用户 {year - 1} 年秋天去了京都。", "去年秋天去了京都", True),
+        # Wrong resolution, no time words at all, or a year the user named.
+        (f"用户计划 {year + 2} 年报名上海半马。", "明年想报上海半马", False),
+        (f"用户于 {year} 年 9 月底买了一把人体工学椅。", "刚买了把人体工学椅", False),
+        (f"用户 {year} 年去了京都。", "我 2019 年去了京都", False),
+    ]
+
+
+@pytest.mark.parametrize(("memory", "quote", "accepted"), _year_offset_cases())
+def test_grounding_accepts_only_years_resolved_from_relative_time(
+    memory: str,
+    quote: str,
+    accepted: bool,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=quote,
+        require_quote_in_user_message=True,
+    )
+
+    assert (rejection is None) is accepted, rejection
+
+
+@pytest.mark.parametrize(
+    ("message", "quote", "memory", "entity", "accepted"),
+    [
+        # The quote continues a subject the same message named just before it.
+        (
+            "我女朋友叫小雨，做 UI 设计的。她 11 月 3 号生日",
+            "她 11 月 3 号生日",
+            "用户的女朋友小雨的生日是 11 月 3 号。",
+            "小雨",
+            True,
+        ),
+        (
+            "我英语看技术文档没问题，口语就一般般了",
+            "口语就一般般了",
+            "用户英语口语水平一般。",
+            "英语",
+            True,
+        ),
+        # A quote about the user cannot inherit a third party named earlier.
+        (
+            "我朋友小雨在北京工作，我在上海工作",
+            "我在上海工作",
+            "小雨在上海工作。",
+            "小雨",
+            False,
+        ),
+        # The entity must precede the quote, and must be the user's own words.
+        (
+            "她 11 月 3 号生日，我女朋友叫小雨",
+            "她 11 月 3 号生日",
+            "用户的女朋友小雨的生日是 11 月 3 号。",
+            "小雨",
+            False,
+        ),
+        (
+            "我女朋友做 UI 设计的。她 11 月 3 号生日",
+            "她 11 月 3 号生日",
+            "用户的女朋友小美的生日是 11 月 3 号。",
+            "小美",
+            False,
+        ),
+    ],
+)
+def test_grounding_entity_may_come_from_a_preceding_antecedent(
+    message: str,
+    quote: str,
+    memory: str,
+    entity: str,
+    accepted: bool,
+) -> None:
+    from app.memory.extractor import validate_candidate_for_save
+    from app.memory.models import CandidateMemory
+
+    candidate = CandidateMemory(
+        action="create",
+        memory=memory,
+        type="semantic",
+        importance=8,
+        confidence=0.95,
+        source_quote=quote,
+        entities=[entity],
+    )
+
+    rejection = validate_candidate_for_save(
+        candidate,
+        user_message=message,
+        require_quote_in_user_message=True,
+    )
+
+    assert (rejection is None) is accepted, rejection
+
+
+@pytest.mark.parametrize(
+    ("memory", "quote", "consistent"),
+    [
+        ("用户单程通勤约 40 分钟。", "单程差不多 40 分钟", True),
+        ("用户不得不早起。", "我不得不早起", True),
+        ("用户不要用 Java。", "别用 Java", True),
+        ("用户特别能吃辣。", "我特别能吃辣", True),
+        ("用户用 Java。", "别用 Java", False),
+    ],
+)
+def test_grounding_negation_ignores_idioms_and_reads_imperative_bie(
+    memory: str,
+    quote: str,
+    consistent: bool,
+) -> None:
+    from app.memory.extractor import has_text_grounding_anchor
+
+    assert has_text_grounding_anchor(memory, quote) is consistent
+
+
 @pytest.mark.parametrize(
     "quote",
     [
