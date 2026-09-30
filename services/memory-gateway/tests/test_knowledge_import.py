@@ -283,3 +283,41 @@ def test_import_requires_click_through_before_honoring_lower_user_sensitivity(
     assert document["sensitivity"] == "normal"
     assert document["detected_sensitivity"] == "sensitive"
     assert document["sensitivity_override_confirmed"] is True
+
+
+def test_damaged_docx_archive_is_a_validation_error_not_an_outage(client, auth_headers) -> None:
+    data = bytearray(_docx_bytes())
+    # Flip bytes inside the compressed member so the CRC check fails on read.
+    data[60] ^= 0xFF
+    data[61] ^= 0xFF
+
+    with pytest.raises(KnowledgeValidationError):
+        parse_knowledge_file(bytes(data), filename="damaged.docx")
+
+    response = client.post(
+        "/knowledge/import",
+        params={"filename": "damaged.docx"},
+        headers={
+            **auth_headers,
+            "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        },
+        content=bytes(data),
+    )
+    assert response.status_code == 422
+
+
+def test_docx_and_epub_parse_inside_the_isolated_worker(monkeypatch) -> None:
+    monkeypatch.setattr(parsing, "_PDF_WALL_SECONDS", 0.001)
+    with pytest.raises(KnowledgeFileParseError) as docx_error:
+        parse_knowledge_file(_docx_bytes(), filename="slow.docx")
+    assert docx_error.value.code == "knowledge_docx_wall_timeout"
+    with pytest.raises(KnowledgeFileParseError) as epub_error:
+        parse_knowledge_file(_epub_bytes(), filename="slow.epub")
+    assert epub_error.value.code == "knowledge_epub_wall_timeout"
+
+
+def test_text_import_strips_utf8_bom_so_first_heading_is_recognised() -> None:
+    parsed = parse_knowledge_file("﻿# 标题\n\n正文".encode("utf-8"), filename="notes.md")
+
+    assert parsed.text.startswith("# 标题")
+    assert "﻿" not in parsed.text

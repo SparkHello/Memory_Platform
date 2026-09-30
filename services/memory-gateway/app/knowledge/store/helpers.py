@@ -483,8 +483,14 @@ def _search_hit_from_row(
     signal: str,
 ) -> KnowledgeSearchHit:
     content = row["content"]
+    title_path = _json_string_list(row["title_path_json"])
     if query:
-        excerpt, local_start, local_end = _excerpt(content, query, _SEARCH_EXCERPT_CHARS)
+        excerpt, local_start, local_end = _excerpt(
+            content,
+            query,
+            _SEARCH_EXCERPT_CHARS,
+            title_path=" / ".join([row["title"] or "", *title_path]),
+        )
     else:
         excerpt, local_start, local_end = content, 0, len(content)
     absolute_start = int(row["char_start"]) + local_start
@@ -497,7 +503,6 @@ def _search_hit_from_row(
         signals.append("trigram")
     if query and query.casefold() in content.casefold():
         signals.append("exact_phrase")
-    title_path = _json_string_list(row["title_path_json"])
     if query and query.casefold() in " / ".join(title_path).casefold():
         signals.append("heading")
     if signal == "reference":

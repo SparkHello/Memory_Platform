@@ -17,7 +17,7 @@ import {
   X
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isAbortError, type MemoryApi } from "../../api";
+import { ApiError, isAbortError, type MemoryApi } from "../../api";
 import { Badge } from "../../components/Badge";
 import { DataTable } from "../../components/DataTable";
 import { Modal } from "../../components/Modal";
@@ -32,6 +32,7 @@ import type {
   KnowledgeDocumentStatus,
   KnowledgeExport,
   KnowledgeReadResponse,
+  KnowledgeRestoreResult,
   KnowledgeVersion,
   MemorySensitivity,
   ProvidersStatus
@@ -72,6 +73,7 @@ export function KnowledgeLibraryPage({
   if (documentId) {
     return (
       <KnowledgeDetailPage
+        key={documentId}
         api={api}
         documentId={documentId}
         notify={notify}
@@ -187,7 +189,22 @@ function KnowledgeListPage({
     if (!ok) return;
     setRestoring(true);
     try {
-      const result = await api.restoreKnowledge(restorePreview);
+      let result: KnowledgeRestoreResult;
+      try {
+        result = await api.restoreKnowledge(restorePreview);
+      } catch (firstError) {
+        if (!(firstError instanceof ApiError) || firstError.code !== "sensitivity_confirmation_required") {
+          throw firstError;
+        }
+        const again = await confirm({
+          title: "备份中含有低于本地检测结果的敏感级别",
+          message: "备份里有文档曾被确认按低于本地检测的级别保存。是否沿用备份中的级别恢复？选择取消则中止恢复。",
+          confirmLabel: "沿用备份级别恢复",
+          tone: "warning"
+        });
+        if (!again) return;
+        result = await api.restoreKnowledge(restorePreview, true);
+      }
       const restored = result.restored_documents ?? 0;
       const skipped = result.skipped_documents ?? 0;
       const failed = result.failed_versions ?? 0;
@@ -546,8 +563,14 @@ function KnowledgeDetailPage({
   const reindex = async (version: KnowledgeVersion) => {
     if (!detail) return;
     try {
-      await api.reindexKnowledgeDocument(detail.document.id, version.id);
-      notify("重新索引已完成", "success");
+      const result = await api.reindexKnowledgeDocument(detail.document.id, version.id);
+      if (result.version?.index_status === "failed") {
+        notify(`重建索引失败：${result.version.index_error || "请查看版本详情"}`, "error");
+      } else if (result.embedding?.status === "failed") {
+        notify("关键词索引已重建；向量索引失败，可稍后重试", "error");
+      } else {
+        notify("重新索引已完成", "success");
+      }
       onChanged();
       await load();
     } catch (indexError) {
@@ -563,11 +586,20 @@ function KnowledgeDetailPage({
     try {
       const chunks: string[] = [];
       let cursor = "";
-      for (let page = 0; page < 500; page += 1) {
+      let complete = false;
+      // 50 MiB 文档按 2 万字符分页最多约 2700 页；再留余量。
+      for (let page = 0; page < 4000; page += 1) {
         const result = await api.readKnowledge({ reference: selectedVersionRef, cursor, maxChars: 20000, includeSensitive: true });
         chunks.push(readPageText(result));
-        if (result.complete || !result.next_cursor || result.next_cursor === cursor) break;
+        if (result.complete || !result.next_cursor || result.next_cursor === cursor) {
+          complete = true;
+          break;
+        }
         cursor = result.next_cursor;
+      }
+      if (!complete) {
+        notify("正文过长，未能完整下载；请改用备份导出", "error");
+        return;
       }
       const safeTitle = (detail.document.title || "knowledge").replace(/[\\/:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "") || "knowledge";
       downloadFile(

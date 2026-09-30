@@ -237,7 +237,7 @@ def _model_gateway_knowledge_payload(
         "model": model,
         "messages": deepcopy(messages),
         "tools": deepcopy(tools),
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "stream": False,
         "reasoning_effort": reasoning_effort,
     }
@@ -516,7 +516,14 @@ class KnowledgeSearchAgent:
             quality == "deep" or flash.needs_pro or flash.may_escalate
         )
         if not should_escalate:
-            metadata.fallback_reason = flash.failure_reason or "agent_round_limit"
+            if flash_selected:
+                # fast quality cannot escalate, but the flash phase already
+                # produced locally validated references; they beat the raw
+                # lexical baseline even though the model wanted a second look.
+                metadata.agent_used = True
+                metadata.fallback_reason = "agent_escalation_unavailable"
+                return self._finish(flash_selected, metadata, started, baseline_values)
+            metadata.fallback_reason = flash.failure_reason or "agent_escalation_unavailable"
             return self._finish(
                 baseline_refs,
                 metadata,
@@ -547,6 +554,12 @@ class KnowledgeSearchAgent:
             return self._finish(pro.selected_refs, metadata, started, baseline_values)
 
         metadata.fallback_reason = pro.failure_reason
+        if flash_selected:
+            # The pro review failed remotely, but the flash selection was
+            # already validated against local candidates: prefer it over the
+            # lexical baseline rather than discarding agent work.
+            metadata.agent_used = True
+            return self._finish(flash_selected, metadata, started, baseline_values)
         return self._finish(
             baseline_refs,
             metadata,
@@ -606,6 +619,56 @@ class KnowledgeSearchAgent:
                     model=used_model,
                     failure_reason=_agent_failure_reason(exc),
                 )
+
+            if not calls:
+                # Prose instead of a tool call: keep the turn in the transcript,
+                # tell the model what is expected and try once more.  A
+                # truncated reply (finish_reason=length) is reported separately
+                # because it points at max_tokens rather than at the model.
+                invalid_streak += 1
+                last_failure = (
+                    "agent_response_truncated"
+                    if _finish_reason(raw) == "length"
+                    else "invalid_agent_response"
+                )
+                metadata.tool_steps.append(
+                    KnowledgeAgentToolStep(
+                        model=used_model,
+                        round=round_number,
+                        tool="invalid",
+                        status="rejected",
+                    )
+                )
+                if invalid_streak >= 2:
+                    return _LoopOutcome(
+                        selected_refs=[],
+                        rounds=round_number,
+                        model=used_model,
+                        may_escalate=True,
+                        failure_reason=last_failure,
+                    )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _response_message_text(raw, "content"),
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "error": "tool_call_required",
+                                "hint": (
+                                    "Reply only with a search_index, inspect_chunks "
+                                    "or select_references tool call; free text is ignored."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                continue
 
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
@@ -1144,13 +1207,23 @@ def _parse_tool_args(model: type[BaseModel], value: str | dict[str, Any]) -> Any
 
 
 def _extract_tool_calls(response: dict[str, Any]) -> list[_ToolCall]:
+    """Return the response's tool calls; an empty list means a text-only reply.
+
+    ``tool_choice: auto`` explicitly allows the model to answer in prose, so a
+    missing ``tool_calls`` field is a recoverable round, not a protocol error.
+    Malformed calls still raise.
+    """
     try:
         choices = response["choices"]
         message = choices[0]["message"]
-        raw_calls = message["tool_calls"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("agent response did not contain tool calls") from exc
-    if not isinstance(raw_calls, list) or not raw_calls or len(raw_calls) > 8:
+        raise ValueError("agent response did not contain a message") from exc
+    if not isinstance(message, Mapping):
+        raise ValueError("agent response message must be an object")
+    raw_calls = message.get("tool_calls")
+    if raw_calls is None or raw_calls == []:
+        return []
+    if not isinstance(raw_calls, list) or len(raw_calls) > 8:
         raise ValueError("agent response contained invalid tool calls")
 
     calls: list[_ToolCall] = []
@@ -1185,6 +1258,14 @@ def _response_model(response: Mapping[str, Any], *, fallback: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()[:200]
     return fallback
+
+
+def _finish_reason(response: Mapping[str, Any]) -> str:
+    try:
+        value = response["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 def _response_message_text(response: Mapping[str, Any], field: str) -> str:

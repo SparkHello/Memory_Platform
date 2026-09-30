@@ -16,6 +16,7 @@ import time
 from typing import Final
 from urllib.parse import unquote, urlsplit
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 
 from app.knowledge.store import KnowledgeValidationError
@@ -23,7 +24,7 @@ from app.knowledge.store import KnowledgeValidationError
 
 _SUPPORTED_EXTENSIONS: Final = {".txt", ".md", ".markdown", ".pdf", ".docx", ".epub"}
 _MAX_ARCHIVE_FILES: Final = 10_000
-_MAX_ARCHIVE_UNCOMPRESSED_BYTES: Final = 100 * 1024 * 1024
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES: Final = 64 * 1024 * 1024
 _MAX_TABLE_CELLS: Final = 200_000
 _MAX_PDF_PAGES: Final = 1000
 _MAX_PDF_TEXT_CHARS: Final = 10_000_000
@@ -75,15 +76,17 @@ def parse_knowledge_file(
     if extension in {".txt", ".md", ".markdown"}:
         return _parse_text(data, safe_name, extension)
     if extension == ".pdf":
-        return _parse_pdf_isolated(data, safe_name)
+        return _parse_isolated("pdf", data, safe_name)
     if extension == ".docx":
-        return _parse_docx(data, safe_name)
-    return _parse_epub(data, safe_name)
+        return _parse_isolated("docx", data, safe_name)
+    return _parse_isolated("epub", data, safe_name)
 
 
 def _parse_text(data: bytes, filename: str, extension: str) -> ParsedKnowledgeDocument:
     try:
-        text = data.decode("utf-8")
+        # utf-8-sig drops the BOM that Windows editors prepend; otherwise the
+        # first heading starts with U+FEFF and is never recognised as one.
+        text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise KnowledgeValidationError("text and Markdown files must use UTF-8") from exc
     text = _clean_text(text)
@@ -98,19 +101,44 @@ def _parse_text(data: bytes, filename: str, extension: str) -> ParsedKnowledgeDo
     )
 
 
+_PARSER_LABELS: Final = {"pdf": "PDF", "docx": "DOCX", "epub": "EPUB"}
+_ARCHIVE_ERRORS: Final = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    zlib.error,
+    NotImplementedError,
+    RuntimeError,
+    ValueError,
+    OSError,
+    ET.ParseError,
+)
+
+
 def _parse_pdf_isolated(data: bytes, filename: str) -> ParsedKnowledgeDocument:
+    return _parse_isolated("pdf", data, filename)
+
+
+def _parse_isolated(kind: str, data: bytes, filename: str) -> ParsedKnowledgeDocument:
+    """Parse PDF/DOCX/EPUB in a resource-limited child process.
+
+    ZIP-based formats expand in memory just like PDFs do (a 300 KB DOCX can
+    hold 100 MiB of XML), so every non-plain-text parser shares the same
+    CPU/memory/wall-clock boundary instead of running inside the gateway.
+    """
+    label = _PARSER_LABELS[kind]
+    prefix = f"knowledge_{kind}"
     if not _PDF_PARSE_SLOTS.acquire(timeout=_PDF_WALL_SECONDS):
         raise KnowledgeFileParseError(
-            "knowledge_pdf_busy",
-            "PDF parser is busy; retry after the current import finishes",
+            f"{prefix}_busy",
+            f"{label} parser is busy; retry after the current import finishes",
         )
     try:
         context = multiprocessing.get_context("spawn")
         receiver, sender = context.Pipe(duplex=False)
         process = context.Process(
-            target=_pdf_worker_entry,
-            args=(data, filename, sender),
-            name="memory-gateway-pdf-parser",
+            target=_worker_entry,
+            args=(kind, data, filename, sender),
+            name=f"memory-gateway-{kind}-parser",
             daemon=True,
         )
         process.start()
@@ -119,49 +147,70 @@ def _parse_pdf_isolated(data: bytes, filename: str) -> ParsedKnowledgeDocument:
             if not receiver.poll(_PDF_WALL_SECONDS):
                 _terminate_process(process)
                 raise KnowledgeFileParseError(
-                    "knowledge_pdf_wall_timeout",
-                    "PDF parsing exceeded the 30 second wall-time limit",
+                    f"{prefix}_wall_timeout",
+                    f"{label} parsing exceeded the 30 second wall-time limit",
                 )
             try:
-                kind, payload = receiver.recv()
+                result_kind, payload = receiver.recv()
             except EOFError:
-                kind, payload = "exit", None
+                result_kind, payload = "exit", None
         finally:
             receiver.close()
         process.join(timeout=1.0)
         if process.is_alive():
             _terminate_process(process)
-        if kind == "ok" and isinstance(payload, ParsedKnowledgeDocument):
+        if result_kind == "ok" and isinstance(payload, ParsedKnowledgeDocument):
             return payload
-        if kind == "error" and isinstance(payload, tuple) and len(payload) == 2:
+        if result_kind == "validation" and isinstance(payload, str):
+            raise KnowledgeValidationError(payload)
+        if result_kind == "error" and isinstance(payload, tuple) and len(payload) == 2:
             raise KnowledgeFileParseError(str(payload[0]), str(payload[1]))
-        _raise_pdf_worker_exit(process.exitcode)
+        _raise_worker_exit(kind, process.exitcode)
     finally:
         _PDF_PARSE_SLOTS.release()
 
 
 def _pdf_worker_entry(data: bytes, filename: str, sender: Connection) -> None:
+    _worker_entry("pdf", data, filename, sender)
+
+
+def _worker_entry(kind: str, data: bytes, filename: str, sender: Connection) -> None:
+    label = _PARSER_LABELS.get(kind, kind.upper())
+    prefix = f"knowledge_{kind}"
     try:
         _apply_pdf_worker_limits()
-        result = _parse_pdf_in_worker(data, filename)
+        if kind == "pdf":
+            result = _parse_pdf_in_worker(data, filename)
+        elif kind == "docx":
+            result = _parse_docx(data, filename)
+        elif kind == "epub":
+            result = _parse_epub(data, filename)
+        else:
+            raise KnowledgeValidationError("unsupported knowledge file format")
         sender.send(("ok", result))
     except KnowledgeFileParseError as exc:
         sender.send(("error", (exc.code, str(exc))))
+    except KnowledgeValidationError as exc:
+        sender.send(("validation", str(exc)))
     except MemoryError:
         sender.send(
             (
                 "error",
                 (
-                    "knowledge_pdf_memory_limit",
-                    "PDF parsing exceeded the 512 MiB address-space limit",
+                    f"{prefix}_memory_limit",
+                    f"{label} parsing exceeded the 512 MiB address-space limit",
                 ),
             )
         )
+    except _ARCHIVE_ERRORS:
+        # Damaged or exotic archives (bad CRC, unsupported compression,
+        # truncated members) are the caller's file problem, not an outage.
+        sender.send(("validation", f"{label} archive is invalid or damaged"))
     except BaseException:
         sender.send(
             (
                 "error",
-                ("knowledge_pdf_invalid", "PDF could not be parsed safely"),
+                (f"{prefix}_invalid", f"{label} could not be parsed safely"),
             )
         )
     finally:
@@ -259,24 +308,30 @@ def _terminate_process(process: multiprocessing.Process) -> None:
 
 
 def _raise_pdf_worker_exit(exitcode: int | None) -> None:
+    _raise_worker_exit("pdf", exitcode)
+
+
+def _raise_worker_exit(kind: str, exitcode: int | None) -> None:
+    label = _PARSER_LABELS.get(kind, kind.upper())
+    prefix = f"knowledge_{kind}"
     if exitcode == _PDF_MEMORY_EXIT_CODE:
         raise KnowledgeFileParseError(
-            "knowledge_pdf_memory_limit",
-            "PDF parsing exceeded the 512 MiB memory limit",
+            f"{prefix}_memory_limit",
+            f"{label} parsing exceeded the 512 MiB memory limit",
         )
     if exitcode == -getattr(signal, "SIGXCPU", -1):
         raise KnowledgeFileParseError(
-            "knowledge_pdf_cpu_limit",
-            "PDF parsing exceeded the 20 second CPU limit",
+            f"{prefix}_cpu_limit",
+            f"{label} parsing exceeded the 20 second CPU limit",
         )
     if exitcode == -getattr(signal, "SIGKILL", -1):
         raise KnowledgeFileParseError(
-            "knowledge_pdf_worker_terminated",
-            "PDF parser was terminated by its resource boundary",
+            f"{prefix}_worker_terminated",
+            f"{label} parser was terminated by its resource boundary",
         )
     raise KnowledgeFileParseError(
-        "knowledge_pdf_worker_failed",
-        "PDF parser process exited without a valid result",
+        f"{prefix}_worker_failed",
+        f"{label} parser process exited without a valid result",
     )
 
 
@@ -427,9 +482,13 @@ def _docx_paragraph(element: ET.Element, heading_styles: dict[str, int]) -> str:
 
 def _docx_table(element: ET.Element) -> str:
     rows: list[list[str]] = []
+    rendered_cells = 0
     for row in element.findall(f"{{{_WORD_NS}}}tr"):
         cells: list[str] = []
         for cell in row.findall(f"{{{_WORD_NS}}}tc"):
+            rendered_cells += 1
+            if rendered_cells > _MAX_TABLE_CELLS:
+                raise KnowledgeValidationError("DOCX table exceeds the supported cell count")
             values = [
                 _docx_paragraph(paragraph, {})
                 for paragraph in cell.findall(f"{{{_WORD_NS}}}p")
@@ -605,7 +664,7 @@ class _safe_zip:
     def __enter__(self) -> zipfile.ZipFile:
         try:
             archive = zipfile.ZipFile(BytesIO(self.data))
-        except zipfile.BadZipFile as exc:
+        except _ARCHIVE_ERRORS as exc:
             raise KnowledgeValidationError(f"{self.label} archive is invalid") from exc
         infos = archive.infolist()
         if len(infos) > _MAX_ARCHIVE_FILES:
@@ -615,7 +674,7 @@ class _safe_zip:
         if total > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
             archive.close()
             raise KnowledgeValidationError(
-                f"{self.label} expanded content exceeds 100 MiB"
+                f"{self.label} expanded content exceeds 64 MiB"
             )
         for info in infos:
             path = PurePosixPath(info.filename)

@@ -37,30 +37,50 @@ EMAIL_PATTERN = re.compile(
 # These patterns intentionally require either a high-risk context word or a
 # recognizable identifier shape. They are a local safety floor, not a general
 # purpose PII classifier.
+# Bare credential words.  A short memory sentence such as "我的密码是 x" is
+# almost always about a real secret, so memory keeps treating the mention alone
+# as sensitive.  Long imported documents (manuals, FAQs, tutorials) mention
+# passwords constantly without containing one, so the knowledge detector only
+# counts these words when an assignment marker and a value follow them.
+CREDENTIAL_MENTION_PATTERNS: tuple[str, ...] = (
+    r"密码",
+    r"口令",
+    r"验证码",
+    r"密钥",
+    r"私钥",
+    r"助记词",
+    r"\bpass(?:word|code)\b",
+    r"\bpasswd\b",
+    r"\bpin\s*(?:code)?\b",
+    r"\botp\b",
+    r"\bapi[-_ ]?key\b",
+    r"\baccess[-_ ]?token\b",
+    r"\brefresh[-_ ]?token\b",
+    r"\bsecret[-_ ]?key\b",
+    r"\bprivate[-_ ]?key\b",
+    r"\bseed phrase\b",
+)
+
+# The same words followed by an assignment marker and a value-like token.
+CREDENTIAL_VALUE_PATTERNS: tuple[str, ...] = (
+    r"(?:密码|口令|验证码|密钥|私钥|助记词)\s*(?:是|为|[:：=＝])\s*"
+    r"(?=[^\s，。；、]*[A-Za-z0-9])[^\s，。；、]{4,}",
+    r"(?:密码|口令|验证码|密钥|私钥)\s*[:：=＝]?\s*[A-Za-z0-9!@#$%^&*_+-]{6,}",
+    r"\b(?:pass(?:word|code)|passwd|pin(?:\s*code)?|otp|api[-_ ]?key|access[-_ ]?token"
+    r"|refresh[-_ ]?token|secret[-_ ]?key|private[-_ ]?key|seed phrase)\b\s*[:=：]\s*\S{4,}",
+)
+
+# Recognisable secret shapes count everywhere, with or without a keyword.
+CREDENTIAL_SHAPE_PATTERNS: tuple[str, ...] = (
+    r"\b(?:sk|pk|token)[-_][A-Za-z0-9_-]{4,}\b",
+    r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
+    r"\bAKIA[A-Z0-9]{16}\b",
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+    r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret)\b\s*[:=]",
+)
+
 SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
-    "credential": (
-        r"密码",
-        r"口令",
-        r"验证码",
-        r"密钥",
-        r"私钥",
-        r"助记词",
-        r"\bpass(?:word|code)\b",
-        r"\bpasswd\b",
-        r"\bpin\s*(?:code)?\b",
-        r"\botp\b",
-        r"\bapi[-_ ]?key\b",
-        r"\baccess[-_ ]?token\b",
-        r"\brefresh[-_ ]?token\b",
-        r"\bsecret[-_ ]?key\b",
-        r"\bprivate[-_ ]?key\b",
-        r"\bseed phrase\b",
-        r"\b(?:sk|pk|token)[-_][A-Za-z0-9_-]{4,}\b",
-        r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
-        r"\bAKIA[A-Z0-9]{16}\b",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-        r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passwd|secret)\b\s*[:=]",
-    ),
+    "credential": CREDENTIAL_MENTION_PATTERNS + CREDENTIAL_SHAPE_PATTERNS,
     "government_id": (
         r"身份证",
         r"护照号",
@@ -86,6 +106,17 @@ SENSITIVE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"(?<!\d)\d{15,19}(?!\d)",
     ),
 }
+
+# Contact words that only *mention* a phone number or e-mail address; the
+# shape patterns below still recognise actual numbers and addresses.
+CONTACT_MENTION_PATTERNS: tuple[str, ...] = (
+    r"手机号",
+    r"电话号码",
+    r"电子邮箱",
+    r"邮箱地址",
+    r"\bphone number\b",
+    r"\be-?mail address\b",
+)
 
 PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
     "health": (
@@ -128,13 +159,7 @@ PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"(?:省|市|区|县).{0,20}(?:路|街|道|巷|弄).{0,10}\d+\s*号",
         r"\b\d{1,6}\s+[A-Za-z][A-Za-z .'-]{1,40}\s+(?:Street|St|Road|Rd|Avenue|Ave)\b",
     ),
-    "contact": (
-        r"手机号",
-        r"电话号码",
-        r"电子邮箱",
-        r"邮箱地址",
-        r"\bphone number\b",
-        r"\be-?mail address\b",
+    "contact": CONTACT_MENTION_PATTERNS + (
         r"(?<!\d)1[3-9]\d{9}(?!\d)",
         EMAIL_PATTERN.pattern,
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
@@ -151,24 +176,48 @@ PRIVATE_CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def detected_sensitive_categories(text: str) -> tuple[set[str], set[str]]:
-    """Return (sensitive_categories, private_categories) for text."""
-    sensitive = {
-        category
-        for category, patterns in SENSITIVE_CATEGORY_PATTERNS.items()
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-    }
-    private = {
-        category
-        for category, patterns in PRIVATE_CATEGORY_PATTERNS.items()
-        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-    }
+def detected_sensitive_categories(
+    text: str,
+    *,
+    credential_requires_value: bool = False,
+    contact_requires_value: bool = False,
+) -> tuple[set[str], set[str]]:
+    """Return (sensitive_categories, private_categories) for text.
+
+    ``credential_requires_value`` switches the credential category from
+    "mentions a password" to "contains something that looks like a password":
+    long knowledge documents use it so a manual explaining how to reset a
+    password is not filed as a secret.
+    """
+    sensitive = set()
+    for category, patterns in SENSITIVE_CATEGORY_PATTERNS.items():
+        if category == "credential" and credential_requires_value:
+            patterns = CREDENTIAL_VALUE_PATTERNS + CREDENTIAL_SHAPE_PATTERNS
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
+            sensitive.add(category)
+    private = set()
+    for category, patterns in PRIVATE_CATEGORY_PATTERNS.items():
+        if category == "contact" and contact_requires_value:
+            patterns = tuple(
+                pattern for pattern in patterns if pattern not in CONTACT_MENTION_PATTERNS
+            )
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
+            private.add(category)
     return sensitive, private
 
 
-def detect_text_sensitivity(text: str) -> SensitivityLevel:
+def detect_text_sensitivity(
+    text: str,
+    *,
+    credential_requires_value: bool = False,
+    contact_requires_value: bool = False,
+) -> SensitivityLevel:
     """Return the deterministic local sensitivity floor for arbitrary text."""
-    sensitive_categories, private_categories = detected_sensitive_categories(text)
+    sensitive_categories, private_categories = detected_sensitive_categories(
+        text,
+        credential_requires_value=credential_requires_value,
+        contact_requires_value=contact_requires_value,
+    )
     if sensitive_categories:
         return "sensitive"
     if private_categories:

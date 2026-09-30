@@ -40,7 +40,7 @@ OpenAI-compatible `/v1` 记忆代理已重新启用，适合 FLIT（原 LastChat
 - 评估闭环：机制诊断、真实数据库快照、人工标注、关键词/embedding 召回指标。
 - Temporal KG 基础：`valid_from`、`temporal_subject`、`temporal_predicate`、保守旧事实失效、时间线查询和恢复。
 - 可选向量检索：创建并启用 Model Gateway `memory.embedding` route 即表示开启；`MODEL_GATEWAY_EMBEDDING_SPACE_ID` 为空时自动采用 route 契约，非空时严格固定。route 缺失/关闭则使用关键词检索；已启用但契约无效、不可用或不匹配会令 `/readyz` 返回 503。
-- 独立长文本知识库：支持 UTF-8 文本/Markdown、PDF、DOCX、EPUB，不可变版本、标签/结构化元数据、FTS5 + chunk embedding 混合检索、精确片段引用、全文分页和独立备份恢复。
+- 独立长文本知识库：支持 UTF-8 文本/Markdown、PDF、DOCX、EPUB，不可变版本、标签/结构化元数据、FTS5 三元组 + 中文双字词子串 + chunk embedding 混合检索、精确片段引用、全文分页和独立备份恢复。
 - 模型调用统一经独立 Model Gateway：为聊天、记忆提取、压缩、核心整理、体检、知识 fast/pro 和 embedding 分别配置稳定 route，是唯一模型路径。知识代理始终只编排本地索引和选择引用，最终正文由本地存储逐字返回。
 
 ## 技术栈

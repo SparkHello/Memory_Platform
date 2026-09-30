@@ -585,7 +585,7 @@ async def test_model_gateway_knowledge_client_keeps_phase_deployment_affinity(
     assert requests[0]["url"] == "http://127.0.0.1:2030/v1/chat/completions"
     assert requests[0]["authorization"] == "Bearer central-backend-key"
     assert requests[0]["payload"]["model"] == "knowledge.fast"
-    assert requests[0]["payload"]["max_tokens"] == 1024
+    assert requests[0]["payload"]["max_tokens"] == 2048
     assert requests[0]["payload"]["reasoning_effort"] == "none"
     assert requests[0]["preferred"] == ""
     assert requests[1]["preferred"] == "deployment-fast-a"
@@ -833,3 +833,115 @@ async def test_result_carries_baseline_candidates_without_a_second_search() -> N
     assert store.search_calls == []
     assert [item["chunk_ref"] for item in result.baseline_candidates] == [CHUNK_REF]
     assert result.metadata.baseline_refs == [CHUNK_REF]
+
+
+def _text_response(content: str, *, finish_reason: str = "stop") -> dict:
+    return {
+        "model": "knowledge.fast",
+        "choices": [
+            {
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": content},
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_text_only_reply_is_retried_instead_of_failing_the_phase() -> None:
+    store = FakeStore([_hit(), _hit(SECOND_CHUNK_REF)])
+    remote = FakeCompletionClient(
+        [
+            _text_response("我认为没有相关片段。"),
+            _tool_response(
+                "select_references",
+                {"chunk_refs": [SECOND_CHUNK_REF], "needs_pro": False},
+            ),
+        ]
+    )
+    agent = KnowledgeSearchAgent(store, _central_config(), client=remote)
+
+    result = await agent.search("查找相关资料", "alice")
+
+    assert result.selected_refs == [SECOND_CHUNK_REF]
+    assert result.metadata.agent_used is True
+    assert result.metadata.fallback_reason == ""
+    assert result.metadata.flash_rounds == 2
+    transcript = remote.calls[1]["messages"]
+    assert any(
+        message["role"] == "user" and "tool_call_required" in str(message.get("content"))
+        for message in transcript
+    )
+    assert transcript[2] == {"role": "assistant", "content": "我认为没有相关片段。"}
+    assert [step.status for step in result.metadata.tool_steps][0] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_two_text_only_replies_escalate_to_pro_in_balanced_mode() -> None:
+    store = FakeStore([_hit()])
+    remote = FakeCompletionClient(
+        [
+            _text_response("没有片段"),
+            _text_response("", finish_reason="length"),
+            _tool_response(
+                "select_references",
+                {"chunk_refs": [CHUNK_REF], "needs_pro": False},
+            ),
+        ]
+    )
+    agent = KnowledgeSearchAgent(store, _central_config(), client=remote)
+
+    result = await agent.search("查找相关资料", "alice")
+
+    assert result.selected_refs == [CHUNK_REF]
+    assert result.metadata.escalated is True
+    assert result.metadata.agent_used is True
+    assert [call["model"] for call in remote.calls] == [
+        "knowledge.fast",
+        "knowledge.fast",
+        "knowledge.pro",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fast_quality_keeps_flash_selection_when_model_wants_pro() -> None:
+    store = FakeStore([_hit(), _hit(SECOND_CHUNK_REF)])
+    remote = FakeCompletionClient(
+        [
+            _tool_response(
+                "select_references",
+                {"chunk_refs": [SECOND_CHUNK_REF], "needs_pro": True},
+            )
+        ]
+    )
+    agent = KnowledgeSearchAgent(store, _central_config(), client=remote)
+
+    result = await agent.search("快速查找", "alice", quality="fast")
+
+    assert result.selected_refs == [SECOND_CHUNK_REF]
+    assert result.metadata.agent_used is True
+    assert result.metadata.escalated is False
+    assert result.metadata.fallback_reason == "agent_escalation_unavailable"
+    assert len(remote.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_deep_quality_falls_back_to_flash_selection_when_pro_fails() -> None:
+    store = FakeStore([_hit(), _hit(SECOND_CHUNK_REF)])
+    remote = FakeCompletionClient(
+        [
+            _tool_response(
+                "select_references",
+                {"chunk_refs": [SECOND_CHUNK_REF], "needs_pro": False},
+            ),
+            httpx.ConnectTimeout("pro unavailable"),
+        ]
+    )
+    agent = KnowledgeSearchAgent(store, _central_config(), client=remote)
+
+    result = await agent.search("深度核对", "alice", quality="deep")
+
+    assert result.selected_refs == [SECOND_CHUNK_REF]
+    assert result.metadata.escalated is True
+    assert result.metadata.agent_used is True
+    assert result.metadata.fallback_reason == "agent_timeout"

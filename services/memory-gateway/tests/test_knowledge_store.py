@@ -673,3 +673,243 @@ def test_begin_upload_sweeps_stale_sessions(
         ).fetchone()["count"]
     assert sessions == 0
     assert parts == 0
+
+
+def test_two_character_chinese_words_are_matched_through_substring_channel(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    _commit(
+        knowledge_store,
+        "# 邮件服务器配置\n\n管理员需要在后台填写 SMTP 服务器地址、端口（通常为 465 或 587）。",
+    )
+    _commit(knowledge_store, "# 数据导出\n\n在数据管理页可以导出 CSV。", title="其他")
+
+    # Both words are two characters: invisible to the trigram index, so they
+    # used to produce no result at all.
+    hits = knowledge_store.search_chunks("alice", "端口 配置")
+    assert hits and "邮件服务器配置" in hits[0].title_path
+    assert "substring" in hits[0].match_signals
+
+    # Reordered four-character run whose trigrams never occur verbatim.
+    reordered = knowledge_store.search_chunks("alice", "配置端口")
+    assert reordered and "邮件服务器配置" in reordered[0].title_path
+
+    # Mixed query: trigram and substring channels are fused, not exclusive.
+    fused = knowledge_store.search_chunks("alice", "SMTP 端口")
+    assert fused and fused[0].title_path == ["邮件服务器配置"]
+
+
+def test_long_natural_language_request_keeps_trailing_keywords(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    filler = "用户可以在系统设置页面中查看当前账户的基本信息，点击对应的选项即可进入详细配置。"
+    text = (
+        "# 产品使用手册\n\n"
+        f"## 通知设置\n\n{filler * 3}\n夜间免打扰时段默认为 22:00 到 8:00。\n\n"
+        f"## 邮件服务器配置\n\n{filler * 3}\n管理员需要填写 SMTP 服务器地址和授权码。\n\n"
+    )
+    _commit(knowledge_store, text)
+    request = (
+        "请在用户导入的产品使用手册里找到相关章节，并给出逐字证据，版本不限，"
+        "重点是这个问题：夜间免打扰的默认时段是几点"
+    )
+
+    hits = knowledge_store.search_chunks("alice", request, limit=3)
+
+    assert hits[0].title_path == ["产品使用手册", "通知设置"]
+    # The excerpt window is anchored on the dense span of matched terms, not
+    # on whichever generic word appears first in the chunk.
+    assert "22:00" in hits[0].excerpt
+    # A heading-only "# 产品使用手册" chunk no longer exists to steal a slot.
+    assert all("22:00" in hit.excerpt or "SMTP" in hit.excerpt for hit in hits)
+
+
+def test_heading_only_sections_are_merged_into_following_chunk(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    from app.knowledge.chunking import chunk_knowledge_text
+
+    drafts = chunk_knowledge_text("# 手册\n\n## 空章节\n\n## 通知设置\n\n正文\n\n## 结尾空标题\n")
+
+    assert [draft.title_path for draft in drafts] == [
+        ("手册", "通知设置"),
+        ("手册", "结尾空标题"),
+    ]
+    assert drafts[0].content.startswith("# 手册")
+    assert drafts[0].line_start == 1 and drafts[1].line_start == 9
+
+
+def test_chunk_line_numbers_are_linear_and_exact() -> None:
+    import random
+    import time
+
+    from app.knowledge.chunking import chunk_knowledge_text
+
+    random.seed(7)
+    sample = "# T\n\n" + "".join(
+        random.choice(["段落文字。", "\n", "\n\n", "## 小节\n"]) for _ in range(5000)
+    )
+    for chunk in chunk_knowledge_text(sample):
+        assert chunk.line_start == sample.count("\n", 0, chunk.char_start) + 1
+        assert chunk.line_end == sample.count("\n", 0, chunk.char_end - 1) + 1
+
+    started = time.perf_counter()
+    chunk_knowledge_text("一行文字。\n" * 400_000)
+    assert time.perf_counter() - started < 5.0
+
+
+def test_manual_mentioning_passwords_is_not_flagged_as_credential(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    manual = "# 重置密码\n\n如果忘记了登录密码，可以在登录页点击「忘记密码」，输入验证码后设置新密码。"
+    result = _commit(knowledge_store, manual)
+    assert result.document.sensitivity == "normal"
+    assert result.document.detected_sensitivity == "normal"
+
+    with pytest.raises(KnowledgeSensitivityConfirmationRequired):
+        _commit(knowledge_store, "运维备忘：数据库密码是 Hunter2!2026", title="备忘")
+
+
+def test_tag_scope_is_not_truncated_by_query_limit(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    wanted = knowledge_store.begin_upload("alice", "带标签的旧文档", tags=["wanted"])
+    knowledge_store.append_upload("alice", wanted.id, 0, "旧文档正文")
+    target = knowledge_store.commit_upload("alice", wanted.id, 1)
+    for index in range(3):
+        _commit(knowledge_store, f"新文档正文 {index}", title=f"新文档 {index}")
+
+    refs = knowledge_store.resolve_document_refs("alice", tags=["wanted"], limit=2)
+
+    assert refs == [target.document.ref]
+
+
+def test_embedding_search_returns_best_match_regardless_of_position(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    result = _commit(
+        knowledge_store,
+        "\n\n".join(f"## 段落 {index}\n\n正文 {index} " + "填充。" * 40 for index in range(60)),
+    )
+    chunks = knowledge_store.list_chunks_for_embedding("alice", result.version.ref)
+    assert len(chunks) >= 50
+    vectors = {chunk.ref: [0.0, 1.0] for chunk in chunks}
+    vectors[chunks[-1].ref] = [1.0, 0.0]
+    vectors[chunks[-2].ref] = [0.9, 0.1]
+    knowledge_store.replace_chunk_embeddings(
+        "alice",
+        result.version.ref,
+        model="test-embedding",
+        embedding_space_id="knowledge-space-a",
+        vectors=vectors,
+        total_chunks=len(chunks),
+    )
+
+    hits = knowledge_store.search_chunks_by_embedding(
+        "alice",
+        [1.0, 0.0],
+        embedding_space_id="knowledge-space-a",
+        min_cosine=0.5,
+        limit=2,
+    )
+
+    assert [hit.chunk_ref for hit in hits] == [chunks[-1].ref, chunks[-2].ref]
+    assert hits[0].score > hits[1].score
+
+
+def test_update_document_only_reconsiders_current_version(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    first = _commit(
+        knowledge_store,
+        "旧版本包含 api_key=sk-abcdefghijklmnop",
+        confirm_sensitivity_override=True,
+    )
+    assert first.document.sensitivity_override_confirmed is True
+    second = _commit(
+        knowledge_store,
+        "新版本已经删掉了所有密钥内容",
+        replace_document_ref=first.document.ref,
+    )
+    assert second.document.sensitivity == "normal"
+
+    updated = knowledge_store.update_document(
+        "alice", document_ref=second.document.ref, title="只改标题"
+    )
+    assert updated.sensitivity == "normal"
+    assert updated.detected_sensitivity == "normal"
+
+    # Raising a confirmed override keeps the confirmation instead of jumping
+    # straight to the detected level.
+    third = _commit(
+        knowledge_store,
+        "内部备忘：api_key=sk-zzzzzzzzzzzzzzzz",
+        title="备忘",
+        confirm_sensitivity_override=True,
+    )
+    raised = knowledge_store.update_document(
+        "alice", document_ref=third.document.ref, sensitivity="private"
+    )
+    assert raised.sensitivity == "private"
+    assert raised.sensitivity_override_confirmed is True
+
+
+def test_restore_requires_fresh_confirmation_for_overridden_sensitivity(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    payload = {
+        "format": "memory-gateway-knowledge",
+        "schema_version": 3,
+        "documents": [
+            {
+                "title": "凭据",
+                "sensitivity": "normal",
+                "sensitivity_override_confirmed": True,
+                "current_version_number": 1,
+                "versions": [
+                    {"version_number": 1, "content": "api_key=sk-abcdefghijklmnop"}
+                ],
+            }
+        ],
+    }
+
+    with pytest.raises(KnowledgeSensitivityConfirmationRequired):
+        knowledge_store.restore_export("bob", payload)
+    assert knowledge_store.list_documents("bob", include_sensitive=True) == []
+
+    outcome = knowledge_store.restore_export(
+        "bob", payload, confirm_sensitivity_override=True
+    )
+    assert outcome["restored_documents"] == 1
+    document = knowledge_store.list_documents("bob")[0]
+    assert document.sensitivity == "normal"
+    assert document.sensitivity_override_confirmed is True
+
+
+def test_finished_upload_sessions_are_pruned_and_open_sessions_are_capped(
+    knowledge_store: KnowledgeStore,
+) -> None:
+    import sqlite3
+
+    from app.knowledge.store import constants
+
+    for index in range(3):
+        _commit(knowledge_store, f"正文 {index}", title=f"文档 {index}")
+    with sqlite3.connect(knowledge_store.database_path) as connection:
+        connection.execute(
+            "UPDATE knowledge_upload_sessions SET updated_at = '2000-01-01T00:00:00.000000Z'"
+        )
+    knowledge_store.begin_upload("alice", "触发清理")
+    with sqlite3.connect(knowledge_store.database_path) as connection:
+        statuses = [
+            row[0]
+            for row in connection.execute("SELECT status FROM knowledge_upload_sessions")
+        ]
+    assert statuses == ["open"]
+
+    for index in range(constants._MAX_OPEN_UPLOADS_PER_USER - 1):
+        knowledge_store.begin_upload("alice", f"并发上传 {index}")
+    with pytest.raises(KnowledgeConflictError, match="too many open upload sessions"):
+        knowledge_store.begin_upload("alice", "超出上限")
+    # Other users are unaffected.
+    assert knowledge_store.begin_upload("bob", "别人的上传").status == "open"

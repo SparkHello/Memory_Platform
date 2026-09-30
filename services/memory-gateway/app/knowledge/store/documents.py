@@ -113,28 +113,42 @@ def resolve_document_refs(
         placeholders = ",".join("?" for _ in supplied_ids)
         conditions.append(f"id IN ({placeholders})")
         params.extend(supplied_ids)
-    params.append(limit)
-    with store._connect() as connection:
-        rows = connection.execute(
-            f"""
-            SELECT id, tags_json, metadata_json
-            FROM knowledge_documents
-            WHERE {' AND '.join(conditions)}
-            ORDER BY updated_at DESC, id ASC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-    result: list[str] = []
+    # Tag and metadata filters are evaluated in Python, so the SQL LIMIT may
+    # only be applied when there is nothing left to filter; otherwise older
+    # matching documents beyond the limit would silently vanish from scope.
     wanted_tag_set = set(wanted_tags)
-    for row in rows:
-        row_tags = set(_json_string_list(row["tags_json"]))
-        row_metadata = _json_metadata(row["metadata_json"])
-        if wanted_tag_set and not wanted_tag_set.issubset(row_tags):
-            continue
-        if any(row_metadata.get(key) != value for key, value in wanted_metadata.items()):
-            continue
-        result.append(_document_ref(row["id"]))
+    limit_in_sql = not wanted_tag_set and not wanted_metadata
+    sql = f"""
+        SELECT id, tags_json, metadata_json
+        FROM knowledge_documents
+        WHERE {' AND '.join(conditions)}
+        ORDER BY updated_at DESC, id ASC
+    """
+    if limit_in_sql:
+        sql += " LIMIT ?"
+        params.append(limit)
+    result: list[str] = []
+    with store._connect() as connection:
+        cursor = connection.execute(sql, params)
+        while len(result) < limit:
+            rows = cursor.fetchmany(256)
+            if not rows:
+                break
+            for row in rows:
+                if wanted_tag_set and not wanted_tag_set.issubset(
+                    set(_json_string_list(row["tags_json"]))
+                ):
+                    continue
+                if wanted_metadata:
+                    row_metadata = _json_metadata(row["metadata_json"])
+                    if any(
+                        row_metadata.get(key) != value
+                        for key, value in wanted_metadata.items()
+                    ):
+                        continue
+                result.append(_document_ref(row["id"]))
+                if len(result) >= limit:
+                    break
     return result
 
 
@@ -239,31 +253,34 @@ def update_document(
             if metadata is None
             else _validate_metadata(metadata)
         )
-        content_rows = connection.execute(
+        # Only the version that is actually served can raise the document's
+        # level; joining every historical version both blew up memory for
+        # large documents and re-flagged documents whose current text is clean.
+        current_row = connection.execute(
             """
             SELECT content FROM knowledge_versions
-            WHERE user_id = ? AND document_id = ?
+            WHERE user_id = ? AND document_id = ? AND id = ?
             """,
-            (user_id, document_id),
-        ).fetchall()
+            (user_id, document_id, row["current_version_id"]),
+        ).fetchone()
         detected_sensitivity = _detected_sensitivity(
             new_title,
             new_source,
-            *(item["content"] for item in content_rows),
+            current_row["content"] if current_row is not None else None,
         )
-        preserve_confirmed_override = bool(
-            row["sensitivity_override_confirmed"]
-        ) and (sensitivity is None or declared == row["sensitivity"])
-        if preserve_confirmed_override:
-            new_sensitivity = _validate_sensitivity(row["sensitivity"])
-            sensitivity_override_confirmed = (
-                _SENSITIVITY_RANK[detected_sensitivity]
-                > _SENSITIVITY_RANK[new_sensitivity]
-            )
+        previously_confirmed = bool(row["sensitivity_override_confirmed"])
+        if _SENSITIVITY_RANK[declared] >= _SENSITIVITY_RANK[detected_sensitivity]:
+            new_sensitivity = declared
+            sensitivity_override_confirmed = False
+        elif previously_confirmed and (
+            _SENSITIVITY_RANK[declared] >= _SENSITIVITY_RANK[row["sensitivity"]]
+        ):
+            # The owner already confirmed a level below detection; keeping or
+            # raising that level is still covered by the confirmation.
+            new_sensitivity = declared
+            sensitivity_override_confirmed = True
         else:
-            new_sensitivity = _higher_sensitivity(
-                declared, detected_sensitivity
-            )
+            new_sensitivity = _higher_sensitivity(declared, detected_sensitivity)
             sensitivity_override_confirmed = False
         connection.execute(
             """

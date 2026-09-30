@@ -65,6 +65,8 @@ export function KnowledgeUploadForm({
   const [progress, setProgress] = useState({ completed: 0, total: 0, label: "" });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sensitivityConfirmationRef = useRef<HTMLDivElement>(null);
+  // 敏感级别确认时后端会话仍处于 open，记住它以便确认后直接重新提交，不必重传正文。
+  const pendingCommitRef = useRef<{ uploadId: string; parts: number; sha256: string; text: string } | null>(null);
   const text = mode === "paste" ? pasteText : fileText;
 
   useEffect(() => {
@@ -77,9 +79,16 @@ export function KnowledgeUploadForm({
     }
   }, [sensitivityConfirmation]);
 
+  const discardPendingCommit = () => {
+    const pending = pendingCommitRef.current;
+    pendingCommitRef.current = null;
+    if (pending) void api.cancelKnowledgeUpload(pending.uploadId).catch(() => undefined);
+  };
+
   const chooseMode = (next: SourceMode) => {
     if (busy) return;
     setSensitivityConfirmation(null);
+    discardPendingCommit();
     setMode(next);
     if (next === "paste") {
       setContentType(initialContentType.startsWith("text/") ? initialContentType : "text/markdown");
@@ -164,6 +173,18 @@ export function KnowledgeUploadForm({
         onComplete(result);
         return;
       }
+      const pending = pendingCommitRef.current;
+      if (confirmSensitivityOverride && pending && pending.text === text) {
+        pendingCommitRef.current = null;
+        uploadId = pending.uploadId;
+        setProgress({ completed: pending.parts, total: pending.parts, label: "正在保存并建立索引" });
+        const result = await api.commitKnowledgeUpload(uploadId, pending.parts, pending.sha256, true);
+        uploadId = "";
+        notifyCommit(result, replaceDocumentRef, notify);
+        onComplete(result);
+        return;
+      }
+      discardPendingCommit();
       setProgress({ completed: 0, total: 1, label: "正在创建上传会话" });
       const session = await api.beginKnowledgeUpload({
         title: cleanTitle,
@@ -182,15 +203,20 @@ export function KnowledgeUploadForm({
         setProgress({ completed: index + 1, total: parts.length, label: "正在上传正文" });
       }
       setProgress({ completed: parts.length, total: parts.length, label: "正在保存并建立索引" });
-      const result = await api.commitKnowledgeUpload(
-        uploadId,
-        parts.length,
-        await sha256(text),
-        confirmSensitivityOverride
-      );
-      uploadId = "";
-      notifyCommit(result, replaceDocumentRef, notify);
-      onComplete(result);
+      const digest = await sha256(text);
+      try {
+        const result = await api.commitKnowledgeUpload(uploadId, parts.length, digest, confirmSensitivityOverride);
+        uploadId = "";
+        notifyCommit(result, replaceDocumentRef, notify);
+        onComplete(result);
+      } catch (commitError) {
+        if (commitError instanceof ApiError && commitError.code === "sensitivity_confirmation_required") {
+          // 会话仍然有效，确认后直接再次 commit。
+          pendingCommitRef.current = { uploadId, parts: parts.length, sha256: digest, text };
+          uploadId = "";
+        }
+        throw commitError;
+      }
     } catch (error) {
       if (uploadId) {
         void api.cancelKnowledgeUpload(uploadId).catch(() => undefined);
@@ -257,9 +283,13 @@ export function KnowledgeUploadForm({
           <select value={contentType} disabled={busy || mode === "file"} onChange={(event) => setContentType(event.target.value)}>
             <option value="text/markdown">Markdown</option>
             <option value="text/plain">纯文本</option>
-            <option value="application/pdf">PDF</option>
-            <option value="application/vnd.openxmlformats-officedocument.wordprocessingml.document">Word</option>
-            <option value="application/epub+zip">EPUB</option>
+            {mode === "file" && (
+              <>
+                <option value="application/pdf">PDF</option>
+                <option value="application/vnd.openxmlformats-officedocument.wordprocessingml.document">Word</option>
+                <option value="application/epub+zip">EPUB</option>
+              </>
+            )}
           </select>
         </label>
         <label className="field-block">
@@ -380,7 +410,10 @@ export function KnowledgeUploadForm({
                 type="button"
                 className="ghost-button"
                 disabled={busy}
-                onClick={() => setSensitivityConfirmation(null)}
+                onClick={() => {
+                  setSensitivityConfirmation(null);
+                  discardPendingCommit();
+                }}
               >
                 返回检查
               </button>
@@ -496,6 +529,10 @@ function notifyCommit(result: KnowledgeUploadCommitResult, replaceDocumentRef: s
     return;
   }
   const embeddingFailed = result.embedding?.status === "failed";
+  const warnings = result.import?.warnings ?? [];
+  if (warnings.length > 0) {
+    notify(`导入提示：${warnings.slice(0, 2).join("；")}${warnings.length > 2 ? " 等" : ""}`, "error");
+  }
   notify(
     result.deduplicated
       ? "正文未变化，已保留当前版本"

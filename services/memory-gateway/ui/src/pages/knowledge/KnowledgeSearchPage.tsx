@@ -135,7 +135,7 @@ export function KnowledgeSearchPage({
             <textarea
               value={request}
               rows={5}
-              maxLength={8000}
+              maxLength={4096}
               onChange={(event) => setRequest(event.target.value)}
               placeholder="例如：找到架构文档里关于敏感数据出站的约束，返回原文和对应行号。"
               data-autofocus

@@ -24,10 +24,15 @@ def restore_knowledge_export(
     store: KnowledgeStore,
     user_id: str,
     export_data: dict[str, Any],
+    confirm_sensitivity_override: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(export_data, dict):
         raise KnowledgeValidationError("knowledge restore data must be an object")
-    payload = store.restore_export(user_id=user_id, export_data=export_data)
+    payload = store.restore_export(
+        user_id=user_id,
+        export_data=export_data,
+        confirm_sensitivity_override=confirm_sensitivity_override,
+    )
     if not isinstance(payload, dict):
         raise KnowledgeValidationError("knowledge restore produced an invalid result")
     return payload

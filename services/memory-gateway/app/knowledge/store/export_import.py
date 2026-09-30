@@ -6,7 +6,7 @@ import hashlib
 from typing import Any
 
 from app.knowledge.models import KnowledgeDocument, KnowledgeVersion
-from app.knowledge.store.errors import KnowledgeValidationError
+from app.knowledge.store.errors import KnowledgeValidationError, KnowledgeSensitivityConfirmationRequired
 from app.knowledge.store.helpers import (
     ConnectionProvider,
     DocumentSizeProvider,
@@ -146,9 +146,21 @@ def export_user(store: ConnectionProvider, user_id: str) -> dict[str, Any]:
 
 
 def restore_export(
-    store: KnowledgeWriteProvider, user_id: str, export_data: dict[str, Any]
+    store: KnowledgeWriteProvider,
+    user_id: str,
+    export_data: dict[str, Any],
+    *,
+    confirm_sensitivity_override: bool = False,
 ) -> dict[str, Any]:
-    """Restore an export under ``user_id`` and rebuild every derived index."""
+    """Restore an export under ``user_id`` and rebuild every derived index.
+
+    A backup may carry ``sensitivity_override_confirmed`` flags from the
+    original owner's click-through.  They are honoured only when the caller
+    confirms again (``confirm_sensitivity_override=True``); otherwise the
+    first such document raises
+    :class:`KnowledgeSensitivityConfirmationRequired` so a Web user can
+    review before the lower level is applied.
+    """
     user_id = _required_text(user_id, "user_id", 256)
     if not isinstance(export_data, dict):
         raise KnowledgeValidationError("knowledge export must be an object")
@@ -160,7 +172,14 @@ def restore_export(
         raise KnowledgeValidationError("knowledge export documents must be a list")
     if len(documents_value) > 10_000:
         raise KnowledgeValidationError("knowledge export contains too many documents")
-    prepared = [_validate_import_document(store, value) for value in documents_value]
+    prepared = [
+        _validate_import_document(
+            store,
+            value,
+            confirm_sensitivity_override=confirm_sensitivity_override,
+        )
+        for value in documents_value
+    ]
     total_bytes = sum(
         len(version["content"].encode("utf-8"))
         for item in prepared
@@ -303,7 +322,10 @@ def restore_export(
 
 
 def _validate_import_document(
-    store: DocumentSizeProvider, value: Any
+    store: DocumentSizeProvider,
+    value: Any,
+    *,
+    confirm_sensitivity_override: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise KnowledgeValidationError("each exported knowledge document must be an object")
@@ -372,6 +394,13 @@ def _validate_import_document(
         _SENSITIVITY_RANK[detected_sensitivity]
         > _SENSITIVITY_RANK[declared]
     )
+    if sensitivity_override_confirmed and not confirm_sensitivity_override:
+        # The flag in the file is data, not a decision: it may be edited or
+        # come from another installation.  Require a fresh click-through.
+        raise KnowledgeSensitivityConfirmationRequired(
+            declared_sensitivity=declared,
+            detected_sensitivity=detected_sensitivity,
+        )
     sensitivity = (
         declared
         if sensitivity_override_confirmed

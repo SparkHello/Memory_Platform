@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import hashlib
+import heapq
 import json
 import sqlite3
 from typing import Any
@@ -33,6 +34,8 @@ from app.knowledge.store.utils import (
     _required_text,
     _utc_now,
     _validated_vector,
+    _cjk_bigrams,
+    _query_terms,
 )
 from app.vector_util import try_cosine_similarity
 
@@ -56,8 +59,9 @@ def search_chunks(
     ):
         return []
 
+    fts_terms, short_terms = _query_terms(query)
     compact_query = "".join(query.split())
-    if len(compact_query) < 3:
+    if not fts_terms and not short_terms:
         rows = _search_with_instr(
             store,
             user_id=user_id,
@@ -66,9 +70,11 @@ def search_chunks(
             document_ids=document_ids,
             include_sensitive=include_sensitive,
         )
-        signal = "substring"
-    else:
-        rows = _search_with_fts(
+        return [_search_hit_from_row(row, query=query, signal="substring") for row in rows]
+
+    fts_rows: list[sqlite3.Row] = []
+    if len(compact_query) >= 3 and fts_terms:
+        fts_rows = _search_with_fts(
             store,
             user_id=user_id,
             query=query,
@@ -76,18 +82,84 @@ def search_chunks(
             document_ids=document_ids,
             include_sensitive=include_sensitive,
         )
-        signal = "fts"
-        if not rows:
-            rows = _search_with_instr(
+    short_rows: list[sqlite3.Row] = []
+    if short_terms:
+        # Two-character CJK words cannot be matched by the trigram index, so
+        # they get their own substring channel instead of being dropped.
+        short_rows = _search_with_instr_terms(
+            store,
+            user_id=user_id,
+            terms=short_terms,
+            limit=limit,
+            document_ids=document_ids,
+            include_sensitive=include_sensitive,
+        )
+    if not fts_rows and not short_rows:
+        bigrams = _cjk_bigrams(query, exclude=short_terms)
+        if bigrams:
+            # A four-plus character run whose trigrams never occur verbatim
+            # (different word order, inserted particles) still shares its
+            # two-character words with the document.
+            short_rows = _search_with_instr_terms(
                 store,
                 user_id=user_id,
-                query=query,
+                terms=bigrams,
                 limit=limit,
                 document_ids=document_ids,
                 include_sensitive=include_sensitive,
             )
-            signal = "substring"
-    return [_search_hit_from_row(row, query=query, signal=signal) for row in rows]
+    if not fts_rows and not short_rows:
+        rows = _search_with_instr(
+            store,
+            user_id=user_id,
+            query=query,
+            limit=limit,
+            document_ids=document_ids,
+            include_sensitive=include_sensitive,
+        )
+        return [_search_hit_from_row(row, query=query, signal="substring") for row in rows]
+    if not short_rows:
+        return [_search_hit_from_row(row, query=query, signal="fts") for row in fts_rows]
+    if not fts_rows:
+        return [
+            _search_hit_from_row(row, query=query, signal="substring") for row in short_rows
+        ]
+    return _fuse_lexical_rows(fts_rows, short_rows, query=query, limit=limit)
+
+
+def _fuse_lexical_rows(
+    fts_rows: list[sqlite3.Row],
+    short_rows: list[sqlite3.Row],
+    *,
+    query: str,
+    limit: int,
+    rank_constant: int = 60,
+) -> list[KnowledgeSearchHit]:
+    """Reciprocal-rank fuse the trigram and short-word substring channels."""
+    scores: dict[str, float] = {}
+    rows: dict[str, sqlite3.Row] = {}
+    signals: dict[str, list[str]] = {}
+    for channel, channel_rows in (("fts", fts_rows), ("substring", short_rows)):
+        for rank, row in enumerate(channel_rows, start=1):
+            chunk_id = row["id"]
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rank_constant + rank)
+            if chunk_id not in rows or channel == "fts":
+                rows[chunk_id] = row
+            signals.setdefault(chunk_id, []).append(channel)
+    ordered = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], rows[chunk_id]["ordinal"]))
+    result: list[KnowledgeSearchHit] = []
+    for chunk_id in ordered[:limit]:
+        primary = signals[chunk_id][0]
+        hit = _search_hit_from_row(rows[chunk_id], query=query, signal=primary)
+        extra = [name for name in signals[chunk_id] if name not in hit.match_signals]
+        if len(signals[chunk_id]) > 1:
+            extra.append("lexical_fusion")
+        if extra:
+            hit = hit.model_copy(
+                update={"match_signals": list(dict.fromkeys(hit.match_signals + extra))}
+            )
+        result.append(hit)
+    return result
 
 
 def egress_override_confirmed(
@@ -349,8 +421,13 @@ def search_chunks_by_embedding(
         placeholders = ",".join("?" for _ in document_ids)
         conditions.append(f"c.document_id IN ({placeholders})")
         params.extend(document_ids)
+    # Stream every eligible vector and keep only the best ``limit`` in a heap:
+    # an unordered ``LIMIT`` would silently ignore chunks beyond the cut-off
+    # for large libraries, and materialising all rows costs memory for nothing.
+    heap: list[tuple[float, int, int, dict[str, Any]]] = []
+    sequence = 0
     with store._connect() as connection:
-        rows = connection.execute(
+        cursor = connection.execute(
             f"""
             SELECT
                 c.*, d.title, d.source_name, d.content_type, d.sensitivity,
@@ -363,22 +440,33 @@ def search_chunks_by_embedding(
             JOIN knowledge_versions v
                 ON v.id = c.version_id AND v.user_id = c.user_id
             WHERE {' AND '.join(conditions)}
-            LIMIT 10000
             """,
             params,
-        ).fetchall()
-    scored: list[tuple[float, dict[str, Any]]] = []
-    for row in rows:
-        try:
-            candidate = _validated_vector(json.loads(row["vector_json"]))
-        except (TypeError, json.JSONDecodeError, KnowledgeValidationError):
-            continue
-        cosine = try_cosine_similarity(vector, candidate)
-        if cosine is None or cosine < min_cosine:
-            continue
-        payload = dict(row)
-        payload["rank"] = cosine
-        scored.append((cosine, payload))
+        )
+        while True:
+            rows = cursor.fetchmany(512)
+            if not rows:
+                break
+            for row in rows:
+                try:
+                    candidate = _validated_vector(json.loads(row["vector_json"]))
+                except (TypeError, json.JSONDecodeError, KnowledgeValidationError):
+                    continue
+                cosine = try_cosine_similarity(vector, candidate)
+                if cosine is None or cosine < min_cosine:
+                    continue
+                payload = dict(row)
+                payload.pop("vector_json", None)
+                payload["rank"] = cosine
+                sequence += 1
+                # Heap orders ascending: keep the smallest cosine at the top so
+                # it is the one evicted; negate ordinal so lower ordinals win ties.
+                entry = (cosine, -int(row["ordinal"]), -sequence, payload)
+                if len(heap) < limit:
+                    heapq.heappush(heap, entry)
+                elif entry[:2] > heap[0][:2]:
+                    heapq.heapreplace(heap, entry)
+    scored = [(entry[0], entry[3]) for entry in heap]
     scored.sort(key=lambda item: (-item[0], item[1]["ordinal"]))
     return [
         _search_hit_from_row(row, query=query, signal="embedding")
@@ -540,6 +628,68 @@ def _search_with_instr(
             LIMIT ?
             """,
             [query, query, *params],
+        ).fetchall()
+
+
+def _search_with_instr_terms(
+    store: ConnectionProvider,
+    *,
+    user_id: str,
+    terms: Sequence[str],
+    limit: int,
+    document_ids: list[str],
+    include_sensitive: bool,
+) -> list[sqlite3.Row]:
+    """Substring channel for short words; ranks by how many terms a chunk holds."""
+    terms = [term for term in dict.fromkeys(terms) if term][:64]
+    if not terms:
+        return []
+    hit_exprs = " + ".join(
+        "(instr(lower(c.content), lower(?)) > 0 OR instr(lower(c.title_path_json), lower(?)) > 0)"
+        for _ in terms
+    )
+    term_params: list[Any] = []
+    for term in terms:
+        term_params.extend((term, term))
+    conditions = [
+        "c.user_id = ?",
+        "d.status = 'active'",
+        "d.current_version_id = c.version_id",
+        "v.index_status = 'ready'",
+    ]
+    params: list[Any] = [user_id]
+    if not include_sensitive:
+        conditions.append("d.sensitivity = 'normal'")
+    if document_ids:
+        placeholders = ",".join("?" for _ in document_ids)
+        conditions.append(f"c.document_id IN ({placeholders})")
+        params.extend(document_ids)
+    params.append(limit)
+    with store._connect() as connection:
+        return connection.execute(
+            f"""
+            SELECT * FROM (
+                SELECT
+                    c.*,
+                    d.title,
+                    d.source_name,
+                    d.content_type,
+                    d.sensitivity,
+                    v.version_number,
+                    ({hit_exprs}) AS matched_terms,
+                    0.0 AS rank
+                FROM knowledge_chunks c
+                JOIN knowledge_documents d
+                    ON d.id = c.document_id AND d.user_id = c.user_id
+                JOIN knowledge_versions v
+                    ON v.id = c.version_id AND v.user_id = c.user_id
+                WHERE {' AND '.join(conditions)}
+            )
+            WHERE matched_terms > 0
+            ORDER BY matched_terms DESC, length(content) ASC, ordinal ASC
+            LIMIT ?
+            """,
+            [*term_params, *params],
         ).fetchall()
 
 

@@ -46,6 +46,11 @@ def chunk_knowledge_text(
         raise ValueError("overlap_chars must be non-negative and smaller than target_chars")
 
     drafts: list[KnowledgeChunkDraft] = []
+    # Chunk starts and chunk ends each advance monotonically, but a start can
+    # sit before the previous end because of overlap, so give each its own
+    # forward-only counter.
+    start_lines = _LineCounter(text)
+    end_lines = _LineCounter(text)
     for section in _markdown_sections(text):
         start = section.start
         while start < section.end:
@@ -64,8 +69,8 @@ def chunk_knowledge_text(
                     title_path=section.title_path,
                     char_start=start,
                     char_end=end,
-                    line_start=_line_at(text, start),
-                    line_end=_last_touched_line(text, start, end),
+                    line_start=start_lines.line_at(start),
+                    line_end=end_lines.last_touched_line(start, end),
                     content=content,
                 )
             )
@@ -104,7 +109,37 @@ def _markdown_sections(text: str) -> list[_Section]:
                 title_path=tuple(path),
             )
         )
-    return [section for section in sections if section.end > section.start]
+    sections = [section for section in sections if section.end > section.start]
+    return _merge_heading_only_sections(text, sections)
+
+
+def _merge_heading_only_sections(text: str, sections: list[_Section]) -> list[_Section]:
+    """Fold sections that contain nothing but their heading into the next one.
+
+    A bare ``# Title`` chunk carries no answer, yet bm25 length normalisation
+    ranked it above real content whenever a query mentioned the document
+    name.  The heading text stays in the merged chunk and in the child's
+    ``title_path``, so nothing is lost.
+    """
+    merged: list[_Section] = []
+    pending_start: int | None = None
+    for index, section in enumerate(sections):
+        body = text[section.start : section.end]
+        heading = _HEADING_RE.match(body)
+        heading_only = (
+            heading is not None
+            and section.title_path
+            and not body[heading.end() :].strip()
+            and index + 1 < len(sections)
+        )
+        if heading_only:
+            if pending_start is None:
+                pending_start = section.start
+            continue
+        start = section.start if pending_start is None else pending_start
+        pending_start = None
+        merged.append(_Section(start=start, end=section.end, title_path=section.title_path))
+    return merged
 
 
 def _choose_end(text: str, *, start: int, section_end: int, target_chars: int) -> int:
@@ -137,6 +172,37 @@ def _prefer_overlap_boundary(
     if boundary >= lower and desired - boundary <= 80:
         return boundary + 1
     return min(desired, upper)
+
+
+class _LineCounter:
+    """Incremental newline counter.
+
+    Chunk offsets grow monotonically, so counting newlines from the previous
+    offset keeps line numbering linear in the document size instead of
+    rescanning from zero for every chunk (which made a 50 MiB import take
+    minutes inside the commit transaction).
+    """
+
+    __slots__ = ("_text", "_offset", "_line")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._offset = 0
+        self._line = 1
+
+    def line_at(self, offset: int) -> int:
+        offset = max(0, offset)
+        if offset < self._offset:
+            self._offset = 0
+            self._line = 1
+        self._line += self._text.count("\n", self._offset, offset)
+        self._offset = offset
+        return self._line
+
+    def last_touched_line(self, start: int, end: int) -> int:
+        if end <= start:
+            return self.line_at(start)
+        return self.line_at(end - 1)
 
 
 def _line_at(text: str, offset: int) -> int:

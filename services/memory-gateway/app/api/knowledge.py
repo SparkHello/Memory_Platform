@@ -106,6 +106,7 @@ class KnowledgeReadRequest(BaseModel):
 
 class KnowledgeRestoreRequest(BaseModel):
     data: dict
+    confirm_sensitivity_override: bool = False
 
 
 @router.get("/status")
@@ -587,6 +588,7 @@ async def restore_knowledge(
             store=store,
             user_id=user_id,
             export_data=body.data,
+            confirm_sensitivity_override=body.confirm_sensitivity_override,
         )
     )
     embedding_results = []

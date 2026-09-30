@@ -6,7 +6,7 @@ from typing import Any, Sequence
 
 import anyio
 
-from app.knowledge.models import KnowledgeSearchHit
+from app.knowledge.models import KnowledgeChunk, KnowledgeSearchHit
 from app.knowledge.store import KnowledgeStore
 from app.knowledge.store.utils import _safe_error
 from app.memory.search import (
@@ -127,7 +127,7 @@ class KnowledgeEmbeddingIndexer:
                     operation="knowledge_index",
                 ):
                     embedded = await self.embedding_client.embed_many(
-                        [chunk.content for chunk in batch],
+                        [_embedding_text(chunk) for chunk in batch],
                         screen_sensitivity=not override_confirmed,
                     )
                 for chunk, vector in zip(batch, embedded, strict=False):
@@ -174,6 +174,19 @@ class KnowledgeEmbeddingIndexer:
                 )
             )
             return {"status": "failed", "stored": len(vectors), "total": len(chunks)}
+
+
+def _embedding_text(chunk: KnowledgeChunk) -> str:
+    """Prefix the heading path so a chunk keeps its section context.
+
+    Manuals refer to "this feature" or "the setting above" constantly; the
+    heading path is the cheapest way to tell the embedding model which
+    feature that is.
+    """
+    title_path = " / ".join(part for part in chunk.title_path if part)
+    if not title_path:
+        return chunk.content
+    return f"{title_path}\n{chunk.content}"
 
 
 class KnowledgeRetrievalService:

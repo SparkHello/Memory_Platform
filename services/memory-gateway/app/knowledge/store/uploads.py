@@ -17,6 +17,7 @@ from app.knowledge.store.constants import (
     _SHA256_RE,
     _UPLOAD_PART_MAX_CHARS,
     _UPLOAD_TTL_HOURS,
+    _MAX_OPEN_UPLOADS_PER_USER,
 )
 from app.knowledge.store.errors import (
     KnowledgeConflictError,
@@ -48,6 +49,7 @@ from app.knowledge.store.utils import (
     _optional_text,
     _required_text,
     _utc_after,
+    _utc_before,
     _utc_now,
     _validate_content_type,
     _validate_metadata,
@@ -86,10 +88,27 @@ def begin_upload(
         connection.execute(
             """
             DELETE FROM knowledge_upload_sessions
-            WHERE user_id = ? AND status IN ('open', 'expired') AND expires_at < ?
+            WHERE user_id = ?
+              AND (
+                (status IN ('open', 'expired') AND expires_at < ?)
+                OR (status IN ('committed', 'failed', 'cancelled') AND updated_at < ?)
+              )
             """,
-            (user_id, now),
+            (user_id, now, _utc_before(hours=_UPLOAD_TTL_HOURS)),
         )
+        open_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM knowledge_upload_sessions
+                WHERE user_id = ? AND status = 'open' AND expires_at >= ?
+                """,
+                (user_id, now),
+            ).fetchone()["count"]
+        )
+        if open_count >= _MAX_OPEN_UPLOADS_PER_USER:
+            raise KnowledgeConflictError(
+                "too many open upload sessions; commit or cancel existing uploads first"
+            )
         if replace_document_ref:
             replace_id = _document_id(replace_document_ref)
             row = _get_document_row(

@@ -621,7 +621,7 @@ export class MemoryApi {
     documentReference: string,
     versionReference: string,
     signal?: AbortSignal
-  ): Promise<unknown> {
+  ): Promise<KnowledgeUploadCommitResult> {
     return this.request(
       `/knowledge/documents/${encodeURIComponent(documentReference)}/versions/${encodeURIComponent(versionReference)}/reindex`,
       { method: "POST", signal, timeoutMs: 120000 }
@@ -682,10 +682,14 @@ export class MemoryApi {
     return this.request("/knowledge/export", { signal, timeoutMs: 120000 });
   }
 
-  async restoreKnowledge(data: KnowledgeExport, signal?: AbortSignal): Promise<KnowledgeRestoreResult> {
+  async restoreKnowledge(
+    data: KnowledgeExport,
+    confirmSensitivityOverride = false,
+    signal?: AbortSignal
+  ): Promise<KnowledgeRestoreResult> {
     return this.request("/knowledge/restore", {
       method: "POST",
-      body: { data },
+      body: { data, confirm_sensitivity_override: confirmSensitivityOverride },
       signal,
       timeoutMs: 120000
     });

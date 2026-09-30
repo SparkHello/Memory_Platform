@@ -163,7 +163,7 @@ Recommended system-prompt policy:
 - 用户个人背景、偏好、关系、习惯和过去经历使用 search_memory；用户导入的文档、笔记、手册和长文本使用 search_knowledge。
 - 不确定当前用户有哪些知识资料可用时，先调用 list_knowledge_documents，再决定是否搜索。
 - 敏感知识默认不列出、不检索；只有用户本轮明确要求访问相关敏感资料时，才设置 include_sensitive=true。
-- search_knowledge 的 request 应完整描述目标事实、可能来源、版本/时间约束和是否需要逐字证据，而不是只传零散关键词。
+- search_knowledge 的 request 应以要查找的事实为主，并尽量沿用文档里可能出现的原词（术语、功能名、参数名、数字）；可以补充来源、版本和是否需要逐字证据，但不要用大段铺垫开头。本地检索先做关键词/三元组匹配，代理关闭时只有这一层，一句话里的关键词越靠前、越贴近原文，命中越准。
 - search_knowledge 的 limit 取值 1–10，MCP 对越界值静默钳制到该范围；REST `/knowledge/search` 则对越界 limit 返回 422。
 - list_knowledge_documents 默认不包含敏感文档（include_sensitive=false，模型视角）；REST `GET /knowledge/documents` 默认 include_sensitive=true（管理台视角），这是有意差异。
 - 搜索结果只包含本地原文的逐字 excerpt 和稳定引用。需要更多上下文时用 read_knowledge 读取 chunk；只有用户明确要求全文或任务确需全局审阅时才分页读取 version reference。
@@ -185,7 +185,9 @@ response space/dimension headers and the actual vector length, and any blank, mi
 or mismatched configuration safely falls back to local FTS rather than mixing vector
 spaces. Document tags and scalar metadata can restrict the authorized local scope
 before either channel runs. When `KNOWLEDGE_AGENT_EGRESS_POLICY=none`, no query or
-excerpt is sent to a remote model. `normal` permits only normal documents; `all` may
+excerpt is sent to the knowledge-agent routes; the request text is still embedded
+through `memory.embedding` when an embedding space is configured, subject to the same
+egress ceiling as memory embeddings. `normal` permits only normal documents; `all` may
 also permit private/sensitive excerpts, but sensitive egress additionally requires the
 existing `ALLOW_SENSITIVE_EGRESS=true` gate. The agent can only search local candidates
 and select version-bound references; response text is always read from local SQLite.

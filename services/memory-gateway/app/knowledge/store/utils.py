@@ -62,6 +62,12 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _utc_before(*, hours: int) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+
+
 def _utc_after(*, hours: int) -> str:
     return (datetime.now(UTC) + timedelta(hours=hours)).isoformat(
         timespec="microseconds"
@@ -222,7 +228,15 @@ def _validated_vector(values: Sequence[float] | Any) -> list[float]:
 
 
 def _detect_sensitivity(text: str) -> KnowledgeSensitivity:
-    return detect_text_sensitivity(text)  # type: ignore[return-value]
+    # Knowledge documents are long third-party texts: a manual that explains
+    # how to reset a password must not be filed as a credential.  Only values
+    # (``密码：Abc123``, ``api_key=sk-...``) count as sensitive here; memory
+    # keeps the stricter mention-only floor.
+    return detect_text_sensitivity(  # type: ignore[return-value]
+        text,
+        credential_requires_value=True,
+        contact_requires_value=True,
+    )
 
 
 def detect_knowledge_text_sensitivity(text: str) -> KnowledgeSensitivity:
@@ -257,41 +271,155 @@ def _json_string_list(value: str) -> list[str]:
     return [item for item in decoded if isinstance(item, str)]
 
 
-def _fts_query(query: str) -> str:
+_QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:+-]+|[\u3400-\u9fff]+")
+_CJK_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
+_MAX_FTS_TERMS = 256
+
+
+def _query_terms(query: str) -> tuple[list[str], list[str]]:
+    """Split a natural-language query into trigram-safe and short terms.
+
+    Returns ``(fts_terms, short_terms)``.  ``fts_terms`` are phrases of at
+    least three characters that the trigram FTS table can match: the whole
+    query, Latin/number tokens, every CJK run of three or more characters,
+    and every character trigram inside those runs.  ``short_terms`` are the
+    two-character CJK words (``端口``, ``密码``, ``导出``) that carry most of
+    the meaning in Chinese queries but are invisible to a trigram index; the
+    caller matches them with a substring scan instead of dropping them.
+    """
     query = query.strip()
-    terms: list[str] = []
-    # Exact phrase first; trigrams then make natural-language requests less
-    # brittle without letting user input become FTS syntax.
+    fts_terms: list[str] = []
+    short_terms: list[str] = []
     if len(query) >= 3:
-        terms.append(query)
-    for token in re.findall(r"[A-Za-z0-9_./:+-]+|[\u3400-\u9fff]+", query):
-        if len(token) < 3:
+        fts_terms.append(query)
+    for token in _QUERY_TOKEN_RE.findall(query):
+        if _CJK_RUN_RE.fullmatch(token):
+            if len(token) == 2:
+                short_terms.append(token)
+                continue
+            if len(token) < 3:
+                continue
+            fts_terms.append(token)
+            if len(token) > 3:
+                fts_terms.extend(
+                    token[index : index + 3] for index in range(len(token) - 2)
+                )
+        elif len(token) >= 3:
+            fts_terms.append(token)
+    unique_fts = list(dict.fromkeys(fts_terms))[:_MAX_FTS_TERMS]
+    unique_short = list(dict.fromkeys(short_terms))[:64]
+    return unique_fts, unique_short
+
+
+def _cjk_bigrams(query: str, *, exclude: Sequence[str] = ()) -> list[str]:
+    """Two-character windows of longer CJK runs, used when trigrams miss.
+
+    ``配置端口`` written as one run never matches a document that says
+    ``端口……配置``; its bigrams ``配置`` and ``端口`` do.
+    """
+    excluded = set(exclude)
+    bigrams: list[str] = []
+    for run in _CJK_RUN_RE.findall(query):
+        if len(run) < 4:
             continue
-        if re.fullmatch(r"[\u3400-\u9fff]+", token) and len(token) > 3:
-            terms.extend(token[index : index + 3] for index in range(len(token) - 2))
-        else:
-            terms.append(token)
-    unique = list(dict.fromkeys(terms))[:32]
-    if not unique:
-        unique = [query]
-    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in unique)
+        for index in range(len(run) - 1):
+            bigram = run[index : index + 2]
+            if bigram not in excluded:
+                bigrams.append(bigram)
+    return list(dict.fromkeys(bigrams))[:64]
 
 
-def _excerpt(content: str, query: str, maximum: int) -> tuple[str, int, int]:
+def _fts_query(query: str) -> str:
+    """Build an FTS5 MATCH expression; user input never becomes FTS syntax."""
+    fts_terms, _ = _query_terms(query)
+    if not fts_terms:
+        fts_terms = [query.strip()]
+    return " OR ".join(
+        f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms
+    )
+
+
+def _excerpt(
+    content: str,
+    query: str,
+    maximum: int,
+    *,
+    title_path: str = "",
+) -> tuple[str, int, int]:
     if len(content) <= maximum:
         return content, 0, len(content)
-    position = content.casefold().find(query.casefold())
-    if position < 0:
-        positions = [
-            content.casefold().find(term.casefold())
-            for term in re.findall(r"[A-Za-z0-9_./:+-]{3,}|[\u3400-\u9fff]{3,}", query)
-        ]
-        positions = [value for value in positions if value >= 0]
-        position = min(positions) if positions else 0
-    start = max(0, position - maximum // 3)
+    folded = content.casefold()
+    position = folded.find(query.casefold())
+    if position >= 0:
+        start = max(0, position - maximum // 3)
+    else:
+        start = _densest_window_start(
+            folded, query, maximum, title_path=title_path.casefold()
+        )
     end = min(len(content), start + maximum)
     start = max(0, end - maximum)
     return content[start:end], start, end
+
+
+def _densest_window_start(
+    folded: str,
+    query: str,
+    maximum: int,
+    *,
+    title_path: str = "",
+) -> int:
+    """Start offset of the ``maximum``-wide window covering the most query terms.
+
+    The earliest-match heuristic used to anchor the excerpt on whatever
+    generic word appeared first ("用户", "系统"), which for long requests
+    pointed the window at preamble while the answer sat further down the
+    chunk.  Counting distinct matched terms per window keeps the excerpt on
+    the densest span instead.
+    """
+    fts_terms, short_terms = _query_terms(query)
+    terms = [term.casefold() for term in fts_terms[1:] + short_terms]
+    terms = [term for term in terms if term and term != query.casefold()]
+    # Words that merely repeat the section heading (a request usually names
+    # the document it is asking about) say little about where the answer is;
+    # longer phrases and Latin tokens are more specific than CJK trigrams.
+    weights: list[float] = []
+    for term in terms:
+        weight = 2.0 if len(term) >= 4 else 1.0
+        if title_path and term in title_path:
+            weight *= 0.1
+        weights.append(weight)
+    matches: list[tuple[int, int]] = []
+    for term_index, term in enumerate(terms):
+        offset = folded.find(term)
+        seen = 0
+        while offset >= 0 and seen < 24:
+            matches.append((offset, term_index))
+            seen += 1
+            offset = folded.find(term, offset + 1)
+    if not matches:
+        return 0
+    matches.sort()
+    counts: dict[int, int] = {}
+    best_start = matches[0][0]
+    best_span_end = matches[0][0]
+    best_score = 0.0
+    left = 0
+    for position, term_index in matches:
+        counts[term_index] = counts.get(term_index, 0) + 1
+        while position - matches[left][0] >= maximum:
+            left_index = matches[left][1]
+            counts[left_index] -= 1
+            if counts[left_index] == 0:
+                del counts[left_index]
+            left += 1
+        score = sum(weights[index] for index in counts)
+        if score > best_score:
+            best_score = score
+            best_start = matches[left][0]
+            best_span_end = position
+    # Centre the matched span inside the window when there is slack.
+    slack = maximum - (best_span_end - best_start + 1)
+    return max(0, best_start - max(0, slack) // 3)
 
 
 def _cursor_key(signing_key: str | bytes) -> bytes:

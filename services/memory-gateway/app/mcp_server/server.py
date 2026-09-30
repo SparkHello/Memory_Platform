@@ -371,10 +371,11 @@ async def search_knowledge(
     tags: list[str] = [],
     metadata_filter: dict[str, str] = {},
 ) -> str:
-    """按完整自然语言需求检索独立知识库，返回版本绑定的逐字片段。
+    """按自然语言需求检索独立知识库，返回版本绑定的逐字片段。
 
-    request 应描述要查找或核对的事实；document_refs、tags、metadata_filter 可将
-    检索限制到已知文档或精确元数据范围。
+    request 应直接写要查找或核对的事实，并尽量使用文档里可能出现的原词（术语、
+    功能名、参数名、数字），不要用大段铺垫开头；document_refs、tags、metadata_filter
+    可将检索限制到已知文档或精确元数据范围。
     quality 可选 fast、balanced、deep。limit 取值 1–10，越界会被静默钳制到该范围
     （REST /knowledge/search 对越界 limit 返回 422）。远程搜索代理只能选择本地索引
     已经返回的 chunk 引用，最终 excerpt 始终由本地 KnowledgeStore 按当前用户重新读取，
