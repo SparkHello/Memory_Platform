@@ -53,7 +53,13 @@ from app.memory.ingest import (
     _decision_log_json,
     _text_audit_fields,
 )
-from app.memory.models import MemoryIngestResult, MemoryRecord, RecentContextSummary
+from app.memory.models import (
+    MemoryContextPair,
+    MemoryIngestResult,
+    MemoryRecord,
+    RecentContextSummary,
+)
+from app.memory.pairing import context_pairs
 from app.memory.redaction import detect_text_sensitivity
 from app.memory.search import (
     ACTIVATION_LIMIT,
@@ -1419,16 +1425,25 @@ def _fit_memory_context(
     *,
     max_chars: int,
 ) -> tuple[str, list[MemoryRecord]]:
+    pairs = _safe_context_pairs(memories)
     selected: list[MemoryRecord] = []
     rendered = ""
     for memory in memories:
         candidate_memories = [*selected, memory]
-        candidate = render_memory_context(candidate_memories)
+        candidate = render_memory_context(candidate_memories, pairs=pairs)
         if len(candidate) > max_chars:
             continue
         selected = candidate_memories
         rendered = candidate
     return rendered, selected
+
+
+def _safe_context_pairs(memories: list[MemoryRecord]) -> list[MemoryContextPair]:
+    try:
+        return context_pairs(memories)
+    except Exception:
+        logger.exception("聊天网关标注同主题记忆失败；本轮注入不带配对说明。")
+        return []
 
 
 def _inject_memory_context(messages: list[Any], context: str) -> list[Any]:

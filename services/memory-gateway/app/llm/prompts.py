@@ -1,10 +1,26 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from app.memory.models import CoreMemorySection, MemoryRecord, RecentContextSummary
+from app.memory.models import (
+    CoreMemorySection,
+    MemoryContextPair,
+    MemoryRecord,
+    RecentContextSummary,
+)
 from app.memory.utils import _parse_iso_datetime
 
 
-def render_memory_context(memories: list[MemoryRecord]) -> str:
+def render_memory_context(
+    memories: list[MemoryRecord],
+    *,
+    pairs: Sequence[MemoryContextPair] = (),
+) -> str:
+    """Render recalled memories; ``pairs`` outside ``memories`` are ignored.
+
+    Each line carries the date the statement was recorded (``created_at``), not
+    when the fact became true: a mention date labelled as an effective date
+    would teach the model the wrong timeline.
+    """
     if not memories:
         return ""
 
@@ -13,6 +29,9 @@ def render_memory_context(memories: list[MemoryRecord]) -> str:
     ]
     for index, memory in enumerate(memories, start=1):
         labels = []
+        recorded_at = _parse_iso_datetime(memory.created_at)
+        if recorded_at is not None:
+            labels.append(f"记录于：{recorded_at.date().isoformat()}")
         if memory.stability != "stable":
             labels.append(f"稳定性：{memory.stability}")
         if memory.valid_until:
@@ -29,7 +48,30 @@ def render_memory_context(memories: list[MemoryRecord]) -> str:
             )
         suffix = f"（{'；'.join(labels)}）" if labels else ""
         lines.append(f"{index}. {memory.content}{suffix}")
+    lines.extend(_memory_pair_notes(memories, pairs))
     return "\n".join(lines)
+
+
+def _memory_pair_notes(
+    memories: list[MemoryRecord],
+    pairs: Sequence[MemoryContextPair],
+) -> list[str]:
+    positions = {memory.id: index for index, memory in enumerate(memories, start=1)}
+    notes: list[str] = []
+    for pair in pairs:
+        older = positions.get(pair.older_id)
+        newer = positions.get(pair.newer_id)
+        if older is None or newer is None:
+            continue
+        if pair.kind == "superseded":
+            notes.append(f"注：第 {older} 条已被第 {newer} 条取代。")
+            continue
+        first, second = sorted((older, newer))
+        notes.append(
+            f"注：第 {first}、{second} 条主题相近且都仍有效，第 {newer} 条记录更晚；"
+            "两者可能并存，也可能后者已取代前者。"
+        )
+    return notes
 
 
 CORE_SECTION_TITLES = {

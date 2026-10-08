@@ -101,7 +101,7 @@ pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test
 
 ```bash
 .venv/bin/python scripts/eval_recall.py --init --database data/memory.db
-# 编辑 eval/labels.jsonl 为每个 query 填 relevant_ids
+# 编辑 eval/labels.jsonl 为每个 query 填 relevant_ids，可选 stale_ids（对该 query 已过时、不应召回的记忆）
 .venv/bin/python scripts/eval_recall.py --run
 ```
 
@@ -217,7 +217,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `app/memory/egress.py`：按句子划分出站文本，供所有 ingest 入口（`/v1`、REST ingest、MCP `submit_memory_text`、对话导入）共用：只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子；紧邻「记住」的被扣留句子不经模型、不生成向量地原句本地保存（`type=semantic`、importance 8、confidence 0.9、「私密信息」空间），其余被扣留句子只留哈希/长度/级别审计，正文绝不入日志。
 - `app/memory/resolver.py`：判断候选记忆应创建、更新旧记忆还是忽略。除精确/逐字包含外，只在同类型有效旧事实通过向量相似、实体全覆盖、主题重合、结构化值覆盖和无状态变化等保守门槛时，忽略其更笼统的语义改写；普通同主题补充仍新建并交给体检。旧事实替换分三层：temporal 白名单 key → 按 key 失效旧版本；无 key 但带明确转变标记（现在/已经/改成/换成/不再/取代、整词 `instead`/`switched`/`now`/`no longer`）且通过严格配对安全检查（同主体——「用户的橘猫/女朋友/大学室友」这类带修饰语的第三方与用户本人永不配对、同类型同敏感级别、属性关系族（居住/就职/就读/拥有/年龄/身份/去过/买卖/申请）完全一致——「养了叫年糕的橘猫」不会被「年糕现在三岁」替换，复合事实也不会因其中一部分变化被整条关闭、共享可替换关系族或同类结构化值不同取值、旧记忆无过去时/意图标记、余弦≥0.80；偏好/消费类只在显式否定冲突时替换）→ 无键自动替换，把旧记忆原地关闭（`status=resolved`、`valid_until`、`superseded_by`），依赖 embedding，由 `MEMORY_AUTO_SUPERSEDE` 控制、默认开启；其余（纯极性翻转、`supplement`、episodic/reflective、pinned/resolved、无向量）→ 创建并交给体检。
 - `app/memory/core.py`：核心记忆整理。只从已保存长期记忆中提炼，并要求 evidence ids。
-- `app/memory/review.py`：记忆体检建议，不直接修改数据。
+- `app/memory/review.py`：记忆体检建议，不直接修改数据。同类型记忆对先按字面（0.65）配对；字面配不上、但向量余弦≥0.80（同一 embedding 空间）且 `pairing.may_be_versions_of_same_fact` 成立的仍有效记忆对另出一条「可能是新旧版本」建议，兑现 resolver「建议体检确认」的承诺。
+- `app/memory/pairing.py`：体检与召回注入共用的「可能是同一事实新旧版本」判定。只看 semantic/emotional/procedural、同主体、属性关系族有交集（极性翻转可越过，兼容「没有坚持」被读成拥有）、可并存的偏好/消费类需新句带转变词或极性翻转；门槛复用 resolver 常量。`context_pairs` 给注入列表生成 `superseded`（已存的取代链接）与 `parallel`（两条都有效）配对，`render_memory_context(pairs=...)` 渲染成末尾「注：」行；每条记忆另带「记录于」（`created_at`，绝不能写成生效日期）。它不改任何数据；规则变更要跑 `tests/test_memory_conflict_cases.py` 的 21 个中文冲突用例。
 - `app/memory/report.py`：记忆报告、导出和恢复导入。
 - `app/memory/graph_traverse.py`：从 seed 记忆出发的有界 Personalized PageRank / waypoint 图遍历，返回关联记忆排序和路径解释。
 - `app/memory/utils.py`：记忆模块共享的纯工具函数，例如 ISO datetime 解析、JSON 对象提取、文本 terms/normalize、相似度和否定词检测、`_utc_now`/`_ordered_unique`，以及 review/review_revision/resolver 共用的 pair-relation 判定（`pair_relation`/`pair_conflict`，各调用方阈值作参数保持现状）；另有按 `(memory_id, updated_at, embedding_space_id)` 失效的 embedding 向量解析缓存（`_memory_embedding_vector`，上限 2048 条 LRU）。
@@ -232,7 +233,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `scripts/audit_memory_db.py`：真实 SQLite 记忆库的只读巡检工具。只检查 schema、旧 type 残留、Time Ripple 配置、JSON 字段和 usage_count/temporal 统计，不写入 `data/memory.db`，也不打印密钥。
 - `app/memory/evaluation.py`：机制诊断与召回评测共享实现，供 REST/Web 和 CLI 共同调用。
 - `scripts/diagnose_memory_health.py`：只读诊断各记忆机制是否被真实数据激活（扇区分化、生命周期状态、temporal KG、图结构），把原始计数翻译成 active/degenerate/dormant/sparse 判定。
-- `scripts/eval_recall.py`：微型召回评测。`--init` 按 user id 建立物理隔离快照，`--run` 以 `record_usage=False` 输出排序、无答案误召、拒答和实际 fallback 指标。真实库全程只读，`eval/` 已被 gitignore。
+- `scripts/eval_recall.py`：微型召回评测。`--init` 按 user id 建立物理隔离快照，`--run` 以 `record_usage=False` 输出排序、无答案误召、拒答、过时版本召回（逐题 `stale_ids`）和实际 fallback 指标。真实库全程只读，`eval/` 已被 gitignore。
 - `docs/client_integration.md`：Kelivo/iOS 接入说明。维护 MCP 原文提交原则、temporal key 填写边界，以及对外把 `usage_count` 解释为 `activation_count` 的文案。
 - `ui/`：React/Vite 本地 Memory Console。连接信息只写浏览器 `localStorage`，第一阶段 Settings 不写 `.env`；“对话上下文”页同时展示 `/v1` 自动分支树和按 conversation ID 保存的近期摘要；“用量与费用”页展示实际模型、Token、可计费金额、完整度和价格来源。
 - `ui/src/pages/system/ProvidersPage.tsx`：Model Gateway 配置页。普通访问密钥只读；admin key 只保存在 React 内存中，刷新即清除。渠道密钥字段只允许替换、不回填、不删除；路由必须先校验当前 revision，再原子应用。`NewChannelWizard.tsx` 提供从零新建渠道的分步向导（选预设/自定义渠道 → 单向写入密钥 → discovery 检查拉取模型列表 → 选模型与能力 → 创建 deployment 并把 memory.* / knowledge.* 路由指向它），每阶段都先 dry_run 校验再应用。
@@ -249,7 +250,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 | `/v1` 透明代理、FLIT tools/多模态、流式、幂等、故障切换 | `pytest tests/test_chat_gateway.py tests/test_openai_gateway_client.py tests/test_chat_streaming.py tests/test_extraction_prefilter.py` |
 | MCP 工具、instructions、鉴权 | `pytest tests/test_mcp_server.py` |
 | 保存门槛、source_quote、敏感信息、按句出站 | `pytest tests/test_memory_extraction.py tests/test_memory_egress.py tests/test_extraction_prefilter.py tests/test_mcp_server.py` |
-| 无键自动替换、时态链恢复、体检去重 | `pytest tests/test_memory_resolver.py tests/test_memory_store.py tests/test_memory_review.py tests/test_direct_memory_api.py` |
+| 无键自动替换、时态链恢复、体检去重 | `pytest tests/test_memory_resolver.py tests/test_memory_store.py tests/test_memory_review.py tests/test_direct_memory_api.py tests/test_memory_conflict_cases.py` |
+| 召回注入的记录日期与新旧版本注释、体检向量配对 | `pytest tests/test_memory_pairing.py tests/test_memory_conflict_cases.py tests/test_memory_review.py tests/test_chat_gateway.py` |
 | SQLite schema、迁移、CRUD、空间分类、软删除 | `pytest tests/test_schema_migrations.py tests/test_memory_store.py` |
 | 搜索排序、embedding fallback、使用统计 | `pytest tests/test_memory_search.py tests/test_embedding_config.py` |
 | 真实库只读巡检脚本 | `pytest tests/test_memory_audit_script.py`，必要时再运行 `scripts/audit_memory_db.py --database data/memory.db --env-file .env` |

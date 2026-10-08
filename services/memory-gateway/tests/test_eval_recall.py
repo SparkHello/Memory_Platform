@@ -993,3 +993,76 @@ def test_run_eval_does_not_record_usage(memory_store: MemoryStore) -> None:
     refreshed = memory_store.get_memory(memory_id=coffee.id, user_id="default")
     assert refreshed is not None
     assert refreshed.usage_count == 0
+
+
+def test_score_query_reports_stale_versions_ranked_before_the_answer() -> None:
+    row = eval_recall._score_query("q", ["new"], ["old", "new", "x"], k=4, stale=["old"])
+
+    assert row["hit"] == 1.0
+    assert row["stale_count"] == 1
+    assert row["stale_hits"] == 1
+    assert row["stale_first"] is True
+
+    later = eval_recall._score_query("q", ["new"], ["new", "old"], k=4, stale=["old"])
+    assert later["stale_hits"] == 1
+    assert later["stale_first"] is False
+
+
+def test_score_query_counts_an_id_marked_both_relevant_and_stale_as_relevant() -> None:
+    row = eval_recall._score_query("q", ["m"], ["m"], k=4, stale=["m"])
+
+    assert row["hit"] == 1.0
+    assert row["stale_count"] == 0
+    assert row["stale_hits"] == 0
+
+
+def test_stale_ids_are_validated_and_overlap_is_only_a_warning() -> None:
+    labels = [
+        {
+            "id": "q1",
+            "query": "用户现在住哪",
+            "judgment": "relevant",
+            "relevant_ids": ["m-new"],
+            "stale_ids": ["m-new", "m-old", "m-gone"],
+        }
+    ]
+
+    issues = _label_validation_issues(labels, valid_ids={"m-new", "m-old"})
+    assert [issue["code"] for issue in issues] == [
+        "stale_ids_overlap_relevant",
+        "unknown_memory_id",
+    ]
+    assert issues[1]["memory_id"] == "m-gone"
+
+    with pytest.raises(EvaluationError, match="m-gone"):
+        _validate_labels(labels, valid_ids={"m-new", "m-old"})
+    normalized = _validate_labels(labels, valid_ids={"m-new", "m-old", "m-gone"})
+    assert normalized[0]["stale_ids"] == ["m-new", "m-old", "m-gone"]
+
+
+def test_run_eval_reports_stale_hit_rate_only_over_labelled_queries(
+    memory_store: MemoryStore,
+) -> None:
+    old = memory_store.create_memory(user_id="default", content="用户住在常德。")
+    new = memory_store.create_memory(user_id="default", content="用户住在西宁。")
+    coffee = memory_store.create_memory(user_id="default", content="用户喜欢黑咖啡。")
+    labels = [
+        {"id": "now", "query": "住在", "relevant_ids": [new.id], "stale_ids": [old.id]},
+        {"id": "before", "query": "常德", "relevant_ids": [old.id]},
+        {"id": "coffee", "query": "咖啡", "relevant_ids": [coffee.id]},
+    ]
+
+    result = eval_recall.run_eval(
+        snapshot_db=memory_store.database_path,
+        labels=labels,
+        user_id="default",
+        k=8,
+        embedding_client=NullEmbeddingClient(),
+    )
+
+    summary = result["summary"]
+    assert summary["queries_with_stale"] == 1
+    assert summary["stale_hit_rate"] == 1.0
+    now = next(row for row in result["per_query"] if row["id"] == "now")
+    assert now["stale_hits"] == 1
+    assert "stale=1/1" in eval_recall.format_text_report(result)

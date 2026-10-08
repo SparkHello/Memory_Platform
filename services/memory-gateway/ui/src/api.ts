@@ -1291,6 +1291,7 @@ export class MemoryApi {
           query: label.query,
           judgment: label.judgment,
           relevant_ids: label.relevant_ids,
+          stale_ids: label.stale_ids,
           note: label.note || undefined
         }))
       },

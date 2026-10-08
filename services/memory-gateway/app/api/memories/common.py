@@ -305,6 +305,7 @@ class RecallEvalLabelRequest(BaseModel):
     query: str = Field(default="", max_length=QUERY_MAX_CHARS)
     judgment: Literal["unlabeled", "relevant", "no_answer"] | None = None
     relevant_ids: list[PublicId] = Field(default_factory=list, max_length=1000)
+    stale_ids: list[PublicId] = Field(default_factory=list, max_length=1000)
     note: str | None = Field(default=None, max_length=NOTE_MAX_CHARS)
 
 class RecallEvalLabelsRequest(BaseModel):

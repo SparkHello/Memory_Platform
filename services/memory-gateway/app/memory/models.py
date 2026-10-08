@@ -441,6 +441,18 @@ class AutoSupersedeDecision(BaseModel):
     reason: str
 
 
+class MemoryContextPair(BaseModel):
+    """Two recalled memories the injected context should relate for the model.
+
+    ``superseded``: ``older`` was closed by ``newer`` (a stored supersede link).
+    ``parallel``: both are still live and may be versions of the same fact.
+    """
+
+    older_id: str
+    newer_id: str
+    kind: Literal["superseded", "parallel"]
+
+
 class ResolveResult(BaseModel):
     action: MemoryAction
     memory: MemoryRecord | None = None

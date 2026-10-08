@@ -389,6 +389,8 @@ export interface RecallEvalLabel {
   query: string;
   judgment: RecallEvalJudgment;
   relevant_ids: string[];
+  /** Outdated for this query (e.g. the old city for "where do I live now"); edited in labels.jsonl. */
+  stale_ids?: string[];
   note?: string | null;
 }
 
@@ -417,6 +419,9 @@ export interface RecallEvalSummary {
   no_answer_false_positive_rate?: number;
   no_answer_abstention_rate?: number;
   no_answer_mean_retrieved?: number;
+  queries_with_stale?: number;
+  stale_hit_rate?: number;
+  stale_first_rate?: number;
   retrieval_mode_counts?: Record<string, number>;
   fallback_queries?: number;
 }

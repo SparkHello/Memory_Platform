@@ -53,9 +53,10 @@ TARGET_LABEL_MAX = 30
 MAX_RECALL_EVAL_K = 20
 
 LABELS_TEMPLATE = """# memory-gateway 召回评测标注文件
-# 每行一个 JSON 对象：{"id": "q001", "query": "一句话检索意图", "judgment": "relevant|no_answer|unlabeled", "relevant_ids": ["应被召回的 memory id"], "note": "可选说明"}
+# 每行一个 JSON 对象：{"id": "q001", "query": "一句话检索意图", "judgment": "relevant|no_answer|unlabeled", "relevant_ids": ["应被召回的 memory id"], "stale_ids": ["可选：对这个 query 已过时、不应召回的 memory id"], "note": "可选说明"}
 # - query 用自然的检索意图，模拟客户端调用 search_memory 时的 query。
 # - relevant_ids 从 memories_preview.tsv 或 Web 评测闭环页里挑选你认为这个 query 应该命中的记忆 id。
+# - stale_ids 逐题标注：问“现在住哪”时旧城市是 stale；问“之前住哪”时同一条旧记忆是 relevant，不要标 stale。
 # - 没有相关记忆时，将 judgment 明确设为 no_answer；空 relevant_ids 本身仍表示尚未标注。
 # - 以 # 开头的行和空行会被忽略。
 {"id": "q001", "query": "用户的饮食偏好", "judgment": "unlabeled", "relevant_ids": [], "note": "示例，请完成标注"}
@@ -344,6 +345,19 @@ def run_eval(
             _mean(float(row["retrieved"]) for row in no_answer_results),
             4,
         )
+    stale_results = [
+        row for row in per_query if row["graded"] and row["stale_count"]
+    ]
+    summary["queries_with_stale"] = len(stale_results)
+    if stale_results:
+        summary["stale_hit_rate"] = round(
+            _mean(1.0 if row["stale_hits"] else 0.0 for row in stale_results),
+            4,
+        )
+        summary["stale_first_rate"] = round(
+            _mean(1.0 if row["stale_first"] else 0.0 for row in stale_results),
+            4,
+        )
     retrieval_mode_counts: dict[str, int] = {}
     for row in per_query:
         retrieval_mode = str(row["retrieval_mode"])
@@ -448,6 +462,7 @@ async def _search_all(
             k=k,
             label_id=str(label.get("id") or ""),
             judgment=str(label.get("judgment") or "unlabeled"),
+            stale=[str(memory_id) for memory_id in label.get("stale_ids", [])],
         )
         row.update(
             {
@@ -498,12 +513,15 @@ def _score_query(
     k: int,
     label_id: str = "",
     judgment: str | None = None,
+    stale: list[str] | None = None,
 ) -> dict[str, object]:
     relevant_set = set(relevant)
+    stale_set = set(stale or ()) - relevant_set
     top_k = predicted[:k]
     retrieved = len(top_k)
     hit_positions = [i for i, memory_id in enumerate(top_k, start=1) if memory_id in relevant_set]
     relevant_hits = len(hit_positions)
+    stale_positions = [i for i, memory_id in enumerate(top_k, start=1) if memory_id in stale_set]
 
     precision_at_k = relevant_hits / k
     returned_precision = relevant_hits / retrieved if retrieved else 0.0
@@ -533,6 +551,12 @@ def _score_query(
         "reciprocal_rank": round(reciprocal_rank, 4),
         "ndcg": round(ndcg, 4),
         "false_positive": normalized_judgment == "no_answer" and retrieved > 0,
+        "stale_count": len(stale_set),
+        "stale_hits": len(stale_positions),
+        # An outdated version ranked before every current answer is the case
+        # the chat model is most likely to repeat.
+        "stale_first": bool(stale_positions)
+        and (not hit_positions or stale_positions[0] < hit_positions[0]),
         "predicted_ids": top_k,
     }
 
@@ -588,6 +612,12 @@ def format_text_report(result: dict[str, object]) -> str:
                 f"- no-answer false-positive rate: {summary.get('no_answer_false_positive_rate')}"
             )
             lines.append(f"- no-answer abstention rate:     {summary.get('no_answer_abstention_rate')}")
+        if summary.get("queries_with_stale"):
+            lines.append(
+                f"- stale hit rate@k:   {summary.get('stale_hit_rate')} "
+                f"({summary.get('queries_with_stale')} queries with stale_ids)"
+            )
+            lines.append(f"- stale ranked first: {summary.get('stale_first_rate')}")
         if not graded:
             lines.append("No graded queries yet. Set judgment to relevant or no_answer, then re-run.")
     lines.append("")
@@ -604,9 +634,14 @@ def format_text_report(result: dict[str, object]) -> str:
         if row.get("judgment") == "unlabeled":
             lines.append(f"- (ungraded) {row['query']}")
             continue
+        stale = (
+            f" stale={row['stale_hits']}/{row['stale_count']}"
+            if row.get("stale_count")
+            else ""
+        )
         lines.append(
             f"- hit={int(row['hit'])} p={row['precision']} r={row['recall']} "
-            f"rr={row['reciprocal_rank']} ndcg={row['ndcg']} :: {row['query']}"
+            f"rr={row['reciprocal_rank']} ndcg={row['ndcg']}{stale} :: {row['query']}"
         )
     return "\n".join(lines)
 
@@ -1359,6 +1394,10 @@ def _normalize_label_entry(entry: object, *, index: int) -> dict[str, object]:
     if not isinstance(relevant_raw, list):
         raise EvaluationError(f"Label relevant_ids must be a list: {entry!r}")
     relevant_ids = [str(memory_id).strip() for memory_id in relevant_raw if str(memory_id).strip()]
+    stale_raw = entry.get("stale_ids") or []
+    if not isinstance(stale_raw, list):
+        raise EvaluationError(f"Label stale_ids must be a list: {entry!r}")
+    stale_ids = [str(memory_id).strip() for memory_id in stale_raw if str(memory_id).strip()]
     judgment_raw = entry.get("judgment")
     if judgment_raw is None or not str(judgment_raw).strip():
         judgment = "relevant" if relevant_ids else "unlabeled"
@@ -1371,6 +1410,8 @@ def _normalize_label_entry(entry: object, *, index: int) -> dict[str, object]:
         "judgment": judgment,
         "relevant_ids": list(dict.fromkeys(relevant_ids)),
     }
+    if stale_ids:
+        label["stale_ids"] = list(dict.fromkeys(stale_ids))
     if note_raw is not None:
         label["note"] = str(note_raw)
     return label
@@ -1407,7 +1448,7 @@ def _label_validation_issues(
 ) -> list[dict[str, object]]:
     issues: list[dict[str, object]] = []
     seen: set[str] = set()
-    seen_queries: dict[str, tuple[str, tuple[str, ...], str]] = {}
+    seen_queries: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], str]] = {}
     for label in labels:
         label_id = str(label.get("id") or "")
         query = str(label.get("query") or "").strip()
@@ -1418,18 +1459,21 @@ def _label_validation_issues(
         seen.add(label_id)
         judgment = str(label.get("judgment") or "unlabeled")
         relevant_ids = list(label.get("relevant_ids", []))
+        stale_ids = list(label.get("stale_ids", []))
         normalized_query = " ".join(query.casefold().split())
         query_signature = (
             judgment,
             tuple(sorted(str(memory_id) for memory_id in relevant_ids)),
+            tuple(sorted(str(memory_id) for memory_id in stale_ids)),
             label_id,
         )
         previous = seen_queries.get(normalized_query)
         if normalized_query and previous is not None:
-            previous_judgment, previous_ids, previous_label_id = previous
+            previous_judgment, previous_ids, previous_stale_ids, previous_label_id = previous
             same_annotation = (
                 judgment == previous_judgment
                 and query_signature[1] == previous_ids
+                and query_signature[2] == previous_stale_ids
             )
             issues.append(
                 {
@@ -1477,7 +1521,17 @@ def _label_validation_issues(
                     "message": f"{label_id} 尚未标注，不应勾选相关记忆。",
                 }
             )
-        for memory_id in relevant_ids:
+        overlap = sorted(set(map(str, relevant_ids)) & set(map(str, stale_ids)))
+        if overlap:
+            issues.append(
+                {
+                    "code": "stale_ids_overlap_relevant",
+                    "label_id": label_id,
+                    "memory_id": overlap[0],
+                    "message": f"{label_id} 的记忆同时标为相关和过时，评测按相关计:{overlap[0]}",
+                }
+            )
+        for memory_id in dict.fromkeys([*relevant_ids, *stale_ids]):
             memory_id_text = str(memory_id)
             if memory_id_text not in valid_ids:
                 issues.append(
@@ -1496,12 +1550,13 @@ def _deduplicate_identical_queries(
 ) -> list[dict[str, object]]:
     """Collapse exact duplicate samples so one query cannot silently reweight metrics."""
     unique: list[dict[str, object]] = []
-    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    seen: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
     for label in labels:
         signature = (
             " ".join(str(label.get("query") or "").casefold().split()),
             str(label.get("judgment") or "unlabeled"),
             tuple(sorted(str(value) for value in label.get("relevant_ids", []))),
+            tuple(sorted(str(value) for value in label.get("stale_ids", []))),
         )
         if signature in seen:
             continue

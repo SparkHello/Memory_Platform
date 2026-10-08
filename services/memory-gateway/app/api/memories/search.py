@@ -41,6 +41,7 @@ from app.llm.runtime import resolve_model_runtime
 from app.memory.health import MemoryHealthChecker
 from app.memory.ingest import MemoryIngestService
 from app.memory.models import RecentContextSummary
+from app.memory.pairing import context_pairs
 from app.memory.search import (
     EmbeddingClient,
     MemorySearchService,
@@ -302,7 +303,10 @@ async def get_memory_context(
             recent_md = render_recent_context_summary_context(recent_obj)
         search_md = ""
         if search_results_raw:
-            search_md = render_memory_context(search_results_raw)
+            search_md = render_memory_context(
+                search_results_raw,
+                pairs=context_pairs(search_results_raw),
+            )
         blocks = [b for b in (core_md, recent_md, search_md) if b]
         return PlainTextResponse("\n\n".join(blocks), media_type="text/markdown")
 

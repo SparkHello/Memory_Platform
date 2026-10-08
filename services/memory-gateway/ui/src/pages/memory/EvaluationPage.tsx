@@ -594,6 +594,12 @@ function ResultCard({
                 <Metric label="平均误召" value={result.summary.no_answer_mean_retrieved} />
               </>
             )}
+            {(result.summary.queries_with_stale || 0) > 0 && (
+              <>
+                <Metric label="召回过时" value={result.summary.stale_hit_rate} />
+                <Metric label="过时排首" value={result.summary.stale_first_rate} />
+              </>
+            )}
           </div>
           <div className="evaluation-query-results">
             {result.per_query.map((row) => {

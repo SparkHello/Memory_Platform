@@ -447,3 +447,39 @@ def test_recall_run_grades_explicit_no_answer_labels(
     assert summary["no_answer_false_positive_rate"] == 1.0
     assert summary["no_answer_abstention_rate"] == 0.0
     assert run.json()["per_query"][0]["false_positive"] is True
+
+
+def test_recall_labels_round_trip_stale_ids_and_report_stale_hits(
+    client,
+    auth_headers,
+    memory_store: MemoryStore,
+):
+    old = memory_store.create_memory(user_id="default", content="用户住在常德。")
+    new = memory_store.create_memory(user_id="default", content="用户住在西宁。")
+    assert client.post("/memories/evaluation/recall/init", headers=auth_headers).status_code == 200
+
+    saved = client.put(
+        "/memories/evaluation/recall/labels",
+        headers=auth_headers,
+        json={
+            "labels": [
+                {
+                    "id": "q-now",
+                    "query": "住在",
+                    "judgment": "relevant",
+                    "relevant_ids": [new.id],
+                    "stale_ids": [old.id],
+                }
+            ]
+        },
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["labels"][0]["stale_ids"] == [old.id]
+    run = client.post(
+        "/memories/evaluation/recall/run",
+        headers=auth_headers,
+        json={"mode": "keyword", "k": 8},
+    )
+    assert run.status_code == 200
+    assert run.json()["summary"]["stale_hit_rate"] == 1.0

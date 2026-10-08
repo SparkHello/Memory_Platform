@@ -14,6 +14,14 @@ from app.memory.models import (
     MemoryReviewRiskTag,
     MemoryReviewSeverity,
 )
+from app.memory.pairing import (
+    may_be_versions_of_same_fact,
+    older_and_newer,
+    polarity_conflict,
+    semantic_similarity,
+    unit_memory_vectors,
+)
+from app.memory.resolver import _AUTO_SUPERSEDE_TYPES, EMBEDDING_SIMILARITY_THRESHOLD
 from app.memory.review_signals import (
     LOW_LIFE_THRESHOLD,
     STALE_DAYS,
@@ -25,6 +33,7 @@ from app.memory.review_signals import (
     is_time_variable_memory,
 )
 from app.memory.store import MemoryStore
+from app.memory.temporal import is_current_temporal_memory
 from app.memory.utils import (
     PairTextSignals,
     _parse_iso_datetime,
@@ -321,6 +330,66 @@ def _relationship_recommendations(
             seen_pairs.add(pair)
             recommendations.append(recommendation)
 
+    recommendations.extend(
+        _semantic_pair_recommendations(
+            grouped,
+            seen_pairs=seen_pairs,
+            core_map=core_map,
+        )
+    )
+    return recommendations
+
+
+def _semantic_pair_recommendations(
+    grouped: dict[str, list[_PreparedMemory]],
+    *,
+    seen_pairs: set[tuple[str, str]],
+    core_map: dict[str, list[CoreMemorySectionName]],
+) -> list[MemoryReviewRecommendation]:
+    """Pairs the resolver filed for 体检 but the lexical scan cannot see.
+
+    The resolver keeps a semantically related new statement next to the live
+    fact (cosine >= 0.80) and promises the pair to 体检; paraphrases such as
+    "在读 OSTEP" / "在读 CSAPP 第 8 章" share too few characters for the 0.65
+    lexical threshold, so they are matched here by embedding instead.
+    """
+    recommendations: list[MemoryReviewRecommendation] = []
+    for memory_type, group in grouped.items():
+        if memory_type not in _AUTO_SUPERSEDE_TYPES:
+            continue
+        current = [item.record for item in group if is_current_temporal_memory(item.record)]
+        vectors = unit_memory_vectors(current)
+        candidates = [memory for memory in current if memory.id in vectors]
+        for index, left in enumerate(candidates):
+            for right in candidates[index + 1 :]:
+                pair = tuple(sorted((left.id, right.id)))
+                if pair in seen_pairs:
+                    continue
+                score = semantic_similarity(left, right, vectors)
+                if score is None or score < EMBEDDING_SIMILARITY_THRESHOLD:
+                    continue
+                older, newer = older_and_newer(left, right)
+                if not may_be_versions_of_same_fact(older, newer):
+                    continue
+                seen_pairs.add(pair)
+                conflict = polarity_conflict(older, newer)
+                recommendations.append(
+                    _recommendation(
+                        action="review",
+                        relation="conflict" if conflict else "supersede",
+                        reason=(
+                            "两条同类型记忆语义相近且可能互相冲突，建议确认哪条仍然成立"
+                            if conflict
+                            else "两条同类型记忆说法不同但语义相近，可能是同一件事的新旧版本，"
+                            "建议确认是否由较新的一条取代旧的"
+                        ),
+                        memory_ids=[older.id, newer.id],
+                        suggested_content=newer.content,
+                        risk_tags=["conflict"] if conflict else [],
+                        severity="high" if conflict else "medium",
+                        core_map=core_map,
+                    )
+                )
     return recommendations
 
 
