@@ -1,0 +1,5 @@
+# 本地 HTTPS 反向代理：把 https://localhost:8443 转发到 Memory Gateway (127.0.0.1:2026)
+# 证书由 Caddy 内置本地 CA 自动签发（首次启动后需执行一次 caddy trust）
+localhost:8443
+
+reverse_proxy 127.0.0.1:2026
