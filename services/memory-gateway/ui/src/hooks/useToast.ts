@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type ToastKind = "success" | "error" | "info";
+// warning：操作成功但有需要用户读完的提示（例如导入警告），和 error 一样不自动消失。
+export type ToastKind = "success" | "error" | "warning" | "info";
 
 export type ToastMessage = {
   kind: ToastKind;
@@ -22,8 +23,8 @@ export function useToast() {
     if (!toast) {
       return;
     }
-    // 错误提示停留到用户手动关闭，避免还没读完就消失
-    if (toast.kind === "error") {
+    // 错误和警告提示停留到用户手动关闭，避免还没读完就消失
+    if (toast.kind === "error" || toast.kind === "warning") {
       return;
     }
     const timer = window.setTimeout(clearToast, 3200);

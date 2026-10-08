@@ -14,6 +14,7 @@ from app.knowledge.models import (
 from app.knowledge.store.errors import (
     KnowledgeConflictError,
     KnowledgeNotFoundError,
+    KnowledgeSensitivityConfirmationRequired,
     KnowledgeValidationError,
 )
 from app.knowledge.store.helpers import (
@@ -215,7 +216,17 @@ def update_document(
     sensitivity: KnowledgeSensitivity | None = None,
     tags: Sequence[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    confirm_sensitivity_override: bool | None = None,
 ) -> KnowledgeDocument:
+    """Update document metadata.
+
+    ``confirm_sensitivity_override`` mirrors the import flow for Web callers:
+    ``False`` raises :class:`KnowledgeSensitivityConfirmationRequired` instead
+    of silently lifting a level the owner lowered below local detection, and
+    ``True`` records the owner's confirmation.  ``None`` (MCP, which must not
+    expose a bypass) keeps the conservative behaviour of saving the higher
+    level.
+    """
     user_id = _required_text(user_id, "user_id", 256)
     document_id = _document_id(
         _one_reference(document_id, document_ref, "document")
@@ -279,6 +290,14 @@ def update_document(
             # raising that level is still covered by the confirmation.
             new_sensitivity = declared
             sensitivity_override_confirmed = True
+        elif confirm_sensitivity_override:
+            new_sensitivity = declared
+            sensitivity_override_confirmed = True
+        elif confirm_sensitivity_override is False:
+            raise KnowledgeSensitivityConfirmationRequired(
+                declared_sensitivity=declared,
+                detected_sensitivity=detected_sensitivity,
+            )
         else:
             new_sensitivity = _higher_sensitivity(declared, detected_sensitivity)
             sensitivity_override_confirmed = False

@@ -81,6 +81,7 @@ class KnowledgeDocumentUpdateRequest(BaseModel):
     sensitivity: KnowledgeSensitivity | None = None
     tags: list[str] | None = Field(default=None, max_length=32)
     metadata: dict[str, str | int | float | bool] | None = None
+    confirm_sensitivity_override: bool = False
 
 
 class KnowledgePurgeRequest(BaseModel):
@@ -378,6 +379,7 @@ def update_knowledge_document(
         sensitivity=body.sensitivity,
         tags=body.tags,
         metadata=body.metadata,
+        confirm_sensitivity_override=body.confirm_sensitivity_override,
     )
     return {"document": _document_payload(document)}
 

@@ -2128,6 +2128,11 @@ code {
   color: var(--success);
 }
 
+.toast.warning {
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: var(--warning);
+}
+
 @media (max-width: 780px) {
   /* 手机上底栏占着最下面 ~70px，toast 抬高避免盖住页面主按钮和底栏。 */
   .toast {

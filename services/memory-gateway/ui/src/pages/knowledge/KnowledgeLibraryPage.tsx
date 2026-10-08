@@ -491,13 +491,30 @@ function KnowledgeDetailPage({
     if (!detail || !title.trim()) return;
     setSaving(true);
     try {
-      await api.updateKnowledgeDocument(detail.document.id, {
+      const payload = {
         title: title.trim(),
         source_name: sourceName.trim(),
         sensitivity,
         tags: parseKnowledgeTags(tagsText),
         metadata: parseKnowledgeMetadata(metadataText)
-      });
+      };
+      try {
+        await api.updateKnowledgeDocument(detail.document.id, payload);
+      } catch (firstError) {
+        if (!(firstError instanceof ApiError) || firstError.code !== "sensitivity_confirmation_required") {
+          throw firstError;
+        }
+        // 选择的级别低于本地检测结果：和导入一样先让用户明确确认，而不是悄悄改回更高级别。
+        const detected = String(firstError.data?.detected_sensitivity || "sensitive");
+        const ok = await confirm({
+          title: "敏感级别低于本地检测结果",
+          message: `你选择了“${displayText(sensitivity)}”，但本地规则检测为“${displayText(detected)}”。规则可能因教材示例、号码或“密码”等词误判。确认后按你的选择保存，并记录这次确认。`,
+          confirmLabel: `按“${displayText(sensitivity)}”保存`,
+          tone: "warning"
+        });
+        if (!ok) return;
+        await api.updateKnowledgeDocument(detail.document.id, { ...payload, confirm_sensitivity_override: true });
+      }
       notify("文档信息已更新", "success");
       setEditing(false);
       onChanged();

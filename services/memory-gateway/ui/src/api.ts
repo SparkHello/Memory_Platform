@@ -574,6 +574,7 @@ export class MemoryApi {
       sensitivity?: string;
       tags?: string[];
       metadata?: Record<string, string | number | boolean>;
+      confirm_sensitivity_override?: boolean;
     },
     signal?: AbortSignal
   ): Promise<KnowledgeDocument> {

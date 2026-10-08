@@ -1,5 +1,5 @@
 import { FileText, ShieldAlert, Upload, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, type MemoryApi } from "../../api";
 import type {
   KnowledgeUploadCommitResult,
@@ -66,8 +66,22 @@ export function KnowledgeUploadForm({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sensitivityConfirmationRef = useRef<HTMLDivElement>(null);
   // 敏感级别确认时后端会话仍处于 open，记住它以便确认后直接重新提交，不必重传正文。
-  const pendingCommitRef = useRef<{ uploadId: string; parts: number; sha256: string; text: string } | null>(null);
+  const pendingCommitRef = useRef<{ uploadId: string; parts: number; sha256: string; signature: string } | null>(null);
   const text = mode === "paste" ? pasteText : fileText;
+  // 确认面板针对的是提交那一刻的表单；之后改了任何字段，面板上的级别和暂存会话都已过期。
+  const textFingerprint = useMemo(() => fingerprint(text), [text]);
+  const formSignature = JSON.stringify([
+    mode,
+    title.trim(),
+    sourceName.trim(),
+    sensitivity,
+    tagsText,
+    metadataText,
+    contentType,
+    replaceDocumentRef,
+    mode === "file" && file ? `${file.name}:${file.size}:${file.lastModified}` : textFingerprint
+  ]);
+  const confirmationSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (sensitivityConfirmation) {
@@ -84,6 +98,14 @@ export function KnowledgeUploadForm({
     pendingCommitRef.current = null;
     if (pending) void api.cancelKnowledgeUpload(pending.uploadId).catch(() => undefined);
   };
+
+  useEffect(() => {
+    if (!sensitivityConfirmation || confirmationSignatureRef.current === formSignature) return;
+    setSensitivityConfirmation(null);
+    discardPendingCommit();
+    notify("表单已修改，请重新提交以按新内容检查敏感级别", "info");
+    // discardPendingCommit 只读 ref，不需要进依赖。
+  }, [formSignature, sensitivityConfirmation, notify]);
 
   const chooseMode = (next: SourceMode) => {
     if (busy) return;
@@ -152,6 +174,7 @@ export function KnowledgeUploadForm({
       return;
     }
 
+    const submittedSignature = formSignature;
     setBusy(true);
     let uploadId = "";
     try {
@@ -174,7 +197,7 @@ export function KnowledgeUploadForm({
         return;
       }
       const pending = pendingCommitRef.current;
-      if (confirmSensitivityOverride && pending && pending.text === text) {
+      if (confirmSensitivityOverride && pending && pending.signature === submittedSignature) {
         pendingCommitRef.current = null;
         uploadId = pending.uploadId;
         setProgress({ completed: pending.parts, total: pending.parts, label: "正在保存并建立索引" });
@@ -212,7 +235,7 @@ export function KnowledgeUploadForm({
       } catch (commitError) {
         if (commitError instanceof ApiError && commitError.code === "sensitivity_confirmation_required") {
           // 会话仍然有效，确认后直接再次 commit。
-          pendingCommitRef.current = { uploadId, parts: parts.length, sha256: digest, text };
+          pendingCommitRef.current = { uploadId, parts: parts.length, sha256: digest, signature: submittedSignature };
           uploadId = "";
         }
         throw commitError;
@@ -225,6 +248,7 @@ export function KnowledgeUploadForm({
         error instanceof ApiError
         && error.code === "sensitivity_confirmation_required"
       ) {
+        confirmationSignatureRef.current = submittedSignature;
         setSensitivityConfirmation({
           declared: sensitivityValue(error.data?.declared_sensitivity, sensitivity),
           detected: sensitivityValue(error.data?.detected_sensitivity, "sensitive")
@@ -529,20 +553,31 @@ function notifyCommit(result: KnowledgeUploadCommitResult, replaceDocumentRef: s
     return;
   }
   const embeddingFailed = result.embedding?.status === "failed";
+  const outcome = result.deduplicated
+    ? "正文未变化，已保留当前版本"
+    : embeddingFailed
+      ? "文档已建立关键词索引；向量索引失败，可稍后重建"
+      : replaceDocumentRef
+        ? "新版本已建立索引"
+        : "文档已加入知识库";
+  // 只有一个 toast 槽位：导入提示必须和结果并成一条，否则会被紧接着的结果覆盖。
   const warnings = result.import?.warnings ?? [];
   if (warnings.length > 0) {
-    notify(`导入提示：${warnings.slice(0, 2).join("；")}${warnings.length > 2 ? " 等" : ""}`, "error");
+    const shown = `${warnings.slice(0, 2).join("；")}${warnings.length > 2 ? ` 等 ${warnings.length} 条` : ""}`;
+    notify(`${outcome}。导入提示：${shown}`, embeddingFailed ? "error" : "warning");
+    return;
   }
-  notify(
-    result.deduplicated
-      ? "正文未变化，已保留当前版本"
-      : embeddingFailed
-        ? "文档已建立关键词索引；向量索引失败，可稍后重建"
-        : replaceDocumentRef
-          ? "新版本已建立索引"
-          : "文档已加入知识库",
-    embeddingFailed ? "error" : "success"
-  );
+  notify(outcome, embeddingFailed ? "error" : "success");
+}
+
+// 32 位 FNV-1a：只用来判断正文是否被改过，不做任何安全用途。
+function fingerprint(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
 }
 
 function splitText(text: string, maxLength: number): string[] {
