@@ -55,12 +55,17 @@ def _base_args(tmp_path: Path) -> list[str]:
 
 
 def _installed_modelgw() -> Path:
-    """modelgw belonging to this interpreter, not a project-venv pip install."""
+    """modelgw belonging to this interpreter, not a project-venv pip install.
+
+    A venv ``python`` is usually a symlink to the base interpreter. Console
+    scripts live next to the symlink, so resolve only as a fallback.
+    """
     name = "modelgw.exe" if os.name == "nt" else "modelgw"
-    candidate = Path(sys.executable).resolve().with_name(name)
-    if candidate.is_file():
-        return candidate
-    found = shutil.which("modelgw")
+    executable = Path(sys.executable)
+    for candidate in (executable.with_name(name), executable.resolve().with_name(name)):
+        if candidate.is_file():
+            return candidate
+    found = shutil.which(name)
     if found:
         return Path(found)
     pytest.fail(
@@ -566,18 +571,21 @@ def test_stack_install_quickstart_stack_install_keeps_backend_policy_stable(
     # helper would pip install --no-deps into services/memory-gateway/.venv.
     # CI has no project venv; a developer venv must not be mutated by pytest.
     modelgw = _installed_modelgw()
+    original_run = subprocess.run
 
     def reject_pip(command, *command_args, **command_kwargs):
         parts = [str(part) for part in command]
         if "pip" in parts:
             raise AssertionError(f"stack install test invoked pip: {parts}")
-        return subprocess.run(command, *command_args, **command_kwargs)
+        return original_run(command, *command_args, **command_kwargs)
 
     monkeypatch.setattr(
         "app.cli._ensure_model_gateway_runtime",
         lambda *runtime_args, **runtime_kwargs: modelgw,
     )
-    monkeypatch.setattr("app.cli.subprocess.run", reject_pip)
+    # ``app.cli.subprocess`` is the subprocess module, so this also covers
+    # stack_install. Bind the original function first to avoid recursion.
+    monkeypatch.setattr(subprocess, "run", reject_pip)
 
     assert main(install_arguments) == 0
     model_paths = gateway_paths(model_home)
