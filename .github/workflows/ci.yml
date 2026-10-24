@@ -70,7 +70,9 @@ jobs:
             $errors | ForEach-Object { Write-Error $_ }
             exit 1
           }
-          python -m pytest -q `
+          # Installer tests only read deploy/ text. --noconftest skips
+          # services/memory-gateway/tests/conftest.py, which imports the app.
+          python -m pytest -q --noconftest `
             services/memory-gateway/tests/test_installer_parity.py `
             services/memory-gateway/tests/test_windows_docker_install_script.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -90,7 +92,9 @@ jobs:
             $errors | ForEach-Object { Write-Error $_ }
             exit 1
           }
-          python -m pytest -q `
+          # Installer tests only read deploy/ text. --noconftest skips
+          # services/memory-gateway/tests/conftest.py, which imports the app.
+          python -m pytest -q --noconftest `
             services/memory-gateway/tests/test_installer_parity.py `
             services/memory-gateway/tests/test_windows_docker_install_script.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

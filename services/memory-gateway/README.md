@@ -207,12 +207,14 @@ cp .env.example .env
 编辑 `.env`，先设置本地访问密钥、两个物理隔离的数据库路径，以及独立 Model Gateway 接口：
 
 ```env
-GATEWAY_API_KEY=change-me
+# 留空。change-me、replace-me、your- 开头的示例值不能当访问密钥。
+# 新客户端用 memgw token create；迁移期的随机 legacy key 用 memgw secret set gateway。
+GATEWAY_API_KEY=
 DATABASE_PATH=data/memory.db
 KNOWLEDGE_DATABASE_PATH=data/knowledge.db
 
 MODEL_GATEWAY_BASE_URL=http://127.0.0.1:2030/v1
-MODEL_GATEWAY_API_KEY=your-local-model-gateway-client-key
+MODEL_GATEWAY_API_KEY=
 ALLOW_SENSITIVE_EGRESS=false
 
 CHAT_GATEWAY_ENABLED=true
@@ -312,8 +314,8 @@ curl \
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GATEWAY_API_KEY` | 空 | 一个版本迁移期的 legacy all-scope 凭据；新客户端改用 Auth DB 中的按设备 token。 |
-| `GATEWAY_LEGACY_API_KEY_ENABLED` | `true` | 所有设备迁移并验证后设为 `false`，立即停用 legacy key。 |
+| `GATEWAY_API_KEY` | 空 | 一个版本迁移期的 legacy all-scope 凭据；新客户端改用 Auth DB 中的按设备 token。已知占位符（`change-me`、`replace-me`、`your-` 前缀，忽略大小写和首尾空白）在 legacy 启用时会让进程拒绝启动，也不能通过 Bearer 认证。 |
+| `GATEWAY_LEGACY_API_KEY_ENABLED` | `true` | 所有设备迁移并验证后设为 `false`，立即停用 legacy key。默认保持 `true`，兼容只在 `.env` 里写了真实密钥、没有显式开关的既有安装。Docker 安装器与 `memgw stack install` 会自己写入 `true`/`false`，不依赖这个默认值。 |
 | `GATEWAY_SIGNING_SECRET` | 空 | 独立签名 cursor、review/purge preview 等短期状态；缺失时相关能力 503，绝不回退访问 token。 |
 | `AUTH_DATABASE_PATH` | `data/auth.db` | 只保存 token ID、SHA-256、固定 user/role、使用与撤销时间，不保存 token 明文。 |
 | `CHAT_GATEWAY_ENABLED` | `true` | 是否启用 `/v1/models` 和 `/v1/chat/completions`。 |

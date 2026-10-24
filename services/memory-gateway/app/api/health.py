@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 import httpx
 
 from app.config import Settings, get_settings
+from app.credential_policy import is_placeholder_credential
 from app.disk_capacity import disk_readiness_code
 from app.llm.embedding_contract import (
     embedding_contract_generation,
@@ -176,6 +177,7 @@ def _database_readiness_code(settings: Settings) -> str:
     legacy_available = bool(
         settings.gateway_legacy_api_key_enabled
         and settings.gateway_api_key.strip()
+        and not is_placeholder_credential(settings.gateway_api_key)
     )
     if not active_scoped_token and not legacy_available:
         return "auth_credentials_unavailable"

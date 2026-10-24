@@ -18,21 +18,24 @@ test("mobile routes and repeated current destination reset real page scrolling",
   await page.getByLabel("搜索记忆").press("Escape");
   await page.locator("body").click({ position: { x: 2, y: 2 } });
 
+  // 窄屏由 .content-area 滚动，html/body 固定为 overflow:hidden，window.scrollY 保持 0。
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(300);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  await scrollContentArea(page);
+  await expect.poll(() => contentScrollTop(page)).toBeGreaterThan(300);
   const mobileNav = page.getByRole("navigation", { name: "移动端导航" });
   await mobileNav.getByRole("button", { name: "记忆库", exact: true }).click();
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+  await expect.poll(() => contentScrollTop(page)).toBe(0);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
 
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(300);
+  await scrollContentArea(page);
+  await expect.poll(() => contentScrollTop(page)).toBeGreaterThan(300);
   // 移动底栏主导航现在是 工作室/记忆库/知识库/模型/接入（含首配需要的模型入口）。
   await mobileNav.getByRole("button", { name: "接入", exact: true }).click();
   await expect(page).toHaveURL(/#\/integration$/);
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
-  expect(
-    await page.evaluate(() => document.querySelector<HTMLElement>(".content-area")?.scrollTop || 0)
-  ).toBe(0);
+  await expect.poll(() => contentScrollTop(page)).toBe(0);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
 
   expect(api.blockedExternalUrls).toEqual([]);
   expect(api.unknownApiPaths).toEqual([]);
@@ -69,6 +72,20 @@ test("390px 底栏五个主入口与更多保持单行，换行即失败", async
     [...lefts].sort((left, right) => left - right)
   );
 });
+
+async function scrollContentArea(page: import("@playwright/test").Page) {
+  await page.evaluate(() => {
+    const content = document.querySelector<HTMLElement>(".content-area");
+    if (!content) throw new Error("missing .content-area");
+    content.scrollTo(0, content.scrollHeight);
+  });
+}
+
+async function contentScrollTop(page: import("@playwright/test").Page) {
+  return page.evaluate(
+    () => document.querySelector<HTMLElement>(".content-area")?.scrollTop ?? 0
+  );
+}
 
 async function horizontalOverflow(page: import("@playwright/test").Page) {
   return page.evaluate(() => {

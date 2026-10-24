@@ -31,9 +31,10 @@ cp .env.example .env
 编辑 `.env`，逐项说明如下：
 
 ```env
-# 【必填】本服务的访问令牌，AI 客户端、REST、Web 控制台共用它。
-# 未配置时所有受保护接口返回 500。请改成足够长的随机字符串。
-GATEWAY_API_KEY=change-me
+# 留空。不要填写 change-me 或其他示例值：legacy 认证默认开启时，
+# 已知占位符会让服务拒绝启动，也不能当作 Bearer 访问密钥。
+# 新客户端用 memgw token create；只有迁移期才用 memgw secret set gateway 写入随机密钥。
+GATEWAY_API_KEY=
 
 # 【默认启用】OpenAI Chat Completions 透明记忆代理。
 CHAT_GATEWAY_ENABLED=true
@@ -58,7 +59,7 @@ CHAT_GATEWAY_EXTRACTION_PREFILTER=true
 # 未配置时 /readyz 返回 model_runtime_configuration_error，依赖模型的功能不可用，
 # 但手动保存、检索、管理功能仍可用。渠道、模型与价格在 Model Gateway 侧管理。
 MODEL_GATEWAY_BASE_URL=http://127.0.0.1:2030/v1
-MODEL_GATEWAY_API_KEY=your-local-model-gateway-client-key
+MODEL_GATEWAY_API_KEY=
 
 # 【安全边界】是否允许把本地判定为 sensitive（密码/密钥、证件号、银行卡/账号）的句子发给远程模型。
 # 默认 false，只有确认 provider 获准处理敏感数据时才改 true。
@@ -144,7 +145,7 @@ X-User-Id: default
 
 ```bash
 curl -X POST http://localhost:2026/memories/search \
-  -H "Authorization: Bearer change-me" \
+  -H "Authorization: Bearer <登录密钥或聊天密钥>" \
   -H "X-User-Id: default" \
   -H "Content-Type: application/json" \
   -d '{"query": "咖啡"}'

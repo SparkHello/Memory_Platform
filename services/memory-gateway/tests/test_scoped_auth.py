@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from app.auth.middleware import EarlyAuthMiddleware, ProcessAccessGate, _is_irreversible
 from app.auth.tokens import AuthTokenStore
 from app.config import Settings, get_settings
+from app.credential_policy import is_placeholder_credential
 
 
 MCP_HEADERS = {
@@ -340,6 +341,102 @@ def test_batch_purge_preview_is_read_only_but_commit_uses_irreversible_gate(clie
     )
     assert limited.status_code == 429
     assert "不可逆管理操作" in limited.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "legacy_key",
+    (
+        "change-me",
+        "Change-Me",
+        " change-me ",
+        "your-api-key",
+        "your-upstream-api-key",
+        "replace-me",
+        "your-local-model-gateway-client-key",
+    ),
+)
+def test_placeholder_legacy_key_is_rejected_when_legacy_auth_is_enabled(
+    legacy_key: str,
+) -> None:
+    with pytest.raises(ValidationError, match="占位符"):
+        Settings(
+            _env_file=None,
+            GATEWAY_API_KEY=legacy_key,
+            GATEWAY_LEGACY_API_KEY_ENABLED=True,
+        )
+
+
+def test_placeholder_can_remain_stored_only_while_legacy_auth_is_off() -> None:
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="change-me",
+        GATEWAY_LEGACY_API_KEY_ENABLED=False,
+    )
+
+    assert settings.gateway_api_key == "change-me"
+    assert is_placeholder_credential(settings.gateway_api_key)
+
+
+def test_legacy_key_containing_placeholder_text_is_not_a_placeholder() -> None:
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="change-me-is-only-a-prefix-of-this-random-key",
+        GATEWAY_LEGACY_API_KEY_ENABLED=True,
+    )
+
+    assert settings.gateway_legacy_api_key_enabled is True
+
+
+@pytest.mark.anyio
+async def test_placeholder_legacy_key_is_rejected_at_auth_even_if_settings_bypass_validation(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        GATEWAY_API_KEY="real-legacy-key-not-a-placeholder",
+        GATEWAY_LEGACY_API_KEY_ENABLED=True,
+        DATABASE_PATH=str(tmp_path / "memory.db"),
+        KNOWLEDGE_DATABASE_PATH=str(tmp_path / "knowledge.db"),
+        AUTH_DATABASE_PATH=str(tmp_path / "auth.db"),
+    )
+    settings.gateway_api_key = "change-me"
+
+    async def downstream(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def request(path: str, token: str) -> int:
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(message)
+
+        await EarlyAuthMiddleware(
+            downstream,
+            settings_provider=lambda: settings,
+        )(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": path,
+                "headers": [(b"authorization", f"Bearer {token}".encode())],
+            },
+            receive,
+            send,
+        )
+        return int(sent[0]["status"])
+
+    assert await request("/memories", "change-me") == 401
+    assert await request("/auth/tokens", "change-me") == 401
+    assert await request("/memories", "Change-Me") == 401
+
+    settings.gateway_api_key = "real-legacy-key-not-a-placeholder"
+    assert await request("/memories", "real-legacy-key-not-a-placeholder") == 200
+    assert await request("/auth/tokens", "real-legacy-key-not-a-placeholder") == 200
+    assert await request("/memories", "change-me") == 401
 
 
 def test_signing_secret_must_be_independent_from_every_access_token() -> None:
