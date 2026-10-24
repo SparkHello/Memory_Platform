@@ -22,7 +22,7 @@ from app.memory.store import MemoryStore
 from app.schema_migrations import enable_wal_with_retry
 
 
-_LATEST_MEMORY_SCHEMA_VERSION = 7
+_LATEST_MEMORY_SCHEMA_VERSION = 8
 
 
 def _initialize_memory_store_in_process(db_path: str, start, results) -> None:
@@ -200,7 +200,7 @@ class TestMemorySchemaMigrations:
 
         store.init_db()
 
-        assert _user_version(db_path) == 7
+        assert _user_version(db_path) == _LATEST_MEMORY_SCHEMA_VERSION
         with store._connect() as connection:
             columns = {
                 row["name"]

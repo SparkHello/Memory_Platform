@@ -30,6 +30,7 @@ from app.memory.models import (
 )
 from app.memory.store.constants import _UNSET
 from app.memory.store.errors import RevisionConflictError
+from app.memory.vector_index import embedding_unit_blob, vector_recall_ready
 from app.memory.store.helpers import (
     ConnectionProvider,
     _bounded_float,
@@ -406,7 +407,7 @@ def update_memory(
             UPDATE memories
             SET content = ?, type = ?, importance = ?, confidence = ?,
                 valence = ?, arousal = ?, source_message = ?, source_conversation_id = ?,
-                embedding_json = ?, embedding_space_id = ?,
+                embedding_json = ?, embedding_space_id = ?, embedding_unit = ?,
                 stability = ?, valid_from = ?, valid_until = ?,
                 review_after = ?, sensitivity = ?,
                 evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
@@ -426,6 +427,7 @@ def update_memory(
                 prospective.source_conversation_id,
                 prospective.embedding_json,
                 prospective.embedding_space_id,
+                embedding_unit_blob(prospective.embedding_json),
                 prospective.stability,
                 prospective.valid_from,
                 prospective.valid_until,
@@ -603,60 +605,137 @@ def list_memories_for_resolution(store: ConnectionProvider, *, user_id: str) -> 
         ).fetchall()
     return _rows_to_memories(store, rows)
 
+class RecallSnapshot:
+    """Repeatable page reader bound to one open read transaction."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        user_id: str,
+        page_size: int,
+        omits_embeddings: bool,
+    ) -> None:
+        self.connection = connection
+        self.user_id = user_id
+        self.omits_embeddings = omits_embeddings
+        self._page_size = page_size
+        self._select_sql = _recall_select_sql(
+            connection,
+            omit_embedding_json=omits_embeddings,
+        )
+
+    def __call__(self) -> Iterator[list[MemoryRecord]]:
+        last_rowid: int | None = None
+        while True:
+            if last_rowid is None:
+                rows = self.connection.execute(
+                    f"""
+                    SELECT {self._select_sql}
+                    FROM memories
+                    WHERE user_id = ? AND archived = 0
+                      AND (status IS NULL OR status != 'archived')
+                    ORDER BY rowid ASC
+                    LIMIT ?
+                    """,
+                    (self.user_id, self._page_size),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    f"""
+                    SELECT {self._select_sql}
+                    FROM memories
+                    WHERE user_id = ? AND archived = 0
+                      AND (status IS NULL OR status != 'archived')
+                      AND rowid > ?
+                    ORDER BY rowid ASC
+                    LIMIT ?
+                    """,
+                    (self.user_id, last_rowid, self._page_size),
+                ).fetchall()
+            if not rows:
+                return
+            last_rowid = int(rows[-1]["recall_rowid"])
+            yield _rows_to_memories_on_connection(
+                connection=self.connection,
+                rows=rows,
+            )
+
+    def hydrate_embeddings(self, memories: list[MemoryRecord]) -> None:
+        """Put the stored embedding text back onto ranked hits."""
+        if not memories or not self.omits_embeddings:
+            return
+        found: dict[str, sqlite3.Row] = {}
+        ids = [memory.id for memory in memories]
+        for offset in range(0, len(ids), 500):
+            batch = ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self.connection.execute(
+                f"""
+                SELECT id, embedding_json, embedding_space_id
+                FROM memories
+                WHERE user_id = ? AND id IN ({placeholders})
+                """,
+                (self.user_id, *batch),
+            ).fetchall()
+            for row in rows:
+                found[str(row["id"])] = row
+        for memory in memories:
+            row = found.get(memory.id)
+            if row is None:
+                continue
+            raw = row["embedding_json"]
+            memory.embedding_json = raw if raw else None
+            space_id = row["embedding_space_id"]
+            memory.embedding_space_id = (
+                str(space_id).strip() if raw and space_id else None
+            )
+
+
+def _recall_select_sql(
+    connection: sqlite3.Connection,
+    *,
+    omit_embedding_json: bool,
+) -> str:
+    names = [str(row[1]) for row in connection.execute("PRAGMA table_info(memories)")]
+    parts = ["rowid AS recall_rowid"]
+    for name in names:
+        quoted = '"' + name.replace('"', '""') + '"'
+        if omit_embedding_json and name in {"embedding_json", "embedding_unit"}:
+            parts.append(f"NULL AS {quoted}")
+        else:
+            parts.append(quoted)
+    if omit_embedding_json:
+        parts.append("1 AS embedding_json_omitted")
+    return ", ".join(parts)
+
+
 @contextmanager
 def memory_recall_snapshot(
     store: ConnectionProvider,
     *,
     user_id: str,
     page_size: int = 500,
-) -> Iterator[Callable[[], Iterator[list[MemoryRecord]]]]:
+    omit_embedding_json: bool = False,
+) -> Iterator[RecallSnapshot]:
     """Expose repeatable, bounded page scans from one SQLite snapshot.
 
     Search needs two passes because keyword IDF is corpus-wide.  Returning a
     fresh page iterator for each pass keeps the read transaction (and thus
     the visible corpus) stable without ever materializing the whole library.
+    Vector recall omits ``embedding_json`` from those pages and scores a
+    cached unit-vector matrix instead.
     """
     bounded_page_size = max(1, min(int(page_size), 1000))
     with store._connect() as connection:
         connection.execute("BEGIN")
-
-        def read_pages() -> Iterator[list[MemoryRecord]]:
-            last_rowid: int | None = None
-            while True:
-                if last_rowid is None:
-                    rows = connection.execute(
-                        """
-                        SELECT rowid AS recall_rowid, *
-                        FROM memories
-                        WHERE user_id = ? AND archived = 0
-                          AND (status IS NULL OR status != 'archived')
-                        ORDER BY rowid ASC
-                        LIMIT ?
-                        """,
-                        (user_id, bounded_page_size),
-                    ).fetchall()
-                else:
-                    rows = connection.execute(
-                        """
-                        SELECT rowid AS recall_rowid, *
-                        FROM memories
-                        WHERE user_id = ? AND archived = 0
-                          AND (status IS NULL OR status != 'archived')
-                          AND rowid > ?
-                        ORDER BY rowid ASC
-                        LIMIT ?
-                        """,
-                        (user_id, last_rowid, bounded_page_size),
-                    ).fetchall()
-                if not rows:
-                    return
-                last_rowid = int(rows[-1]["recall_rowid"])
-                yield _rows_to_memories_on_connection(
-                    connection=connection,
-                    rows=rows,
-                )
-
-        yield read_pages
+        omit = bool(omit_embedding_json) and vector_recall_ready(connection)
+        yield RecallSnapshot(
+            connection,
+            user_id=user_id,
+            page_size=bounded_page_size,
+            omits_embeddings=omit,
+        )
 
 def get_memories_max_updated_at(store: ConnectionProvider, *, user_id: str) -> str | None:
     """返回该用户所有活跃记忆的最新 updated_at，用于缓存失效比对。"""
@@ -860,10 +939,18 @@ def update_memory_embedding(
         cursor = connection.execute(
             """
             UPDATE memories
-            SET embedding_json = ?, embedding_space_id = ?, updated_at = ?
+            SET embedding_json = ?, embedding_space_id = ?, embedding_unit = ?,
+                updated_at = ?
             WHERE id = ? AND user_id = ? AND archived = 0
             """,
-            (embedding_json, normalized_space_id, now, memory_id, user_id),
+            (
+                embedding_json,
+                normalized_space_id,
+                embedding_unit_blob(embedding_json),
+                now,
+                memory_id,
+                user_id,
+            ),
         )
     return cursor.rowcount > 0
 

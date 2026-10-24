@@ -19,6 +19,9 @@ dependencies = [
     "pydantic-settings>=2.3.0",
     "python-dotenv>=1.0.1",
     "pypdf>=5.0.0",
+    # Vector recall batches dot products of stored unit vectors. Import is
+    # optional at runtime so an environment without a wheel still recalls.
+    "numpy>=2.1,<3",
     "pywin32>=311; sys_platform == 'win32'",
 ]
 

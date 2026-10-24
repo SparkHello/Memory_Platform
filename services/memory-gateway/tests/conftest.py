@@ -585,9 +585,11 @@ def memory_store(tmp_path) -> MemoryStore:
     store.init_db()
     # 清除模块级搜索缓存，避免测试间残留
     from app.memory.search import _CACHE_METRICS, _EMBEDDING_CACHE, SEARCH_CACHE
+    from app.memory.vector_index import clear_vector_index_cache
     _EMBEDDING_CACHE.clear()
     SEARCH_CACHE.clear()
     _CACHE_METRICS.clear()
+    clear_vector_index_cache()
     return store
 
 

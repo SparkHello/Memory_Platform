@@ -27,6 +27,7 @@ from app.memory.classification import (
     normalize_classification_names,
 )
 from app.memory.store.constants import _CONVERSATION_BRANCH_NODE_RETENTION_LIMIT
+from app.memory.vector_index import embedding_unit_blob
 from app.memory.store.helpers import (
     ConnectionProvider,
     _bounded_float,
@@ -1321,6 +1322,7 @@ def _import_prepared_memory_record_on_connection(
         memory.origin,
         memory.embedding_json,
         memory.embedding_space_id,
+        embedding_unit_blob(memory.embedding_json),
         memory.last_used_at,
         memory.usage_count,
         memory.stability,
@@ -1351,7 +1353,7 @@ def _import_prepared_memory_record_on_connection(
             SET user_id = ?, content = ?, type = ?, importance = ?,
                 confidence = ?, valence = ?, arousal = ?, source_message = ?,
                 source_conversation_id = ?, origin = ?, embedding_json = ?,
-                embedding_space_id = ?,
+                embedding_space_id = ?, embedding_unit = ?,
                 last_used_at = ?, usage_count = ?, stability = ?,
                 valid_from = ?, valid_until = ?, review_after = ?, sensitivity = ?,
                 evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,

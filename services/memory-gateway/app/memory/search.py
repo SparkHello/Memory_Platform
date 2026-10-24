@@ -42,6 +42,7 @@ from app.memory.temporal import (
     temporal_query_window,
 )
 from app.memory.utils import _memory_embedding_vector, _parse_iso_datetime, _terms
+from app.memory.vector_index import max_cosines_by_id
 from app.sensitivity import SENSITIVITY_RANK
 from app.usage.context import current_usage_context, model_usage_scope
 from app.usage.attribution import model_gateway_usage_headers
@@ -706,8 +707,23 @@ class MemorySearchService:
             # A keyword score contains corpus-wide metadata IDF.  The first
             # pass computes those statistics; the second pass ranks from the
             # exact same SQLite snapshot and keeps only bounded global channel
-            # candidates.
-            with self.store.memory_recall_snapshot(user_id=user_id) as read_pages:
+            # candidates. Embedding scores come from one unit-vector matrix
+            # for that snapshot, so the pages do not carry embedding JSON.
+            with self.store.memory_recall_snapshot(
+                user_id=user_id,
+                omit_embedding_json=bool(query_embeddings),
+            ) as read_pages:
+                precomputed = (
+                    max_cosines_by_id(
+                        read_pages.connection,
+                        database_path=str(getattr(self.store, "database_path", "")),
+                        user_id=user_id,
+                        embedding_space_id=embedding_space_id,
+                        query_embeddings=query_embeddings,
+                    )
+                    if query_embeddings and read_pages.omits_embeddings
+                    else None
+                )
                 for page in read_pages():
                     page = eligible(page)
                     document_count += len(page)
@@ -727,6 +743,7 @@ class MemorySearchService:
                             page,
                             query_embeddings,
                             embedding_space_id=embedding_space_id,
+                            precomputed=precomputed,
                         ):
                             sequence += 1
                             _push_bounded_scored_memory(
@@ -754,18 +771,21 @@ class MemorySearchService:
                             memory=memory,
                             sequence=sequence,
                         )
+                selected = _combine_recall_hits(
+                    embedding_heap,
+                    keyword_heap,
+                    limit=limit,
+                    now=now,
+                )
+                read_pages.hydrate_embeddings([hit.memory for hit in selected])
+                return selected
 
-        combined: dict[str, MemorySearchHit] = {}
-        for score, memory in _scored_memories_descending(embedding_heap):
-            _upsert_hit(combined, memory, score, "embedding", now=now)
-        for score, memory in _scored_memories_descending(keyword_heap):
-            _upsert_hit(combined, memory, score, "keyword", now=now)
-        hits = list(combined.values())
-        hits.sort(
-            key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
-            reverse=True,
+        return _combine_recall_hits(
+            embedding_heap,
+            keyword_heap,
+            limit=limit,
+            now=now,
         )
-        return hits[:limit]
 
     def _fts_keyword_candidates(
         self,
@@ -1090,25 +1110,32 @@ class MemorySearchService:
         query_embeddings: list[list[float]],
         *,
         embedding_space_id: str,
+        precomputed: dict[str, float] | None = None,
     ) -> list[tuple[float, MemoryRecord]]:
         if not embedding_space_id or not query_embeddings:
             return []
         scored: list[tuple[float, MemoryRecord]] = []
-        for memory in memories:
-            memory_embedding = _memory_embedding_vector(
-                memory,
-                expected_space_id=embedding_space_id,
-            )
-            if memory_embedding is None:
-                continue
-            # 多意图消息按子句取最高相似度，避免整句向量稀释单个意图。
-            cosine = max(
-                cosine_similarity(query_embedding, memory_embedding)
-                for query_embedding in query_embeddings
-            )
-            score = cosine * 100.0
-            if cosine >= EMBEDDING_MIN_COSINE:
-                scored.append((score, memory))
+        if precomputed is not None:
+            for memory in memories:
+                cosine = precomputed.get(memory.id)
+                if cosine is None or cosine < EMBEDDING_MIN_COSINE:
+                    continue
+                scored.append((float(cosine) * 100.0, memory))
+        else:
+            for memory in memories:
+                memory_embedding = _memory_embedding_vector(
+                    memory,
+                    expected_space_id=embedding_space_id,
+                )
+                if memory_embedding is None:
+                    continue
+                # 多意图消息按子句取最高相似度，避免整句向量稀释单个意图。
+                cosine = max(
+                    cosine_similarity(query_embedding, memory_embedding)
+                    for query_embedding in query_embeddings
+                )
+                if cosine >= EMBEDDING_MIN_COSINE:
+                    scored.append((cosine * 100.0, memory))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
@@ -1330,6 +1357,26 @@ def _upsert_hit(
             topic_score,
         )
     _refresh_hit_ranking(existing, now=now)
+
+
+def _combine_recall_hits(
+    embedding_heap: list[tuple[float, int, str, int, MemoryRecord]],
+    keyword_heap: list[tuple[float, int, str, int, MemoryRecord]],
+    *,
+    limit: int,
+    now: datetime,
+) -> list[MemorySearchHit]:
+    combined: dict[str, MemorySearchHit] = {}
+    for score, memory in _scored_memories_descending(embedding_heap):
+        _upsert_hit(combined, memory, score, "embedding", now=now)
+    for score, memory in _scored_memories_descending(keyword_heap):
+        _upsert_hit(combined, memory, score, "keyword", now=now)
+    hits = list(combined.values())
+    hits.sort(
+        key=lambda hit: (hit.total_score, hit.topic_score, hit.memory.updated_at),
+        reverse=True,
+    )
+    return hits[:limit]
 
 
 def _push_bounded_scored_memory(
