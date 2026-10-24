@@ -23,6 +23,7 @@ from app.memory.models import (
 )
 from app.memory.redaction import sensitivity_floor
 from app.memory.utils import _ordered_unique, _parse_iso_datetime
+from app.memory.vector_index import embedding_unit_blob
 
 
 class ConnectionProvider(Protocol):
@@ -205,14 +206,14 @@ def _insert_memory_row(
             id, user_id, content, type, importance, confidence,
             valence, arousal,
             source_message, source_conversation_id, origin, embedding_json,
-            embedding_space_id,
+            embedding_space_id, embedding_unit,
             last_used_at, usage_count, stability, valid_from, valid_until, review_after,
             sensitivity, evidence_memory_ids_json, topics_json, entities_json,
             temporal_subject, temporal_predicate,
             status, digested, decay_lambda, supersedes, superseded_by,
             created_at, updated_at, archived_at, archived, revision
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             memory.id,
@@ -228,6 +229,7 @@ def _insert_memory_row(
             memory.origin,
             memory.embedding_json,
             memory.embedding_space_id,
+            embedding_unit_blob(memory.embedding_json),
             memory.last_used_at,
             memory.usage_count,
             memory.stability,
@@ -319,6 +321,9 @@ def _row_to_memory(
     space_ids: list[str],
 ) -> MemoryRecord:
     data = dict(row)
+    data.pop("recall_rowid", None)
+    data.pop("embedding_unit", None)
+    embedding_omitted = bool(data.pop("embedding_json_omitted", 0))
     raw_evidence = data.pop("evidence_memory_ids_json", None)
     raw_topics = data.pop("topics_json", None)
     raw_entities = data.pop("entities_json", None)
@@ -328,7 +333,12 @@ def _row_to_memory(
     data["type"] = normalize_memory_type(data.get("type") or "semantic")
     data["origin"] = data.get("origin") or "user_asserted"
     data.setdefault("embedding_space_id", None)
-    if not data.get("embedding_json"):
+    if embedding_omitted:
+        # The recall scan left the JSON body in SQLite. Keep the space id so
+        # ranking metadata still matches the stored row; the hit is filled
+        # back in before it leaves the snapshot.
+        data["embedding_json"] = ""
+    elif not data.get("embedding_json"):
         data["embedding_space_id"] = None
     data["usage_count"] = float(data.get("usage_count") or 0)
     data["digested"] = bool(data.get("digested"))

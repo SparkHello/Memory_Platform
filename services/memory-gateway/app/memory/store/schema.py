@@ -43,7 +43,16 @@ def create_tables(connection: sqlite3.Connection) -> None:
             updated_at TEXT,
             archived_at TEXT,
             archived INTEGER DEFAULT 0,
-            revision INTEGER NOT NULL DEFAULT 1
+            revision INTEGER NOT NULL DEFAULT 1,
+            embedding_unit BLOB
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_vector_epoch (
+            user_id TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL
         )
         """
     )
@@ -275,6 +284,72 @@ def create_indexes(connection: sqlite3.Connection) -> None:
         ON conversation_branch_nodes(
             user_id, conversation_id, archived, updated_at DESC
         )
+        """
+    )
+    ensure_vector_epoch_triggers(connection)
+
+
+def ensure_vector_epoch_triggers(connection: sqlite3.Connection) -> None:
+    """Bump a per-user epoch when the active vector set changes.
+
+    Usage updates do not name these columns, so recall exposure does not
+    rebuild the cached matrix. The WHEN clause ignores SET clauses that
+    write the same vector again.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_vector_epoch (
+            user_id TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_vector_epoch_insert
+        AFTER INSERT ON memories
+        WHEN NEW.user_id IS NOT NULL
+        BEGIN
+            INSERT INTO memory_vector_epoch(user_id, epoch)
+            VALUES (NEW.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch = epoch + 1;
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_vector_epoch_delete
+        AFTER DELETE ON memories
+        WHEN OLD.user_id IS NOT NULL
+        BEGIN
+            INSERT INTO memory_vector_epoch(user_id, epoch)
+            VALUES (OLD.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch = epoch + 1;
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_vector_epoch_update
+        AFTER UPDATE OF
+            embedding_json, embedding_space_id, embedding_unit,
+            archived, status, user_id
+        ON memories
+        WHEN OLD.embedding_json IS NOT NEW.embedding_json
+            OR OLD.embedding_space_id IS NOT NEW.embedding_space_id
+            OR OLD.embedding_unit IS NOT NEW.embedding_unit
+            OR OLD.archived IS NOT NEW.archived
+            OR OLD.status IS NOT NEW.status
+            OR OLD.user_id IS NOT NEW.user_id
+        BEGIN
+            INSERT INTO memory_vector_epoch(user_id, epoch)
+            VALUES (NEW.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch = epoch + 1;
+            INSERT INTO memory_vector_epoch(user_id, epoch)
+            SELECT OLD.user_id, 1
+            WHERE OLD.user_id IS NOT NEW.user_id
+            ON CONFLICT(user_id) DO UPDATE SET epoch = epoch + 1;
+        END
         """
     )
 

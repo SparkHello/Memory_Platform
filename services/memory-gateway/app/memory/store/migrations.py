@@ -228,6 +228,41 @@ def _memory_migration_v7(connection: sqlite3.Connection) -> None:
     )
 
 
+def _memory_migration_v8(connection: sqlite3.Connection) -> None:
+    """Store an L2-normalized blob beside each existing embedding.
+
+    ``embedding_json`` stays the original provider vector. Recall dots the
+    unit blob, which is cosine similarity within float tolerance. Rows that
+    cannot be normalized are marked with an empty blob and stay out of
+    vector recall, matching the previous incomparable-vector rule.
+    """
+    from app.memory.vector_index import backfill_embedding_units
+
+    schema_ensure._ensure_columns(
+        connection,
+        "memories",
+        {"embedding_unit": "BLOB"},
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_vector_epoch (
+            user_id TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL
+        )
+        """
+    )
+    backfill_embedding_units(connection)
+    connection.execute(
+        """
+        INSERT INTO memory_vector_epoch(user_id, epoch)
+        SELECT user_id, 1 FROM memories
+        WHERE user_id IS NOT NULL
+        GROUP BY user_id
+        ON CONFLICT(user_id) DO UPDATE SET epoch = epoch + 1
+        """
+    )
+
+
 _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _memory_migration_v1),
     (2, _memory_migration_v2),
@@ -236,6 +271,7 @@ _MEMORY_SCHEMA_MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]
     (5, _memory_migration_v5),
     (6, _memory_migration_v6),
     (7, _memory_migration_v7),
+    (8, _memory_migration_v8),
 ]
 
 if _MEMORY_SCHEMA_MIGRATIONS[-1][0] != MEMORY_SCHEMA_VERSION:
