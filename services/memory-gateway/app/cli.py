@@ -38,6 +38,7 @@ from app.cli_config import (
     write_json_atomic,
 )
 from app.config import Settings, describe_settings_error
+from app.credential_policy import PLACEHOLDER_LEGACY_KEY_MESSAGE
 from app.stack_backup import (
     create_stack_backup,
     recover_interrupted_stack_restore,
@@ -1104,6 +1105,10 @@ def _cmd_secret_set(args: Any, paths: CliPaths, project_root: Path) -> int:
     value = sys.stdin.read().strip() if args.stdin else getpass.getpass(f"{args.name} 密钥：")
     if not value:
         raise ValueError("密钥不能为空")
+    # ``secret set gateway`` always turns legacy auth on, so reject placeholders
+    # here even when the current flag is still false.
+    if args.name == "gateway" and is_placeholder_value(value):
+        raise ValueError(PLACEHOLDER_LEGACY_KEY_MESSAGE)
     if args.name in {"gateway", "signing"}:
         candidate = effective_environment(paths, project_root)
         candidate[variable] = value

@@ -192,6 +192,7 @@ def test_ci_runs_windows_installer_contract_on_both_powershell_engines() -> None
     assert "shell: pwsh" in workflow
     assert workflow.count("test_installer_parity.py") == 2
     assert workflow.count("test_windows_docker_install_script.py") == 2
+    assert workflow.count("--noconftest") == 2
     assert workflow.count("windows_installer_journal.ps1") == 2
     # Construct non-ASCII names from code points: this remains real Chinese
     # when Windows PowerShell 5.1 reads the UTF-8-without-BOM harness as ANSI.

@@ -25,6 +25,11 @@ from model_gateway_contracts import (
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.credential_policy import (
+    PLACEHOLDER_LEGACY_KEY_MESSAGE,
+    is_placeholder_credential,
+)
+
 _PRIVATE_MODEL_GATEWAY_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -442,6 +447,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "GATEWAY_SIGNING_SECRET 必须与 MODEL_GATEWAY_API_KEY 独立"
             )
+        if (
+            self.gateway_legacy_api_key_enabled
+            and is_placeholder_credential(self.gateway_api_key)
+        ):
+            raise ValueError(PLACEHOLDER_LEGACY_KEY_MESSAGE)
         return self
 
     @model_validator(mode="after")

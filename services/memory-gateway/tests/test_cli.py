@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 from types import SimpleNamespace
@@ -51,6 +52,21 @@ def _base_args(tmp_path: Path) -> list[str]:
         "--project-root",
         str(PROJECT_ROOT),
     ]
+
+
+def _installed_modelgw() -> Path:
+    """modelgw belonging to this interpreter, not a project-venv pip install."""
+    name = "modelgw.exe" if os.name == "nt" else "modelgw"
+    candidate = Path(sys.executable).resolve().with_name(name)
+    if candidate.is_file():
+        return candidate
+    found = shutil.which("modelgw")
+    if found:
+        return Path(found)
+    pytest.fail(
+        "modelgw is not installed for this interpreter; "
+        "this test refuses to pip-install into a project virtualenv"
+    )
 
 
 def test_stack_install_application_does_not_depend_on_cli_modules() -> None:
@@ -530,6 +546,7 @@ def test_stack_install_rotates_and_syncs_backend_key_without_echo(
 
 def test_stack_install_quickstart_stack_install_keeps_backend_policy_stable(
     tmp_path,
+    monkeypatch,
 ) -> None:
     from model_gateway.config_store import gateway_paths, load_config, read_secrets
     from model_gateway.memory_client import CHAT_ROUTES, EMBEDDING_ROUTE
@@ -545,6 +562,22 @@ def test_stack_install_quickstart_stack_install_keeps_backend_policy_stable(
         "--model-gateway-home",
         str(model_home),
     ]
+    # The sibling model-gateway checkout is an installable source, so the real
+    # helper would pip install --no-deps into services/memory-gateway/.venv.
+    # CI has no project venv; a developer venv must not be mutated by pytest.
+    modelgw = _installed_modelgw()
+
+    def reject_pip(command, *command_args, **command_kwargs):
+        parts = [str(part) for part in command]
+        if "pip" in parts:
+            raise AssertionError(f"stack install test invoked pip: {parts}")
+        return subprocess.run(command, *command_args, **command_kwargs)
+
+    monkeypatch.setattr(
+        "app.cli._ensure_model_gateway_runtime",
+        lambda *runtime_args, **runtime_kwargs: modelgw,
+    )
+    monkeypatch.setattr("app.cli.subprocess.run", reject_pip)
 
     assert main(install_arguments) == 0
     model_paths = gateway_paths(model_home)
@@ -972,6 +1005,28 @@ def test_server_command_exports_settings_path_but_not_secret_values(
     for name, value in synthetic.items():
         assert name not in environment
         assert value not in environment.values()
+
+
+def test_secret_set_gateway_rejects_placeholder_without_enabling_legacy(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    args = _base_args(tmp_path)
+    assert main([*args, "init", "--no-import-env"]) == 0
+    paths = cli_paths(tmp_path / "memgw-home")
+    update_env_value(paths.settings_env, "GATEWAY_LEGACY_API_KEY_ENABLED", "false")
+    submitted = "your-private-example"
+    monkeypatch.setattr("sys.stdin", io.StringIO(submitted + "\n"))
+
+    assert main([*args, "secret", "set", "gateway", "--stdin"]) == 2
+
+    error = capsys.readouterr().err
+    assert "占位符" in error
+    assert submitted not in error
+    values = read_env_file(paths.settings_env)
+    assert values.get("GATEWAY_API_KEY", "") != submitted
+    assert values["GATEWAY_LEGACY_API_KEY_ENABLED"] == "false"
 
 
 def test_settings_error_redaction_and_secret_name_suffixes() -> None:
