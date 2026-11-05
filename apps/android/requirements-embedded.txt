@@ -9,6 +9,9 @@
 # Everything left is pure Python except the two packages marked "rust", which
 # have no Android wheels anywhere; apps/android/wheels/ holds the copies built
 # on the phone by Termux (scripts/android/termux-export-wheels.sh).
+# numpy is a memory-gateway dependency used to batch vector recall. It is
+# intentionally absent here: the recall path falls back to a pure-Python dot
+# product of the same stored unit vectors when numpy cannot be imported.
 fastapi==0.141.1
 starlette==1.3.1
 uvicorn==0.52.1

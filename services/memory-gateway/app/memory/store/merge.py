@@ -199,7 +199,7 @@ def merge_memories(
             SET content = ?, type = ?, importance = ?, confidence = ?,
                 valence = ?, arousal = ?, source_message = ?,
                 source_conversation_id = ?, embedding_json = NULL,
-                embedding_space_id = NULL,
+                embedding_space_id = NULL, embedding_unit = NULL,
                 stability = ?, valid_from = ?, valid_until = ?,
                 review_after = ?, sensitivity = ?,
                 evidence_memory_ids_json = ?, topics_json = ?, entities_json = ?,
