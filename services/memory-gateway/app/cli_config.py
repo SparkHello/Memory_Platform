@@ -13,13 +13,9 @@ from typing import Any, Mapping
 
 from dotenv import dotenv_values
 
+from app.credential_policy import is_placeholder_credential
 
-_PLACEHOLDERS = {
-    "change-me",
-    "your-api-key",
-    "your-upstream-api-key",
-    "replace-me",
-}
+
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Direct-provider / local catalog env names retired after Model Gateway convergence.
@@ -292,7 +288,7 @@ def is_secret_name(name: str) -> bool:
 
 
 def is_placeholder_value(value: str) -> bool:
-    return _is_placeholder(value)
+    return is_placeholder_credential(value)
 
 
 def _validate_project_root(path: Path) -> Path:
@@ -367,8 +363,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _is_placeholder(value: str) -> bool:
-    lowered = value.strip().lower()
-    return lowered in _PLACEHOLDERS or lowered.startswith("your-")
+    return is_placeholder_credential(value)
 
 
 def _is_secret_name(name: str) -> bool:

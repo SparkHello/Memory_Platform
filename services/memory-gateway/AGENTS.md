@@ -171,7 +171,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
 - `X-User-Id` 是用户隔离边界；未传时使用 `default`。新增查询、导出、恢复、日志或工具时都要确认按 user id 过滤。
 - MCP 使用 `stateless_http=True` 和 `json_response=True`，测试默认每个 POST 都是独立请求。
 - MCP 关闭 DNS rebinding protection 是为了让局域网/iPhone/Tailscale 访问可用；不要在没有替代接入方案的情况下改回默认。
-- `GATEWAY_API_KEY`（或 scoped token）是本地 Memory 服务的客户端密钥；`MODEL_GATEWAY_API_KEY` 是 Memory 调用 Model Gateway 的 backend client key，二者均不得透传给终端用户客户端。
+- `GATEWAY_API_KEY`（或 scoped token）是本地 Memory 服务的客户端密钥；`MODEL_GATEWAY_API_KEY` 是 Memory 调用 Model Gateway 的 backend client key，二者均不得透传给终端用户客户端。已知占位符（`change-me`、`replace-me`、`your-` 前缀）与 CLI 共用同一份名单：legacy 启用时 `Settings` 拒绝启动，鉴权层也不会接受，示例配置必须留空。
 - `ALLOW_SENSITIVE_EGRESS=false` 时，`sensitive`（密码/密钥、证件号、银行卡/账号）原文不得发送给远程记忆提取、embedding、AI 体检或知识代理；记忆提取和 embedding 按句子过滤（`app/memory/egress.py`），只扣留级别超过 `MEMORY_EGRESS_CEILING` 的句子，压缩、体检和知识代理仍扣留全部非 `normal` 文本；新增后台模型调用必须经过同一出站策略。`/v1` 当前聊天正文是用户主动发往其配置聊天上游的数据，不受此开关阻断；自动注入可包含与当前问题相关的 `private` 记忆（排序压低并加提示标签），但必须排除 `sensitive` 记忆和本地复检为 `sensitive` 的内容。
 - ingest 附带的 `assistant_message` 和较早消歧上下文都属于发送给提取模型的上下文；当 `ALLOW_SENSITIVE_EGRESS=false` 且本地检测为敏感时必须丢弃对应助手文本、摘要或轮次，只用安全上下文与用户原文继续提取。较早上下文只能消歧，本轮 `source_quote` 仍是事实值的唯一权威来源；依赖上下文时必须校验 `context_quote`，且模型生成的压缩摘要不得作为 `context_quote` 来源，只有保留的最近原文可以。
 - `KNOWLEDGE_DATABASE_PATH` 必须与 `DATABASE_PATH` 指向不同文件；测试也必须使用临时 knowledge DB，不能创建或修改真实 `data/knowledge.db`。

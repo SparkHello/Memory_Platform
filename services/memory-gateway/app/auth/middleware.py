@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.tokens import AuthPrincipal, AuthTokenStore
 from app.config import Settings, get_settings, is_local_console_login_source
+from app.credential_policy import is_placeholder_credential
 from app.disk_capacity import DiskCapacityError, is_storage_exhausted
 
 
@@ -225,6 +226,7 @@ def _authenticate(token: str, settings: Settings) -> AuthPrincipal | None:
     if (
         settings.gateway_legacy_api_key_enabled
         and legacy_key
+        and not is_placeholder_credential(legacy_key)
         and _constant_time_text_equal(token, legacy_key)
     ):
         bound_user_id = settings.gateway_user_id.strip() or "default"
